@@ -59,10 +59,10 @@ services:
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD", "bash", "-ec", ": </dev/tcp/127.0.0.1/5672"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
 
 volumes:
   uploads_data:

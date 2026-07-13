@@ -1,0 +1,8 @@
+[Unit]
+Description=GoIM readiness watchdog
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/goim-watchdog.sh

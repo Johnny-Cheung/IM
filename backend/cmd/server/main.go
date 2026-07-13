@@ -64,6 +64,10 @@ func main() {
 	}
 	defer logger.Sync()
 
+	// 统一管理服务退出：系统信号和 RabbitMQ 异常都会走同一套优雅关闭流程。
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	// ── 初始化 MySQL ──
 	db, err := infra.NewMySQLPool(&cfg.MySQL)
 	if err != nil {
@@ -82,19 +86,27 @@ func main() {
 	logger.Info("Redis 已连接")
 
 	// ── 初始化 RabbitMQ ──
-	mqConn, mqCh, err := infra.NewRabbitMQConn(&cfg.RabbitMQ)
+	mqConn, mqCh, err := infra.ConnectRabbitMQWithRetry(
+		ctx,
+		&cfg.RabbitMQ,
+		time.Second,
+		30*time.Second,
+		func(connectErr error, retryAfter time.Duration) {
+			logger.Warn("连接 RabbitMQ 失败，等待重试",
+				zap.Error(connectErr),
+				zap.Duration("retryAfter", retryAfter),
+			)
+		},
+	)
 	if err != nil {
-		logger.Fatal("连接 RabbitMQ 失败", zap.Error(err))
+		logger.Error("RabbitMQ 初始化终止", zap.Error(err))
+		return
 	}
 	defer mqConn.Close()
-
-	if err := infra.DeclareQueues(mqCh); err != nil {
-		logger.Fatal("声明 RabbitMQ 队列失败", zap.Error(err))
-	}
 	logger.Info("RabbitMQ 已连接，队列已声明")
+	mqFailure := monitorRabbitMQ(ctx, mqConn, mqCh)
 
 	// ── 加载 Lua 脚本到 Redis ──
-	ctx := context.Background()
 	if err := goredis.LoadLuaScripts(rdb, ctx); err != nil {
 		logger.Fatal("加载 Redis Lua 脚本失败", zap.Error(err))
 	}
@@ -132,7 +144,8 @@ func main() {
 
 	// ── 设置 Gin 路由 ──
 	router := setupRouter(
-		cfg, mysqlRepo, redisRepo, rdb, mqCh, cm,
+		cfg, mysqlRepo, redisRepo, rdb, cm,
+		func() bool { return !mqConn.IsClosed() && !mqCh.IsClosed() },
 		dispatcher, logger,
 		authHandler, friendHandler, groupHandler,
 		momentHandler, msgOpHandler, settingsHandler,
@@ -187,10 +200,13 @@ func main() {
 	logger.Info("GoIM 服务器已启动", zap.Int("port", cfg.Server.Port))
 
 	// ── 优雅关闭 ──
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	logger.Info("正在关闭服务器...")
+	select {
+	case <-ctx.Done():
+		logger.Info("收到退出信号，正在关闭服务器...")
+	case mqErr := <-mqFailure:
+		logger.Error("RabbitMQ 连接异常，正在关闭服务器等待容器重启", zap.Error(mqErr))
+		stop()
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -210,8 +226,8 @@ func setupRouter(
 	mysqlRepo repository.MySQLRepo,
 	redisRepo repository.RedisRepo,
 	rdb *goredisv9.Client,
-	mqCh *amqp.Channel,
 	cm *conn.ConnectionManager,
+	mqReady func() bool,
 	dispatcher *ws.MessageDispatcher,
 	logger *zap.Logger,
 	authHandler *api.AuthHandler,
@@ -233,6 +249,13 @@ func setupRouter(
 	// ── 健康检查 ──
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "goim"})
+	})
+	r.GET("/ready", func(c *gin.Context) {
+		if !mqReady() {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unavailable", "service": "goim", "rabbitmq": "disconnected"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ready", "service": "goim", "rabbitmq": "connected"})
 	})
 
 	// ── Swagger 文档 ──
@@ -282,4 +305,31 @@ func setupRouter(
 	}
 
 	return r
+}
+
+// monitorRabbitMQ 将连接或主通道的异常关闭转换为单一故障信号。
+// 正常关闭时 ctx 会先取消，因此不会触发重复的异常退出流程。
+func monitorRabbitMQ(ctx context.Context, conn *amqp.Connection, ch *amqp.Channel) <-chan error {
+	failure := make(chan error, 1)
+	connClosed := conn.NotifyClose(make(chan *amqp.Error, 1))
+	channelClosed := ch.NotifyClose(make(chan *amqp.Error, 1))
+
+	report := func(component string, notifications <-chan *amqp.Error) {
+		select {
+		case <-ctx.Done():
+			return
+		case closeErr, ok := <-notifications:
+			if !ok || closeErr == nil {
+				return
+			}
+			select {
+			case failure <- fmt.Errorf("RabbitMQ %s 已关闭: %w", component, closeErr):
+			default:
+			}
+		}
+	}
+
+	go report("连接", connClosed)
+	go report("通道", channelClosed)
+	return failure
 }
