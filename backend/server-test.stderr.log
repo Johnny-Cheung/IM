@@ -1,0 +1,22 @@
+{"level":"info","ts":1786114539.931317,"caller":"server/main.go:80","msg":"MySQL 已连接"}
+{"level":"info","ts":1786114539.9324572,"caller":"server/main.go:87","msg":"Redis 已连接"}
+{"level":"info","ts":1786114539.9560947,"caller":"server/main.go:107","msg":"RabbitMQ 已连接，队列已声明"}
+{"level":"info","ts":1786114539.9693475,"caller":"server/main.go:115","msg":"Redis Lua 脚本已加载"}
+{"level":"info","ts":1786114539.983746,"caller":"relay/message_relay.go:47","msg":"message stream relay started","group":"goim-message-relay","consumer":"Jannie-29140"}
+{"level":"info","ts":1786114539.986418,"caller":"consumer/moment_feed_consumer.go:63","msg":"动态消息消费者已启动"}
+{"level":"info","ts":1786114539.9875531,"caller":"consumer/like_persist_consumer.go:71","msg":"点赞持久化消费者已启动","batchSize":200,"flushInterval":0.5}
+{"level":"info","ts":1786114539.9875531,"caller":"server/main.go:219","msg":"MQ 消费者已启动"}
+{"level":"info","ts":1786114539.9881146,"caller":"server/main.go:246","msg":"GoIM 服务器已启动","port":18080}
+{"level":"info","ts":1786114539.9881146,"caller":"server/main.go:228","msg":"pprof 已启动","addr":":16060"}
+{"level":"info","ts":1786114539.9881146,"caller":"server/main.go:240","msg":"正在启动 HTTP 服务器","addr":":18080"}
+2026/08/07 23:00:42 用户 14 (111111) 通过 WebSocket 连接
+2026/08/07 23:01:08 用户 15 (222222) 通过 WebSocket 连接
+2026/08/07 23:01:41 用户 15 (222222) 通过 WebSocket 连接
+2026/08/07 23:02:18 用户 15 (222222) 通过 WebSocket 连接
+2026/08/07 23:02:20 用户 15 (222222) 通过 WebSocket 连接
+{"level":"info","ts":1786116811.6058245,"caller":"consumer/like_persist_consumer.go:99","msg":"点赞持久化消费者投递通道已关闭"}
+{"level":"info","ts":1786116811.6058245,"caller":"consumer/message_persist_consumer.go:45","msg":"message persistence consumer stopped"}
+{"level":"info","ts":1786116811.6058245,"caller":"consumer/moment_feed_consumer.go:69","msg":"动态消息消费者投递通道已关闭"}
+{"level":"error","ts":1786116811.6058245,"caller":"server/main.go:253","msg":"RabbitMQ 连接异常，正在关闭服务器等待容器重启","error":"RabbitMQ 连接 已关闭: Exception (501) Reason: \"EOF\"","stacktrace":"main.main\n\tC:/Users/29332/Desktop/IM/backend/cmd/server/main.go:253\nruntime.main\n\tD:/Sofeware/Go/src/runtime/proc.go:285"}
+{"level":"warn","ts":1786116811.6087759,"caller":"relay/message_relay.go:69","msg":"read message persistence stream failed","error":"context canceled"}
+{"level":"info","ts":1786116811.6098623,"caller":"server/main.go:266","msg":"服务器已退出"}

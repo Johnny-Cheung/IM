@@ -11,6 +11,8 @@ import (
 // 此函数可在启动时调用以预热缓存，使后续调用使用 EVALSHA 而非 EVAL。
 func LoadLuaScripts(rdb *goredis.Client, ctx context.Context) error {
 	scripts := []string{
+		luaPrivateMsgWrite,
+		luaGroupMsgWrite,
 		luaPrivateMsgCheck,
 		luaGroupMsgCheck,
 		luaInboxMarkRead,

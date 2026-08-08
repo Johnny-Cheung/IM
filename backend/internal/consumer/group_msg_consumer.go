@@ -59,11 +59,11 @@ func (c *GroupMsgConsumer) Start(ctx context.Context) error {
 	deliveries, err := c.ch.Consume(
 		groupMsgQueue,
 		"goim-group-msg-consumer", // 消费者标签
-		false,                      // autoAck — 我们手动确认
-		false,                      // exclusive
-		false,                      // noLocal
-		false,                      // noWait
-		nil,                        // args
+		false,                     // autoAck — 我们手动确认
+		false,                     // exclusive
+		false,                     // noLocal
+		false,                     // noWait
+		nil,                       // args
 	)
 	if err != nil {
 		return fmt.Errorf("消费 group_msg_fanout 失败: %w", err)
@@ -114,15 +114,16 @@ func (c *GroupMsgConsumer) process(ctx context.Context, msg *model.GroupMessage)
 
 	// ── 1. 构建群组发件箱的 InboxMessage ──
 	outboxMsg := &model.InboxMessage{
-		MsgID:    msg.ID,
-		ConvID:   convID,
-		ConvType: model.ConvTypeGroup,
-		FromID:   msg.SenderID,
-		ToID:     msg.GroupID,
-		MsgType:  msg.MsgType,
-		Content:  msg.Content,
-		GroupSeq: msg.GroupSeq,
-		Timestamp: timestamp,
+		MsgID:       msg.ID,
+		ClientMsgID: msg.ClientMsgID,
+		ConvID:      convID,
+		ConvType:    model.ConvTypeGroup,
+		FromID:      msg.SenderID,
+		ToID:        msg.GroupID,
+		MsgType:     msg.MsgType,
+		Content:     msg.Content,
+		GroupSeq:    msg.GroupSeq,
+		Timestamp:   timestamp,
 	}
 
 	// ── 2. 写入群组发件箱 ──
@@ -179,7 +180,7 @@ func (c *GroupMsgConsumer) process(ctx context.Context, msg *model.GroupMessage)
 	// ── 5. 插入 MySQL ──
 	if c.mysqlRepo != nil {
 		if err := c.mysqlRepo.InsertGroupMessage(ctx, msg); err != nil {
-		return fmt.Errorf("插入群消息到 MySQL: %w", err)
+			return fmt.Errorf("插入群消息到 MySQL: %w", err)
 		}
 	}
 

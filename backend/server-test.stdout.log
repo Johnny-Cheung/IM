@@ -1,0 +1,156 @@
+[GIN-debug] [WARNING] Creating an Engine instance with the Logger and Recovery middleware already attached.
+
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+[GIN-debug] GET    /health                   --> main.setupRouter.func1 (4 handlers)
+[GIN-debug] GET    /ready                    --> main.setupRouter.func2 (4 handlers)
+[GIN-debug] GET    /swagger/*any             --> github.com/swaggo/gin-swagger.CustomWrapHandler.func1 (4 handlers)
+[GIN-debug] POST   /api/v1/auth/register     --> github.com/goim/goim/internal/api.(*AuthHandler).Register-fm (4 handlers)
+[GIN-debug] POST   /api/v1/auth/login        --> github.com/goim/goim/internal/api.(*AuthHandler).Login-fm (4 handlers)
+[GIN-debug] POST   /api/v1/auth/refresh      --> github.com/goim/goim/internal/api.(*AuthHandler).Refresh-fm (4 handlers)
+[GIN-debug] GET    /api/v1/avatar/:userID    --> github.com/goim/goim/internal/api.(*AvatarHandler).GetAvatar-fm (4 handlers)
+[GIN-debug] PUT    /api/v1/account/username  --> github.com/goim/goim/internal/api.(*AuthHandler).UpdateUsername-fm (5 handlers)
+[GIN-debug] PUT    /api/v1/account/password  --> github.com/goim/goim/internal/api.(*AuthHandler).UpdatePassword-fm (5 handlers)
+[GIN-debug] POST   /api/v1/friend/request    --> github.com/goim/goim/internal/api.(*FriendHandler).SendFriendRequest-fm (5 handlers)
+[GIN-debug] POST   /api/v1/friend/accept     --> github.com/goim/goim/internal/api.(*FriendHandler).AcceptFriendRequest-fm (5 handlers)
+[GIN-debug] POST   /api/v1/friend/reject     --> github.com/goim/goim/internal/api.(*FriendHandler).RejectFriendRequest-fm (5 handlers)
+[GIN-debug] GET    /api/v1/friend/requests   --> github.com/goim/goim/internal/api.(*FriendHandler).GetFriendRequests-fm (5 handlers)
+[GIN-debug] GET    /api/v1/friend/list       --> github.com/goim/goim/internal/api.(*FriendHandler).GetFriendList-fm (5 handlers)
+[GIN-debug] DELETE /api/v1/friend/:friendID  --> github.com/goim/goim/internal/api.(*FriendHandler).DeleteFriend-fm (5 handlers)
+[GIN-debug] POST   /api/v1/friend/block      --> github.com/goim/goim/internal/api.(*FriendHandler).BlockUser-fm (5 handlers)
+[GIN-debug] POST   /api/v1/friend/unblock    --> github.com/goim/goim/internal/api.(*FriendHandler).UnblockUser-fm (5 handlers)
+[GIN-debug] POST   /api/v1/group             --> github.com/goim/goim/internal/api.(*GroupHandler).CreateGroup-fm (5 handlers)
+[GIN-debug] GET    /api/v1/group/list        --> github.com/goim/goim/internal/api.(*GroupHandler).ListMyGroups-fm (5 handlers)
+[GIN-debug] PUT    /api/v1/group/:groupID    --> github.com/goim/goim/internal/api.(*GroupHandler).UpdateGroup-fm (5 handlers)
+[GIN-debug] GET    /api/v1/group/:groupID    --> github.com/goim/goim/internal/api.(*GroupHandler).GetGroupInfo-fm (5 handlers)
+[GIN-debug] POST   /api/v1/group/:groupID/member --> github.com/goim/goim/internal/api.(*GroupHandler).AddMember-fm (5 handlers)
+[GIN-debug] DELETE /api/v1/group/:groupID/member/:memberID --> github.com/goim/goim/internal/api.(*GroupHandler).RemoveMember-fm (5 handlers)
+[GIN-debug] GET    /api/v1/group/:groupID/members --> github.com/goim/goim/internal/api.(*GroupHandler).GetMembers-fm (5 handlers)
+[GIN-debug] PUT    /api/v1/group/:groupID/member/:memberID/role --> github.com/goim/goim/internal/api.(*GroupHandler).UpdateMemberRole-fm (5 handlers)
+[GIN-debug] PUT    /api/v1/group/:groupID/owner --> github.com/goim/goim/internal/api.(*GroupHandler).TransferOwnership-fm (5 handlers)
+[GIN-debug] POST   /api/v1/group/:groupID/leave --> github.com/goim/goim/internal/api.(*GroupHandler).LeaveGroup-fm (5 handlers)
+[GIN-debug] POST   /api/v1/moment            --> github.com/goim/goim/internal/api.(*MomentHandler).PublishMoment-fm (5 handlers)
+[GIN-debug] GET    /api/v1/moment/:momentID  --> github.com/goim/goim/internal/api.(*MomentHandler).GetMoment-fm (5 handlers)
+[GIN-debug] GET    /api/v1/moment/user/:userID --> github.com/goim/goim/internal/api.(*MomentHandler).GetUserMoments-fm (5 handlers)
+[GIN-debug] POST   /api/v1/moment/:momentID/like --> github.com/goim/goim/internal/api.(*MomentHandler).LikeMoment-fm (5 handlers)
+[GIN-debug] DELETE /api/v1/moment/:momentID/like --> github.com/goim/goim/internal/api.(*MomentHandler).UnlikeMoment-fm (5 handlers)
+[GIN-debug] GET    /api/v1/moment/:momentID/likers --> github.com/goim/goim/internal/api.(*MomentHandler).GetMomentLikers-fm (5 handlers)
+[GIN-debug] DELETE /api/v1/moment/:momentID  --> github.com/goim/goim/internal/api.(*MomentHandler).DeleteMoment-fm (5 handlers)
+[GIN-debug] POST   /api/v1/moment/:momentID/comment --> github.com/goim/goim/internal/api.(*MomentHandler).CommentMoment-fm (5 handlers)
+[GIN-debug] DELETE /api/v1/moment/comment/:commentID --> github.com/goim/goim/internal/api.(*MomentHandler).DeleteComment-fm (5 handlers)
+[GIN-debug] GET    /api/v1/moment/feed       --> github.com/goim/goim/internal/api.(*MomentHandler).GetFeed-fm (5 handlers)
+[GIN-debug] POST   /api/v1/msg/revoke        --> github.com/goim/goim/internal/api.(*MsgOpHandler).RevokeMessage-fm (5 handlers)
+[GIN-debug] DELETE /api/v1/msg/:msgID        --> github.com/goim/goim/internal/api.(*MsgOpHandler).DeleteMessage-fm (5 handlers)
+[GIN-debug] GET    /api/v1/msg/search        --> github.com/goim/goim/internal/api.(*MsgOpHandler).SearchMessages-fm (5 handlers)
+[GIN-debug] GET    /api/v1/settings          --> github.com/goim/goim/internal/api.(*SettingsHandler).GetSettings-fm (5 handlers)
+[GIN-debug] PUT    /api/v1/settings          --> github.com/goim/goim/internal/api.(*SettingsHandler).UpdateSettings-fm (5 handlers)
+[GIN-debug] POST   /api/v1/settings/mute     --> github.com/goim/goim/internal/api.(*SettingsHandler).AddMuteConv-fm (5 handlers)
+[GIN-debug] DELETE /api/v1/settings/mute/:convID --> github.com/goim/goim/internal/api.(*SettingsHandler).RemoveMuteConv-fm (5 handlers)
+[GIN-debug] POST   /api/v1/upload/avatar     --> github.com/goim/goim/internal/api.(*UploadHandler).UploadAvatar-fm (5 handlers)
+[GIN-debug] GET    /ws                       --> main.setupRouter.ServeWebSocket.func7 (4 handlers)
+[GIN-debug] GET    /uploads/*filepath        --> github.com/gin-gonic/gin.(*RouterGroup).createStaticHandler.func1 (4 handlers)
+[GIN-debug] HEAD   /uploads/*filepath        --> github.com/gin-gonic/gin.(*RouterGroup).createStaticHandler.func1 (4 handlers)
+[GIN] 2026/08/07 - 22:55:56 | 200 |            0s |       127.0.0.1 | GET      "/health"
+[GIN] 2026/08/07 - 22:55:56 | 200 |            0s |       127.0.0.1 | GET      "/ready"
+[GIN] 2026/08/07 - 23:00:15 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/auth/refresh"
+[GIN] 2026/08/07 - 23:00:15 | 401 |            0s |             ::1 | POST     "/api/v1/auth/refresh"
+[GIN] 2026/08/07 - 23:00:25 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/auth/register"
+[GIN] 2026/08/07 - 23:00:25 | 409 |     28.9972ms |             ::1 | POST     "/api/v1/auth/register"
+[GIN] 2026/08/07 - 23:00:42 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/auth/register"
+[GIN] 2026/08/07 - 23:00:42 | 201 |     85.0901ms |             ::1 | POST     "/api/v1/auth/register"
+[GIN] 2026/08/07 - 23:00:42 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/auth/login"
+[GIN] 2026/08/07 - 23:00:42 | 200 |     69.8377ms |             ::1 | POST     "/api/v1/auth/login"
+[GIN] 2026/08/07 - 23:00:42 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/settings"
+[GIN] 2026/08/07 - 23:00:42 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/settings"
+[GIN] 2026/08/07 - 23:00:42 | 200 |      7.6349ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:00:42 | 200 |      3.8793ms |             ::1 | GET      "/ws?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxNCwidXNlcm5hbWUiOiIxMTExMTEiLCJleHAiOjE3ODYxMjIwNDJ9.ZVefFhXSwhyFEyAWgwFWnY9cF9lvh11E4d9JIT-SZeQ"
+[GIN] 2026/08/07 - 23:00:42 | 200 |      2.2077ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:00:42 | 200 |      2.7853ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:00:42 | 200 |      1.6131ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:00:42 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:00:42 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/group/list"
+[GIN] 2026/08/07 - 23:00:42 | 200 |      1.5806ms |             ::1 | GET      "/api/v1/group/list"
+[GIN] 2026/08/07 - 23:00:42 | 200 |     12.5095ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:00:44 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/requests?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:00:44 | 200 |      3.2787ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:00:44 | 200 |      8.7836ms |             ::1 | GET      "/api/v1/friend/requests?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:00:57 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:00:57 | 200 |      3.8699ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:01 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/auth/refresh"
+[GIN] 2026/08/07 - 23:01:01 | 401 |            0s |             ::1 | POST     "/api/v1/auth/refresh"
+[GIN] 2026/08/07 - 23:01:08 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/auth/register"
+[GIN] 2026/08/07 - 23:01:08 | 201 |     67.4854ms |             ::1 | POST     "/api/v1/auth/register"
+[GIN] 2026/08/07 - 23:01:08 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/auth/login"
+[GIN] 2026/08/07 - 23:01:08 | 200 |     60.6079ms |             ::1 | POST     "/api/v1/auth/login"
+[GIN] 2026/08/07 - 23:01:08 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/settings"
+[GIN] 2026/08/07 - 23:01:08 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/settings"
+[GIN] 2026/08/07 - 23:01:08 | 200 |      3.2129ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:01:08 | 200 |      2.1925ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:01:08 | 200 |      2.1504ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:01:08 | 200 |      2.1879ms |             ::1 | GET      "/ws?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxNSwidXNlcm5hbWUiOiIyMjIyMjIiLCJleHAiOjE3ODYxMjIwNjh9.PbhjJaCL7dOKbT6Bj2BUHoBtoWyY-IJF2rU-p3R-Mw8"
+[GIN] 2026/08/07 - 23:01:08 | 200 |      2.1897ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:01:08 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:08 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/group/list"
+[GIN] 2026/08/07 - 23:01:08 | 200 |         559µs |             ::1 | GET      "/api/v1/group/list"
+[GIN] 2026/08/07 - 23:01:08 | 200 |      3.2709ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:10 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/requests?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:10 | 200 |      3.3282ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:10 | 200 |     19.5602ms |             ::1 | GET      "/api/v1/friend/requests?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:12 | 200 |       4.068ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:01:12 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:12 | 200 |      1.7274ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:23 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:23 | 200 |      4.5665ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:23 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/request"
+[GIN] 2026/08/07 - 23:01:23 | 201 |     48.7977ms |             ::1 | POST     "/api/v1/friend/request"
+[GIN] 2026/08/07 - 23:01:27 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:27 | 200 |      2.5374ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:29 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/moment/feed?cursor=&limit=20"
+[GIN] 2026/08/07 - 23:01:29 | 200 |      4.9859ms |             ::1 | GET      "/api/v1/moment/feed?cursor=&limit=20"
+[GIN] 2026/08/07 - 23:01:38 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:38 | 200 |      2.4241ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:41 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/settings"
+[GIN] 2026/08/07 - 23:01:41 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/requests?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:41 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/settings"
+[GIN] 2026/08/07 - 23:01:41 | 200 |      2.6041ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:41 | 200 |      2.6797ms |             ::1 | GET      "/ws?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxNSwidXNlcm5hbWUiOiIyMjIyMjIiLCJleHAiOjE3ODYxMjIwNjh9.PbhjJaCL7dOKbT6Bj2BUHoBtoWyY-IJF2rU-p3R-Mw8"
+[GIN] 2026/08/07 - 23:01:41 | 200 |       1.631ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:01:41 | 200 |      1.6079ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:01:41 | 200 |      4.2844ms |             ::1 | GET      "/api/v1/friend/requests?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:41 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/group/list"
+[GIN] 2026/08/07 - 23:01:41 | 200 |       1.627ms |             ::1 | GET      "/api/v1/group/list"
+[GIN] 2026/08/07 - 23:01:41 | 200 |      2.7137ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:42 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:42 | 200 |      4.6271ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:43 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/accept"
+[GIN] 2026/08/07 - 23:01:43 | 200 |     66.9657ms |             ::1 | POST     "/api/v1/friend/accept"
+[GIN] 2026/08/07 - 23:01:43 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:43 | 200 |      3.8356ms |             ::1 | GET      "/api/v1/friend/requests?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:43 | 200 |     13.8473ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:43 | 200 |     15.7249ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:48 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:48 | 200 |     14.6806ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:56 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:01:56 | 200 |       8.271ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:02:11 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:02:11 | 200 |      9.0983ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:02:18 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/settings"
+[GIN] 2026/08/07 - 23:02:18 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/settings"
+[GIN] 2026/08/07 - 23:02:18 | 200 |      2.9119ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:02:18 | 200 |       2.728ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:02:18 | 200 |      2.1584ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:02:18 | 200 |      3.2784ms |             ::1 | GET      "/ws?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxNSwidXNlcm5hbWUiOiIyMjIyMjIiLCJleHAiOjE3ODYxMjIwNjh9.PbhjJaCL7dOKbT6Bj2BUHoBtoWyY-IJF2rU-p3R-Mw8"
+[GIN] 2026/08/07 - 23:02:18 | 200 |      2.2168ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:02:18 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:02:18 | 204 |            0s |             ::1 | OPTIONS  "/api/v1/group/list"
+[GIN] 2026/08/07 - 23:02:18 | 200 |      8.0996ms |             ::1 | GET      "/api/v1/group/list"
+[GIN] 2026/08/07 - 23:02:18 | 200 |     10.9191ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"
+[GIN] 2026/08/07 - 23:02:20 | 200 |      3.2493ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:02:20 | 200 |      2.1798ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:02:20 | 200 |      2.7191ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:02:20 | 200 |      2.1494ms |             ::1 | GET      "/ws?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxNSwidXNlcm5hbWUiOiIyMjIyMjIiLCJleHAiOjE3ODYxMjIwNjh9.PbhjJaCL7dOKbT6Bj2BUHoBtoWyY-IJF2rU-p3R-Mw8"
+[GIN] 2026/08/07 - 23:02:20 | 200 |      2.2307ms |             ::1 | GET      "/api/v1/settings"
+[GIN] 2026/08/07 - 23:02:20 | 200 |      1.7787ms |             ::1 | GET      "/api/v1/group/list"
+[GIN] 2026/08/07 - 23:02:20 | 200 |     15.2093ms |             ::1 | GET      "/api/v1/friend/list?limit=100&offset=0"

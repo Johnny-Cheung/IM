@@ -68,7 +68,7 @@ func (s *GroupService) CreateGroup(ctx context.Context, ownerID int64, name, not
 
 	// 更新 Redis 缓存
 	if err := s.redisRepo.AddGroupMemberRedis(ctx, groupID, ownerID); err != nil {
-		s.logger.Warn("将群主添加到 Redis 群组缓存失败", zap.Int64("groupID", groupID), zap.Int64("userID", ownerID), zap.Error(err))
+		return 0, fmt.Errorf("sync owner membership to redis: %w", err)
 	}
 
 	return groupID, nil
@@ -186,7 +186,10 @@ func (s *GroupService) AddMember(ctx context.Context, groupID, userID, newMember
 
 	// 更新 Redis 缓存
 	if err := s.redisRepo.AddGroupMemberRedis(ctx, groupID, newMemberID); err != nil {
-		s.logger.Warn("将成员添加到 Redis 群组缓存失败", zap.Int64("groupID", groupID), zap.Int64("userID", newMemberID), zap.Error(err))
+		// Returning success here would leave the send-time Lua authorization
+		// cache stale.  The caller must retry/repair instead of believing the
+		// member can already send messages.
+		return fmt.Errorf("sync group membership to redis: %w", err)
 	}
 
 	return nil
@@ -233,14 +236,14 @@ func (s *GroupService) RemoveMember(ctx context.Context, groupID, userID, remove
 		return fmt.Errorf(ErrCannotRemoveOwner)
 	}
 
-	// 从 MySQL 中移除
-	if err := s.mysqlRepo.RemoveGroupMember(ctx, groupID, removeMemberID); err != nil {
-		return fmt.Errorf("remove group member: %w", err)
-	}
-
-	// 从 Redis 中移除
+	// Remove Redis authorization first.  Once this returns, a removed user can
+	// no longer pass the send-time Lua membership check, even if the following
+	// MySQL write is temporarily unavailable.
 	if err := s.redisRepo.RemoveGroupMemberRedis(ctx, groupID, removeMemberID); err != nil {
-		s.logger.Warn("从 Redis 群组缓存中移除成员失败", zap.Int64("groupID", groupID), zap.Int64("userID", removeMemberID), zap.Error(err))
+		return fmt.Errorf("sync group member removal to redis: %w", err)
+	}
+	if err := s.mysqlRepo.RemoveGroupMember(ctx, groupID, removeMemberID); err != nil {
+		return fmt.Errorf("remove group member after redis authorization removal: %w", err)
 	}
 
 	return nil
@@ -417,14 +420,12 @@ func (s *GroupService) LeaveGroup(ctx context.Context, groupID, userID int64) er
 		return fmt.Errorf(ErrMemberNotFound)
 	}
 
-	// 从 MySQL 中移除
-	if err := s.mysqlRepo.RemoveGroupMember(ctx, groupID, userID); err != nil {
-		return fmt.Errorf("leave group: %w", err)
-	}
-
-	// 从 Redis 中移除
+	// Same ordering as kick/removal: authorization must be revoked first.
 	if err := s.redisRepo.RemoveGroupMemberRedis(ctx, groupID, userID); err != nil {
-		s.logger.Warn("退出时从 Redis 群组缓存中移除成员失败", zap.Int64("groupID", groupID), zap.Int64("userID", userID), zap.Error(err))
+		return fmt.Errorf("sync group leave to redis: %w", err)
+	}
+	if err := s.mysqlRepo.RemoveGroupMember(ctx, groupID, userID); err != nil {
+		return fmt.Errorf("leave group after redis authorization removal: %w", err)
 	}
 
 	return nil

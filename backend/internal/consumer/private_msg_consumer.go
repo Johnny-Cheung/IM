@@ -114,28 +114,30 @@ func (c *PrivateMsgConsumer) process(ctx context.Context, msg *model.PrivateMess
 
 	// ── 1. 为接收者构建 InboxMessage（readStatus=0）──
 	receiverInboxMsg := &model.InboxMessage{
-		MsgID:      msg.ID,
-		ConvID:     convID,
-		ConvType:   model.ConvTypePrivate,
-		FromID:     msg.SenderID,
-		ToID:       msg.ReceiverID,
-		MsgType:    msg.MsgType,
-		Content:    msg.Content,
-		ReadStatus: 0, // 接收者未读
-		Timestamp:  timestamp,
+		MsgID:       msg.ID,
+		ClientMsgID: msg.ClientMsgID,
+		ConvID:      convID,
+		ConvType:    model.ConvTypePrivate,
+		FromID:      msg.SenderID,
+		ToID:        msg.ReceiverID,
+		MsgType:     msg.MsgType,
+		Content:     msg.Content,
+		ReadStatus:  0, // 接收者未读
+		Timestamp:   timestamp,
 	}
 
 	// ── 2. 为发送者构建 InboxMessage（readStatus=1）──
 	senderInboxMsg := &model.InboxMessage{
-		MsgID:      msg.ID,
-		ConvID:     convID,
-		ConvType:   model.ConvTypePrivate,
-		FromID:     msg.SenderID,
-		ToID:       msg.ReceiverID,
-		MsgType:    msg.MsgType,
-		Content:    msg.Content,
-		ReadStatus: 1, // 发送者"已读"自己的消息
-		Timestamp:  timestamp,
+		MsgID:       msg.ID,
+		ClientMsgID: msg.ClientMsgID,
+		ConvID:      convID,
+		ConvType:    model.ConvTypePrivate,
+		FromID:      msg.SenderID,
+		ToID:        msg.ReceiverID,
+		MsgType:     msg.MsgType,
+		Content:     msg.Content,
+		ReadStatus:  1, // 发送者"已读"自己的消息
+		Timestamp:   timestamp,
 	}
 
 	// ── 3. 写入双方收件箱 ──

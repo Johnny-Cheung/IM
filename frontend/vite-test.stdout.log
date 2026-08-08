@@ -1,0 +1,10 @@
+
+> goim-web@0.1.0 dev
+> vite --host 0.0.0.0
+
+
+  [32m[1mVITE[22m v8.1.4[39m  [2mready in [0m[1m4868[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://localhost:[1m5173[22m/[39m
+  [32m➜[39m  [1mNetwork[22m: [36mhttp://172.20.208.1:[1m5173[22m/[39m
+  [32m➜[39m  [1mNetwork[22m: [36mhttp://10.144.136.152:[1m5173[22m/[39m

@@ -36,6 +36,12 @@ var cleanupPatterns = []string{
 	"conv_list:*",
 }
 
+var indexedMessageOrderPatterns = []string{
+	"inbox_order:*",
+	"outbox_order:*",
+	"conv_order:*",
+}
+
 // ──────────────────────────────────────────────────────
 // StartCleanupTask — 启动定期清理goroutine
 // ──────────────────────────────────────────────────────
@@ -63,9 +69,9 @@ func StartCleanupTask(rdb *redis.Client, logger *zap.Logger, interval time.Durat
 
 // CleanupExpiredData 扫描所有 inbox/outbox/timeline/conv_list 键，
 // 并对每个键执行以下修剪操作：
-//   1. ZREMRANGEBYSCORE — 删除超过3天的条目
-//   2. ZREMRANGEBYRANK  — 限制最大条目数（inbox: 1000, outbox: 500, timeline: 100）
-//      conv_list 键仅按时间修剪（不限数量上限）。
+//  1. ZREMRANGEBYSCORE — 删除超过3天的条目
+//  2. ZREMRANGEBYRANK  — 限制最大条目数（inbox: 1000, outbox: 500, timeline: 100）
+//     conv_list 键仅按时间修剪（不限数量上限）。
 func CleanupExpiredData(rdb *redis.Client, logger *zap.Logger) {
 	ctx := context.Background()
 	// inbox/outbox/timeline/conv_list 的 ZSet score 统一使用 Unix 毫秒时间戳。
@@ -94,6 +100,118 @@ func CleanupExpiredData(rdb *redis.Client, logger *zap.Logger) {
 				break
 			}
 		}
+	}
+	cleanupIndexedMessageData(rdb, logger, threshold)
+	cleanupConfirmedPersistEvents(rdb, logger)
+}
+
+// cleanupIndexedMessageData keeps the stable order-ZSET/data-HASH layout in
+// sync.  Removing only ZSET entries would leak the corresponding HASH values.
+func cleanupIndexedMessageData(rdb *redis.Client, logger *zap.Logger, threshold int64) {
+	ctx := context.Background()
+	for _, pattern := range indexedMessageOrderPatterns {
+		var cursor uint64
+		for {
+			keys, next, err := rdb.Scan(ctx, cursor, pattern, scanBatchSize).Result()
+			if err != nil {
+				logger.Warn("scan indexed message keys failed", zap.String("pattern", pattern), zap.Error(err))
+				break
+			}
+			for _, orderKey := range keys {
+				cleanIndexedOrder(rdb, ctx, logger, orderKey, threshold)
+			}
+			cursor = next
+			if cursor == 0 {
+				break
+			}
+		}
+	}
+}
+
+func cleanIndexedOrder(rdb *redis.Client, ctx context.Context, logger *zap.Logger, orderKey string, threshold int64) {
+	dataKey, maxCount := indexedDataKeyAndMax(orderKey)
+	if dataKey == "" {
+		return
+	}
+	remove := func(ids []string) {
+		if len(ids) == 0 {
+			return
+		}
+		pipe := rdb.Pipeline()
+		pipe.ZRem(ctx, orderKey, stringSliceToInterface(ids)...)
+		pipe.HDel(ctx, dataKey, ids...)
+		if _, err := pipe.Exec(ctx); err != nil {
+			logger.Warn("trim indexed message data failed", zap.String("key", orderKey), zap.Error(err))
+		}
+	}
+	old, err := rdb.ZRangeByScore(ctx, orderKey, &redis.ZRangeBy{Min: "-inf", Max: strconv.FormatInt(threshold, 10)}).Result()
+	if err != nil {
+		logger.Warn("read old indexed message ids failed", zap.String("key", orderKey), zap.Error(err))
+		return
+	}
+	remove(old)
+	if maxCount <= 0 {
+		return
+	}
+	card, err := rdb.ZCard(ctx, orderKey).Result()
+	if err != nil {
+		return
+	}
+	if card <= int64(maxCount) {
+		return
+	}
+	ids, err := rdb.ZRange(ctx, orderKey, 0, card-int64(maxCount)-1).Result()
+	if err != nil {
+		return
+	}
+	remove(ids)
+}
+
+func indexedDataKeyAndMax(orderKey string) (string, int) {
+	switch {
+	case strings.HasPrefix(orderKey, "inbox_order:"):
+		return strings.Replace(orderKey, "inbox_order:", "inbox_data:", 1), maxInboxEntries
+	case strings.HasPrefix(orderKey, "outbox_order:"):
+		return strings.Replace(orderKey, "outbox_order:", "outbox_data:", 1), maxOutboxEntries
+	case strings.HasPrefix(orderKey, "conv_order:"):
+		return strings.Replace(orderKey, "conv_order:", "conv_meta:", 1), 0
+	default:
+		return "", 0
+	}
+}
+
+func stringSliceToInterface(values []string) []interface{} {
+	out := make([]interface{}, len(values))
+	for i, v := range values {
+		out[i] = v
+	}
+	return out
+}
+
+// cleanupConfirmedPersistEvents is deliberately marker-driven.  It never
+// trims by age alone, so an outage cannot delete an unconfirmed persistence
+// event from the Stream.
+func cleanupConfirmedPersistEvents(rdb *redis.Client, logger *zap.Logger) {
+	ctx := context.Background()
+	entries, err := rdb.XRangeN(ctx, "message_persist_stream", "-", "+", 1000).Result()
+	if err != nil && err != redis.Nil {
+		logger.Warn("scan message persistence stream failed", zap.Error(err))
+		return
+	}
+	for _, entry := range entries {
+		confirmed, err := rdb.SIsMember(ctx, "message_persist_confirmed", entry.ID).Result()
+		if err != nil || !confirmed {
+			continue
+		}
+		if err := rdb.XAck(ctx, "message_persist_stream", "goim-message-relay", entry.ID).Err(); err != nil {
+			logger.Warn("ack stale confirmed stream event failed", zap.String("id", entry.ID), zap.Error(err))
+			continue
+		}
+		if err := rdb.XDel(ctx, "message_persist_stream", entry.ID).Err(); err != nil {
+			logger.Warn("delete stale confirmed stream event failed", zap.String("id", entry.ID), zap.Error(err))
+			continue
+		}
+		_ = rdb.SRem(ctx, "message_persist_confirmed", entry.ID).Err()
 	}
 }
 

@@ -33,16 +33,35 @@ type MsgRevoked struct {
 
 // InboxMessage — 存储在 Redis inbox/outbox ZSet 中的消息
 type InboxMessage struct {
-	MsgID      int64  `json:"msgId"`
-	ConvID     string `json:"convId"`
-	ConvType   int    `json:"convType"`
-	FromID     int64  `json:"fromId"`
-	ToID       int64  `json:"toId"`
-	MsgType    int    `json:"msgType"`
-	Content    string `json:"content"`
-	ReadStatus int    `json:"readStatus"`         // 0=未读, 1=已读 (仅私聊)
-	GroupSeq   int64  `json:"groupSeq,omitempty"` // 群消息序号 (仅群聊)
-	Timestamp  int64  `json:"timestamp"`
+	MsgID       int64  `json:"msgId"`
+	ClientMsgID string `json:"clientMsgId,omitempty"`
+	ConvID      string `json:"convId"`
+	ConvType    int    `json:"convType"`
+	FromID      int64  `json:"fromId"`
+	ToID        int64  `json:"toId"`
+	MsgType     int    `json:"msgType"`
+	Content     string `json:"content"`
+	ReadStatus  int    `json:"readStatus"`         // 0=未读, 1=已读 (仅私聊)
+	GroupSeq    int64  `json:"groupSeq,omitempty"` // 群消息序号 (仅群聊)
+	Timestamp   int64  `json:"timestamp"`
+}
+
+// MessagePersistEvent is the durable event written by the atomic Redis send
+// script and relayed to RabbitMQ.  Redis owns the routing/state changes; the
+// consumer only persists this immutable event to MySQL.
+type MessagePersistEvent struct {
+	EventID         string  `json:"eventId,omitempty"`
+	ServerMsgID     int64   `json:"serverMsgId"`
+	ClientMsgID     string  `json:"clientMsgId"`
+	ConvType        int     `json:"convType"`
+	SenderID        int64   `json:"senderId"`
+	ReceiverID      int64   `json:"receiverId,omitempty"`
+	GroupID         int64   `json:"groupId,omitempty"`
+	Content         string  `json:"content"`
+	MsgType         int     `json:"msgType"`
+	ServerTimestamp int64   `json:"serverTimestamp"`
+	GroupSeq        int64   `json:"groupSeq,omitempty"`
+	Recipients      []int64 `json:"recipients,omitempty"`
 }
 
 // ServerAck — 消息到达服务器后返回给发送者的回执

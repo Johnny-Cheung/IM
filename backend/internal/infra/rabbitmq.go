@@ -11,6 +11,8 @@ import (
 
 // QueueNames 列出 IM 系统所需的所有持久队列。
 var QueueNames = []string{
+	"message_persist",
+	"message_persist_dlq",
 	"private_msg_persist",
 	"group_msg_fanout",
 	"moment_push",
@@ -89,7 +91,14 @@ func ConnectRabbitMQWithRetry(
 // DeclareQueues 在给定通道上声明所有 5 个持久队列。
 func DeclareQueues(ch *amqp.Channel) error {
 	for _, name := range QueueNames {
-		_, err := ch.QueueDeclare(name, true, false, false, false, nil)
+		var args amqp.Table
+		if name == "message_persist" {
+			args = amqp.Table{
+				"x-dead-letter-exchange":    "",
+				"x-dead-letter-routing-key": "message_persist_dlq",
+			}
+		}
+		_, err := ch.QueueDeclare(name, true, false, false, false, args)
 		if err != nil {
 			return err
 		}

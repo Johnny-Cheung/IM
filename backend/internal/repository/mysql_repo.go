@@ -84,10 +84,12 @@ func NewMySQLRepo(db *sql.DB) *MySQLRepoImpl {
 // ── 消息 ──
 
 func (m *MySQLRepoImpl) InsertPrivateMessage(ctx context.Context, msg *model.PrivateMessage) error {
-	query := `INSERT INTO private_messages (id, sender_id, receiver_id, content, msg_type, created_at)
-	          VALUES (?, ?, ?, ?, ?, ?)`
-	_, err := m.db.ExecContext(ctx, query,
+	query := `INSERT INTO private_messages (id, client_msg_id, sender_id, receiver_id, content, msg_type, created_at)
+	          VALUES (?, ?, ?, ?, ?, ?, ?)
+	          ON DUPLICATE KEY UPDATE id = id`
+	result, err := m.db.ExecContext(ctx, query,
 		msg.ID,
+		msg.ClientMsgID,
 		msg.SenderID,
 		msg.ReceiverID,
 		msg.Content,
@@ -97,14 +99,30 @@ func (m *MySQLRepoImpl) InsertPrivateMessage(ctx context.Context, msg *model.Pri
 	if err != nil {
 		return fmt.Errorf("插入 private_messages: %w", err)
 	}
+	if affected, err := result.RowsAffected(); err == nil && affected == 0 {
+		var stored model.PrivateMessage
+		var clientID sql.NullString
+		err := m.db.QueryRowContext(ctx, `SELECT client_msg_id, sender_id, receiver_id, content, msg_type FROM private_messages WHERE id = ?`, msg.ID).Scan(&clientID, &stored.SenderID, &stored.ReceiverID, &stored.Content, &stored.MsgType)
+		if err != nil {
+			return fmt.Errorf("verify duplicate private message: %w", err)
+		}
+		if clientID.Valid {
+			stored.ClientMsgID = clientID.String
+		}
+		if stored.ClientMsgID != msg.ClientMsgID || stored.SenderID != msg.SenderID || stored.ReceiverID != msg.ReceiverID || stored.Content != msg.Content || stored.MsgType != msg.MsgType {
+			return fmt.Errorf("private message id %d conflicts with existing content", msg.ID)
+		}
+	}
 	return nil
 }
 
 func (m *MySQLRepoImpl) InsertGroupMessage(ctx context.Context, msg *model.GroupMessage) error {
-	query := `INSERT INTO group_messages (id, group_id, sender_id, content, msg_type, group_seq, created_at)
-	          VALUES (?, ?, ?, ?, ?, ?, ?)`
-	_, err := m.db.ExecContext(ctx, query,
+	query := `INSERT INTO group_messages (id, client_msg_id, group_id, sender_id, content, msg_type, group_seq, created_at)
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	          ON DUPLICATE KEY UPDATE id = id`
+	result, err := m.db.ExecContext(ctx, query,
 		msg.ID,
+		msg.ClientMsgID,
 		msg.GroupID,
 		msg.SenderID,
 		msg.Content,
@@ -114,6 +132,20 @@ func (m *MySQLRepoImpl) InsertGroupMessage(ctx context.Context, msg *model.Group
 	)
 	if err != nil {
 		return fmt.Errorf("插入 group_messages: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err == nil && affected == 0 {
+		var stored model.GroupMessage
+		var clientID sql.NullString
+		err := m.db.QueryRowContext(ctx, `SELECT client_msg_id, group_id, sender_id, content, msg_type, group_seq FROM group_messages WHERE id = ?`, msg.ID).Scan(&clientID, &stored.GroupID, &stored.SenderID, &stored.Content, &stored.MsgType, &stored.GroupSeq)
+		if err != nil {
+			return fmt.Errorf("verify duplicate group message: %w", err)
+		}
+		if clientID.Valid {
+			stored.ClientMsgID = clientID.String
+		}
+		if stored.ClientMsgID != msg.ClientMsgID || stored.GroupID != msg.GroupID || stored.SenderID != msg.SenderID || stored.Content != msg.Content || stored.MsgType != msg.MsgType || stored.GroupSeq != msg.GroupSeq {
+			return fmt.Errorf("group message id %d conflicts with existing content", msg.ID)
+		}
 	}
 	return nil
 }

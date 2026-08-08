@@ -133,13 +133,60 @@ func (r *RedisRepoImpl) WriteOutbox(ctx context.Context, groupID int64, msg *mod
 }
 
 func (r *RedisRepoImpl) ReadInbox(ctx context.Context, userID int64, lastSyncTime, lastSyncMsgID int64, batchSize int) ([]model.InboxMessage, error) {
+	if n, err := r.rdb.Exists(ctx, fmt.Sprintf("inbox_order:%d", userID)).Result(); err == nil && n > 0 {
+		return r.readIndexedMessages(ctx, fmt.Sprintf("inbox_order:%d", userID), fmt.Sprintf("inbox_data:%d", userID), lastSyncTime, lastSyncMsgID, batchSize)
+	}
 	key := fmt.Sprintf("inbox:%d", userID)
 	return r.readMessagesAfter(ctx, key, lastSyncTime, lastSyncMsgID, batchSize)
 }
 
 func (r *RedisRepoImpl) ReadOutbox(ctx context.Context, groupID int64, lastSyncTime, lastSyncMsgID int64, limit int) ([]model.InboxMessage, error) {
+	if n, err := r.rdb.Exists(ctx, fmt.Sprintf("outbox_order:%d", groupID)).Result(); err == nil && n > 0 {
+		return r.readIndexedMessages(ctx, fmt.Sprintf("outbox_order:%d", groupID), fmt.Sprintf("outbox_data:%d", groupID), lastSyncTime, lastSyncMsgID, limit)
+	}
 	key := fmt.Sprintf("outbox:%d", groupID)
 	return r.readMessagesAfter(ctx, key, lastSyncTime, lastSyncMsgID, limit)
+}
+
+func (r *RedisRepoImpl) readIndexedMessages(ctx context.Context, orderKey, dataKey string, lastSyncTime, lastSyncMsgID int64, limit int) ([]model.InboxMessage, error) {
+	ids, err := r.rdb.ZRangeByScore(ctx, orderKey, &goredis.ZRangeBy{Min: fmt.Sprintf("%d", lastSyncTime), Max: "+inf"}).Result()
+	if err != nil {
+		return nil, fmt.Errorf("read message order: %w", err)
+	}
+	if len(ids) == 0 {
+		return []model.InboxMessage{}, nil
+	}
+	pipe := r.rdb.Pipeline()
+	cmds := make([]*goredis.StringCmd, len(ids))
+	for i, id := range ids {
+		cmds[i] = pipe.HGet(ctx, dataKey, id)
+	}
+	_, _ = pipe.Exec(ctx)
+	msgs := make([]model.InboxMessage, 0, len(ids))
+	for _, cmd := range cmds {
+		raw, e := cmd.Result()
+		if e != nil {
+			continue
+		}
+		var m model.InboxMessage
+		if json.Unmarshal([]byte(raw), &m) != nil {
+			continue
+		}
+		if m.Timestamp < lastSyncTime || (m.Timestamp == lastSyncTime && lastSyncMsgID > 0 && m.MsgID <= lastSyncMsgID) {
+			continue
+		}
+		msgs = append(msgs, m)
+		if limit > 0 && len(msgs) >= limit {
+			break
+		}
+	}
+	sort.Slice(msgs, func(i, j int) bool {
+		if msgs[i].Timestamp != msgs[j].Timestamp {
+			return msgs[i].Timestamp < msgs[j].Timestamp
+		}
+		return msgs[i].MsgID < msgs[j].MsgID
+	})
+	return msgs, nil
 }
 
 // readMessagesAfter 按复合游标 (timestamp, msgId) 严格向后读取消息。
@@ -181,6 +228,16 @@ func (r *RedisRepoImpl) readMessagesAfter(ctx context.Context, key string, lastS
 // ── 会话列表 ──
 
 func (r *RedisRepoImpl) UpdateConvList(ctx context.Context, userID int64, convID string, summary string, timestamp int64) error {
+	// New representation keeps a stable convID index and the JSON separately.
+	if err := r.rdb.ZAdd(ctx, fmt.Sprintf("conv_order:%d", userID), goredis.Z{Score: float64(timestamp), Member: convID}).Err(); err != nil {
+		return err
+	}
+	if summary == "" {
+		summary = convID
+	}
+	if err := r.rdb.HSet(ctx, fmt.Sprintf("conv_meta:%d", userID), convID, summary).Err(); err != nil {
+		return err
+	}
 	key := fmt.Sprintf("conv_list:%d", userID)
 	// Legacy representation stores the complete JSON summary as the ZSet member.
 	// Remove every older member for this convID before adding the latest summary.
@@ -208,6 +265,30 @@ func (r *RedisRepoImpl) UpdateConvList(ctx context.Context, userID int64, convID
 }
 
 func (r *RedisRepoImpl) GetConvList(ctx context.Context, userID int64) ([]model.ConvSummary, error) {
+	orderKey, dataKey := fmt.Sprintf("conv_order:%d", userID), fmt.Sprintf("conv_meta:%d", userID)
+	if n, _ := r.rdb.Exists(ctx, orderKey).Result(); n > 0 {
+		ids, err := r.rdb.ZRevRange(ctx, orderKey, 0, -1).Result()
+		if err != nil {
+			return nil, err
+		}
+		raw, err := r.rdb.HMGet(ctx, dataKey, ids...).Result()
+		if err != nil {
+			return nil, err
+		}
+		out := make([]model.ConvSummary, 0, len(ids))
+		for i, v := range raw {
+			if v == nil {
+				continue
+			}
+			var s model.ConvSummary
+			if json.Unmarshal([]byte(fmt.Sprint(v)), &s) == nil && s.ConvID != "" {
+				out = append(out, s)
+			} else {
+				out = append(out, model.ConvSummary{ConvID: ids[i]})
+			}
+		}
+		return out, nil
+	}
 	key := fmt.Sprintf("conv_list:%d", userID)
 	// ZREVRANGE返回按lastMsgTime降序排列的成员。
 	members, err := r.rdb.ZRevRange(ctx, key, 0, -1).Result()
@@ -332,6 +413,9 @@ func (r *RedisRepoImpl) AddGroupMemberRedis(ctx context.Context, groupID, userID
 	if err := r.rdb.SAdd(ctx, userKey, groupIDStr).Err(); err != nil {
 		return fmt.Errorf("SADD用户群组: %w", err)
 	}
+	if err := r.rdb.HSetNX(ctx, fmt.Sprintf("group_member_info:%d", groupID), userIDStr, `{"role":0,"muted":false}`).Err(); err != nil {
+		return fmt.Errorf("HSET群成员信息: %w", err)
+	}
 	return nil
 }
 
@@ -350,6 +434,7 @@ func (r *RedisRepoImpl) RemoveGroupMemberRedis(ctx context.Context, groupID, use
 	pipe := r.rdb.Pipeline()
 	pipe.SRem(ctx, groupKey, userIDStr)
 	pipe.SRem(ctx, userKey, groupIDStr)
+	pipe.HDel(ctx, fmt.Sprintf("group_member_info:%d", groupID), userIDStr)
 	for _, existing := range members {
 		var summary model.ConvSummary
 		if (json.Unmarshal([]byte(existing), &summary) == nil && summary.ConvID == convID) || existing == convID {

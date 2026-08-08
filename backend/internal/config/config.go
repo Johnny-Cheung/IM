@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -14,6 +15,7 @@ type Config struct {
 	JWT      JWTConfig      `yaml:"jwt"`
 	File     FileConfig     `yaml:"file"`
 	Moment   MomentConfig   `yaml:"moment"`
+	Message  MessageConfig  `yaml:"message"`
 }
 
 type ServerConfig struct {
@@ -39,6 +41,12 @@ type RedisConfig struct {
 
 type RabbitMQConfig struct {
 	URL string `yaml:"url"`
+}
+
+type MessageConfig struct {
+	// AtomicPipeline enables Redis Lua + Stream relay.  Set false during a
+	// rollback to use the legacy RabbitMQ consumers temporarily.
+	AtomicPipeline bool `yaml:"atomic_pipeline"`
 }
 
 type JWTConfig struct {
@@ -80,6 +88,11 @@ func LoadConfig(path string) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
+	}
+	// The new pipeline is the default for deployments that do not yet have a
+	// message section in their config file.
+	if !strings.Contains(string(data), "atomic_pipeline:") {
+		cfg.Message.AtomicPipeline = true
 	}
 
 	// 朋友圈 Feed 默认值（未配置时生效）

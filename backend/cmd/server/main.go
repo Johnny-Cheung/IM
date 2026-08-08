@@ -42,6 +42,7 @@ import (
 	"github.com/goim/goim/internal/infra"
 	"github.com/goim/goim/internal/middleware"
 	goredis "github.com/goim/goim/internal/redis"
+	"github.com/goim/goim/internal/relay"
 	"github.com/goim/goim/internal/repository"
 	"github.com/goim/goim/internal/service"
 	"github.com/goim/goim/internal/ws"
@@ -105,6 +106,7 @@ func main() {
 	defer mqConn.Close()
 	logger.Info("RabbitMQ 已连接，队列已声明")
 	mqFailure := monitorRabbitMQ(ctx, mqConn, mqCh)
+	var relayPublishFailure <-chan error
 
 	// ── 加载 Lua 脚本到 Redis ──
 	if err := goredis.LoadLuaScripts(rdb, ctx); err != nil {
@@ -116,12 +118,45 @@ func main() {
 	mysqlRepo := repository.NewMySQLRepo(db)
 	redisRepo := repository.NewRedisRepo(rdb)
 	mqRepo := repository.NewMQRepo(mqCh)
+	// Publisher confirm is ordered per AMQP channel.  Keep the Stream relay on
+	// a dedicated channel so confirms for unrelated publishers (moments/likes)
+	// can never be mistaken for a message persistence confirmation.
+	var persistMQRepo *repository.MQRepoImpl
+	if cfg.Message.AtomicPipeline {
+		persistCh, err := mqConn.Channel()
+		if err != nil {
+			logger.Fatal("创建消息 relay RabbitMQ 通道失败", zap.Error(err))
+		}
+		defer persistCh.Close()
+		persistMQRepo = repository.NewMQRepo(persistCh)
+		persistClosed := persistCh.NotifyClose(make(chan *amqp.Error, 1))
+		persistFailure := make(chan error, 1)
+		relayPublishFailure = persistFailure
+		go func() {
+			select {
+			case <-ctx.Done():
+			case closeErr, ok := <-persistClosed:
+				if ok && closeErr != nil {
+					select {
+					case persistFailure <- fmt.Errorf("RabbitMQ 消息 relay 发布通道已关闭: %w", closeErr):
+					default:
+					}
+				}
+			}
+		}()
+	}
 
 	// ── 初始化连接管理器 ──
 	cm := conn.NewConnectionManager()
 
 	// ── 初始化服务层 ──
-	msgSvc := service.NewMsgService(redisRepo, mqRepo, cm, logger)
+	var msgSvc *service.MsgService
+	if cfg.Message.AtomicPipeline {
+		msgSvc = service.NewMsgServiceWithMySQL(redisRepo, mqRepo, mysqlRepo, cm, logger)
+	} else {
+		msgSvc = service.NewMsgService(redisRepo, mqRepo, cm, logger)
+		logger.Warn("message atomic pipeline is disabled; using legacy consumers")
+	}
 	authSvc := service.NewAuthService(mysqlRepo, cfg.JWT.Secret, cfg.JWT.AccessExpHours, cfg.JWT.RefreshExpDays)
 	friendSvc := service.NewFriendService(mysqlRepo, redisRepo, logger)
 	groupSvc := service.NewGroupService(mysqlRepo, redisRepo, logger)
@@ -153,16 +188,27 @@ func main() {
 	)
 
 	// ── 启动 MQ 消费者 ──
-	privateMsgConsumer := consumer.NewPrivateMsgConsumer(mqCh, mysqlRepo, redisRepo, cm, logger)
-	groupMsgConsumer := consumer.NewGroupMsgConsumer(mqCh, mysqlRepo, redisRepo, cm, logger)
 	momentFeedConsumer := consumer.NewMomentFeedConsumer(mqCh, mysqlRepo, redisRepo, logger, cfg.Moment.BigUserFriendThreshold, cfg.Moment.TimelineMaxLen)
 	likePersistConsumer := consumer.NewLikePersistConsumer(mqCh, mysqlRepo, logger, cfg.Moment.LikePersistBatchSize, cfg.Moment.LikePersistFlushMs)
 
-	if err := privateMsgConsumer.Start(ctx); err != nil {
-		logger.Fatal("启动私聊消息消费者失败", zap.Error(err))
-	}
-	if err := groupMsgConsumer.Start(ctx); err != nil {
-		logger.Fatal("启动群聊消息消费者失败", zap.Error(err))
+	if cfg.Message.AtomicPipeline {
+		messagePersistConsumer := consumer.NewMessagePersistConsumer(mqCh, mysqlRepo, logger)
+		messageRelay := relay.NewMessageRelay(redisRepo, persistMQRepo, cm, logger)
+		if err := messagePersistConsumer.Start(ctx); err != nil {
+			logger.Fatal("启动消息持久化消费者失败", zap.Error(err))
+		}
+		if err := messageRelay.Start(ctx); err != nil {
+			logger.Fatal("启动消息 Stream relay 失败", zap.Error(err))
+		}
+	} else {
+		privateMsgConsumer := consumer.NewPrivateMsgConsumer(mqCh, mysqlRepo, redisRepo, cm, logger)
+		groupMsgConsumer := consumer.NewGroupMsgConsumer(mqCh, mysqlRepo, redisRepo, cm, logger)
+		if err := privateMsgConsumer.Start(ctx); err != nil {
+			logger.Fatal("启动私聊消息消费者失败", zap.Error(err))
+		}
+		if err := groupMsgConsumer.Start(ctx); err != nil {
+			logger.Fatal("启动群聊消息消费者失败", zap.Error(err))
+		}
 	}
 	if err := momentFeedConsumer.Start(ctx); err != nil {
 		logger.Fatal("启动动态推送消费者失败", zap.Error(err))
@@ -205,6 +251,9 @@ func main() {
 		logger.Info("收到退出信号，正在关闭服务器...")
 	case mqErr := <-mqFailure:
 		logger.Error("RabbitMQ 连接异常，正在关闭服务器等待容器重启", zap.Error(mqErr))
+		stop()
+	case mqErr := <-relayPublishFailure:
+		logger.Error("RabbitMQ relay 发布通道异常，正在关闭服务器等待容器重启", zap.Error(mqErr))
 		stop()
 	}
 

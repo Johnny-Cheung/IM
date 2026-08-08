@@ -31,10 +31,12 @@ const (
 // MsgService 处理所有与消息相关的 WebSocket 操作：发送、
 // 送达确认、已读确认、离线同步以及消息撤回。
 type MsgService struct {
-	redisRepo repository.RedisRepo
-	mqRepo    repository.MQRepo
-	cm        *conn.ConnectionManager
-	logger    *zap.Logger
+	redisRepo      repository.RedisRepo
+	mqRepo         repository.MQRepo
+	mysqlRepo      repository.MySQLRepo
+	atomicPipeline bool
+	cm             *conn.ConnectionManager
+	logger         *zap.Logger
 }
 
 // NewMsgService 创建一个具有所有必要依赖项的 MsgService。
@@ -45,6 +47,16 @@ func NewMsgService(redisRepo repository.RedisRepo, mqRepo repository.MQRepo, cm 
 		cm:        cm,
 		logger:    logger,
 	}
+}
+
+// NewMsgServiceWithMySQL enables group membership cache repair when a rolling
+// deployment encounters a cold Redis group cache.  The original constructor is
+// retained for source-compatible unit tests and lightweight deployments.
+func NewMsgServiceWithMySQL(redisRepo repository.RedisRepo, mqRepo repository.MQRepo, mysqlRepo repository.MySQLRepo, cm *conn.ConnectionManager, logger *zap.Logger) *MsgService {
+	s := NewMsgService(redisRepo, mqRepo, cm, logger)
+	s.mysqlRepo = mysqlRepo
+	s.atomicPipeline = true
+	return s
 }
 
 // ──────────────────────────────────────────────────────
@@ -59,6 +71,10 @@ func (s *MsgService) HandleSendMessage(userID int64, data []byte) {
 	if err := json.Unmarshal(data, &req); err != nil {
 		s.logger.Warn("解析 SendMessage 失败", zap.Error(err))
 		s.sendError(userID, 400, "消息格式无效")
+		return
+	}
+	if strings.TrimSpace(req.ClientMsgID) == "" || len(req.ClientMsgID) > 128 || req.ToID <= 0 || req.MsgType <= 0 || len(req.Content) > 1024*1024 {
+		s.sendError(userID, 400, "消息字段无效")
 		return
 	}
 
@@ -78,6 +94,28 @@ func (s *MsgService) HandleSendMessage(userID int64, data []byte) {
 // 流程：Lua 检查 → 发布到 MQ。
 // serverAck 与接收方推送统一由 MQ 消费者在消息可操作后发送。
 func (s *MsgService) handlePrivateMsg(ctx context.Context, senderID int64, req *model.SendMessage) {
+	if writer, ok := s.redisRepo.(repository.AtomicMessageWriter); s.atomicPipeline && ok {
+		res, err := writer.WritePrivateMessageAtomic(ctx, senderID, req)
+		if err != nil {
+			s.logger.Error("atomic private message write failed", zap.Error(err))
+			s.sendError(senderID, 500, "消息写入失败")
+			return
+		}
+		switch res.ErrCode {
+		case redislua.MsgWriteOK:
+			// The in-process relay will send serverAck/fanout after RabbitMQ confirm.
+			return
+		case redislua.MsgWriteNotFriend:
+			s.sendError(senderID, redislua.CodePMNotFriend, ErrNotFriend)
+		case redislua.MsgWriteBlocked:
+			s.sendError(senderID, redislua.CodePMBlocked, ErrBlocked)
+		case redislua.MsgWriteDuplicate:
+			s.sendError(senderID, redislua.CodePMDuplicate, ErrDuplicate)
+		default:
+			s.sendError(senderID, 500, "消息写入失败")
+		}
+		return
+	}
 	checkResult, err := s.redisRepo.ExecPrivateMsgCheck(ctx, senderID, req.ToID, req.ClientMsgID)
 	if err != nil {
 		s.logger.Error("ExecPrivateMsgCheck 执行失败", zap.Error(err))
@@ -132,6 +170,41 @@ func (s *MsgService) handlePrivateMsg(ctx context.Context, senderID int64, req *
 // 流程：Lua 检查 → 构建 GroupMessage → 发布到 MQ。
 // 带 groupSeq 的 serverAck 由 MQ 消费者在消息可操作后发送。
 func (s *MsgService) handleGroupMsg(ctx context.Context, senderID int64, req *model.SendMessage) {
+	if writer, ok := s.redisRepo.(repository.AtomicMessageWriter); s.atomicPipeline && ok {
+		res, err := writer.WriteGroupMessageAtomic(ctx, req.ToID, senderID, req)
+		if err == nil && res.ErrCode == redislua.MsgWriteNotMember && s.mysqlRepo != nil {
+			if cache, cacheOK := s.redisRepo.(repository.GroupMembershipCache); cacheOK {
+				members, loadErr := s.mysqlRepo.GetGroupMembers(ctx, req.ToID)
+				if loadErr == nil {
+					if warmErr := cache.WarmGroupMembers(ctx, req.ToID, members); warmErr == nil {
+						res, err = writer.WriteGroupMessageAtomic(ctx, req.ToID, senderID, req)
+					} else {
+						s.logger.Warn("warm group membership cache failed", zap.Error(warmErr))
+					}
+				} else {
+					s.logger.Warn("load group members for cache repair failed", zap.Error(loadErr))
+				}
+			}
+		}
+		if err != nil {
+			s.logger.Error("atomic group message write failed", zap.Error(err))
+			s.sendError(senderID, 500, "消息写入失败")
+			return
+		}
+		switch res.ErrCode {
+		case redislua.MsgWriteOK:
+			return
+		case redislua.MsgWriteNotMember:
+			s.sendError(senderID, redislua.CodeGMNotMember, ErrNotMember)
+		case redislua.MsgWriteMuted:
+			s.sendError(senderID, redislua.CodeGMMuted, ErrMuted)
+		case redislua.MsgWriteDuplicate:
+			s.sendError(senderID, redislua.CodeGMDuplicate, ErrDuplicate)
+		default:
+			s.sendError(senderID, 500, "消息写入失败")
+		}
+		return
+	}
 	checkResult, err := s.redisRepo.ExecGroupMsgCheck(ctx, req.ToID, senderID, req.ClientMsgID)
 	if err != nil {
 		s.logger.Error("ExecGroupMsgCheck 执行失败", zap.Error(err))
