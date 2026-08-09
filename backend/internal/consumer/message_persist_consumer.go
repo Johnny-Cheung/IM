@@ -13,7 +13,10 @@ import (
 	"github.com/goim/goim/internal/repository"
 )
 
-const persistMessageQueue = "message_persist"
+const (
+	persistMessageQueue = "message_persist"
+	persistDelayQueue   = "message_persist_delay"
+)
 
 // MessagePersistConsumer has one responsibility: idempotently archive the
 // immutable event in MySQL.  Redis read-model writes and WebSocket fanout are
@@ -74,6 +77,9 @@ func (c *MessagePersistConsumer) handle(ctx context.Context, d amqp.Delivery) {
 	c.retryOrDeadLetter(d, err)
 }
 
+// retryOrDeadLetter 重投带固定间隔的退避：消息先进 message_persist_delay
+// 等待室（5 秒 TTL），过期后由死信交换器自动送回主队列，避免"1 秒内耗尽
+// 重试次数"导致 MySQL 短抖动就误入死信。计数达到上限后 Nack 进死信队列。
 func (c *MessagePersistConsumer) retryOrDeadLetter(d amqp.Delivery, cause error) {
 	count := 0
 	if raw, ok := d.Headers["x-retry-count"]; ok {
@@ -98,7 +104,7 @@ func (c *MessagePersistConsumer) retryOrDeadLetter(d amqp.Delivery, cause error)
 		headers[k] = v
 	}
 	headers["x-retry-count"] = count + 1
-	if err := c.ch.Publish("", "message_persist", false, false, amqp.Publishing{ContentType: d.ContentType, DeliveryMode: 2, Body: d.Body, Headers: headers}); err != nil {
+	if err := c.ch.Publish("", persistDelayQueue, false, false, amqp.Publishing{ContentType: d.ContentType, DeliveryMode: 2, Body: d.Body, Headers: headers}); err != nil {
 		c.logger.Error("republish message persistence retry failed", zap.Error(err))
 		_ = d.Nack(false, true)
 		return

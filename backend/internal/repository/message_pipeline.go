@@ -30,6 +30,14 @@ type StreamStore interface {
 	ClaimPersistEvents(context.Context, string, string, time.Duration, int) ([]PersistStreamEntry, error)
 	AckDeletePersistEvent(context.Context, string, string) error
 	TrimPersistStream(context.Context, string, time.Duration, int) error
+
+	// ── 失败待办 ──
+	// 事件在 Stream 内重试超过年龄阈值后，被移入失败待办（从 Stream 摘除），
+	// 防止 Stream 无限堆积；由 relay 持续重放直到环境恢复。
+	PushFailedEvent(context.Context, []byte) error
+	ListFailedEvents(context.Context, int) ([][]byte, error)
+	RemoveFailedEvent(context.Context, []byte) error
+	FailedEventCount(context.Context) (int64, error)
 }
 
 type GroupMembershipCache interface {
@@ -151,6 +159,42 @@ func (r *RedisRepoImpl) TrimPersistStream(ctx context.Context, stream string, ol
 	}
 	cutoff := time.Now().Add(-olderThan).UnixMilli()
 	return r.rdb.XTrimMinIDApprox(ctx, stream, fmt.Sprintf("%d-0", cutoff), 0).Err()
+}
+
+// ── 失败待办 ──
+
+const failedEventsKey = "relay_failed_events"
+
+// PushFailedEvent 把投递失败且超龄的事件压入失败待办。
+// 待办与 Stream 共享 Redis 持久化（RDB/AOF），可靠性等级一致。
+func (r *RedisRepoImpl) PushFailedEvent(ctx context.Context, payload []byte) error {
+	return r.rdb.LPush(ctx, failedEventsKey, payload).Err()
+}
+
+// ListFailedEvents 返回待办中最旧的 limit 条（从头开始扫描重放）。
+func (r *RedisRepoImpl) ListFailedEvents(ctx context.Context, limit int) ([][]byte, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	raw, err := r.rdb.LRange(ctx, failedEventsKey, 0, int64(limit-1)).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]byte, 0, len(raw))
+	for _, s := range raw {
+		out = append(out, []byte(s))
+	}
+	return out, nil
+}
+
+// RemoveFailedEvent 按 payload 精确移除一条待办（重放成功时调用）。
+func (r *RedisRepoImpl) RemoveFailedEvent(ctx context.Context, payload []byte) error {
+	return r.rdb.LRem(ctx, failedEventsKey, 1, payload).Err()
+}
+
+// FailedEventCount 返回待办总长度，用于堆积告警。
+func (r *RedisRepoImpl) FailedEventCount(ctx context.Context) (int64, error) {
+	return r.rdb.LLen(ctx, failedEventsKey).Result()
 }
 
 func (r *RedisRepoImpl) RedisClient() *goredis.Client { return r.rdb }

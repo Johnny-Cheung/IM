@@ -296,7 +296,3 @@ func pushToConnection(cm *conn.ConnectionManager, logger *zap.Logger, userID int
 	}
 }
 
-// nowUnixMilli 返回当前时间的 Unix 毫秒数。
-func nowUnixMilli() int64 {
-	return time.Now().UnixMilli()
-}

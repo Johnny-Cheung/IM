@@ -20,6 +20,14 @@ import (
 
 const (
 	persistGroup = "goim-message-relay"
+
+	// failBacklogAgeThreshold 是事件在 Stream 内重试的最大年龄：投递失败且
+	// 年龄超过阈值的事件移入失败待办并从 Stream 摘除，防止 Stream 无限堆积。
+	failBacklogAgeThreshold = 30 * time.Minute
+	// failBacklogWarnThreshold 是失败待办长度的告警阈值。
+	failBacklogWarnThreshold = 1000
+	// backlogReplayBatch 是每轮循环最多重放的待办条数。
+	backlogReplayBatch = 100
 )
 
 type MessageRelay struct {
@@ -72,22 +80,19 @@ func (r *MessageRelay) run(ctx context.Context) {
 			}
 		}
 		if len(entries) == 0 {
+			r.replayBacklog(ctx)
 			retry.Reset(0)
 			continue
 		}
-		failed := false
 		for _, entry := range entries {
 			if err := r.handle(ctx, entry); err != nil {
 				r.logger.Warn("relay message failed; leaving Stream entry pending", zap.String("streamID", entry.ID), zap.Error(err))
-				failed = true
-				break
+				// 失败隔离：不中断本批。失败条目留在 pending，由 10s 后的
+				// XAUTOCLAIM 单独接管重试，同批其余消息照常投递。
 			}
 		}
-		if failed {
-			retry.Reset(time.Second)
-		} else {
-			retry.Reset(0)
-		}
+		r.replayBacklog(ctx)
+		retry.Reset(0)
 	}
 }
 
@@ -100,6 +105,19 @@ func (r *MessageRelay) handle(ctx context.Context, entry repository.PersistStrea
 		return r.store.AckDeletePersistEvent(ctx, r.group, entry.ID)
 	}
 	if err := r.publisher.PublishPersistEvent(ctx, evt); err != nil {
+		// 投递失败且事件已超龄（Stream 内已重试约 30 分钟）：移入失败待办并从
+		// Stream 摘除，防止 Stream 无限堆积。待办由 replayBacklog 持续重放，
+		// 直到环境恢复，因此消息并未丢失。
+		if age := time.Since(time.UnixMilli(evt.ServerTimestamp)); age >= failBacklogAgeThreshold {
+			if backlogErr := r.moveToBacklog(ctx, entry); backlogErr != nil {
+				r.logger.Error("move event to failure backlog failed",
+					zap.String("streamID", entry.ID), zap.Int64("msgID", evt.ServerMsgID), zap.Error(backlogErr))
+			} else {
+				r.logger.Warn("event moved to failure backlog",
+					zap.String("streamID", entry.ID), zap.Int64("msgID", evt.ServerMsgID), zap.Duration("age", age))
+				return nil
+			}
+		}
 		return fmt.Errorf("publish event %d with confirm: %w", evt.ServerMsgID, err)
 	}
 	if err := r.store.AckDeletePersistEvent(ctx, r.group, entry.ID); err != nil {
@@ -107,6 +125,48 @@ func (r *MessageRelay) handle(ctx context.Context, entry repository.PersistStrea
 	}
 	r.pushAfterConfirm(evt)
 	return nil
+}
+
+// moveToBacklog 把事件移入失败待办：先写待办、再摘除 Stream 条目。
+// 若两步之间崩溃，事件会同时存在于待办与 Stream（重复投递由 MySQL 幂等消化），
+// 但绝不会出现"已摘除却无处保存"的丢失窗口。
+func (r *MessageRelay) moveToBacklog(ctx context.Context, entry repository.PersistStreamEntry) error {
+	if err := r.store.PushFailedEvent(ctx, entry.Payload); err != nil {
+		return err
+	}
+	return r.store.AckDeletePersistEvent(ctx, r.group, entry.ID)
+}
+
+// replayBacklog 尝试重放失败待办中的事件：投递成功则移除，失败则保留待下轮重试。
+// 待办无时间压力——环境恢复后自然消化；长度超阈值时告警提示系统处于降级状态。
+func (r *MessageRelay) replayBacklog(ctx context.Context) {
+	count, err := r.store.FailedEventCount(ctx)
+	if err != nil {
+		r.logger.Warn("read failure backlog size failed", zap.Error(err))
+	} else if count >= failBacklogWarnThreshold {
+		r.logger.Error("failure backlog exceeds warning threshold",
+			zap.Int64("count", count), zap.Duration("ageThreshold", failBacklogAgeThreshold))
+	}
+	payloads, err := r.store.ListFailedEvents(ctx, backlogReplayBatch)
+	if err != nil {
+		r.logger.Warn("read failure backlog failed", zap.Error(err))
+		return
+	}
+	for _, payload := range payloads {
+		evt, err := redislua.DecodePersistEvent(payload)
+		if err != nil {
+			r.logger.Error("discarding malformed backlog event", zap.Error(err))
+			_ = r.store.RemoveFailedEvent(ctx, payload)
+			continue
+		}
+		if err := r.publisher.PublishPersistEvent(ctx, evt); err != nil {
+			r.logger.Warn("backlog replay failed; keeping event for next round", zap.Int64("msgID", evt.ServerMsgID), zap.Error(err))
+			continue
+		}
+		if err := r.store.RemoveFailedEvent(ctx, payload); err != nil {
+			r.logger.Warn("remove replayed backlog event failed", zap.Int64("msgID", evt.ServerMsgID), zap.Error(err))
+		}
+	}
 }
 
 func (r *MessageRelay) pushAfterConfirm(evt *model.MessagePersistEvent) {

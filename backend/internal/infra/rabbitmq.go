@@ -13,6 +13,7 @@ import (
 var QueueNames = []string{
 	"message_persist",
 	"message_persist_dlq",
+	"message_persist_delay",
 	"private_msg_persist",
 	"group_msg_fanout",
 	"moment_push",
@@ -88,14 +89,23 @@ func ConnectRabbitMQWithRetry(
 	}
 }
 
-// DeclareQueues 在给定通道上声明所有 5 个持久队列。
+// DeclareQueues 在给定通道上声明所有持久队列。
+// message_persist_delay 是落库重试的"等待室"：消息进队 5 秒后过期，
+// 经死信交换器送回主队列，实现固定间隔退避（无需延迟插件）。
 func DeclareQueues(ch *amqp.Channel) error {
 	for _, name := range QueueNames {
 		var args amqp.Table
-		if name == "message_persist" {
+		switch name {
+		case "message_persist":
 			args = amqp.Table{
 				"x-dead-letter-exchange":    "",
 				"x-dead-letter-routing-key": "message_persist_dlq",
+			}
+		case "message_persist_delay":
+			args = amqp.Table{
+				"x-dead-letter-exchange":    "",
+				"x-dead-letter-routing-key": "message_persist",
+				"x-message-ttl":             5000, // 5 秒延迟
 			}
 		}
 		_, err := ch.QueueDeclare(name, true, false, false, false, args)
