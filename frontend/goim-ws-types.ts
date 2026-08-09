@@ -101,6 +101,8 @@ export interface DeliverAck {
 /** 已读确认 */
 export interface ReadAck {
   convId: string;
+  /** 群聊已读水位线：已展示的最后一条群消息序号（私聊忽略，可选；缺省时服务端标记到最新） */
+  lastReadGroupSeq?: number;
 }
 
 /** 离线同步请求 */

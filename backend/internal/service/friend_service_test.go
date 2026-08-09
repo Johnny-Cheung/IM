@@ -376,6 +376,8 @@ func (m *mockFriendRedisRepo) SetGroupReadPos(_ context.Context, _ int64, _ stri
 func (m *mockFriendRedisRepo) GetGroupReadPos(_ context.Context, _ int64, _ string) (int64, error) {
 	return 0, nil
 }
+
+func (m *mockFriendRedisRepo) GetGroupSeq(_ context.Context, _ int64) (int64, error) { return 0, nil }
 func (m *mockFriendRedisRepo) GetGroupMemberships(_ context.Context, _ int64) ([]int64, error) {
 	return nil, nil
 }

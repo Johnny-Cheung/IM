@@ -152,13 +152,14 @@ redis.call('HSET', 'outbox_data:' .. groupID, tostring(msgID), msgJSON)
 redis.call('ZADD', 'outbox:' .. groupID, ts, msgJSON)
 trimMessageBox('outbox_order:' .. groupID, 'outbox_data:' .. groupID, 2000)
 redis.call('ZREMRANGEBYRANK', 'outbox:' .. groupID, 0, -2001)
+-- 群未读采用水位线模型（未读 = 群最新 seq − 成员已读游标，读取端计算），
+-- 因此这里不再对每个成员 HINCRBY unread。
 local summary = cjson.encode({convId=convID, convType=2, targetId=tonumber(groupID), lastMsg=content, lastMsgTime=ts})
 for _, uid in ipairs(members) do
   local id = tonumber(uid)
   table.insert(recipients, id)
   redis.call('ZADD', 'conv_order:' .. uid, ts, convID)
   redis.call('HSET', 'conv_meta:' .. uid, convID, summary)
-  if id ~= tonumber(sender) then redis.call('HINCRBY', 'unread:' .. uid, convID, 1) end
 end
 local event = string.gsub(cjson.encode({serverMsgId='__goim_msg_id__', clientMsgId=clientID, convType=2, senderId=tonumber(sender), groupId=tonumber(groupID), content=content, msgType=msgType, serverTimestamp=ts, groupSeq=groupSeq, recipients=recipients}), '"__goim_msg_id__"', exactMsgID)
 local eventID = redis.call('XADD', KEYS[5], '*', 'payload', event, 'serverMsgId', tostring(msgID), 'convType', '2')

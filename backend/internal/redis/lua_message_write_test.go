@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	goredis "github.com/redis/go-redis/v9"
+
 	"github.com/goim/goim/internal/model"
 	"github.com/stretchr/testify/require"
 )
@@ -64,7 +66,7 @@ func TestAtomicGroupMessageWrite(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(entries[0].Values["payload"].(string)), &event))
 	require.Equal(t, res.MsgID, event.ServerMsgID)
 	require.Equal(t, int64(1), rdb.ZCard(ctx, "outbox_order:91003").Val())
-	unread, err := rdb.HGet(ctx, "unread:91005", "g_91003").Int64()
-	require.NoError(t, err)
-	require.Equal(t, int64(1), unread)
+	// 水位线模型：群未读 = 群最新 seq − 成员已读游标，发送脚本不再写 unread hash
+	_, err = rdb.HGet(ctx, "unread:91005", "g_91003").Result()
+	require.ErrorIs(t, err, goredis.Nil, "群未读不应再写入 unread hash")
 }

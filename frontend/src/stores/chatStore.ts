@@ -22,6 +22,8 @@ export interface ChatMessage {
   id: string;
   clientMsgId?: string;
   serverMsgId?: number;
+  /** 群消息序号（群聊专属）：用作已读水位线（我最后看到第几条） */
+  groupSeq?: number;
   convId: string;
   from: "me" | "other";
   senderId: number;
@@ -101,6 +103,7 @@ function serverMessageToChat(message: InboxMessage, currentUserId: number): Chat
   return {
     id: `server-${message.msgId}`,
     serverMsgId: message.msgId,
+    groupSeq: message.groupSeq,
     convId: message.convId,
     from: message.fromId === currentUserId ? "me" : "other",
     senderId: message.fromId,
@@ -187,7 +190,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   }),
 
   acknowledge: (ack) => set((state) => ({
-    messagesByConversation: Object.fromEntries(Object.entries(state.messagesByConversation).map(([convId, messages]) => [convId, messages.map((message) => message.clientMsgId === ack.clientMsgId ? { ...message, serverMsgId: ack.serverMsgId, status: "sent" as const, error: undefined } : message)])),
+    messagesByConversation: Object.fromEntries(Object.entries(state.messagesByConversation).map(([convId, messages]) => [convId, messages.map((message) => message.clientMsgId === ack.clientMsgId ? { ...message, serverMsgId: ack.serverMsgId, groupSeq: ack.groupSeq ?? message.groupSeq, status: "sent" as const, error: undefined } : message)])),
   })),
 
   failLatestPending: (error) => set((state) => {

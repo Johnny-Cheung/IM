@@ -280,8 +280,10 @@ func (s *MsgService) HandleDeliverAck(userID int64, data []byte) {
 // ──────────────────────────────────────────────────────
 
 // HandleReadAck 处理来自客户端的已读确认。
-// 它通过 Lua 脚本原子性地将指定会话中所有未读消息标记为已读，
-// 并清除未读计数器。
+// 私聊：通过 Lua 原子清零该会话的未读计数器。
+// 群聊：写入已读水位线（group_read_pos），未读数由读取端按
+// "群最新 seq − 我的游标" 计算；客户端未携带 lastReadGroupSeq
+// （老客户端）时降级为标记到当前最新，行为等同旧的整会话清零。
 func (s *MsgService) HandleReadAck(userID int64, data []byte) {
 	var req model.ReadAck
 	if err := json.Unmarshal(data, &req); err != nil {
@@ -291,6 +293,42 @@ func (s *MsgService) HandleReadAck(userID int64, data []byte) {
 	}
 
 	ctx := context.Background()
+
+	if strings.HasPrefix(req.ConvID, "g_") {
+		seq := req.LastReadGroupSeq
+		if seq <= 0 {
+			groupID, err := strconv.ParseInt(strings.TrimPrefix(req.ConvID, "g_"), 10, 64)
+			if err != nil {
+				s.sendError(userID, 400, "convId 格式无效")
+				return
+			}
+			if seq, err = s.redisRepo.GetGroupSeq(ctx, groupID); err != nil {
+				s.logger.Error("读取群最新序号失败",
+					zap.Int64("userID", userID),
+					zap.String("convID", req.ConvID),
+					zap.Error(err),
+				)
+				s.sendError(userID, 500, "标记已读失败")
+				return
+			}
+		}
+		if err := s.redisRepo.SetGroupReadPos(ctx, userID, req.ConvID, seq); err != nil {
+			s.logger.Error("写入群已读水位线失败",
+				zap.Int64("userID", userID),
+				zap.String("convID", req.ConvID),
+				zap.Int64("seq", seq),
+				zap.Error(err),
+			)
+			s.sendError(userID, 500, "标记已读失败")
+			return
+		}
+		s.logger.Debug("群已读水位线已更新",
+			zap.Int64("userID", userID),
+			zap.String("convID", req.ConvID),
+			zap.Int64("seq", seq),
+		)
+		return
+	}
 
 	count, err := s.redisRepo.ExecInboxMarkRead(ctx, userID, req.ConvID)
 	if err != nil {
@@ -302,8 +340,6 @@ func (s *MsgService) HandleReadAck(userID int64, data []byte) {
 		s.sendError(userID, 500, "标记已读失败")
 		return
 	}
-	// 群消息存放在共享 outbox 而非个人 inbox，所以上面的 Lua 对群聊会返回 0。
-	// 无论会话类型如何，收到 readAck 都应清空该会话的服务端未读计数。
 	if err := s.redisRepo.ClearUnread(ctx, userID, req.ConvID); err != nil {
 		s.logger.Error("ClearUnread 执行失败",
 			zap.Int64("userID", userID),

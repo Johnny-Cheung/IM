@@ -57,8 +57,13 @@ export function ChatPage() {
   useEffect(() => {
     if (!selectedId) return;
     markConversationRead(selectedId);
-    if (!previewMode && connectionState === "connected") goimSocket.send({ type: "readAck", data: { convId: selectedId } });
-  }, [connectionState, markConversationRead, messages.length, previewMode, selectedId]);
+    if (!previewMode && connectionState === "connected") {
+      // 群聊已读水位线：携带最后一条已展示群消息的序号，服务端据此精确定位"读到第几条"。
+      // 私聊无 groupSeq，不携带该字段（服务端按原行为清零计数）。
+      const lastGroupSeq = messages.reduce((max, message) => (message.groupSeq ? Math.max(max, message.groupSeq) : max), 0);
+      goimSocket.send({ type: "readAck", data: lastGroupSeq > 0 ? { convId: selectedId, lastReadGroupSeq: lastGroupSeq } : { convId: selectedId } });
+    }
+  }, [connectionState, markConversationRead, messages, previewMode, selectedId]);
 
   useLayoutEffect(() => {
     if (!selectedId || (mode === "live" && !syncCompleted)) return;

@@ -362,6 +362,8 @@ func (r *mockGroupRedisRepo) SetGroupReadPos(_ context.Context, _ int64, _ strin
 func (r *mockGroupRedisRepo) GetGroupReadPos(_ context.Context, _ int64, _ string) (int64, error) {
 	return 0, nil
 }
+
+func (r *mockGroupRedisRepo) GetGroupSeq(_ context.Context, _ int64) (int64, error) { return 0, nil }
 func (r *mockGroupRedisRepo) CheckDuplicate(_ context.Context, _ int64, _ string) (bool, error) {
 	return false, nil
 }

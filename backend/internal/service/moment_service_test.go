@@ -494,6 +494,8 @@ func (m *momentMockRedisRepo) SetGroupReadPos(_ context.Context, _ int64, _ stri
 func (m *momentMockRedisRepo) GetGroupReadPos(_ context.Context, _ int64, _ string) (int64, error) {
 	panic("未实现")
 }
+
+func (m *momentMockRedisRepo) GetGroupSeq(_ context.Context, _ int64) (int64, error) { return 0, nil }
 func (m *momentMockRedisRepo) GetGroupMemberships(_ context.Context, _ int64) ([]int64, error) {
 	panic("未实现")
 }

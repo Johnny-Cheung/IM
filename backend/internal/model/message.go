@@ -80,6 +80,9 @@ type DeliverAck struct {
 // ReadAck — 用户将会话标记为已读
 type ReadAck struct {
 	ConvID string `json:"convId"`
+	// LastReadGroupSeq 群聊已读水位线：客户端已展示的最后一条群消息序号。
+	// 缺省(0)时服务端降级为"标记到当前最新"（等价旧的整会话清零）；私聊忽略此字段。
+	LastReadGroupSeq int64 `json:"lastReadGroupSeq,omitempty"`
 }
 
 // SyncReq — 客户端请求离线消息同步

@@ -39,6 +39,7 @@ type mockRedisRepo struct {
 	outboxMessages map[int64][]model.InboxMessage // groupID -> 消息列表
 	groupMembers   map[int64][]int64              // userID -> groupID 列表
 	groupReadPos   map[string]int64               // "userID:convID" -> seq
+	groupSeq       map[int64]int64                // groupID -> 群最新序号
 	unreadMap      map[string]int64               // convID -> 计数
 	convList       map[int64][]model.ConvSummary  // userID -> 会话摘要列表
 
@@ -56,6 +57,7 @@ func newMockRedisRepo() *mockRedisRepo {
 		outboxMessages: make(map[int64][]model.InboxMessage),
 		groupMembers:   make(map[int64][]int64),
 		groupReadPos:   make(map[string]int64),
+		groupSeq:       make(map[int64]int64),
 		unreadMap:      make(map[string]int64),
 		convList:       make(map[int64][]model.ConvSummary),
 	}
@@ -157,6 +159,12 @@ func (m *mockRedisRepo) GetGroupReadPos(_ context.Context, userID int64, convID 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.groupReadPos[convID], nil
+}
+
+func (m *mockRedisRepo) GetGroupSeq(_ context.Context, groupID int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.groupSeq[groupID], nil
 }
 
 func (m *mockRedisRepo) GetGroupMemberships(_ context.Context, userID int64) ([]int64, error) {
@@ -733,15 +741,35 @@ func TestReadAck_Success(t *testing.T) {
 	assert.Equal(t, int64(0), redisMock.unreadMap["p_1_2"])
 }
 
-func TestReadAck_GroupClearsUnreadWithoutInboxMessages(t *testing.T) {
+func TestReadAck_GroupWritesWatermark(t *testing.T) {
 	redisMock := newMockRedisRepo()
-	redisMock.unreadMap["g_100"] = 10
+	redisMock.unreadMap["g_100"] = 10 // hash 残留不应参与群未读
 	cm := conn.NewConnectionManager()
 	svc := NewMsgService(redisMock, newMockMQRepo(), cm, testLogger())
+	data, _ := json.Marshal(model.ReadAck{ConvID: "g_100", LastReadGroupSeq: 42})
+	svc.HandleReadAck(1, data)
+	assert.False(t, redisMock.markReadCalled, "群聊已读不再走收件箱 Lua")
+	assert.Equal(t, int64(42), redisMock.groupReadPos["g_100"], "群已读水位线应写入客户端携带的序号")
+}
+
+func TestReadAck_GroupFallbackToLatestSeq(t *testing.T) {
+	redisMock := newMockRedisRepo()
+	redisMock.groupSeq[100] = 57
+	cm := conn.NewConnectionManager()
+	svc := NewMsgService(redisMock, newMockMQRepo(), cm, testLogger())
+	// 老客户端不带 lastReadGroupSeq → 降级为标记到当前最新（行为等同旧的整会话清零）
 	data, _ := json.Marshal(model.ReadAck{ConvID: "g_100"})
 	svc.HandleReadAck(1, data)
-	assert.True(t, redisMock.markReadCalled)
-	assert.Equal(t, int64(0), redisMock.unreadMap["g_100"], "群聊没有个人 inbox 消息时也必须清零未读")
+	assert.Equal(t, int64(57), redisMock.groupReadPos["g_100"], "缺省序号时水位线应落到群最新 seq")
+}
+
+func TestReadAck_GroupInvalidConvID(t *testing.T) {
+	redisMock := newMockRedisRepo()
+	cm := conn.NewConnectionManager()
+	svc := NewMsgService(redisMock, newMockMQRepo(), cm, testLogger())
+	data, _ := json.Marshal(model.ReadAck{ConvID: "g_abc"})
+	svc.HandleReadAck(1, data)
+	assert.NotContains(t, redisMock.groupReadPos, "g_abc", "非法群 ID 不应写入水位线")
 }
 
 func TestReadAck_InvalidFormat(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -35,6 +36,8 @@ type RedisRepo interface {
 	// ── 群组已读位置 ──
 	SetGroupReadPos(ctx context.Context, userID int64, convID string, seq int64) error
 	GetGroupReadPos(ctx context.Context, userID int64, convID string) (int64, error)
+	// GetGroupSeq 返回群消息序号计数器的当前值（未发过消息的群为 0）。
+	GetGroupSeq(ctx context.Context, groupID int64) (int64, error)
 
 	// ── 群组成员关系 ──
 	GetGroupMemberships(ctx context.Context, userID int64) ([]int64, error)
@@ -327,6 +330,11 @@ func (r *RedisRepoImpl) ClearUnread(ctx context.Context, userID int64, convID st
 	return r.rdb.HSet(ctx, key, convID, 0).Err()
 }
 
+// GetUnreadMap 返回全部会话的未读数：
+//   - 私聊会话：来自 unread:{userID} 计数 hash（发送时 +1、readAck 清零）；
+//   - 群聊会话：水位线模型，未读 = 群最新 groupSeq − 我的已读游标（读取时计算）。
+//
+// hash 中残留的群会话字段（水位线迁移遗留，旧链路写入）不再作为计数来源，直接忽略。
 func (r *RedisRepoImpl) GetUnreadMap(ctx context.Context, userID int64) (map[string]int64, error) {
 	key := fmt.Sprintf("unread:%d", userID)
 	raw, err := r.rdb.HGetAll(ctx, key).Result()
@@ -336,12 +344,65 @@ func (r *RedisRepoImpl) GetUnreadMap(ctx context.Context, userID int64) (map[str
 
 	result := make(map[string]int64, len(raw))
 	for k, v := range raw {
+		if strings.HasPrefix(k, "g_") {
+			continue // 群会话未读已由水位线计算，忽略 hash 残留
+		}
 		n, _ := strconv.ParseInt(v, 10, 64)
 		if n > 0 {
 			result[k] = n
 		}
 	}
+
+	// 群未读：以 user_groups 集合为准（保证新建群/新入群用户也能算出未读）。
+	groupIDs, err := r.GetGroupMemberships(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("读取用户群组以计算未读: %w", err)
+	}
+	if len(groupIDs) > 0 {
+		if err := r.fillGroupUnread(ctx, userID, groupIDs, result); err != nil {
+			return nil, err
+		}
+	}
 	return result, nil
+}
+
+// fillGroupUnread 为每个群计算 未读 = 群最新 seq − 我的已读游标（clamp ≥ 0）。
+// 游标缺失（迁移/初始化遗漏）时防御性按"已读到最新"处理，避免未读徽标爆炸。
+func (r *RedisRepoImpl) fillGroupUnread(ctx context.Context, userID int64, groupIDs []int64, result map[string]int64) error {
+	pipe := r.rdb.Pipeline()
+	type seqRead struct {
+		convID string
+		cmd    *goredis.StringCmd
+	}
+	reads := make([]seqRead, 0, len(groupIDs))
+	for _, gid := range groupIDs {
+		reads = append(reads, seqRead{convID: fmt.Sprintf("g_%d", gid), cmd: pipe.Get(ctx, fmt.Sprintf("group_seq:%d", gid))})
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != goredis.Nil {
+		return fmt.Errorf("批量读取群序号: %w", err)
+	}
+	for _, rd := range reads {
+		seq := int64(0)
+		if v, err := rd.cmd.Int64(); err == nil {
+			seq = v
+		}
+		pos := int64(0)
+		rawPos, err := r.rdb.HGet(ctx, fmt.Sprintf("group_read_pos:%d", userID), rd.convID).Result()
+		switch {
+		case err == goredis.Nil:
+			pos = seq // 无游标：防御性视为已读到最新
+		case err != nil:
+			return fmt.Errorf("HGet群已读游标: %w", err)
+		default:
+			if pos, err = strconv.ParseInt(rawPos, 10, 64); err != nil {
+				return fmt.Errorf("解析群已读游标: %w", err)
+			}
+		}
+		if unread := seq - pos; unread > 0 {
+			result[rd.convID] = unread
+		}
+	}
+	return nil
 }
 
 // ── 群组已读位置 ──
@@ -359,6 +420,17 @@ func (r *RedisRepoImpl) GetGroupReadPos(ctx context.Context, userID int64, convI
 			return 0, nil // 尚无已读位置
 		}
 		return 0, fmt.Errorf("HGet群组已读位置: %w", err)
+	}
+	return strconv.ParseInt(val, 10, 64)
+}
+
+func (r *RedisRepoImpl) GetGroupSeq(ctx context.Context, groupID int64) (int64, error) {
+	val, err := r.rdb.Get(ctx, fmt.Sprintf("group_seq:%d", groupID)).Result()
+	if err == goredis.Nil {
+		return 0, nil // 群尚未发过消息
+	}
+	if err != nil {
+		return 0, fmt.Errorf("GET群序号: %w", err)
 	}
 	return strconv.ParseInt(val, 10, 64)
 }
@@ -415,6 +487,16 @@ func (r *RedisRepoImpl) AddGroupMemberRedis(ctx context.Context, groupID, userID
 	}
 	if err := r.rdb.HSetNX(ctx, fmt.Sprintf("group_member_info:%d", groupID), userIDStr, `{"role":0,"muted":false}`).Err(); err != nil {
 		return fmt.Errorf("HSET群成员信息: %w", err)
+	}
+	// 新成员已读水位线初始化为当前群序号：历史消息不计入未读。
+	// （水位线模型下未读 = 群最新 seq − 游标，缺失游标会使整个群历史都算未读）
+	seq, err := r.GetGroupSeq(ctx, groupID)
+	if err != nil {
+		return fmt.Errorf("读取群序号以初始化已读游标: %w", err)
+	}
+	convID := fmt.Sprintf("g_%d", groupID)
+	if err := r.rdb.HSet(ctx, fmt.Sprintf("group_read_pos:%d", userID), convID, strconv.FormatInt(seq, 10)).Err(); err != nil {
+		return fmt.Errorf("初始化群已读游标: %w", err)
 	}
 	return nil
 }

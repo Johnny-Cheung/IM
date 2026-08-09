@@ -135,6 +135,10 @@ func (m *MockRedisRepo) GetGroupReadPos(ctx context.Context, userID int64, convI
 	return 0, fmt.Errorf("存根：消费者未使用")
 }
 
+func (m *MockRedisRepo) GetGroupSeq(ctx context.Context, groupID int64) (int64, error) {
+	return 0, fmt.Errorf("存根：消费者未使用")
+}
+
 func (m *MockRedisRepo) GetGroupMemberships(ctx context.Context, userID int64) ([]int64, error) {
 	return nil, fmt.Errorf("存根：消费者未使用")
 }

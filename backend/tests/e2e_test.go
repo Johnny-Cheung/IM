@@ -154,7 +154,7 @@ func TestMain(m *testing.M) {
 
 	// ── 构建 HTTP 处理器 ──
 	authHandler := api.NewAuthHandler(authSvc)
-	friendHandler := api.NewFriendHandler(friendSvc)
+	friendHandler := api.NewFriendHandler(friendSvc, rdb)
 	groupHandler := api.NewGroupHandler(groupSvc)
 	momentHandler := api.NewMomentHandler(momentSvc)
 	msgOpHandler := api.NewMsgOpHandler(msgOpSvc)
@@ -1250,11 +1250,34 @@ func TestE2E_SyncCompositeCursorSameTimestamp(t *testing.T) {
 // TestE2E_SettingsFlow 测试用户设置的生命周期。
 func TestE2E_SettingsFlow(t *testing.T) {
 	username := fmt.Sprintf("e2e_set_%d", time.Now().UnixNano())
-	registerUser(t, env.baseURL, username, "pass1234")
+	friendName := fmt.Sprintf("e2e_setf_%d", time.Now().UnixNano())
+	meID := registerUser(t, env.baseURL, username, "pass1234")
 	token := loginUser(t, env.baseURL, username, "pass1234")
+	friendID := registerUser(t, env.baseURL, friendName, "pass1234")
+	friendToken := loginUser(t, env.baseURL, friendName, "pass1234")
+
+	// 静音校验要求会话双方为好友：先建立好友关系（修复预存断裂）
+	status, body := doAuthedRequest(t, http.MethodPost, env.baseURL, "/api/v1/friend/request",
+		map[string]interface{}{"to_user_id": friendID, "message": "settings flow"}, token)
+	if status != http.StatusCreated {
+		t.Fatalf("发送好友申请: status=%d body=%s", status, body)
+	}
+	var reqResp struct {
+		Data struct {
+			RequestID int64 `json:"request_id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &reqResp); err != nil || reqResp.Data.RequestID == 0 {
+		t.Fatalf("解析好友申请响应: err=%v body=%s", err, body)
+	}
+	status, body = doAuthedRequest(t, http.MethodPost, env.baseURL, "/api/v1/friend/accept",
+		map[string]interface{}{"request_id": reqResp.Data.RequestID}, friendToken)
+	if status != http.StatusOK {
+		t.Fatalf("接受好友申请: status=%d body=%s", status, body)
+	}
 
 	// 步骤 1：获取默认设置
-	status, body := doAuthedRequest(t, http.MethodGet, env.baseURL, "/api/v1/settings", nil, token)
+	status, body = doAuthedRequest(t, http.MethodGet, env.baseURL, "/api/v1/settings", nil, token)
 	if status != http.StatusOK {
 		t.Fatalf("获取设置: status=%d body=%s", status, body)
 	}
@@ -1270,8 +1293,8 @@ func TestE2E_SettingsFlow(t *testing.T) {
 		t.Fatalf("更新设置: status=%d body=%s", status, body)
 	}
 
-	// 步骤 3：静音会话
-	convID := "p_1_2"
+	// 步骤 3：静音会话（使用真实好友会话）
+	convID := fmt.Sprintf("p_%d_%d", min64(meID, friendID), max64(meID, friendID))
 	status, body = doAuthedRequest(t, http.MethodPost, env.baseURL, "/api/v1/settings/mute",
 		map[string]interface{}{"convId": convID}, token)
 	if status != http.StatusOK {
