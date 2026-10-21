@@ -11,10 +11,37 @@
 
 ## 当前状态
 
-项目正在 `refactor/im` 分支从基础工程开始重构。当前正在讨论 [v0.1 基础工程](docs/versions/v0.1.md)，尚未开始实现；先建设 v0.x 基础 IM，后续再根据实际结果推进 v1.x 和 v2.x。
+项目正在 `refactor/im` 分支从基础工程开始重构。当前 [v0.1 基础工程](docs/versions/v0.1.md) 已完成本地实现和验证，开发机独立部署验收待执行；先建设 v0.x 基础 IM，后续再根据实际结果推进 v1.x 和 v2.x。
 
 ## 路线图
 
 完整版本规划见 [docs/roadmap.md](docs/roadmap.md)。
 
 版本只使用 `v0.1`、`v0.2` 这样的两段式编号，用于表达建设顺序。具体版本开始前再讨论范围、方案和验收标准；每个可验证的小步完成后提交并推送到远程分支。
+
+## v0.1 本地运行
+
+后端和前端分别启动：
+
+```bash
+cd backend && go run ./cmd/server
+cd frontend && npm install && npm run dev
+```
+
+浏览器打开 `http://localhost:5173/`。Vite 会将 `/health` 请求代理到 `http://127.0.0.1:8080`。
+
+构建并由 Go 统一托管前端：
+
+```bash
+cd frontend && npm run build
+cd backend && go run ./cmd/server -web-dir ../frontend/dist
+```
+
+此时浏览器打开 `http://127.0.0.1:8080/`。后端也可以使用 `-addr` 参数指定监听地址。
+
+Linux amd64 构建：
+
+```bash
+cd backend
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/im-server-linux-amd64 ./cmd/server
+```
