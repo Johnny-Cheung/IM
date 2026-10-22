@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/config"
@@ -118,7 +119,16 @@ func newRouter(webDir string, ready func(context.Context) error) (*gin.Engine, e
 			c.Status(http.StatusMethodNotAllowed)
 			return
 		}
-		fileServer.ServeHTTP(c.Writer, c.Request)
+		requestPath := c.Request.URL.Path
+		if requestPath == "/api" || strings.HasPrefix(requestPath, "/api/") {
+			c.Status(http.StatusNotFound)
+			return
+		}
+		if filepath.Ext(requestPath) != "" {
+			fileServer.ServeHTTP(c.Writer, c.Request)
+			return
+		}
+		c.File(indexPath)
 	})
 	return router, nil
 }

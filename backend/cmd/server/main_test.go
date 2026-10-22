@@ -121,3 +121,68 @@ func TestStaticDirectoryRequiresIndex(t *testing.T) {
 		t.Fatal("newRouter() error = nil, want missing index error")
 	}
 }
+
+func TestSPAFallback(t *testing.T) {
+	webDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(webDir, "index.html"), []byte("app shell"), 0o644); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	router, err := newRouter(webDir, nil)
+	if err != nil {
+		t.Fatalf("newRouter() error = %v", err)
+	}
+
+	for _, requestPath := range []string{"/", "/login", "/register", "/settings"} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, requestPath, nil)
+		router.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d", requestPath, recorder.Code, http.StatusOK)
+		}
+		if recorder.Body.String() != "app shell" {
+			t.Fatalf("%s body = %q, want app shell", requestPath, recorder.Body.String())
+		}
+	}
+}
+
+func TestSPAFallbackDoesNotHandleAPI(t *testing.T) {
+	webDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(webDir, "index.html"), []byte("app shell"), 0o644); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	router, err := newRouter(webDir, nil)
+	if err != nil {
+		t.Fatalf("newRouter() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/unknown", nil)
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
+	if recorder.Body.String() == "app shell" {
+		t.Fatal("API route returned the SPA shell")
+	}
+}
+
+func TestSPAFallbackLeavesMissingAssets404(t *testing.T) {
+	webDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(webDir, "index.html"), []byte("app shell"), 0o644); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	router, err := newRouter(webDir, nil)
+	if err != nil {
+		t.Fatalf("newRouter() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/missing.js", nil)
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
+}
