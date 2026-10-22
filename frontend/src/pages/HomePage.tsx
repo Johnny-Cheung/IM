@@ -56,6 +56,7 @@ export function HomePage() {
         <button
           className="button button--secondary"
           disabled={loggingOut}
+          id="logout-button"
           onClick={() => void handleLogout()}
           type="button"
         >

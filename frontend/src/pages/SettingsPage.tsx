@@ -110,7 +110,7 @@ export function SettingsPage() {
           <h2 id="account-heading">账号信息</h2>
           <label className="field">
             <span>用户名</span>
-            <input readOnly value={user.username} />
+            <input readOnly name="username" value={user.username} />
             <span className="field-hint">用户名是登录名和对外 ID，注册后不可修改。</span>
           </label>
         </section>
@@ -118,12 +118,13 @@ export function SettingsPage() {
         <section className="settings-section" aria-labelledby="nickname-heading">
           <h2 id="nickname-heading">昵称</h2>
           <p className="settings-copy">昵称用于展示，可以重复。</p>
-          <form className="form" onSubmit={handleNicknameSubmit}>
+          <form className="form" id="nickname-form" onSubmit={handleNicknameSubmit}>
             <label className="field">
               <span>新昵称</span>
               <input
                 autoComplete="nickname"
                 maxLength={20}
+                name="nickname"
                 onChange={(event) => {
                   setNickname(event.target.value);
                   setNicknameSuccess(false);
@@ -136,7 +137,7 @@ export function SettingsPage() {
             {nicknameError && <p className="form-error" role="alert">{nicknameError}</p>}
             {nicknameSuccess && <p className="success" role="status">昵称已更新。</p>}
 
-            <button className="button" disabled={savingNickname} type="submit">
+            <button className="button" disabled={savingNickname} id="save-nickname" type="submit">
               {savingNickname ? "保存中…" : "保存昵称"}
             </button>
           </form>
@@ -147,11 +148,12 @@ export function SettingsPage() {
           <p className="settings-copy">
             修改成功后，本账号的全部登录会话都会失效，需要重新登录。
           </p>
-          <form className="form" onSubmit={handlePasswordSubmit}>
+          <form className="form" id="password-form" onSubmit={handlePasswordSubmit}>
             <label className="field">
               <span>旧密码</span>
               <input
                 autoComplete="current-password"
+                name="old_password"
                 onChange={(event) => setOldPassword(event.target.value)}
                 required
                 type="password"
@@ -163,6 +165,7 @@ export function SettingsPage() {
               <span>新密码</span>
               <input
                 autoComplete="new-password"
+                name="new_password"
                 onChange={(event) => setNewPassword(event.target.value)}
                 required
                 type="password"
@@ -175,6 +178,7 @@ export function SettingsPage() {
               <span>确认新密码</span>
               <input
                 autoComplete="new-password"
+                name="new_password_confirmation"
                 onChange={(event) => setConfirmation(event.target.value)}
                 required
                 type="password"
@@ -184,7 +188,7 @@ export function SettingsPage() {
 
             {passwordError && <p className="form-error" role="alert">{passwordError}</p>}
 
-            <button className="button" disabled={savingPassword} type="submit">
+            <button className="button" disabled={savingPassword} id="save-password" type="submit">
               {savingPassword ? "修改中…" : "修改密码"}
             </button>
           </form>
