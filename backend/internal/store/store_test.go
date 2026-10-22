@@ -18,11 +18,13 @@ func TestMigrationsAreEmbedded(t *testing.T) {
 			names = append(names, entry.Name())
 		}
 	}
-	if len(names) != 2 {
-		t.Fatalf("migration count = %d (%v), want 2", len(names), names)
+	if len(names) != 3 {
+		t.Fatalf("migration count = %d (%v), want 3", len(names), names)
 	}
-	if names[0] != "001_create_users.sql" || names[1] != "002_create_sessions.sql" {
-		t.Fatalf("migration names = %v, want users then sessions", names)
+	if names[0] != "001_create_users.sql" ||
+		names[1] != "002_create_sessions.sql" ||
+		names[2] != "003_unique_active_session.sql" {
+		t.Fatalf("migration names = %v, want users, sessions, unique active session", names)
 	}
 }
 

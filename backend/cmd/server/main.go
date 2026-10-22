@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/config"
+	"github.com/Johnny-Cheung/IM/backend/internal/httpapi"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/gin-gonic/gin"
 )
@@ -54,6 +55,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	httpapi.New(dataStore).Register(router)
 
 	log.Printf("%s listening on %s", serviceName, options.addr)
 	if err := http.ListenAndServe(options.addr, router); err != nil {
