@@ -2,9 +2,13 @@ module github.com/Johnny-Cheung/IM/backend
 
 go 1.26
 
-require github.com/gin-gonic/gin v1.9.1
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/go-sql-driver/mysql v1.10.1
+)
 
 require (
+	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/bytedance/sonic v1.9.1 // indirect
 	github.com/chenzhuoyu/base64x v0.0.0-20221115062448-fe3a3abad311 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.2 // indirect

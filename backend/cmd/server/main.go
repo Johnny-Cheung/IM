@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
+	"github.com/Johnny-Cheung/IM/backend/internal/config"
+	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/gin-gonic/gin"
 )
 
@@ -27,7 +31,26 @@ func main() {
 	flag.StringVar(&options.webDir, "web-dir", "", "directory containing the frontend build")
 	flag.Parse()
 
-	router, err := newRouter(options.webDir)
+	dsn, err := config.MySQLDSN()
+	if err != nil {
+		log.Fatalf("load MySQL configuration: %v", err)
+	}
+
+	startupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	dataStore, err := store.Open(startupCtx, dsn)
+	if err != nil {
+		log.Fatalf("connect MySQL: %v", err)
+	}
+	defer dataStore.Close()
+
+	if err := dataStore.Migrate(startupCtx); err != nil {
+		log.Fatalf("migrate MySQL: %v", err)
+	}
+	log.Printf("MySQL ready; migrations applied")
+
+	router, err := newRouter(options.webDir, dataStore.Ping)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -38,7 +61,7 @@ func main() {
 	}
 }
 
-func newRouter(webDir string) (*gin.Engine, error) {
+func newRouter(webDir string, ready func(context.Context) error) (*gin.Engine, error) {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.Recovery())
@@ -47,6 +70,30 @@ func newRouter(webDir string) (*gin.Engine, error) {
 		c.JSON(http.StatusOK, gin.H{
 			"status":  "ok",
 			"service": serviceName,
+		})
+	})
+
+	router.GET("/ready", func(c *gin.Context) {
+		if ready == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"status":   "degraded",
+				"database": "unavailable",
+			})
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		defer cancel()
+		if err := ready(ctx); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"status":   "degraded",
+				"database": "unavailable",
+			})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status":   "ok",
+			"database": "ok",
 		})
 	})
 
