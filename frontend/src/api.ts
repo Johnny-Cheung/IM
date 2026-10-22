@@ -3,6 +3,39 @@ export type User = {
   nickname: string;
 };
 
+export type Relationship =
+  | "self"
+  | "friend"
+  | "incoming_pending"
+  | "outgoing_pending"
+  | "none";
+
+export type PublicUser = {
+  username: string;
+  nickname: string;
+};
+
+export type UserLookup = PublicUser & {
+  relationship: Relationship;
+};
+
+export type FriendRequest = {
+  id: number;
+  user: PublicUser;
+  created_at: string;
+};
+
+export type FriendRequests = {
+  incoming: FriendRequest[];
+  outgoing: FriendRequest[];
+};
+
+export type SendFriendRequestResult = {
+  status: "pending" | "accepted";
+  request_id?: number;
+  friend?: PublicUser;
+};
+
 export type RegisterInput = {
   username: string;
   nickname: string;
@@ -103,6 +136,36 @@ export const api = {
         old_password: oldPassword,
         new_password: newPassword,
       }),
+    }),
+
+  lookupUser: (username: string) =>
+    request<UserLookup>(`/api/users/${encodeURIComponent(username)}`),
+
+  listFriends: () =>
+    request<{ friends: PublicUser[] }>("/api/friends"),
+
+  listFriendRequests: () =>
+    request<FriendRequests>("/api/friend-requests"),
+
+  sendFriendRequest: (username: string) =>
+    request<SendFriendRequestResult>("/api/friend-requests", {
+      method: "POST",
+      body: JSON.stringify({ username }),
+    }),
+
+  acceptFriendRequest: (requestID: number) =>
+    request<{ friend: PublicUser }>(`/api/friend-requests/${requestID}/accept`, {
+      method: "POST",
+    }),
+
+  rejectFriendRequest: (requestID: number) =>
+    request<void>(`/api/friend-requests/${requestID}/reject`, {
+      method: "POST",
+    }),
+
+  deleteFriend: (username: string) =>
+    request<void>(`/api/friends/${encodeURIComponent(username)}`, {
+      method: "DELETE",
     }),
 };
 

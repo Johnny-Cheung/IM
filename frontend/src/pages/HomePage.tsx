@@ -47,21 +47,24 @@ export function HomePage() {
         </div>
 
         <p className="settings-copy">
-          这是 v0.2 的占位主页，好友和聊天会在后续版本加入。
+          好友管理已经可用，聊天会在后续版本加入。
         </p>
         <p className="settings-copy">
           同一账号只保留一个有效登录会话，在其他设备登录后这里会失效。
         </p>
 
-        <button
-          className="button button--secondary"
-          disabled={loggingOut}
-          id="logout-button"
-          onClick={() => void handleLogout()}
-          type="button"
-        >
-          {loggingOut ? "退出中…" : "退出登录"}
-        </button>
+        <div className="button-stack">
+          <Link className="button button--secondary" to="/friends">好友管理</Link>
+          <button
+            className="button button--secondary"
+            disabled={loggingOut}
+            id="logout-button"
+            onClick={() => void handleLogout()}
+            type="button"
+          >
+            {loggingOut ? "退出中…" : "退出登录"}
+          </button>
+        </div>
       </section>
     </main>
   );

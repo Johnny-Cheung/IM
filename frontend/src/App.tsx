@@ -1,5 +1,6 @@
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { AuthProvider, GuestOnly, RequireAuth } from "./auth";
+import { FriendsPage } from "./pages/FriendsPage";
 import { HomePage } from "./pages/HomePage";
 import { LoginPage } from "./pages/LoginPage";
 import { RegisterPage } from "./pages/RegisterPage";
@@ -25,6 +26,10 @@ export function App() {
           <Route
             path="/settings"
             element={<RequireAuth><SettingsPage /></RequireAuth>}
+          />
+          <Route
+            path="/friends"
+            element={<RequireAuth><FriendsPage /></RequireAuth>}
           />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
