@@ -69,3 +69,31 @@ func (s *Store) GetUserByUsernameKey(ctx context.Context, usernameKey string) (U
 	}
 	return user, nil
 }
+
+// GetUserByID loads a user by internal ID.
+func (s *Store) GetUserByID(ctx context.Context, userID uint64) (User, error) {
+	var user User
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, username, nickname, password_hash
+		 FROM users WHERE id = ?`,
+		userID,
+	).Scan(&user.ID, &user.Username, &user.Nickname, &user.PasswordHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return User{}, ErrUserNotFound
+	}
+	if err != nil {
+		return User{}, fmt.Errorf("get user by id: %w", err)
+	}
+	return user, nil
+}
+
+// UpdateNickname changes a user's display nickname.
+func (s *Store) UpdateNickname(ctx context.Context, userID uint64, nickname string) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE users SET nickname = ? WHERE id = ?`,
+		nickname, userID,
+	); err != nil {
+		return fmt.Errorf("update nickname: %w", err)
+	}
+	return nil
+}

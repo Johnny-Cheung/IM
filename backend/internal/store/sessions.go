@@ -130,3 +130,49 @@ func (s *Store) RevokeSession(
 	}
 	return nil
 }
+
+// UpdatePasswordAndRevokeSessions updates the password hash and revokes every
+// active session for the user in one transaction.
+func (s *Store) UpdatePasswordAndRevokeSessions(
+	ctx context.Context,
+	userID uint64,
+	passwordHash string,
+	revokedAt time.Time,
+) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin password transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var lockedID uint64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM users WHERE id = ? FOR UPDATE`, userID,
+	).Scan(&lockedID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrUserNotFound
+		}
+		return fmt.Errorf("lock user for password change: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE users SET password_hash = ? WHERE id = ?`,
+		passwordHash, userID,
+	); err != nil {
+		return fmt.Errorf("update password: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE sessions
+		 SET revoked_at = ?, revoke_reason = ?
+		 WHERE user_id = ? AND revoked_at IS NULL`,
+		revokedAt, RevokeReasonPasswordChanged, userID,
+	); err != nil {
+		return fmt.Errorf("revoke sessions after password change: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit password change: %w", err)
+	}
+	return nil
+}

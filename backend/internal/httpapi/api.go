@@ -25,6 +25,8 @@ type Store interface {
 		username, usernameKey, nickname, passwordHash string,
 	) (store.User, error)
 	GetUserByUsernameKey(ctx context.Context, usernameKey string) (store.User, error)
+	GetUserByID(ctx context.Context, userID uint64) (store.User, error)
+	UpdateNickname(ctx context.Context, userID uint64, nickname string) error
 	CreateSession(
 		ctx context.Context,
 		userID uint64,
@@ -36,6 +38,12 @@ type Store interface {
 		ctx context.Context,
 		tokenHash []byte,
 		reason string,
+		revokedAt time.Time,
+	) error
+	UpdatePasswordAndRevokeSessions(
+		ctx context.Context,
+		userID uint64,
+		passwordHash string,
 		revokedAt time.Time,
 	) error
 }
@@ -57,6 +65,8 @@ func (a *API) Register(router *gin.Engine) {
 	group.POST("/auth/login", a.login)
 	group.POST("/auth/logout", a.logout)
 	group.GET("/me", a.requireUser, a.me)
+	group.PATCH("/me", a.requireUser, a.updateMe)
+	group.PUT("/me/password", a.requireUser, a.updatePassword)
 }
 
 type registerRequest struct {
@@ -68,6 +78,15 @@ type registerRequest struct {
 type loginRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+type updateNicknameRequest struct {
+	Nickname string `json:"nickname"`
+}
+
+type updatePasswordRequest struct {
+	OldPassword string `json:"old_password"`
+	NewPassword string `json:"new_password"`
 }
 
 type userResponse struct {
@@ -212,12 +231,7 @@ func (a *API) logout(c *gin.Context) {
 }
 
 func (a *API) me(c *gin.Context) {
-	value, ok := c.Get("currentUser")
-	if !ok {
-		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
-		return
-	}
-	user, ok := value.(store.User)
+	user, ok := currentUser(c)
 	if !ok {
 		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
 		return
@@ -226,6 +240,97 @@ func (a *API) me(c *gin.Context) {
 		Username: user.Username,
 		Nickname: user.Nickname,
 	})
+}
+
+func (a *API) updateMe(c *gin.Context) {
+	user, ok := currentUser(c)
+	if !ok {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
+		return
+	}
+
+	var request updateNicknameRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_request", "请求格式不正确")
+		return
+	}
+	nickname, err := auth.CleanNickname(request.Nickname)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_nickname", "昵称需为 1–20 个字符，且不能只包含空白")
+		return
+	}
+
+	if err := a.store.UpdateNickname(c.Request.Context(), user.ID, nickname); err != nil {
+		log.Printf("update nickname: %v", err)
+		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
+		return
+	}
+	c.JSON(http.StatusOK, userResponse{
+		Username: user.Username,
+		Nickname: nickname,
+	})
+}
+
+func (a *API) updatePassword(c *gin.Context) {
+	user, ok := currentUser(c)
+	if !ok {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
+		return
+	}
+
+	var request updatePasswordRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_request", "请求格式不正确")
+		return
+	}
+	if err := auth.ValidatePassword(request.NewPassword); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_password", "密码至少 8 个字符，且不超过 72 个字节")
+		return
+	}
+
+	fullUser, err := a.store.GetUserByID(c.Request.Context(), user.ID)
+	if errors.Is(err, store.ErrUserNotFound) {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
+		return
+	}
+	if err != nil {
+		log.Printf("load user for password change: %v", err)
+		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
+		return
+	}
+	if !auth.CheckPassword(fullUser.PasswordHash, request.OldPassword) {
+		writeError(c, http.StatusBadRequest, "invalid_old_password", "旧密码不正确")
+		return
+	}
+
+	passwordHash, err := auth.HashPassword(request.NewPassword)
+	if err != nil {
+		log.Printf("hash new password: %v", err)
+		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
+		return
+	}
+	if err := a.store.UpdatePasswordAndRevokeSessions(
+		c.Request.Context(),
+		user.ID,
+		passwordHash,
+		time.Now().UTC(),
+	); err != nil {
+		log.Printf("update password: %v", err)
+		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
+		return
+	}
+
+	clearSessionCookie(c)
+	c.Status(http.StatusNoContent)
+}
+
+func currentUser(c *gin.Context) (store.User, bool) {
+	value, ok := c.Get("currentUser")
+	if !ok {
+		return store.User{}, false
+	}
+	user, ok := value.(store.User)
+	return user, ok
 }
 
 func (a *API) requireUser(c *gin.Context) {

@@ -25,6 +25,21 @@ type fakeStore struct {
 	createSessionErr error
 	revokeSessionErr error
 
+	fullUser          store.User
+	fullUserErr       error
+	updateNicknameErr error
+	updatePasswordErr error
+
+	updatedNickname struct {
+		userID   uint64
+		nickname string
+	}
+	passwordChange struct {
+		userID       uint64
+		passwordHash string
+		revokedAt    time.Time
+	}
+
 	createdSession struct {
 		userID    uint64
 		tokenHash []byte
@@ -59,6 +74,31 @@ func (f *fakeStore) GetUserByUsernameKey(context.Context, string) (store.User, e
 		return store.User{}, f.userErr
 	}
 	return f.user, nil
+}
+
+func (f *fakeStore) GetUserByID(context.Context, uint64) (store.User, error) {
+	if f.fullUserErr != nil {
+		return store.User{}, f.fullUserErr
+	}
+	return f.fullUser, nil
+}
+
+func (f *fakeStore) UpdateNickname(_ context.Context, userID uint64, nickname string) error {
+	f.updatedNickname.userID = userID
+	f.updatedNickname.nickname = nickname
+	return f.updateNicknameErr
+}
+
+func (f *fakeStore) UpdatePasswordAndRevokeSessions(
+	_ context.Context,
+	userID uint64,
+	passwordHash string,
+	revokedAt time.Time,
+) error {
+	f.passwordChange.userID = userID
+	f.passwordChange.passwordHash = passwordHash
+	f.passwordChange.revokedAt = revokedAt
+	return f.updatePasswordErr
 }
 
 func (f *fakeStore) CreateSession(
