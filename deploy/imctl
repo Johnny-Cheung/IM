@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# Control script for the isolated IM rebuild deployment.
+set -euo pipefail
+ROOT=/opt/IM-Rebuild
+UNIT=im-rebuild
+PORT=8198
+ADDR="0.0.0.0:${PORT}"
+BASELINE="${ROOT}/preflight/host.before"
+
+RUNTIME_DIR="${ROOT}/runtime/docker"
+RUNTIME_UNIT=im-rebuild-docker
+DOCKER_SOCK="unix://${ROOT}/runtime/run/docker.sock"
+
+MYSQL_NAME=im-rebuild-mysql
+MYSQL_PORT=13307
+MYSQL_DATA="${ROOT}/mysql/data"
+MYSQL_SECRETS="${ROOT}/mysql/secrets"
+MYSQL_ROOT_SECRET="${MYSQL_SECRETS}/mysql-root"
+MYSQL_APP_SECRET="${MYSQL_SECRETS}/mysql-app"
+CONFIG_DIR="${ROOT}/config"
+BACKEND_APP_SECRET="${CONFIG_DIR}/mysql-app"
+
+D() { "${RUNTIME_DIR}/docker" --host "${DOCKER_SOCK}" "$@"; }
+
+snapshot() {
+  /sbin/iptables-save | grep -v '^#' | sed -E 's/\[[0-9]+:[0-9]+\]/[COUNTERS]/'
+  printf 'ip_forward=%s\n' "$(cat /proc/sys/net/ipv4/ip_forward)"
+  /sbin/ip -o link show
+  ps -C nginx,hhvm_bin -o pid=,lstart=,comm= | sort || true
+}
+
+wait_ready() {
+  local attempt code
+  for attempt in $(seq 1 40); do
+    code="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 2 "http://127.0.0.1:${PORT}/ready" || true)"
+    if [ "${code}" = "200" ]; then
+      return 0
+    fi
+    if [ "${code}" = "404" ]; then
+      if curl --fail --silent --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null; then
+        return 0
+      fi
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+runtime_start() {
+  if D info >/dev/null 2>&1; then
+    return 0
+  fi
+  test -x "${RUNTIME_DIR}/dockerd"
+  mkdir -p "${ROOT}/runtime/run" "${ROOT}/runtime/data" "${ROOT}/logs"
+  if systemctl is-failed --quiet "${RUNTIME_UNIT}"; then
+    systemctl reset-failed "${RUNTIME_UNIT}"
+  fi
+  systemd-run --unit="${RUNTIME_UNIT}" --description="IM rebuild private Docker runtime" \
+    --property=CPUAccounting=yes --property=CPUQuota=50% \
+    --property=MemoryAccounting=yes --property=MemoryLimit=536870912 \
+    /usr/bin/env "PATH=${RUNTIME_DIR}:/usr/sbin:/usr/bin:/sbin:/bin" "${RUNTIME_DIR}/dockerd" \
+    --host "${DOCKER_SOCK}" --group root \
+    --data-root "${ROOT}/runtime/data" --exec-root "${ROOT}/runtime/run" \
+    --pidfile "${ROOT}/runtime/run/dockerd.pid" --storage-driver overlay2 \
+    --bridge none --iptables=false --ip6tables=false --ip-forward=false --ip-masq=false \
+    --userland-proxy=false --exec-opt native.cgroupdriver=cgroupfs \
+    --log-level warn --default-ulimit nofile=8192:8192 >/dev/null
+  local attempt
+  for attempt in $(seq 1 40); do
+    if D info >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  journalctl -u "${RUNTIME_UNIT}" --no-pager -n 40 >&2 || true
+  return 1
+}
+
+runtime_stop() {
+  if systemctl is-active --quiet "${RUNTIME_UNIT}"; then
+    systemctl stop "${RUNTIME_UNIT}"
+  fi
+  if systemctl is-failed --quiet "${RUNTIME_UNIT}"; then
+    systemctl reset-failed "${RUNTIME_UNIT}"
+  fi
+}
+
+prepare_backend_config() {
+  mkdir -p "${CONFIG_DIR}"
+  chmod 755 "${CONFIG_DIR}"
+  install -o nobody -g root -m 0400 "${MYSQL_APP_SECRET}" "${BACKEND_APP_SECRET}"
+}
+
+mysql_start() {
+  runtime_start
+  test -s "${MYSQL_ROOT_SECRET}"
+  test -s "${MYSQL_APP_SECRET}"
+  mkdir -p "${MYSQL_DATA}"
+  if D container inspect "${MYSQL_NAME}" >/dev/null 2>&1; then
+    if [ "$(D inspect -f '{{.State.Running}}' "${MYSQL_NAME}")" != "true" ]; then
+      D start "${MYSQL_NAME}" >/dev/null
+    fi
+  else
+    D run -d --name "${MYSQL_NAME}" --network host --restart=no \
+      --cpus 0.5 --memory 512m --memory-swap 512m --pids-limit 192 \
+      --mount "type=bind,src=${MYSQL_DATA},dst=/var/lib/mysql" \
+      --mount "type=bind,src=${MYSQL_ROOT_SECRET},dst=/run/secrets/mysql-root,readonly" \
+      --mount "type=bind,src=${MYSQL_APP_SECRET},dst=/run/secrets/mysql-app,readonly" \
+      --env MYSQL_ROOT_PASSWORD_FILE=/run/secrets/mysql-root \
+      --env MYSQL_DATABASE=im --env MYSQL_USER=im_app \
+      --env MYSQL_PASSWORD_FILE=/run/secrets/mysql-app \
+      --log-driver=json-file --log-opt max-size=10m --log-opt max-file=2 \
+      mysql:8.4 --port="${MYSQL_PORT}" --bind-address=127.0.0.1 --mysqlx=OFF \
+      --max-connections=50 --innodb-buffer-pool-size=128M --performance-schema=OFF \
+      --innodb-redo-log-capacity=16M --skip-log-bin \
+      --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci >/dev/null
+  fi
+  local attempt
+  for attempt in $(seq 1 60); do
+    if D exec "${MYSQL_NAME}" mysqladmin --protocol=tcp --host=127.0.0.1 --port="${MYSQL_PORT}" ping --silent >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  D logs --tail 60 "${MYSQL_NAME}" >&2 || true
+  return 1
+}
+
+mysql_stop() {
+  if D info >/dev/null 2>&1; then
+    if D container inspect "${MYSQL_NAME}" >/dev/null 2>&1; then
+      D stop "${MYSQL_NAME}" >/dev/null || true
+    fi
+  fi
+}
+
+mysql_status() {
+  if ! D info >/dev/null 2>&1; then
+    echo "mysql: runtime stopped"
+    return 0
+  fi
+  if ! D container inspect "${MYSQL_NAME}" >/dev/null 2>&1; then
+    echo "mysql: not created"
+    return 0
+  fi
+  local state
+  state="$(D inspect -f '{{.State.Status}}' "${MYSQL_NAME}")"
+  echo "mysql: ${state} (127.0.0.1:${MYSQL_PORT})"
+  if [ "${state}" = "running" ]; then
+    D stats --no-stream --format '  memory={{.MemUsage}} cpu={{.CPUPerc}}' "${MYSQL_NAME}" 2>/dev/null || true
+  fi
+}
+
+backend_stop() {
+  if systemctl is-active --quiet "${UNIT}"; then
+    systemctl stop "${UNIT}"
+  fi
+  if systemctl is-failed --quiet "${UNIT}"; then
+    systemctl reset-failed "${UNIT}"
+  fi
+}
+
+backend_start() {
+  if systemctl is-active --quiet "${UNIT}"; then
+    echo "backend is already running on port ${PORT}"
+    return 0
+  fi
+  if systemctl is-failed --quiet "${UNIT}"; then
+    systemctl reset-failed "${UNIT}"
+  fi
+  test -x "${ROOT}/bin/im-server"
+  test -f "${ROOT}/web/index.html"
+  local listeners
+  listeners="$(ss -lnt | awk '{print $4}')"
+  if grep -q ":${PORT}\$" <<<"${listeners}"; then
+    echo "Port ${PORT} is already in use; refusing to start." >&2
+    return 1
+  fi
+  if [ ! -f "${BASELINE}" ]; then
+    snapshot > "${BASELINE}"
+  fi
+  prepare_backend_config
+  systemd-run --unit="${UNIT}" --description="IM rebuild backend" \
+    --uid=nobody --gid=nobody \
+    --property=CPUAccounting=yes --property=CPUQuota=25% \
+    --property=MemoryAccounting=yes --property=MemoryLimit=134217728 \
+    /usr/bin/env \
+      IM_MYSQL_HOST=127.0.0.1 \
+      IM_MYSQL_PORT=13307 \
+      IM_MYSQL_DB=im \
+      IM_MYSQL_USER=im_app \
+      IM_MYSQL_PASSWORD_FILE="${BACKEND_APP_SECRET}" \
+    "${ROOT}/bin/im-server" -addr "${ADDR}" -web-dir "${ROOT}/web"
+  if wait_ready; then
+    echo "IM rebuild backend is ready on port ${PORT}"
+  else
+    journalctl -u "${UNIT}" --no-pager -n 30
+    return 1
+  fi
+}
+
+start() {
+  runtime_start
+  mysql_start
+  backend_start
+}
+
+stop() {
+  backend_stop
+  mysql_stop
+  runtime_stop
+  echo "IM rebuild stopped; files and MySQL data are kept."
+}
+
+status() {
+  if systemctl is-active --quiet "${UNIT}"; then
+    echo "backend: running (port ${PORT})"
+    systemctl show "${UNIT}" -p MainPID -p MemoryCurrent -p ActiveEnterTimestamp | sed 's/^/  /'
+    printf '  health: '
+    curl --silent --max-time 2 "http://127.0.0.1:${PORT}/health" || printf 'unreachable'
+    printf '\n'
+    printf '  ready: '
+    curl --silent --max-time 2 "http://127.0.0.1:${PORT}/ready" || printf 'unavailable'
+    printf '\n'
+  else
+    echo "backend: stopped"
+  fi
+  mysql_status
+  if D info >/dev/null 2>&1; then
+    echo "docker: running ($(D info --format '{{.ServerVersion}}' 2>/dev/null))"
+  else
+    echo "docker: stopped"
+  fi
+  if [ -f "${ROOT}/RELEASE" ]; then
+    sed 's/^/  /' "${ROOT}/RELEASE"
+  fi
+}
+
+logs() {
+  local service="${1:-backend}" lines="${2:-80}"
+  case "${service}" in
+    backend) journalctl -u "${UNIT}" --no-pager -n "${lines}" ;;
+    mysql) D logs --tail "${lines}" "${MYSQL_NAME}" ;;
+    runtime) journalctl -u "${RUNTIME_UNIT}" --no-pager -n "${lines}" ;;
+    *) echo "Usage: $0 logs [backend|mysql|runtime] [lines]" >&2; return 2 ;;
+  esac
+}
+
+verify_host() {
+  if [ ! -f "${BASELINE}" ]; then
+    echo "No host baseline recorded." >&2
+    return 1
+  fi
+  if diff "${BASELINE}" <(snapshot) >/dev/null; then
+    echo "firewall rules, IP forwarding, interfaces and existing web processes unchanged"
+  else
+    echo "Host state differs from the recorded baseline:" >&2
+    diff "${BASELINE}" <(snapshot) >&2 || true
+    return 1
+  fi
+}
+
+case "${1:-status}" in
+  baseline) mkdir -p "${ROOT}/preflight"; snapshot > "${BASELINE}"; echo "baseline recorded" ;;
+  start) start ;;
+  stop) stop ;;
+  restart) backend_stop; prepare_backend_config; backend_start ;;
+  status) status ;;
+  mysql-start) mysql_start ;;
+  mysql-stop) mysql_stop ;;
+  mysql-status) mysql_status ;;
+  runtime-start) runtime_start ;;
+  runtime-stop) runtime_stop ;;
+  verify-host) verify_host ;;
+  logs) logs "${2:-backend}" "${3:-80}" ;;
+  *) echo "Usage: $0 {baseline|start|stop|restart|status|mysql-start|mysql-stop|mysql-status|runtime-start|runtime-stop|verify-host|logs [backend|mysql|runtime] [lines]}" >&2; exit 2 ;;
+esac
