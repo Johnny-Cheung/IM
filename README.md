@@ -11,7 +11,7 @@
 
 ## 当前状态
 
-项目正在 `refactor/im` 分支从基础工程开始重构。[v0.1 基础工程](docs/versions/v0.1.md) 和 [v0.2 用户体系](docs/versions/v0.2.md) 均已通过验收，当前开始对齐 v0.3 好友体系；先建设 v0.x 基础 IM，后续再根据实际结果推进 v1.x 和 v2.x。
+项目正在 `refactor/im` 分支从基础工程开始重构。[v0.1 基础工程](docs/versions/v0.1.md) 和 [v0.2 用户体系](docs/versions/v0.2.md) 均已通过验收，[v0.3 好友体系](docs/versions/v0.3.md) 范围已对齐，待实现；先建设 v0.x 基础 IM，后续再根据实际结果推进 v1.x 和 v2.x。
 
 ## 路线图
 
