@@ -244,6 +244,7 @@ export function FriendsPage() {
           <button
             className="button button--compact button--secondary"
             disabled={refreshing}
+            id="refresh-friends"
             onClick={() => void refresh(false)}
             type="button"
           >
@@ -273,7 +274,7 @@ export function FriendsPage() {
             <section className="friends-section" aria-labelledby="add-friend-heading">
               <h2 id="add-friend-heading">添加好友</h2>
               <p className="settings-copy">输入完整用户名，不区分大小写。</p>
-              <form className="search-form" onSubmit={handleSearch}>
+              <form className="search-form" id="friend-search-form" onSubmit={handleSearch}>
                 <label className="sr-only" htmlFor="friend-username">用户名</label>
                 <input
                   id="friend-username"
@@ -331,7 +332,7 @@ export function FriendsPage() {
               ) : (
                 <ul className="people-list">
                   {requests.incoming.map((request) => (
-                    <li className="person" key={request.id}>
+                    <li className="person" data-request-id={request.id} key={request.id}>
                       <div className="avatar avatar--small" aria-hidden="true">
                         {initialOf(request.user.nickname)}
                       </div>
@@ -367,7 +368,7 @@ export function FriendsPage() {
                   <h3>我发出的申请</h3>
                   <ul className="people-list">
                     {requests.outgoing.map((request) => (
-                      <li className="person" key={request.id}>
+                      <li className="person" data-username={request.user.username} key={request.id}>
                         <div className="avatar avatar--small" aria-hidden="true">
                           {initialOf(request.user.nickname)}
                         </div>
@@ -383,7 +384,7 @@ export function FriendsPage() {
               )}
             </section>
 
-            <section className="friends-section" aria-labelledby="friends-list-heading">
+            <section className="friends-section" id="friends-list" aria-labelledby="friends-list-heading">
               <div className="section-heading">
                 <h2 id="friends-list-heading">我的好友</h2>
                 <span className="count-badge">{friends.length}</span>
@@ -394,7 +395,7 @@ export function FriendsPage() {
               ) : (
                 <ul className="people-list">
                   {friends.map((friend) => (
-                    <li className="person" key={friend.username}>
+                    <li className="person" data-username={friend.username} key={friend.username}>
                       <div className="avatar avatar--small" aria-hidden="true">
                         {initialOf(friend.nickname)}
                       </div>
