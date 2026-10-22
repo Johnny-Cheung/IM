@@ -46,6 +46,21 @@ type Store interface {
 		passwordHash string,
 		revokedAt time.Time,
 	) error
+	GetRelationship(ctx context.Context, viewerID, targetID uint64) (store.Relationship, error)
+	ListFriends(ctx context.Context, userID uint64) ([]store.PublicUser, error)
+	ListFriendRequests(ctx context.Context, userID uint64) (store.FriendRequests, error)
+	CreateFriendRequest(
+		ctx context.Context,
+		fromID, toID uint64,
+		now time.Time,
+	) (store.FriendRequestResult, error)
+	AcceptFriendRequest(
+		ctx context.Context,
+		userID, requestID uint64,
+		now time.Time,
+	) (store.PublicUser, error)
+	RejectFriendRequest(ctx context.Context, userID, requestID uint64) error
+	DeleteFriend(ctx context.Context, userID, friendID uint64) error
 }
 
 // API registers the versioned JSON endpoints.
@@ -67,6 +82,16 @@ func (a *API) Register(router *gin.Engine) {
 	group.GET("/me", a.requireUser, a.me)
 	group.PATCH("/me", a.requireUser, a.updateMe)
 	group.PUT("/me/password", a.requireUser, a.updatePassword)
+
+	authed := group.Group("")
+	authed.Use(a.requireUser)
+	authed.GET("/users/:username", a.lookupUser)
+	authed.GET("/friends", a.listFriends)
+	authed.DELETE("/friends/:username", a.deleteFriend)
+	authed.POST("/friend-requests", a.sendFriendRequest)
+	authed.GET("/friend-requests", a.listFriendRequests)
+	authed.POST("/friend-requests/:id/accept", a.acceptFriendRequest)
+	authed.POST("/friend-requests/:id/reject", a.rejectFriendRequest)
 }
 
 type registerRequest struct {

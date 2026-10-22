@@ -40,6 +40,38 @@ type fakeStore struct {
 		revokedAt    time.Time
 	}
 
+	relationship       store.Relationship
+	relationshipErr    error
+	friends            []store.PublicUser
+	friendsErr         error
+	friendRequests     store.FriendRequests
+	friendRequestsErr  error
+	createFriendResult store.FriendRequestResult
+	createFriendErr    error
+	acceptFriendResult store.PublicUser
+	acceptFriendErr    error
+	rejectFriendErr    error
+	deleteFriendErr    error
+
+	createdFriendRequest struct {
+		fromID uint64
+		toID   uint64
+		now    time.Time
+	}
+	acceptedFriendRequest struct {
+		userID    uint64
+		requestID uint64
+		now       time.Time
+	}
+	rejectedFriendRequest struct {
+		userID    uint64
+		requestID uint64
+	}
+	deletedFriend struct {
+		userID   uint64
+		friendID uint64
+	}
+
 	createdSession struct {
 		userID    uint64
 		tokenHash []byte
@@ -99,6 +131,62 @@ func (f *fakeStore) UpdatePasswordAndRevokeSessions(
 	f.passwordChange.passwordHash = passwordHash
 	f.passwordChange.revokedAt = revokedAt
 	return f.updatePasswordErr
+}
+
+func (f *fakeStore) GetRelationship(
+	context.Context,
+	uint64,
+	uint64,
+) (store.Relationship, error) {
+	return f.relationship, f.relationshipErr
+}
+
+func (f *fakeStore) ListFriends(context.Context, uint64) ([]store.PublicUser, error) {
+	return f.friends, f.friendsErr
+}
+
+func (f *fakeStore) ListFriendRequests(
+	context.Context,
+	uint64,
+) (store.FriendRequests, error) {
+	return f.friendRequests, f.friendRequestsErr
+}
+
+func (f *fakeStore) CreateFriendRequest(
+	_ context.Context,
+	fromID, toID uint64,
+	now time.Time,
+) (store.FriendRequestResult, error) {
+	f.createdFriendRequest.fromID = fromID
+	f.createdFriendRequest.toID = toID
+	f.createdFriendRequest.now = now
+	return f.createFriendResult, f.createFriendErr
+}
+
+func (f *fakeStore) AcceptFriendRequest(
+	_ context.Context,
+	userID, requestID uint64,
+	now time.Time,
+) (store.PublicUser, error) {
+	f.acceptedFriendRequest.userID = userID
+	f.acceptedFriendRequest.requestID = requestID
+	f.acceptedFriendRequest.now = now
+	return f.acceptFriendResult, f.acceptFriendErr
+}
+
+func (f *fakeStore) RejectFriendRequest(
+	_ context.Context,
+	userID, requestID uint64,
+) error {
+	f.rejectedFriendRequest.userID = userID
+	f.rejectedFriendRequest.requestID = requestID
+	return f.rejectFriendErr
+}
+
+func (f *fakeStore) DeleteFriend(_ context.Context, userID, friendID uint64) error {
+	f.deletedFriend.userID = userID
+	f.deletedFriend.friendID = friendID
+	return f.deleteFriendErr
 }
 
 func (f *fakeStore) CreateSession(
