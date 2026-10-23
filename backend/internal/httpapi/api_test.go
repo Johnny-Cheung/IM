@@ -73,6 +73,27 @@ type fakeStore struct {
 		friendID uint64
 	}
 
+	conversations     []store.Conversation
+	conversationsErr  error
+	messagePage       store.MessagePage
+	messagePageErr    error
+	createdMessage    store.Message
+	createdMessageNew bool
+	createMessageErr  error
+	createMessageCall struct {
+		senderID        uint64
+		recipientID     uint64
+		clientMessageID string
+		body            string
+		now             time.Time
+	}
+	listMessagesCall struct {
+		userID   uint64
+		otherID  uint64
+		beforeID uint64
+		limit    int
+	}
+
 	createdSession struct {
 		userID    uint64
 		tokenHash []byte
@@ -190,6 +211,39 @@ func (f *fakeStore) DeleteFriend(_ context.Context, userID, friendID uint64) err
 	f.deletedFriend.userID = userID
 	f.deletedFriend.friendID = friendID
 	return f.deleteFriendErr
+}
+
+func (f *fakeStore) ListConversations(
+	context.Context,
+	uint64,
+) ([]store.Conversation, error) {
+	return f.conversations, f.conversationsErr
+}
+
+func (f *fakeStore) ListMessages(
+	_ context.Context,
+	userID, otherID, beforeID uint64,
+	limit int,
+) (store.MessagePage, error) {
+	f.listMessagesCall.userID = userID
+	f.listMessagesCall.otherID = otherID
+	f.listMessagesCall.beforeID = beforeID
+	f.listMessagesCall.limit = limit
+	return f.messagePage, f.messagePageErr
+}
+
+func (f *fakeStore) CreateMessage(
+	_ context.Context,
+	senderID, recipientID uint64,
+	clientMessageID, body string,
+	now time.Time,
+) (store.Message, bool, error) {
+	f.createMessageCall.senderID = senderID
+	f.createMessageCall.recipientID = recipientID
+	f.createMessageCall.clientMessageID = clientMessageID
+	f.createMessageCall.body = body
+	f.createMessageCall.now = now
+	return f.createdMessage, f.createdMessageNew, f.createMessageErr
 }
 
 func (f *fakeStore) CreateSession(

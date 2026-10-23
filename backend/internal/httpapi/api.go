@@ -65,15 +65,28 @@ type Store interface {
 		now time.Time,
 	) error
 	DeleteFriend(ctx context.Context, userID, friendID uint64) error
+	ListConversations(ctx context.Context, userID uint64) ([]store.Conversation, error)
+	ListMessages(
+		ctx context.Context,
+		userID, otherID, beforeID uint64,
+		limit int,
+	) (store.MessagePage, error)
+	CreateMessage(
+		ctx context.Context,
+		senderID, recipientID uint64,
+		clientMessageID, body string,
+		now time.Time,
+	) (store.Message, bool, error)
 }
 
 // API registers the versioned JSON endpoints.
 type API struct {
 	store Store
+	hub   *Hub
 }
 
 func New(dataStore Store) *API {
-	return &API{store: dataStore}
+	return &API{store: dataStore, hub: NewHub()}
 }
 
 // Register mounts authentication and current-user routes under /api.
@@ -96,6 +109,10 @@ func (a *API) Register(router *gin.Engine) {
 	authed.GET("/friend-requests", a.listFriendRequests)
 	authed.POST("/friend-requests/:id/accept", a.acceptFriendRequest)
 	authed.POST("/friend-requests/:id/reject", a.rejectFriendRequest)
+	authed.GET("/conversations", a.listConversations)
+	authed.GET("/conversations/:username/messages", a.listMessages)
+	authed.POST("/conversations/:username/messages", a.sendMessage)
+	authed.GET("/ws", a.websocket)
 }
 
 type registerRequest struct {
@@ -246,9 +263,13 @@ func (a *API) login(c *gin.Context) {
 
 func (a *API) logout(c *gin.Context) {
 	if token, err := c.Cookie(sessionCookieName); err == nil && token != "" {
+		tokenHash := auth.HashSessionToken(token)
+		if session, err := a.store.GetSessionWithUser(c.Request.Context(), tokenHash); err == nil {
+			a.hub.CloseUser(session.User.ID)
+		}
 		if err := a.store.RevokeSession(
 			c.Request.Context(),
-			auth.HashSessionToken(token),
+			tokenHash,
 			store.RevokeReasonLogout,
 			time.Now().UTC(),
 		); err != nil {
@@ -349,6 +370,7 @@ func (a *API) updatePassword(c *gin.Context) {
 		return
 	}
 
+	a.hub.CloseUser(user.ID)
 	clearSessionCookie(c)
 	c.Status(http.StatusNoContent)
 }
@@ -360,6 +382,18 @@ func currentUser(c *gin.Context) (store.User, bool) {
 	}
 	user, ok := value.(store.User)
 	return user, ok
+}
+
+func currentSessionExpiresAt(c *gin.Context) time.Time {
+	value, ok := c.Get("sessionExpiresAt")
+	if !ok {
+		return time.Time{}
+	}
+	expiresAt, ok := value.(time.Time)
+	if !ok {
+		return time.Time{}
+	}
+	return expiresAt
 }
 
 func (a *API) requireUser(c *gin.Context) {
@@ -400,6 +434,7 @@ func (a *API) requireUser(c *gin.Context) {
 	}
 
 	c.Set("currentUser", session.User)
+	c.Set("sessionExpiresAt", session.ExpiresAt)
 	c.Next()
 }
 
@@ -418,6 +453,7 @@ func (a *API) startSession(c *gin.Context, userID uint64) error {
 	); err != nil {
 		return err
 	}
+	a.hub.CloseUser(userID)
 	setSessionCookie(c, token)
 	return nil
 }

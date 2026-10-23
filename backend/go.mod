@@ -5,6 +5,7 @@ go 1.26
 require (
 	github.com/gin-gonic/gin v1.9.1
 	github.com/go-sql-driver/mysql v1.10.1
+	github.com/gorilla/websocket v1.5.3
 	golang.org/x/crypto v0.9.0
 )
 
