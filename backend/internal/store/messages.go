@@ -94,7 +94,6 @@ func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Convers
 	if err != nil {
 		return nil, fmt.Errorf("list latest messages: %w", err)
 	}
-	defer func() { _ = latestRows.Close() }()
 
 	indexByUsername := make(map[string]int, len(conversations))
 	for index := range conversations {
@@ -129,7 +128,11 @@ func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Convers
 		indexByUsername[other.Username] = len(conversations) - 1
 	}
 	if err := latestRows.Err(); err != nil {
+		_ = latestRows.Close()
 		return nil, fmt.Errorf("iterate latest messages: %w", err)
+	}
+	if err := latestRows.Close(); err != nil {
+		return nil, fmt.Errorf("close latest messages: %w", err)
 	}
 
 	unreadRows, err := s.db.QueryContext(ctx,
