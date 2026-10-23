@@ -33,9 +33,11 @@ type MessagePage struct {
 
 // Conversation is a chat list entry with the other user and latest message.
 type Conversation struct {
-	User        PublicUser
-	IsFriend    bool
-	LastMessage *Message
+	User                  PublicUser
+	IsFriend              bool
+	LastMessage           *Message
+	UnreadCount           int
+	PeerLastReadMessageID uint64
 }
 
 // ListConversations returns all friends plus users with existing messages,
@@ -128,6 +130,68 @@ func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Convers
 	}
 	if err := latestRows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate latest messages: %w", err)
+	}
+
+	unreadRows, err := s.db.QueryContext(ctx,
+		`SELECT u.username, COUNT(*)
+		 FROM messages m
+		 JOIN users u ON u.id = m.sender_id
+		 LEFT JOIN conversation_reads r
+		   ON r.user_id = ? AND r.peer_user_id = m.sender_id
+		 WHERE m.recipient_id = ?
+		   AND m.id > COALESCE(r.last_read_message_id, 0)
+		 GROUP BY u.username`,
+		userID, userID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list unread counts: %w", err)
+	}
+	for unreadRows.Next() {
+		var username string
+		var unread int64
+		if err := unreadRows.Scan(&username, &unread); err != nil {
+			_ = unreadRows.Close()
+			return nil, fmt.Errorf("scan unread count: %w", err)
+		}
+		if index, ok := indexByUsername[username]; ok {
+			conversations[index].UnreadCount = int(unread)
+		}
+	}
+	if err := unreadRows.Err(); err != nil {
+		_ = unreadRows.Close()
+		return nil, fmt.Errorf("iterate unread counts: %w", err)
+	}
+	if err := unreadRows.Close(); err != nil {
+		return nil, fmt.Errorf("close unread counts: %w", err)
+	}
+
+	peerReadRows, err := s.db.QueryContext(ctx,
+		`SELECT u.username, r.last_read_message_id
+		 FROM conversation_reads r
+		 JOIN users u ON u.id = r.user_id
+		 WHERE r.peer_user_id = ?`,
+		userID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list peer read positions: %w", err)
+	}
+	for peerReadRows.Next() {
+		var username string
+		var lastReadMessageID uint64
+		if err := peerReadRows.Scan(&username, &lastReadMessageID); err != nil {
+			_ = peerReadRows.Close()
+			return nil, fmt.Errorf("scan peer read position: %w", err)
+		}
+		if index, ok := indexByUsername[username]; ok {
+			conversations[index].PeerLastReadMessageID = lastReadMessageID
+		}
+	}
+	if err := peerReadRows.Err(); err != nil {
+		_ = peerReadRows.Close()
+		return nil, fmt.Errorf("iterate peer read positions: %w", err)
+	}
+	if err := peerReadRows.Close(); err != nil {
+		return nil, fmt.Errorf("close peer read positions: %w", err)
 	}
 
 	sort.SliceStable(conversations, func(i, j int) bool {
@@ -304,4 +368,125 @@ func loadMessageByClientID(
 		return Message{}, fmt.Errorf("load message by client id: %w", err)
 	}
 	return message, nil
+}
+
+// ListMessagesAfter returns messages newer than afterID, oldest first.
+func (s *Store) ListMessagesAfter(
+	ctx context.Context,
+	userID, otherID, afterID uint64,
+	limit int,
+) (MessagePage, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, sender_id, recipient_id, client_message_id, body, created_at
+		 FROM messages
+		 WHERE ((sender_id = ? AND recipient_id = ?)
+		     OR (sender_id = ? AND recipient_id = ?))
+		   AND id > ?
+		 ORDER BY id ASC
+		 LIMIT ?`,
+		userID, otherID, otherID, userID, afterID, limit+1,
+	)
+	if err != nil {
+		return MessagePage{}, fmt.Errorf("list messages after: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	messages := make([]Message, 0, limit+1)
+	for rows.Next() {
+		var message Message
+		if err := rows.Scan(
+			&message.ID,
+			&message.SenderID,
+			&message.RecipientID,
+			&message.ClientMessageID,
+			&message.Body,
+			&message.CreatedAt,
+		); err != nil {
+			return MessagePage{}, fmt.Errorf("scan message after: %w", err)
+		}
+		messages = append(messages, message)
+	}
+	if err := rows.Err(); err != nil {
+		return MessagePage{}, fmt.Errorf("iterate messages after: %w", err)
+	}
+
+	hasMore := len(messages) > limit
+	if hasMore {
+		messages = messages[:limit]
+	}
+	return MessagePage{Messages: messages, HasMore: hasMore}, nil
+}
+
+// MarkConversationRead advances the user's read position to the latest
+// incoming message from peer. The returned bool reports whether it advanced.
+func (s *Store) MarkConversationRead(
+	ctx context.Context,
+	userID, peerID uint64,
+	now time.Time,
+) (uint64, bool, error) {
+	if userID == peerID {
+		return 0, false, ErrCannotMessageSelf
+	}
+
+	var latest uint64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(id), 0)
+		 FROM messages
+		 WHERE sender_id = ? AND recipient_id = ?`,
+		peerID, userID,
+	).Scan(&latest); err != nil {
+		return 0, false, fmt.Errorf("find latest incoming message: %w", err)
+	}
+	if latest == 0 {
+		return 0, false, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, fmt.Errorf("begin mark read transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var existing uint64
+	err = tx.QueryRowContext(ctx,
+		`SELECT last_read_message_id
+		 FROM conversation_reads
+		 WHERE user_id = ? AND peer_user_id = ?
+		 FOR UPDATE`,
+		userID, peerID,
+	).Scan(&existing)
+
+	advanced := false
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO conversation_reads
+			   (user_id, peer_user_id, last_read_message_id, updated_at)
+			 VALUES (?, ?, ?, ?)`,
+			userID, peerID, latest, now,
+		); err != nil {
+			return 0, false, fmt.Errorf("insert conversation read: %w", err)
+		}
+		advanced = true
+	case err != nil:
+		return 0, false, fmt.Errorf("load conversation read: %w", err)
+	case latest > existing:
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE conversation_reads
+			 SET last_read_message_id = ?, updated_at = ?
+			 WHERE user_id = ? AND peer_user_id = ?`,
+			latest, now, userID, peerID,
+		); err != nil {
+			return 0, false, fmt.Errorf("update conversation read: %w", err)
+		}
+		advanced = true
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, false, fmt.Errorf("commit conversation read: %w", err)
+	}
+	if advanced {
+		return latest, true, nil
+	}
+	return existing, false, nil
 }
