@@ -42,6 +42,17 @@ type wsReadEvent struct {
 	LastReadMessageID uint64 `json:"last_read_message_id"`
 }
 
+type wsGroupMessageEvent struct {
+	Type    string               `json:"type"`
+	Message groupMessageResponse `json:"message"`
+}
+
+type wsGroupChangedEvent struct {
+	Type    string `json:"type"`
+	GroupID uint64 `json:"group_id"`
+	Action  string `json:"action"`
+}
+
 type wsClient struct {
 	userID    uint64
 	conn      *websocket.Conn
@@ -272,6 +283,33 @@ func (a *API) PublishMessage(senderID, recipientID uint64, message any) {
 		return
 	}
 	a.hub.Broadcast([]uint64{senderID, recipientID}, payload)
+}
+
+// PublishGroupMessage sends a saved group message event to all members.
+func (a *API) PublishGroupMessage(memberIDs []uint64, message groupMessageResponse) {
+	payload, err := json.Marshal(wsGroupMessageEvent{
+		Type:    "group.message.created",
+		Message: message,
+	})
+	if err != nil {
+		log.Printf("marshal group message event: %v", err)
+		return
+	}
+	a.hub.Broadcast(memberIDs, payload)
+}
+
+// PublishGroupChanged tells affected users to refresh a group.
+func (a *API) PublishGroupChanged(memberIDs []uint64, groupID uint64, action string) {
+	payload, err := json.Marshal(wsGroupChangedEvent{
+		Type:    "group.changed",
+		GroupID: groupID,
+		Action:  action,
+	})
+	if err != nil {
+		log.Printf("marshal group changed event: %v", err)
+		return
+	}
+	a.hub.Broadcast(memberIDs, payload)
 }
 
 // PublishRead sends an updated read position to both participants.

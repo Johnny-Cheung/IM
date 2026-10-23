@@ -110,6 +110,49 @@ type fakeStore struct {
 		now    time.Time
 	}
 
+	groupConversations    []store.GroupConversation
+	groupConversationsErr error
+	usersByKey            map[string]store.User
+	groupDetail           store.GroupDetail
+	groupDetailErr        error
+	createGroupErr        error
+	createGroupCall       struct {
+		ownerID   uint64
+		name      string
+		memberIDs []uint64
+		now       time.Time
+	}
+	renameGroupErr  error
+	inviteGroupErr  error
+	inviteGroupCall struct {
+		groupID   uint64
+		inviterID uint64
+		memberIDs []uint64
+		now       time.Time
+	}
+	kickGroupErr           error
+	leaveGroupDissolved    bool
+	leaveGroupErr          error
+	groupMemberIDs         []uint64
+	groupMemberIDsErr      error
+	groupMessagePage       store.GroupMessagePage
+	groupMessagePageErr    error
+	groupMessageAfterPage  store.GroupMessagePage
+	groupMessageAfterErr   error
+	createdGroupMessage    store.GroupMessage
+	createdGroupMessageNew bool
+	createGroupMessageErr  error
+	createGroupMessageCall struct {
+		senderID        uint64
+		groupID         uint64
+		clientMessageID string
+		body            string
+		now             time.Time
+	}
+	markGroupReadResult   uint64
+	markGroupReadAdvanced bool
+	markGroupReadErr      error
+
 	createdSession struct {
 		userID    uint64
 		tokenHash []byte
@@ -139,9 +182,16 @@ func (f *fakeStore) CreateUser(
 	return f.user, nil
 }
 
-func (f *fakeStore) GetUserByUsernameKey(context.Context, string) (store.User, error) {
+func (f *fakeStore) GetUserByUsernameKey(_ context.Context, usernameKey string) (store.User, error) {
 	if f.userErr != nil {
 		return store.User{}, f.userErr
+	}
+	if f.usersByKey != nil {
+		user, ok := f.usersByKey[usernameKey]
+		if !ok {
+			return store.User{}, store.ErrUserNotFound
+		}
+		return user, nil
 	}
 	return f.user, nil
 }
@@ -283,6 +333,98 @@ func (f *fakeStore) CreateMessage(
 	f.createMessageCall.body = body
 	f.createMessageCall.now = now
 	return f.createdMessage, f.createdMessageNew, f.createMessageErr
+}
+
+func (f *fakeStore) CreateGroup(
+	_ context.Context,
+	ownerID uint64,
+	name string,
+	memberIDs []uint64,
+	now time.Time,
+) (store.GroupDetail, error) {
+	f.createGroupCall.ownerID = ownerID
+	f.createGroupCall.name = name
+	f.createGroupCall.memberIDs = memberIDs
+	f.createGroupCall.now = now
+	return f.groupDetail, f.createGroupErr
+}
+
+func (f *fakeStore) ListGroupConversations(
+	context.Context,
+	uint64,
+) ([]store.GroupConversation, error) {
+	return f.groupConversations, f.groupConversationsErr
+}
+
+func (f *fakeStore) GetGroup(context.Context, uint64, uint64) (store.GroupDetail, error) {
+	return f.groupDetail, f.groupDetailErr
+}
+
+func (f *fakeStore) RenameGroup(context.Context, uint64, uint64, string) error {
+	return f.renameGroupErr
+}
+
+func (f *fakeStore) InviteGroupMembers(
+	_ context.Context,
+	groupID, inviterID uint64,
+	memberIDs []uint64,
+	now time.Time,
+) error {
+	f.inviteGroupCall.groupID = groupID
+	f.inviteGroupCall.inviterID = inviterID
+	f.inviteGroupCall.memberIDs = memberIDs
+	f.inviteGroupCall.now = now
+	return f.inviteGroupErr
+}
+
+func (f *fakeStore) KickGroupMember(context.Context, uint64, uint64, uint64) error {
+	return f.kickGroupErr
+}
+
+func (f *fakeStore) LeaveGroup(context.Context, uint64, uint64, time.Time) (bool, error) {
+	return f.leaveGroupDissolved, f.leaveGroupErr
+}
+
+func (f *fakeStore) ListGroupMemberIDs(context.Context, uint64) ([]uint64, error) {
+	return f.groupMemberIDs, f.groupMemberIDsErr
+}
+
+func (f *fakeStore) ListGroupMessages(
+	context.Context,
+	uint64,
+	uint64,
+	uint64,
+	int,
+) (store.GroupMessagePage, error) {
+	return f.groupMessagePage, f.groupMessagePageErr
+}
+
+func (f *fakeStore) ListGroupMessagesAfter(
+	context.Context,
+	uint64,
+	uint64,
+	uint64,
+	int,
+) (store.GroupMessagePage, error) {
+	return f.groupMessageAfterPage, f.groupMessageAfterErr
+}
+
+func (f *fakeStore) CreateGroupMessage(
+	_ context.Context,
+	senderID, groupID uint64,
+	clientMessageID, body string,
+	now time.Time,
+) (store.GroupMessage, bool, error) {
+	f.createGroupMessageCall.senderID = senderID
+	f.createGroupMessageCall.groupID = groupID
+	f.createGroupMessageCall.clientMessageID = clientMessageID
+	f.createGroupMessageCall.body = body
+	f.createGroupMessageCall.now = now
+	return f.createdGroupMessage, f.createdGroupMessageNew, f.createGroupMessageErr
+}
+
+func (f *fakeStore) MarkGroupRead(context.Context, uint64, uint64) (uint64, bool, error) {
+	return f.markGroupReadResult, f.markGroupReadAdvanced, f.markGroupReadErr
 }
 
 func (f *fakeStore) CreateSession(

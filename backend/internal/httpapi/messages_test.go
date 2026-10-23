@@ -65,19 +65,22 @@ func TestListConversations(t *testing.T) {
 		t.Fatalf("conversation count = %d, want 3", len(response.Conversations))
 	}
 	first := response.Conversations[0]
-	if first.User.Username != "bob" || !first.IsFriend ||
-		first.LastMessage == nil || first.LastMessage.Sender.Username != "alice" ||
+	if first.User == nil || first.User.Username != "bob" || !first.IsFriend ||
+		first.LastMessage == nil || first.LastMessage.Recipient == nil ||
+		first.LastMessage.Sender.Username != "alice" ||
 		first.LastMessage.Recipient.Username != "bob" ||
 		first.UnreadCount != 2 || first.PeerLastReadMessageID != 4 {
 		t.Fatalf("first conversation = %#v", first)
 	}
-	if response.Conversations[1].LastMessage != nil {
-		t.Fatalf("carol last message = %#v, want nil", response.Conversations[1].LastMessage)
+	second := response.Conversations[1]
+	if second.User == nil || second.IsFriend ||
+		second.LastMessage == nil || second.LastMessage.Recipient == nil ||
+		second.LastMessage.Sender.Username != "dave" ||
+		second.LastMessage.Recipient.Username != "alice" {
+		t.Fatalf("second conversation = %#v", second)
 	}
 	third := response.Conversations[2]
-	if third.IsFriend || third.LastMessage == nil ||
-		third.LastMessage.Sender.Username != "dave" ||
-		third.LastMessage.Recipient.Username != "alice" {
+	if third.User == nil || !third.IsFriend || third.LastMessage != nil {
 		t.Fatalf("third conversation = %#v", third)
 	}
 }

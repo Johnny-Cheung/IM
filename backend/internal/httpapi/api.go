@@ -87,6 +87,45 @@ type Store interface {
 		clientMessageID, body string,
 		now time.Time,
 	) (store.Message, bool, error)
+	CreateGroup(
+		ctx context.Context,
+		ownerID uint64,
+		name string,
+		memberIDs []uint64,
+		now time.Time,
+	) (store.GroupDetail, error)
+	ListGroupConversations(
+		ctx context.Context,
+		userID uint64,
+	) ([]store.GroupConversation, error)
+	GetGroup(ctx context.Context, userID, groupID uint64) (store.GroupDetail, error)
+	RenameGroup(ctx context.Context, ownerID, groupID uint64, name string) error
+	InviteGroupMembers(
+		ctx context.Context,
+		groupID, inviterID uint64,
+		memberIDs []uint64,
+		now time.Time,
+	) error
+	KickGroupMember(ctx context.Context, ownerID, groupID, targetID uint64) error
+	LeaveGroup(ctx context.Context, userID, groupID uint64, now time.Time) (bool, error)
+	ListGroupMemberIDs(ctx context.Context, groupID uint64) ([]uint64, error)
+	ListGroupMessages(
+		ctx context.Context,
+		userID, groupID, beforeID uint64,
+		limit int,
+	) (store.GroupMessagePage, error)
+	ListGroupMessagesAfter(
+		ctx context.Context,
+		userID, groupID, afterID uint64,
+		limit int,
+	) (store.GroupMessagePage, error)
+	CreateGroupMessage(
+		ctx context.Context,
+		senderID, groupID uint64,
+		clientMessageID, body string,
+		now time.Time,
+	) (store.GroupMessage, bool, error)
+	MarkGroupRead(ctx context.Context, userID, groupID uint64) (uint64, bool, error)
 }
 
 // API registers the versioned JSON endpoints.
@@ -123,6 +162,15 @@ func (a *API) Register(router *gin.Engine) {
 	authed.GET("/conversations/:username/messages", a.listMessages)
 	authed.POST("/conversations/:username/messages", a.sendMessage)
 	authed.POST("/conversations/:username/read", a.markConversationRead)
+	authed.POST("/groups", a.createGroup)
+	authed.GET("/groups/:id", a.getGroup)
+	authed.PATCH("/groups/:id", a.renameGroup)
+	authed.POST("/groups/:id/members", a.inviteGroupMembers)
+	authed.DELETE("/groups/:id/members/:username", a.kickGroupMember)
+	authed.POST("/groups/:id/leave", a.leaveGroup)
+	authed.GET("/groups/:id/messages", a.listGroupMessages)
+	authed.POST("/groups/:id/messages", a.sendGroupMessage)
+	authed.POST("/groups/:id/read", a.markGroupRead)
 	authed.GET("/ws", a.websocket)
 }
 

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,12 +32,25 @@ type messageResponse struct {
 	CreatedAt       time.Time          `json:"created_at"`
 }
 
+type conversationMessageResponse struct {
+	ID              uint64              `json:"id"`
+	GroupID         uint64              `json:"group_id,omitempty"`
+	Sender          publicUserResponse  `json:"sender"`
+	Recipient       *publicUserResponse `json:"recipient,omitempty"`
+	Body            string              `json:"body"`
+	ClientMessageID string              `json:"client_message_id"`
+	CreatedAt       time.Time           `json:"created_at"`
+}
+
 type conversationResponse struct {
-	User                  publicUserResponse `json:"user"`
-	IsFriend              bool               `json:"is_friend"`
-	LastMessage           *messageResponse   `json:"last_message"`
-	UnreadCount           int                `json:"unread_count"`
-	PeerLastReadMessageID uint64             `json:"peer_last_read_message_id"`
+	Type                  string                       `json:"type"`
+	User                  *publicUserResponse          `json:"user,omitempty"`
+	IsFriend              bool                         `json:"is_friend"`
+	Group                 *groupSummaryResponse        `json:"group,omitempty"`
+	IsOwner               bool                         `json:"is_owner"`
+	LastMessage           *conversationMessageResponse `json:"last_message"`
+	UnreadCount           int                          `json:"unread_count"`
+	PeerLastReadMessageID uint64                       `json:"peer_last_read_message_id,omitempty"`
 }
 
 type conversationListResponse struct {
@@ -74,9 +88,15 @@ func (a *API) listConversations(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
 		return
 	}
+	groups, err := a.store.ListGroupConversations(c.Request.Context(), current.ID)
+	if err != nil {
+		log.Printf("list group conversations: %v", err)
+		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
+		return
+	}
 
 	response := conversationListResponse{
-		Conversations: make([]conversationResponse, 0, len(conversations)),
+		Conversations: make([]conversationResponse, 0, len(conversations)+len(groups)),
 	}
 	for _, conversation := range conversations {
 		other := publicUserResponse{
@@ -84,19 +104,116 @@ func (a *API) listConversations(c *gin.Context) {
 			Nickname: conversation.User.Nickname,
 		}
 		item := conversationResponse{
-			User:                  other,
+			Type:                  "direct",
+			User:                  &other,
 			IsFriend:              conversation.IsFriend,
 			UnreadCount:           conversation.UnreadCount,
 			PeerLastReadMessageID: conversation.PeerLastReadMessageID,
 		}
 		if conversation.LastMessage != nil {
-			message := toMessageResponse(*conversation.LastMessage, current, other)
+			message := toConversationMessage(toMessageResponse(*conversation.LastMessage, current, other))
+			item.LastMessage = &message
+		}
+		response.Conversations = append(response.Conversations, item)
+	}
+	for _, conversation := range groups {
+		summary := toGroupSummaryResponse(conversation.Group, conversation.MemberCount)
+		item := conversationResponse{
+			Type:        "group",
+			Group:       &summary,
+			IsOwner:     conversation.IsOwner,
+			UnreadCount: conversation.UnreadCount,
+		}
+		if conversation.LastMessage != nil {
+			message := toConversationMessageFromGroup(toGroupMessageResponse(*conversation.LastMessage))
 			item.LastMessage = &message
 		}
 		response.Conversations = append(response.Conversations, item)
 	}
 
+	sortConversations(response.Conversations)
 	c.JSON(http.StatusOK, response)
+}
+
+func sortConversations(conversations []conversationResponse) {
+	sort.SliceStable(conversations, func(i, j int) bool {
+		left, right := conversations[i], conversations[j]
+		leftAt, leftHas := conversationLastMessageTime(left)
+		rightAt, rightHas := conversationLastMessageTime(right)
+		switch {
+		case leftHas && rightHas:
+			if !leftAt.Equal(rightAt) {
+				return leftAt.After(rightAt)
+			}
+			return conversationTieKey(left) < conversationTieKey(right)
+		case leftHas:
+			return true
+		case rightHas:
+			return false
+		}
+
+		leftDirect := left.Type == "direct"
+		rightDirect := right.Type == "direct"
+		if leftDirect != rightDirect {
+			return leftDirect
+		}
+		if leftDirect {
+			leftTitle := conversationTieKey(left)
+			rightTitle := conversationTieKey(right)
+			if leftTitle != rightTitle {
+				return leftTitle < rightTitle
+			}
+			return left.User.Username < right.User.Username
+		}
+		if left.Group.CreatedAt.Equal(right.Group.CreatedAt) {
+			return left.Group.ID < right.Group.ID
+		}
+		return left.Group.CreatedAt.After(right.Group.CreatedAt)
+	})
+}
+
+func conversationLastMessageTime(item conversationResponse) (time.Time, bool) {
+	if item.LastMessage == nil {
+		return time.Time{}, false
+	}
+	return item.LastMessage.CreatedAt, true
+}
+
+func toConversationMessage(message messageResponse) conversationMessageResponse {
+	recipient := message.Recipient
+	return conversationMessageResponse{
+		ID:              message.ID,
+		Sender:          message.Sender,
+		Recipient:       &recipient,
+		Body:            message.Body,
+		ClientMessageID: message.ClientMessageID,
+		CreatedAt:       message.CreatedAt,
+	}
+}
+
+func toConversationMessageFromGroup(message groupMessageResponse) conversationMessageResponse {
+	return conversationMessageResponse{
+		ID:              message.ID,
+		GroupID:         message.GroupID,
+		Sender:          message.Sender,
+		Body:            message.Body,
+		ClientMessageID: message.ClientMessageID,
+		CreatedAt:       message.CreatedAt,
+	}
+}
+
+func conversationTieKey(item conversationResponse) string {
+	if item.User != nil {
+		nickname := strings.ToLower(item.User.Nickname)
+		if nickname != "" {
+			return nickname
+		}
+		return strings.ToLower(item.User.Username)
+	}
+	if item.Group != nil {
+		return strings.ToLower(item.Group.Name)
+	}
+	return ""
 }
 
 func (a *API) listMessages(c *gin.Context) {
@@ -178,23 +295,8 @@ func (a *API) sendMessage(c *gin.Context) {
 		return
 	}
 
-	var request sendMessageRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
-		writeError(c, http.StatusBadRequest, "invalid_message", "消息格式不正确")
-		return
-	}
-
-	body := strings.TrimSpace(request.Body)
-	if body == "" || strings.ContainsRune(body, '\x00') {
-		writeError(c, http.StatusBadRequest, "invalid_message", "消息不能为空")
-		return
-	}
-	if utf8.RuneCountInString(body) > maxMessageRunes {
-		writeError(c, http.StatusBadRequest, "message_too_long", "消息不能超过 2000 个字符")
-		return
-	}
-	if !clientMessageIDPattern.MatchString(request.ClientMessageID) {
-		writeError(c, http.StatusBadRequest, "invalid_client_message_id", "消息标识不正确")
+	body, clientMessageID, ok := parseMessagePayload(c)
+	if !ok {
 		return
 	}
 
@@ -202,7 +304,7 @@ func (a *API) sendMessage(c *gin.Context) {
 		c.Request.Context(),
 		current.ID,
 		target.ID,
-		request.ClientMessageID,
+		clientMessageID,
 		body,
 		time.Now().UTC(),
 	)
@@ -222,6 +324,28 @@ func (a *API) sendMessage(c *gin.Context) {
 		status = http.StatusCreated
 	}
 	c.JSON(status, sendMessageResponse{Message: response})
+}
+
+func parseMessagePayload(c *gin.Context) (string, string, bool) {
+	var request sendMessageRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_message", "消息格式不正确")
+		return "", "", false
+	}
+	body := strings.TrimSpace(request.Body)
+	if body == "" || strings.ContainsRune(body, '\x00') {
+		writeError(c, http.StatusBadRequest, "invalid_message", "消息不能为空")
+		return "", "", false
+	}
+	if utf8.RuneCountInString(body) > maxMessageRunes {
+		writeError(c, http.StatusBadRequest, "message_too_long", "消息不能超过 2000 个字符")
+		return "", "", false
+	}
+	if !clientMessageIDPattern.MatchString(request.ClientMessageID) {
+		writeError(c, http.StatusBadRequest, "invalid_client_message_id", "消息标识不正确")
+		return "", "", false
+	}
+	return body, request.ClientMessageID, true
 }
 
 func (a *API) markConversationRead(c *gin.Context) {
