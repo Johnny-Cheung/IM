@@ -445,13 +445,21 @@ export function FriendsPage() {
                             </button>
                           </>
                         ) : (
-                          <button
-                            className="button button--compact button--secondary"
-                            onClick={() => setConfirmingDelete(friend.username)}
-                            type="button"
-                          >
-                            删除
-                          </button>
+                          <>
+                            <Link
+                              className="button button--compact button--secondary"
+                              to={`/chat/${encodeURIComponent(friend.username)}`}
+                            >
+                              发消息
+                            </Link>
+                            <button
+                              className="button button--compact button--secondary"
+                              onClick={() => setConfirmingDelete(friend.username)}
+                              type="button"
+                            >
+                              删除
+                            </button>
+                          </>
                         )}
                       </div>
                     </li>

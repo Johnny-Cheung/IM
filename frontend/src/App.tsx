@@ -1,7 +1,7 @@
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { AuthProvider, GuestOnly, RequireAuth } from "./auth";
+import { ChatPage } from "./pages/ChatPage";
 import { FriendsPage } from "./pages/FriendsPage";
-import { HomePage } from "./pages/HomePage";
 import { LoginPage } from "./pages/LoginPage";
 import { RegisterPage } from "./pages/RegisterPage";
 import { SettingsPage } from "./pages/SettingsPage";
@@ -21,7 +21,11 @@ export function App() {
           />
           <Route
             path="/"
-            element={<RequireAuth><HomePage /></RequireAuth>}
+            element={<RequireAuth><ChatPage /></RequireAuth>}
+          />
+          <Route
+            path="/chat/:username"
+            element={<RequireAuth><ChatPage /></RequireAuth>}
           />
           <Route
             path="/settings"

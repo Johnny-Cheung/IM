@@ -50,6 +50,34 @@ export type SendFriendRequestResult = {
   friend?: PublicUser;
 };
 
+export type ChatMessage = {
+  id: number;
+  sender: PublicUser;
+  recipient: PublicUser;
+  body: string;
+  client_message_id: string;
+  created_at: string;
+};
+
+export type Conversation = {
+  user: PublicUser;
+  is_friend: boolean;
+  last_message: ChatMessage | null;
+};
+
+export type ConversationListResponse = {
+  conversations: Conversation[];
+};
+
+export type MessagePageResponse = {
+  messages: ChatMessage[];
+  has_more: boolean;
+};
+
+export type SendMessageResponse = {
+  message: ChatMessage;
+};
+
 export type RegisterInput = {
   username: string;
   nickname: string;
@@ -181,7 +209,38 @@ export const api = {
     request<void>(`/api/friends/${encodeURIComponent(username)}`, {
       method: "DELETE",
     }),
+
+  listConversations: () =>
+    request<ConversationListResponse>("/api/conversations"),
+
+  listMessages: (username: string, beforeID?: number, limit = 30) => {
+    const params = new URLSearchParams();
+    params.set("limit", String(limit));
+    if (beforeID && beforeID > 0) {
+      params.set("before_id", String(beforeID));
+    }
+    return request<MessagePageResponse>(
+      `/api/conversations/${encodeURIComponent(username)}/messages?${params.toString()}`,
+    );
+  },
+
+  sendMessage: (username: string, body: string, clientMessageID: string) =>
+    request<SendMessageResponse>(
+      `/api/conversations/${encodeURIComponent(username)}/messages`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          body,
+          client_message_id: clientMessageID,
+        }),
+      },
+    ),
 };
+
+export function websocketURL(): string {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/api/ws`;
+}
 
 const sessionErrorCodes = new Set([
   "unauthenticated",
