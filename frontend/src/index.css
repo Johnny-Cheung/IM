@@ -1228,3 +1228,43 @@ a:focus-visible {
     display: none;
   }
 }
+
+.conversation-meta {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.unread-badge {
+  background: var(--accent);
+  border-radius: 999px;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 800;
+  min-width: 18px;
+  padding: 2px 6px;
+  text-align: center;
+}
+
+.conversation-item--unread .conversation-name {
+  font-weight: 800;
+}
+
+.read-state {
+  font-size: 11px;
+}
+
+.read-state--read {
+  color: #18794e;
+}
+
+.connection-state--replaced {
+  background: #f1f4f9;
+  color: var(--muted);
+}
+
+.ws-banner--replaced {
+  background: #f1f4f9;
+  color: var(--ink);
+}

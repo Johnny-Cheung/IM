@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { describeError } from "../api";
 import { useAuth } from "../auth";
 import { Brand } from "../components/Brand";
@@ -7,6 +7,8 @@ import { Brand } from "../components/Brand";
 export function LoginPage() {
   const { login, notice } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const relogin = searchParams.get("relogin") === "1";
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -36,6 +38,11 @@ export function LoginPage() {
         <h1 id="login-title">登录</h1>
         <p className="intro">使用用户名和密码进入 IM。</p>
 
+        {relogin && (
+          <p className="notice" role="status">
+            聊天已在其他窗口打开。重新登录会替换当前账号的会话。
+          </p>
+        )}
         {notice && <p className="notice" role="status">{notice}</p>}
 
         <form className="form" onSubmit={handleSubmit}>

@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Navigate } from "react-router-dom";
+import { Navigate, useLocation } from "react-router-dom";
 import {
   api,
   ApiError,
@@ -150,10 +150,12 @@ export function RequireAuth({ children }: { children: ReactNode }) {
 
 export function GuestOnly({ children }: { children: ReactNode }) {
   const { status } = useAuth();
+  const location = useLocation();
+  const relogin = new URLSearchParams(location.search).get("relogin") === "1";
   if (status === "loading") {
     return <SessionLoading />;
   }
-  if (status === "authenticated") {
+  if (status === "authenticated" && !relogin) {
     return <Navigate to="/" replace />;
   }
   return <>{children}</>;

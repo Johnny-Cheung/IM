@@ -24,10 +24,22 @@ import { Brand } from "../components/Brand";
 
 const PAGE_SIZE = 30;
 const MAX_MESSAGE_LENGTH = 2000;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_BASE_DELAY = 1000;
+const RECONNECT_MAX_DELAY = 10000;
+const READ_DEBOUNCE_MS = 300;
+const WS_CLOSE_REPLACED = 4001;
+const WS_CLOSE_SESSION = 4002;
 
-type ConnectionStatus = "connecting" | "open" | "closed";
+type ConnectionStatus = "connecting" | "open" | "closed" | "replaced";
 type MessageStatus = "sent" | "sending" | "failed";
 type DisplayMessage = ChatMessage & { status: MessageStatus };
+
+type ReadEvent = {
+  reader: string;
+  peer: string;
+  lastReadMessageID: number;
+};
 
 type ScrollPosition = {
   height: number;
@@ -216,6 +228,31 @@ function parseIncomingMessage(value: unknown): ChatMessage | null {
   return candidate as ChatMessage;
 }
 
+function parseReadEvent(value: unknown): ReadEvent | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const event = value as {
+    type?: unknown;
+    reader?: unknown;
+    peer?: unknown;
+    last_read_message_id?: unknown;
+  };
+  if (
+    event.type !== "messages.read"
+    || typeof event.reader !== "string"
+    || typeof event.peer !== "string"
+    || typeof event.last_read_message_id !== "number"
+  ) {
+    return null;
+  }
+  return {
+    reader: event.reader,
+    peer: event.peer,
+    lastReadMessageID: event.last_read_message_id,
+  };
+}
+
 export function ChatPage() {
   const { user, logout, invalidate } = useAuth();
   const navigate = useNavigate();
@@ -227,6 +264,7 @@ export function ChatPage() {
   const [conversationsLoading, setConversationsLoading] = useState(true);
   const [conversationsError, setConversationsError] = useState<string | null>(null);
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
+  const [messagesUsername, setMessagesUsername] = useState("");
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [messagesError, setMessagesError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
@@ -236,6 +274,8 @@ export function ChatPage() {
   const [sendError, setSendError] = useState<string | null>(null);
   const [notFriendLocally, setNotFriendLocally] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
+  const [pageVisible, setPageVisible] = useState(() => document.visibilityState === "visible");
   const [loggingOut, setLoggingOut] = useState(false);
 
   const activeUsernameRef = useRef(activeUsername);
@@ -244,6 +284,16 @@ export function ChatPage() {
   const messageListRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const websocketRef = useRef<WebSocket | null>(null);
+  const loggingOutRef = useRef(false);
+  const messagesRef = useRef<DisplayMessage[]>([]);
+  const pageVisibleRef = useRef(pageVisible);
+  const replacedRef = useRef(false);
+  const mountedRef = useRef(true);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const connectRef = useRef<() => void>(() => {});
+  const syncingRef = useRef(false);
+  const readTimerRef = useRef<number | null>(null);
   const nearBottomRef = useRef(true);
   const scrollToBottomNextRef = useRef(false);
   const pendingOlderScrollRef = useRef<ScrollPosition | null>(null);
@@ -263,6 +313,14 @@ export function ChatPage() {
       conversations.map((conversation) => conversation.user.username),
     );
   }, [conversations]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  useEffect(() => {
+    pageVisibleRef.current = pageVisible;
+  }, [pageVisible]);
 
   const handleSessionError = useCallback((error: unknown): boolean => {
     if (!isSessionError(error)) {
@@ -294,6 +352,7 @@ export function ChatPage() {
 
   const loadInitialMessages = useCallback(async (targetUsername: string) => {
     const requestID = ++messagesRequestRef.current;
+    setMessagesUsername(targetUsername);
     setMessagesLoading(true);
     setMessagesError(null);
     setMessages([]);
@@ -339,6 +398,7 @@ export function ChatPage() {
     if (!activeUsername) {
       messagesRequestRef.current += 1;
       setMessages([]);
+      setMessagesUsername("");
       setMessagesError(null);
       setMessagesLoading(false);
       setHasMore(false);
@@ -360,7 +420,68 @@ export function ChatPage() {
     && !activeConversation;
   const isReadOnly = Boolean(activeConversation && !activeConversation.is_friend)
     || notFriendLocally;
+  const isReplaced = connectionStatus === "replaced";
   const activeUser = activeConversation?.user;
+  const messagesBelongToActive = activeKey !== ""
+    && messagesUsername.toLocaleLowerCase() === activeKey;
+  const peerLastReadMessageID = activeConversation?.peer_last_read_message_id ?? 0;
+  const lastOwnSentMessageID = useMemo(() => {
+    if (!user || !messagesBelongToActive) {
+      return 0;
+    }
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.sender.username === user.username && message.status === "sent") {
+        return message.id;
+      }
+    }
+    return 0;
+  }, [messages, messagesBelongToActive, user]);
+
+  const markRead = useCallback(async (targetUsername: string) => {
+    try {
+      await api.markConversationRead(targetUsername);
+      setConversations((previous) => previous.map((conversation) =>
+        conversation.user.username.toLocaleLowerCase() === targetUsername.toLocaleLowerCase()
+          ? { ...conversation, unread_count: 0 }
+          : conversation));
+    } catch (error) {
+      handleSessionError(error);
+    }
+  }, [handleSessionError]);
+
+  useEffect(() => {
+    if (!activeUsername || !messagesBelongToActive) {
+      return;
+    }
+    if (messagesLoading || messages.length === 0) {
+      return;
+    }
+    if (!pageVisible || connectionStatus === "replaced") {
+      return;
+    }
+    if (readTimerRef.current !== null) {
+      window.clearTimeout(readTimerRef.current);
+    }
+    readTimerRef.current = window.setTimeout(() => {
+      readTimerRef.current = null;
+      void markRead(activeUsername);
+    }, READ_DEBOUNCE_MS);
+    return () => {
+      if (readTimerRef.current !== null) {
+        window.clearTimeout(readTimerRef.current);
+        readTimerRef.current = null;
+      }
+    };
+  }, [
+    activeUsername,
+    connectionStatus,
+    markRead,
+    messages,
+    messagesBelongToActive,
+    messagesLoading,
+    pageVisible,
+  ]);
 
   const loadOlderMessages = useCallback(async () => {
     if (!activeUsername || !hasMore || loadingOlder || messagesLoading) {
@@ -447,11 +568,22 @@ export function ChatPage() {
       return;
     }
     const otherUser = sentByCurrent ? message.recipient : message.sender;
+    const incoming = receivedByCurrent;
+    const readingNow = activeUsernameRef.current.toLocaleLowerCase()
+      === otherUser.username.toLocaleLowerCase()
+      && pageVisibleRef.current
+      && !replacedRef.current;
 
     if (conversationUsernamesRef.current.has(otherUser.username)) {
       setConversations((previous) => sortConversations(previous.map((conversation) =>
         conversation.user.username === otherUser.username
-          ? { ...conversation, last_message: message }
+          ? {
+            ...conversation,
+            last_message: message,
+            unread_count: incoming
+              ? (readingNow ? 0 : conversation.unread_count + 1)
+              : conversation.unread_count,
+          }
           : conversation)));
     } else {
       void loadConversations(false);
@@ -470,7 +602,130 @@ export function ChatPage() {
     }
   }, [loadConversations]);
 
-  const connectWebSocket = useCallback(() => {
+  const handleReadEvent = useCallback((event: ReadEvent) => {
+    const currentUser = userRef.current;
+    if (!currentUser) {
+      return;
+    }
+    if (event.reader === currentUser.username) {
+      setConversations((previous) => previous.map((conversation) =>
+        conversation.user.username === event.peer
+          ? { ...conversation, unread_count: 0 }
+          : conversation));
+      return;
+    }
+    if (event.peer === currentUser.username) {
+      setConversations((previous) => previous.map((conversation) =>
+        conversation.user.username === event.reader
+          ? {
+            ...conversation,
+            peer_last_read_message_id: Math.max(
+              conversation.peer_last_read_message_id,
+              event.lastReadMessageID,
+            ),
+          }
+          : conversation));
+    }
+  }, []);
+
+  const scheduleReconnect = useCallback(() => {
+    if (!mountedRef.current || replacedRef.current) {
+      return;
+    }
+    if (reconnectTimerRef.current !== null) {
+      return;
+    }
+    if (reconnectAttemptRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      return;
+    }
+    if (document.visibilityState !== "visible" || !navigator.onLine) {
+      return;
+    }
+
+    const attempt = reconnectAttemptRef.current + 1;
+    reconnectAttemptRef.current = attempt;
+    setReconnectAttempt(attempt);
+    const delay = Math.min(
+      RECONNECT_BASE_DELAY * 2 ** (attempt - 1),
+      RECONNECT_MAX_DELAY,
+    );
+    reconnectTimerRef.current = window.setTimeout(() => {
+      reconnectTimerRef.current = null;
+      connectRef.current();
+    }, delay);
+  }, []);
+
+  const syncActiveMessages = useCallback(async (targetUsername: string) => {
+    if (syncingRef.current) {
+      return;
+    }
+    const newestID = messagesRef.current.reduce(
+      (newest, message) => message.id > 0 ? Math.max(newest, message.id) : newest,
+      0,
+    );
+    if (newestID === 0) {
+      try {
+        const page = await api.listMessages(targetUsername, undefined, PAGE_SIZE);
+        if (activeUsernameRef.current.toLocaleLowerCase() !== targetUsername.toLocaleLowerCase()) {
+          return;
+        }
+        setMessages((previous) => mergeMessages(previous, page.messages.map(toDisplay)));
+        setHasMore(page.has_more);
+        setMessagesError(null);
+        if (nearBottomRef.current) {
+          scrollToBottomNextRef.current = true;
+        }
+      } catch (error) {
+        if (!handleSessionError(error)) {
+          setMessagesError(describeError(error));
+        }
+      }
+      return;
+    }
+
+    syncingRef.current = true;
+    try {
+      let afterID = newestID;
+      let hasMore = true;
+      for (let pageIndex = 0; pageIndex < 10 && hasMore; pageIndex += 1) {
+        const page = await api.listMessagesAfter(targetUsername, afterID, 50);
+        if (activeUsernameRef.current.toLocaleLowerCase() !== targetUsername.toLocaleLowerCase()) {
+          return;
+        }
+        if (page.messages.length > 0) {
+          setMessages((previous) => mergeMessages(previous, page.messages.map(toDisplay)));
+          afterID = page.messages[page.messages.length - 1].id;
+        }
+        hasMore = page.has_more;
+      }
+      if (
+        hasMore
+        && activeUsernameRef.current.toLocaleLowerCase() === targetUsername.toLocaleLowerCase()
+      ) {
+        await loadInitialMessages(targetUsername);
+        return;
+      }
+      if (nearBottomRef.current) {
+        scrollToBottomNextRef.current = true;
+      }
+    } catch (error) {
+      if (!handleSessionError(error)) {
+        await loadInitialMessages(targetUsername).catch(() => undefined);
+      }
+    } finally {
+      syncingRef.current = false;
+    }
+  }, [handleSessionError, loadInitialMessages]);
+
+  const connectWebSocket = useCallback((resetAttempts = false) => {
+    if (resetAttempts) {
+      reconnectAttemptRef.current = 0;
+      setReconnectAttempt(0);
+    }
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
     const existing = websocketRef.current;
     if (existing && (existing.readyState === WebSocket.CONNECTING
       || existing.readyState === WebSocket.OPEN)) {
@@ -485,33 +740,84 @@ export function ChatPage() {
       if (websocketRef.current !== socket) {
         return;
       }
+      replacedRef.current = false;
+      reconnectAttemptRef.current = 0;
+      setReconnectAttempt(0);
       setConnectionStatus("open");
       void loadConversations(false);
+      const active = activeUsernameRef.current;
+      if (active) {
+        void syncActiveMessages(active);
+      }
     };
     socket.onmessage = (event) => {
       try {
-        const message = parseIncomingMessage(JSON.parse(String(event.data)));
-        if (message) {
-          handleIncomingMessage(message);
+        const data = JSON.parse(String(event.data));
+        if (data?.type === "message.created") {
+          const message = parseIncomingMessage(data);
+          if (message) {
+            handleIncomingMessage(message);
+          }
+        } else if (data?.type === "messages.read") {
+          const readEvent = parseReadEvent(data);
+          if (readEvent) {
+            handleReadEvent(readEvent);
+          }
         }
       } catch {
         // Ignore malformed websocket events.
       }
     };
-    socket.onclose = () => {
-      if (websocketRef.current === socket) {
-        websocketRef.current = null;
-        setConnectionStatus("closed");
+    socket.onclose = (event) => {
+      if (websocketRef.current !== socket) {
+        return;
       }
+      websocketRef.current = null;
+      if (event.code === WS_CLOSE_REPLACED) {
+        replacedRef.current = true;
+        reconnectAttemptRef.current = 0;
+        setReconnectAttempt(0);
+        setConnectionStatus("replaced");
+        return;
+      }
+      if (event.code === WS_CLOSE_SESSION) {
+        if (loggingOutRef.current) {
+          navigate("/login", { replace: true });
+          return;
+        }
+        invalidate(event.reason || "session_revoked");
+        navigate("/login", { replace: true });
+        return;
+      }
+      setConnectionStatus("closed");
+      scheduleReconnect();
     };
     socket.onerror = () => {
       socket.close();
     };
-  }, [handleIncomingMessage, loadConversations]);
+  }, [
+    handleIncomingMessage,
+    handleReadEvent,
+    invalidate,
+    loadConversations,
+    navigate,
+    scheduleReconnect,
+    syncActiveMessages,
+  ]);
 
   useEffect(() => {
-    connectWebSocket();
+    connectRef.current = () => connectWebSocket(false);
+  }, [connectWebSocket]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    connectWebSocket(true);
     return () => {
+      mountedRef.current = false;
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       const socket = websocketRef.current;
       websocketRef.current = null;
       if (socket) {
@@ -521,18 +827,45 @@ export function ChatPage() {
   }, [connectWebSocket]);
 
   useEffect(() => {
-    const refreshWhenVisible = () => {
+    const handleVisibility = () => {
+      const visible = document.visibilityState === "visible";
+      setPageVisible(visible);
+      if (!visible) {
+        return;
+      }
+      void loadConversations(false);
+      if (!replacedRef.current && websocketRef.current === null) {
+        reconnectAttemptRef.current = 0;
+        setReconnectAttempt(0);
+        connectRef.current();
+      }
+    };
+    const handleFocus = () => {
       if (document.visibilityState === "visible") {
         void loadConversations(false);
       }
     };
-    document.addEventListener("visibilitychange", refreshWhenVisible);
-    window.addEventListener("focus", refreshWhenVisible);
+    const handleOnline = () => {
+      if (replacedRef.current || websocketRef.current !== null) {
+        return;
+      }
+      reconnectAttemptRef.current = 0;
+      setReconnectAttempt(0);
+      connectRef.current();
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("focus", handleFocus);
+    window.addEventListener("online", handleOnline);
     return () => {
-      document.removeEventListener("visibilitychange", refreshWhenVisible);
-      window.removeEventListener("focus", refreshWhenVisible);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("focus", handleFocus);
+      window.removeEventListener("online", handleOnline);
     };
   }, [loadConversations]);
+
+  function manualReconnect() {
+    connectWebSocket(true);
+  }
 
   useEffect(() => {
     const element = composerRef.current;
@@ -584,7 +917,7 @@ export function ChatPage() {
   }
 
   async function submitMessage() {
-    if (!user || !activeConversation || isReadOnly) {
+    if (!user || !activeConversation || isReadOnly || isReplaced) {
       return;
     }
     const body = draft.trim();
@@ -614,7 +947,7 @@ export function ChatPage() {
   }
 
   async function retryMessage(message: DisplayMessage) {
-    if (isReadOnly) {
+    if (isReadOnly || isReplaced) {
       return;
     }
     setMessages((previous) => previous.map((item) =>
@@ -641,6 +974,7 @@ export function ChatPage() {
     if (loggingOut) {
       return;
     }
+    loggingOutRef.current = true;
     setLoggingOut(true);
     try {
       await logout();
@@ -659,8 +993,17 @@ export function ChatPage() {
   const draftLength = [...draft].length;
   const canSend = Boolean(activeConversation)
     && !isReadOnly
+    && !isReplaced
     && !activeMissing
     && !messagesLoading;
+  const reconnectExhausted = reconnectAttempt >= MAX_RECONNECT_ATTEMPTS;
+  const reconnectText = reconnectAttempt > 0 && !reconnectExhausted
+    ? `实时连接已断开，正在自动重连（第 ${reconnectAttempt} 次）…`
+    : reconnectExhausted
+      ? "实时连接已断开，自动重连未成功。"
+      : "实时连接已断开。";
+  const showReconnectBanner = connectionStatus === "closed"
+    || (connectionStatus === "connecting" && reconnectAttempt > 0);
   const workspaceClass = activeKey
     ? "chat-workspace chat-workspace--active"
     : "chat-workspace";
@@ -684,18 +1027,29 @@ export function ChatPage() {
           </nav>
         </header>
 
-        {connectionStatus === "closed" && (
-          <div className="ws-banner" id="ws-status" role="status">
-            <span>实时连接已断开，新消息可能延迟显示。</span>
+        {connectionStatus === "replaced" ? (
+          <div className="ws-banner ws-banner--replaced" id="ws-replaced" role="alert">
+            <span>聊天已在其他窗口打开。当前窗口不能发送新消息，历史仍可查看。</span>
             <button
               className="button button--compact button--secondary"
-              onClick={connectWebSocket}
+              onClick={() => navigate("/login?relogin=1")}
               type="button"
             >
-              重新连接
+              重新登录
             </button>
           </div>
-        )}
+        ) : showReconnectBanner ? (
+          <div className="ws-banner" id="ws-status" role="status">
+            <span>{reconnectText}</span>
+            <button
+              className="button button--compact button--secondary"
+              onClick={manualReconnect}
+              type="button"
+            >
+              {reconnectAttempt > 0 && !reconnectExhausted ? "立即重连" : "重新连接"}
+            </button>
+          </div>
+        ) : null}
 
         <div className={workspaceClass}>
           <aside className="conversation-pane" aria-label="会话列表">
@@ -734,7 +1088,7 @@ export function ChatPage() {
                   return (
                     <Link
                       aria-current={isActive ? "page" : undefined}
-                      className={`conversation-item${isActive ? " conversation-item--active" : ""}`}
+                      className={`conversation-item${isActive ? " conversation-item--active" : ""}${conversation.unread_count > 0 ? " conversation-item--unread" : ""}`}
                       data-username={conversation.user.username}
                       key={conversation.user.username}
                       to={`/chat/${encodeURIComponent(conversation.user.username)}`}
@@ -745,11 +1099,18 @@ export function ChatPage() {
                       <div className="conversation-info">
                         <div className="conversation-line">
                           <span className="conversation-name">{conversation.user.nickname}</span>
-                          {conversation.last_message && (
-                            <time dateTime={conversation.last_message.created_at}>
-                              {formatConversationTime(conversation.last_message.created_at)}
-                            </time>
-                          )}
+                          <span className="conversation-meta">
+                            {conversation.unread_count > 0 && (
+                              <span className="unread-badge">
+                                {conversation.unread_count > 99 ? "99+" : conversation.unread_count}
+                              </span>
+                            )}
+                            {conversation.last_message && (
+                              <time dateTime={conversation.last_message.created_at}>
+                                {formatConversationTime(conversation.last_message.created_at)}
+                              </time>
+                            )}
+                          </span>
                         </div>
                         <div className="conversation-line conversation-line--preview">
                           <span className="conversation-preview">
@@ -801,7 +1162,9 @@ export function ChatPage() {
                       ? "实时在线"
                       : connectionStatus === "connecting"
                         ? "连接中…"
-                        : "实时断开"}
+                        : connectionStatus === "replaced"
+                          ? "已被接管"
+                          : "实时断开"}
                   </span>
                 </header>
 
@@ -834,6 +1197,8 @@ export function ChatPage() {
                 >
                   {messagesLoading ? (
                     <p className="empty-state">正在加载消息…</p>
+                  ) : !messagesBelongToActive ? (
+                    <p className="empty-state">正在切换会话…</p>
                   ) : activeMissing ? (
                     <div className="message-placeholder message-placeholder--inline">
                       <p>找不到这个会话。可能已不是好友，且没有历史消息。</p>
@@ -884,6 +1249,14 @@ export function ChatPage() {
                                       发送失败，重试
                                     </button>
                                   )}
+                                  {mine
+                                    && message.status === "sent"
+                                    && message.id > 0
+                                    && message.id === lastOwnSentMessageID && (
+                                      <span className={`read-state${peerLastReadMessageID >= message.id ? " read-state--read" : ""}`}>
+                                        {peerLastReadMessageID >= message.id ? "已读" : "未读"}
+                                      </span>
+                                    )}
                                 </div>
                               </div>
                             </div>
@@ -907,13 +1280,15 @@ export function ChatPage() {
                 >
                   <textarea
                     aria-label="消息内容"
-                    disabled={!activeConversation || isReadOnly || activeMissing}
+                    disabled={!activeConversation || isReadOnly || activeMissing || isReplaced}
                     id="message-input"
                     onChange={(event) => handleComposerChange(event.target.value)}
                     onKeyDown={handleComposerKeyDown}
-                    placeholder={isReadOnly
-                      ? "已不是好友，无法发送消息"
-                      : "输入消息，Enter 发送，Shift+Enter 换行"}
+                    placeholder={isReplaced
+                      ? "聊天已在其他窗口打开"
+                      : isReadOnly
+                        ? "已不是好友，无法发送消息"
+                        : "输入消息，Enter 发送，Shift+Enter 换行"}
                     ref={composerRef}
                     rows={1}
                     value={draft}

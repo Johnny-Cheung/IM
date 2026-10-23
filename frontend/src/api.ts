@@ -63,6 +63,8 @@ export type Conversation = {
   user: PublicUser;
   is_friend: boolean;
   last_message: ChatMessage | null;
+  unread_count: number;
+  peer_last_read_message_id: number;
 };
 
 export type ConversationListResponse = {
@@ -223,6 +225,21 @@ export const api = {
       `/api/conversations/${encodeURIComponent(username)}/messages?${params.toString()}`,
     );
   },
+
+  listMessagesAfter: (username: string, afterID: number, limit = 50) => {
+    const params = new URLSearchParams();
+    params.set("limit", String(limit));
+    params.set("after_id", String(afterID));
+    return request<MessagePageResponse>(
+      `/api/conversations/${encodeURIComponent(username)}/messages?${params.toString()}`,
+    );
+  },
+
+  markConversationRead: (username: string) =>
+    request<{ last_read_message_id: number }>(
+      `/api/conversations/${encodeURIComponent(username)}/read`,
+      { method: "POST" },
+    ),
 
   sendMessage: (username: string, body: string, clientMessageID: string) =>
     request<SendMessageResponse>(
