@@ -24,6 +24,10 @@ export function App() {
             element={<RequireAuth><ChatPage /></RequireAuth>}
           />
           <Route
+            path="/chat/group/:groupId"
+            element={<RequireAuth><ChatPage /></RequireAuth>}
+          />
+          <Route
             path="/chat/:username"
             element={<RequireAuth><ChatPage /></RequireAuth>}
           />

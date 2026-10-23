@@ -18,12 +18,18 @@ import {
   websocketURL,
   type ChatMessage,
   type Conversation,
+  type DirectConversation,
+  type GroupConversation,
+  type GroupDetail,
+  type GroupMessage,
+  type PublicUser,
 } from "../api";
 import { useAuth } from "../auth";
 import { Brand } from "../components/Brand";
 
 const PAGE_SIZE = 30;
 const MAX_MESSAGE_LENGTH = 2000;
+const MAX_GROUP_NAME_LENGTH = 30;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY = 1000;
 const RECONNECT_MAX_DELAY = 10000;
@@ -33,12 +39,23 @@ const WS_CLOSE_SESSION = 4002;
 
 type ConnectionStatus = "connecting" | "open" | "closed" | "replaced";
 type MessageStatus = "sent" | "sending" | "failed";
-type DisplayMessage = ChatMessage & { status: MessageStatus };
+type DirectDisplayMessage = ChatMessage & { status: MessageStatus };
+type GroupDisplayMessage = GroupMessage & { status: MessageStatus };
+type DisplayMessage = DirectDisplayMessage | GroupDisplayMessage;
+
+type ActiveTarget =
+  | { kind: "direct"; key: string; username: string }
+  | { kind: "group"; key: string; groupID: number };
 
 type ReadEvent = {
   reader: string;
   peer: string;
   lastReadMessageID: number;
+};
+
+type GroupChangedEvent = {
+  groupID: number;
+  action: string;
 };
 
 type ScrollPosition = {
@@ -66,6 +83,24 @@ const dayFormatter = new Intl.DateTimeFormat("zh-CN", {
   day: "numeric",
 });
 
+function directKey(username: string): string {
+  return `direct:${username.toLocaleLowerCase()}`;
+}
+
+function groupKey(groupID: number): string {
+  return `group:${groupID}`;
+}
+
+function conversationKey(conversation: Conversation): string {
+  return conversation.type === "direct"
+    ? directKey(conversation.user.username)
+    : groupKey(conversation.group.id);
+}
+
+function isGroupMessage(message: DisplayMessage): message is GroupDisplayMessage {
+  return "group_id" in message;
+}
+
 function initialOf(name: string): string {
   return [...name][0] ?? "?";
 }
@@ -85,7 +120,11 @@ function newClientMessageID(): string {
   return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
 }
 
-function toDisplay(message: ChatMessage): DisplayMessage {
+function toDirectDisplay(message: ChatMessage): DirectDisplayMessage {
+  return { ...message, status: "sent" };
+}
+
+function toGroupDisplay(message: GroupMessage): GroupDisplayMessage {
   return { ...message, status: "sent" };
 }
 
@@ -122,6 +161,12 @@ function mergeMessages(
   return sortMessages(merged);
 }
 
+function conversationTitle(conversation: Conversation): string {
+  return conversation.type === "direct"
+    ? conversation.user.nickname
+    : conversation.group.name;
+}
+
 function sortConversations(conversations: Conversation[]): Conversation[] {
   return [...conversations].sort((left, right) => {
     const leftTime = left.last_message
@@ -134,7 +179,7 @@ function sortConversations(conversations: Conversation[]): Conversation[] {
       return rightTime - leftTime;
     }
     if (left.last_message && right.last_message) {
-      return right.last_message.id - left.last_message.id;
+      return conversationTitle(left).localeCompare(conversationTitle(right));
     }
     if (left.last_message) {
       return -1;
@@ -142,21 +187,35 @@ function sortConversations(conversations: Conversation[]): Conversation[] {
     if (right.last_message) {
       return 1;
     }
-    const leftName = left.user.nickname.toLocaleLowerCase();
-    const rightName = right.user.nickname.toLocaleLowerCase();
-    if (leftName !== rightName) {
-      return leftName < rightName ? -1 : 1;
+    if (left.type !== right.type) {
+      return left.type === "direct" ? -1 : 1;
     }
-    return left.user.username.localeCompare(right.user.username);
+    if (left.type === "direct" && right.type === "direct") {
+      const leftName = left.user.nickname.toLocaleLowerCase();
+      const rightName = right.user.nickname.toLocaleLowerCase();
+      if (leftName !== rightName) {
+        return leftName < rightName ? -1 : 1;
+      }
+      return left.user.username.localeCompare(right.user.username);
+    }
+    if (left.type === "group" && right.type === "group") {
+      return (Date.parse(right.group.created_at) || 0)
+        - (Date.parse(left.group.created_at) || 0);
+    }
+    return 0;
   });
 }
 
 function previewOf(conversation: Conversation, currentUsername: string): string {
   const message = conversation.last_message;
   if (!message) {
-    return "还没有消息";
+    return conversation.type === "group" ? "群聊已创建" : "还没有消息";
   }
-  const prefix = message.sender.username === currentUsername ? "我：" : "";
+  const prefix = message.sender.username === currentUsername
+    ? "我："
+    : conversation.type === "group"
+      ? `${message.sender.nickname}：`
+      : "";
   return `${prefix}${message.body.replace(/\s+/g, " ").trim()}`;
 }
 
@@ -228,6 +287,34 @@ function parseIncomingMessage(value: unknown): ChatMessage | null {
   return candidate as ChatMessage;
 }
 
+function parseGroupIncomingMessage(value: unknown): GroupMessage | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const event = value as { type?: unknown; message?: unknown };
+  if (
+    event.type !== "group.message.created"
+    || !event.message
+    || typeof event.message !== "object"
+  ) {
+    return null;
+  }
+  const candidate = event.message as Partial<GroupMessage>;
+  if (
+    typeof candidate.id !== "number"
+    || typeof candidate.group_id !== "number"
+    || typeof candidate.body !== "string"
+    || typeof candidate.client_message_id !== "string"
+    || typeof candidate.created_at !== "string"
+    || !candidate.sender
+    || typeof candidate.sender.username !== "string"
+    || typeof candidate.sender.nickname !== "string"
+  ) {
+    return null;
+  }
+  return candidate as GroupMessage;
+}
+
 function parseReadEvent(value: unknown): ReadEvent | null {
   if (!value || typeof value !== "object") {
     return null;
@@ -253,18 +340,103 @@ function parseReadEvent(value: unknown): ReadEvent | null {
   };
 }
 
+function parseGroupChangedEvent(value: unknown): GroupChangedEvent | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const event = value as {
+    type?: unknown;
+    group_id?: unknown;
+    action?: unknown;
+  };
+  if (
+    event.type !== "group.changed"
+    || typeof event.group_id !== "number"
+    || typeof event.action !== "string"
+  ) {
+    return null;
+  }
+  return { groupID: event.group_id, action: event.action };
+}
+
+async function fetchInitialPage(
+  target: ActiveTarget,
+): Promise<{ messages: DisplayMessage[]; hasMore: boolean }> {
+  if (target.kind === "direct") {
+    const page = await api.listMessages(target.username, undefined, PAGE_SIZE);
+    return {
+      messages: page.messages.map(toDirectDisplay),
+      hasMore: page.has_more,
+    };
+  }
+  const page = await api.listGroupMessages(target.groupID, undefined, PAGE_SIZE);
+  return {
+    messages: page.messages.map(toGroupDisplay),
+    hasMore: page.has_more,
+  };
+}
+
+async function fetchOlderPage(
+  target: ActiveTarget,
+  beforeID: number,
+): Promise<{ messages: DisplayMessage[]; hasMore: boolean }> {
+  if (target.kind === "direct") {
+    const page = await api.listMessages(target.username, beforeID, PAGE_SIZE);
+    return {
+      messages: page.messages.map(toDirectDisplay),
+      hasMore: page.has_more,
+    };
+  }
+  const page = await api.listGroupMessages(target.groupID, beforeID, PAGE_SIZE);
+  return {
+    messages: page.messages.map(toGroupDisplay),
+    hasMore: page.has_more,
+  };
+}
+
+async function fetchAfterPage(
+  target: ActiveTarget,
+  afterID: number,
+): Promise<{ messages: DisplayMessage[]; hasMore: boolean }> {
+  if (target.kind === "direct") {
+    const page = await api.listMessagesAfter(target.username, afterID, 50);
+    return {
+      messages: page.messages.map(toDirectDisplay),
+      hasMore: page.has_more,
+    };
+  }
+  const page = await api.listGroupMessagesAfter(target.groupID, afterID, 50);
+  return {
+    messages: page.messages.map(toGroupDisplay),
+    hasMore: page.has_more,
+  };
+}
+
 export function ChatPage() {
   const { user, logout, invalidate } = useAuth();
   const navigate = useNavigate();
-  const { username: routeUsername = "" } = useParams<{ username: string }>();
-  const activeUsername = routeUsername.trim();
-  const activeKey = activeUsername.toLocaleLowerCase();
+  const params = useParams<{ username?: string; groupId?: string }>();
+  const routeGroupIDText = params.groupId ?? "";
+  const routeGroupID = Number(routeGroupIDText);
+  const routeUsername = (params.username ?? "").trim();
+  const invalidGroupRoute = routeGroupIDText !== ""
+    && (!Number.isInteger(routeGroupID) || routeGroupID <= 0);
+  const activeTarget: ActiveTarget | null = routeGroupIDText !== ""
+    ? (invalidGroupRoute
+      ? null
+      : { kind: "group", key: groupKey(routeGroupID), groupID: routeGroupID })
+    : routeUsername
+      ? { kind: "direct", key: directKey(routeUsername), username: routeUsername }
+      : null;
+  const activeKey = activeTarget?.key ?? "";
+  const activeUsername = activeTarget?.kind === "direct" ? activeTarget.username : "";
+  const activeGroupID = activeTarget?.kind === "group" ? activeTarget.groupID : 0;
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationsLoading, setConversationsLoading] = useState(true);
   const [conversationsError, setConversationsError] = useState<string | null>(null);
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
-  const [messagesUsername, setMessagesUsername] = useState("");
+  const [messagesKey, setMessagesKey] = useState("");
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [messagesError, setMessagesError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
@@ -277,10 +449,28 @@ export function ChatPage() {
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
   const [pageVisible, setPageVisible] = useState(() => document.visibilityState === "visible");
   const [loggingOut, setLoggingOut] = useState(false);
+  const [chatNotice, setChatNotice] = useState<string | null>(null);
+  const [groupDetail, setGroupDetail] = useState<GroupDetail | null>(null);
+  const [groupDetailLoading, setGroupDetailLoading] = useState(false);
+  const [groupDetailError, setGroupDetailError] = useState<string | null>(null);
+  const [groupInfoOpen, setGroupInfoOpen] = useState(false);
+  const [groupNameDraft, setGroupNameDraft] = useState("");
+  const [groupActionError, setGroupActionError] = useState<string | null>(null);
+  const [groupActionBusy, setGroupActionBusy] = useState(false);
+  const [confirmLeave, setConfirmLeave] = useState(false);
+  const [inviteSelection, setInviteSelection] = useState<string[]>([]);
+  const [createGroupOpen, setCreateGroupOpen] = useState(false);
+  const [createGroupName, setCreateGroupName] = useState("");
+  const [createGroupSelection, setCreateGroupSelection] = useState<string[]>([]);
+  const [createGroupError, setCreateGroupError] = useState<string | null>(null);
+  const [createGroupBusy, setCreateGroupBusy] = useState(false);
+  const [friends, setFriends] = useState<PublicUser[]>([]);
+  const [friendsLoading, setFriendsLoading] = useState(false);
+  const [friendsError, setFriendsError] = useState<string | null>(null);
 
-  const activeUsernameRef = useRef(activeUsername);
+  const activeTargetRef = useRef<ActiveTarget | null>(activeTarget);
   const userRef = useRef(user);
-  const conversationUsernamesRef = useRef<Set<string>>(new Set());
+  const conversationKeysRef = useRef<Set<string>>(new Set());
   const messageListRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const websocketRef = useRef<WebSocket | null>(null);
@@ -299,19 +489,19 @@ export function ChatPage() {
   const pendingOlderScrollRef = useRef<ScrollPosition | null>(null);
   const messagesRequestRef = useRef(0);
   const conversationVersionRef = useRef(0);
+  const groupDetailRequestRef = useRef(0);
+  const friendsRequestRef = useRef(0);
 
   useEffect(() => {
-    activeUsernameRef.current = activeUsername;
-  }, [activeUsername]);
+    activeTargetRef.current = activeTarget;
+  }, [activeKey, activeUsername, activeGroupID]);
 
   useEffect(() => {
     userRef.current = user;
   }, [user]);
 
   useEffect(() => {
-    conversationUsernamesRef.current = new Set(
-      conversations.map((conversation) => conversation.user.username),
-    );
+    conversationKeysRef.current = new Set(conversations.map(conversationKey));
   }, [conversations]);
 
   useEffect(() => {
@@ -350,9 +540,66 @@ export function ChatPage() {
     }
   }, [handleSessionError]);
 
-  const loadInitialMessages = useCallback(async (targetUsername: string) => {
+  const loadFriends = useCallback(async () => {
+    const requestID = ++friendsRequestRef.current;
+    setFriendsLoading(true);
+    try {
+      const response = await api.listFriends();
+      if (requestID !== friendsRequestRef.current) {
+        return;
+      }
+      setFriends(response.friends);
+      setFriendsError(null);
+    } catch (error) {
+      if (requestID !== friendsRequestRef.current) {
+        return;
+      }
+      if (!handleSessionError(error)) {
+        setFriendsError(describeError(error));
+      }
+    } finally {
+      if (requestID === friendsRequestRef.current) {
+        setFriendsLoading(false);
+      }
+    }
+  }, [handleSessionError]);
+
+  const loadGroupDetail = useCallback(async (groupID: number, showLoading = false) => {
+    const requestID = ++groupDetailRequestRef.current;
+    if (showLoading) {
+      setGroupDetailLoading(true);
+    }
+    try {
+      const detail = await api.getGroup(groupID);
+      if (requestID !== groupDetailRequestRef.current) {
+        return;
+      }
+      if (
+        activeTargetRef.current?.kind !== "group"
+        || activeTargetRef.current.groupID !== groupID
+      ) {
+        return;
+      }
+      setGroupDetail(detail);
+      setGroupDetailError(null);
+      setGroupNameDraft(detail.group.name);
+    } catch (error) {
+      if (requestID !== groupDetailRequestRef.current) {
+        return;
+      }
+      if (!handleSessionError(error)) {
+        setGroupDetailError(describeError(error));
+      }
+    } finally {
+      if (requestID === groupDetailRequestRef.current) {
+        setGroupDetailLoading(false);
+      }
+    }
+  }, [handleSessionError]);
+
+  const loadInitialMessages = useCallback(async (target: ActiveTarget) => {
     const requestID = ++messagesRequestRef.current;
-    setMessagesUsername(targetUsername);
+    setMessagesKey(target.key);
     setMessagesLoading(true);
     setMessagesError(null);
     setMessages([]);
@@ -365,12 +612,12 @@ export function ChatPage() {
     pendingOlderScrollRef.current = null;
 
     try {
-      const page = await api.listMessages(targetUsername, undefined, PAGE_SIZE);
+      const page = await fetchInitialPage(target);
       if (requestID !== messagesRequestRef.current) {
         return;
       }
-      setMessages(page.messages.map(toDisplay));
-      setHasMore(page.has_more);
+      setMessages(page.messages);
+      setHasMore(page.hasMore);
       scrollToBottomNextRef.current = true;
     } catch (error) {
       if (requestID !== messagesRequestRef.current) {
@@ -391,14 +638,46 @@ export function ChatPage() {
   }, [loadConversations]);
 
   useEffect(() => {
+    if (!activeGroupID) {
+      groupDetailRequestRef.current += 1;
+      setGroupDetail(null);
+      setGroupDetailError(null);
+      setGroupDetailLoading(false);
+      setGroupInfoOpen(false);
+      return;
+    }
+    setGroupDetail(null);
+    setGroupDetailError(null);
+    setGroupNameDraft("");
+    void loadGroupDetail(activeGroupID, true);
+  }, [activeGroupID, loadGroupDetail]);
+
+  useEffect(() => {
+    if (groupDetail) {
+      setGroupNameDraft(groupDetail.group.name);
+    }
+  }, [groupDetail]);
+
+  useEffect(() => {
+    if (createGroupOpen || groupInfoOpen) {
+      void loadFriends();
+    }
+  }, [createGroupOpen, groupInfoOpen, loadFriends]);
+
+  useEffect(() => {
     conversationVersionRef.current += 1;
     setDraft("");
     setDraftError(null);
     setSendError(null);
-    if (!activeUsername) {
+    setGroupInfoOpen(false);
+    setGroupActionError(null);
+    setConfirmLeave(false);
+    setInviteSelection([]);
+    const target = activeTargetRef.current;
+    if (!target) {
       messagesRequestRef.current += 1;
       setMessages([]);
-      setMessagesUsername("");
+      setMessagesKey("");
       setMessagesError(null);
       setMessagesLoading(false);
       setHasMore(false);
@@ -406,52 +685,81 @@ export function ChatPage() {
       setNotFriendLocally(false);
       return;
     }
-    void loadInitialMessages(activeUsername);
-  }, [activeUsername, loadInitialMessages]);
+    void loadInitialMessages(target);
+  }, [activeKey, activeUsername, activeGroupID, loadInitialMessages]);
 
-  const activeConversation = useMemo(
-    () => conversations.find(
-      (conversation) => conversation.user.username.toLocaleLowerCase() === activeKey,
-    ),
-    [conversations, activeKey],
+  const activeDirect = useMemo(
+    () => activeTarget?.kind === "direct"
+      ? conversations.find(
+        (conversation): conversation is DirectConversation =>
+          conversation.type === "direct"
+          && conversation.user.username.toLocaleLowerCase()
+            === activeTarget.username.toLocaleLowerCase(),
+      )
+      : undefined,
+    [conversations, activeKey, activeUsername],
   );
-  const activeMissing = Boolean(activeUsername)
+  const activeGroup = useMemo(
+    () => activeTarget?.kind === "group"
+      ? conversations.find(
+        (conversation): conversation is GroupConversation =>
+          conversation.type === "group" && conversation.group.id === activeTarget.groupID,
+      )
+      : undefined,
+    [conversations, activeKey, activeGroupID],
+  );
+  const activeMissing = Boolean(activeTarget)
     && !conversationsLoading
-    && !activeConversation;
-  const isReadOnly = Boolean(activeConversation && !activeConversation.is_friend)
+    && !activeDirect
+    && !activeGroup;
+  const isReadOnly = Boolean(activeDirect && !activeDirect.is_friend)
     || notFriendLocally;
   const isReplaced = connectionStatus === "replaced";
-  const activeUser = activeConversation?.user;
+  const activeUser = activeDirect?.user;
   const messagesBelongToActive = activeKey !== ""
-    && messagesUsername.toLocaleLowerCase() === activeKey;
-  const peerLastReadMessageID = activeConversation?.peer_last_read_message_id ?? 0;
+    && messagesKey === activeKey;
+  const peerLastReadMessageID = activeDirect?.peer_last_read_message_id ?? 0;
   const lastOwnSentMessageID = useMemo(() => {
-    if (!user || !messagesBelongToActive) {
+    if (!user || !messagesBelongToActive || activeTarget?.kind !== "direct") {
       return 0;
     }
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
+      if (isGroupMessage(message)) {
+        continue;
+      }
       if (message.sender.username === user.username && message.status === "sent") {
         return message.id;
       }
     }
     return 0;
-  }, [messages, messagesBelongToActive, user]);
+  }, [activeKey, messages, messagesBelongToActive, user]);
 
-  const markRead = useCallback(async (targetUsername: string) => {
+  const markRead = useCallback(async (target: ActiveTarget) => {
     try {
-      await api.markConversationRead(targetUsername);
-      setConversations((previous) => previous.map((conversation) =>
-        conversation.user.username.toLocaleLowerCase() === targetUsername.toLocaleLowerCase()
-          ? { ...conversation, unread_count: 0 }
-          : conversation));
+      if (target.kind === "direct") {
+        await api.markConversationRead(target.username);
+        setConversations((previous) => previous.map((conversation) =>
+          conversation.type === "direct"
+            && conversation.user.username.toLocaleLowerCase()
+              === target.username.toLocaleLowerCase()
+            ? { ...conversation, unread_count: 0 }
+            : conversation));
+      } else {
+        await api.markGroupRead(target.groupID);
+        setConversations((previous) => previous.map((conversation) =>
+          conversation.type === "group" && conversation.group.id === target.groupID
+            ? { ...conversation, unread_count: 0 }
+            : conversation));
+      }
     } catch (error) {
       handleSessionError(error);
     }
   }, [handleSessionError]);
 
   useEffect(() => {
-    if (!activeUsername || !messagesBelongToActive) {
+    const target = activeTargetRef.current;
+    if (!target || !messagesBelongToActive) {
       return;
     }
     if (messagesLoading || messages.length === 0) {
@@ -465,7 +773,7 @@ export function ChatPage() {
     }
     readTimerRef.current = window.setTimeout(() => {
       readTimerRef.current = null;
-      void markRead(activeUsername);
+      void markRead(target);
     }, READ_DEBOUNCE_MS);
     return () => {
       if (readTimerRef.current !== null) {
@@ -474,7 +782,7 @@ export function ChatPage() {
       }
     };
   }, [
-    activeUsername,
+    activeKey,
     connectionStatus,
     markRead,
     messages,
@@ -484,7 +792,8 @@ export function ChatPage() {
   ]);
 
   const loadOlderMessages = useCallback(async () => {
-    if (!activeUsername || !hasMore || loadingOlder || messagesLoading) {
+    const target = activeTargetRef.current;
+    if (!target || !hasMore || loadingOlder || messagesLoading) {
       return;
     }
     const oldest = messages.find((message) => message.id > 0);
@@ -496,15 +805,14 @@ export function ChatPage() {
     const previousHeight = container?.scrollHeight ?? 0;
     const previousTop = container?.scrollTop ?? 0;
     setLoadingOlder(true);
-
     try {
-      const page = await api.listMessages(activeUsername, oldest.id, PAGE_SIZE);
+      const page = await fetchOlderPage(target, oldest.id);
       if (version !== conversationVersionRef.current) {
         return;
       }
       pendingOlderScrollRef.current = { height: previousHeight, top: previousTop };
-      setMessages((previous) => mergeMessages(previous, page.messages.map(toDisplay)));
-      setHasMore(page.has_more);
+      setMessages((previous) => mergeMessages(previous, page.messages));
+      setHasMore(page.hasMore);
       setMessagesError(null);
     } catch (error) {
       if (version !== conversationVersionRef.current) {
@@ -519,7 +827,6 @@ export function ChatPage() {
       }
     }
   }, [
-    activeUsername,
     handleSessionError,
     hasMore,
     loadingOlder,
@@ -569,14 +876,17 @@ export function ChatPage() {
     }
     const otherUser = sentByCurrent ? message.recipient : message.sender;
     const incoming = receivedByCurrent;
-    const readingNow = activeUsernameRef.current.toLocaleLowerCase()
-      === otherUser.username.toLocaleLowerCase()
+    const target = activeTargetRef.current;
+    const targetMatches = target?.kind === "direct"
+      && target.username.toLocaleLowerCase() === otherUser.username.toLocaleLowerCase();
+    const readingNow = targetMatches
       && pageVisibleRef.current
       && !replacedRef.current;
 
-    if (conversationUsernamesRef.current.has(otherUser.username)) {
+    if (conversationKeysRef.current.has(directKey(otherUser.username))) {
       setConversations((previous) => sortConversations(previous.map((conversation) =>
-        conversation.user.username === otherUser.username
+        conversation.type === "direct"
+          && conversation.user.username === otherUser.username
           ? {
             ...conversation,
             last_message: message,
@@ -589,13 +899,45 @@ export function ChatPage() {
       void loadConversations(false);
     }
 
-    const active = activeUsernameRef.current.toLocaleLowerCase();
-    const belongsToActive = active !== ""
-      && (message.sender.username.toLocaleLowerCase() === active
-        || message.recipient.username.toLocaleLowerCase() === active);
-    if (belongsToActive) {
+    if (targetMatches) {
       const wasNearBottom = nearBottomRef.current;
-      setMessages((previous) => mergeMessages(previous, [toDisplay(message)]));
+      setMessages((previous) => mergeMessages(previous, [toDirectDisplay(message)]));
+      if (wasNearBottom) {
+        scrollToBottomNextRef.current = true;
+      }
+    }
+  }, [loadConversations]);
+
+  const handleIncomingGroupMessage = useCallback((message: GroupMessage) => {
+    const currentUser = userRef.current;
+    if (!currentUser) {
+      return;
+    }
+    const sentByCurrent = message.sender.username === currentUser.username;
+    const target = activeTargetRef.current;
+    const readingNow = target?.kind === "group"
+      && target.groupID === message.group_id
+      && pageVisibleRef.current
+      && !replacedRef.current;
+
+    if (conversationKeysRef.current.has(groupKey(message.group_id))) {
+      setConversations((previous) => sortConversations(previous.map((conversation) =>
+        conversation.type === "group" && conversation.group.id === message.group_id
+          ? {
+            ...conversation,
+            last_message: message,
+            unread_count: sentByCurrent
+              ? conversation.unread_count
+              : (readingNow ? 0 : conversation.unread_count + 1),
+          }
+          : conversation)));
+    } else {
+      void loadConversations(false);
+    }
+
+    if (target?.kind === "group" && target.groupID === message.group_id) {
+      const wasNearBottom = nearBottomRef.current;
+      setMessages((previous) => mergeMessages(previous, [toGroupDisplay(message)]));
       if (wasNearBottom) {
         scrollToBottomNextRef.current = true;
       }
@@ -609,14 +951,14 @@ export function ChatPage() {
     }
     if (event.reader === currentUser.username) {
       setConversations((previous) => previous.map((conversation) =>
-        conversation.user.username === event.peer
+        conversation.type === "direct" && conversation.user.username === event.peer
           ? { ...conversation, unread_count: 0 }
           : conversation));
       return;
     }
     if (event.peer === currentUser.username) {
       setConversations((previous) => previous.map((conversation) =>
-        conversation.user.username === event.reader
+        conversation.type === "direct" && conversation.user.username === event.reader
           ? {
             ...conversation,
             peer_last_read_message_id: Math.max(
@@ -627,6 +969,29 @@ export function ChatPage() {
           : conversation));
     }
   }, []);
+
+  const handleGroupChanged = useCallback((event: GroupChangedEvent) => {
+    if (event.action === "removed" || event.action === "dissolved") {
+      setConversations((previous) => previous.filter((conversation) =>
+        !(conversation.type === "group" && conversation.group.id === event.groupID)));
+      const target = activeTargetRef.current;
+      if (target?.kind === "group" && target.groupID === event.groupID) {
+        setGroupInfoOpen(false);
+        setChatNotice(event.action === "dissolved"
+          ? "该群聊已解散。"
+          : "你已被移出群聊。");
+        navigate("/", { replace: true });
+      }
+      return;
+    }
+    void loadConversations(false);
+    if (
+      activeTargetRef.current?.kind === "group"
+      && activeTargetRef.current.groupID === event.groupID
+    ) {
+      void loadGroupDetail(event.groupID);
+    }
+  }, [loadConversations, loadGroupDetail, navigate]);
 
   const scheduleReconnect = useCallback(() => {
     if (!mountedRef.current || replacedRef.current) {
@@ -655,7 +1020,7 @@ export function ChatPage() {
     }, delay);
   }, []);
 
-  const syncActiveMessages = useCallback(async (targetUsername: string) => {
+  const syncActiveMessages = useCallback(async (target: ActiveTarget) => {
     if (syncingRef.current) {
       return;
     }
@@ -665,12 +1030,12 @@ export function ChatPage() {
     );
     if (newestID === 0) {
       try {
-        const page = await api.listMessages(targetUsername, undefined, PAGE_SIZE);
-        if (activeUsernameRef.current.toLocaleLowerCase() !== targetUsername.toLocaleLowerCase()) {
+        const page = await fetchInitialPage(target);
+        if (activeTargetRef.current?.key !== target.key) {
           return;
         }
-        setMessages((previous) => mergeMessages(previous, page.messages.map(toDisplay)));
-        setHasMore(page.has_more);
+        setMessages((previous) => mergeMessages(previous, page.messages));
+        setHasMore(page.hasMore);
         setMessagesError(null);
         if (nearBottomRef.current) {
           scrollToBottomNextRef.current = true;
@@ -686,23 +1051,20 @@ export function ChatPage() {
     syncingRef.current = true;
     try {
       let afterID = newestID;
-      let hasMore = true;
-      for (let pageIndex = 0; pageIndex < 10 && hasMore; pageIndex += 1) {
-        const page = await api.listMessagesAfter(targetUsername, afterID, 50);
-        if (activeUsernameRef.current.toLocaleLowerCase() !== targetUsername.toLocaleLowerCase()) {
+      let more = true;
+      for (let pageIndex = 0; pageIndex < 10 && more; pageIndex += 1) {
+        const page = await fetchAfterPage(target, afterID);
+        if (activeTargetRef.current?.key !== target.key) {
           return;
         }
         if (page.messages.length > 0) {
-          setMessages((previous) => mergeMessages(previous, page.messages.map(toDisplay)));
+          setMessages((previous) => mergeMessages(previous, page.messages));
           afterID = page.messages[page.messages.length - 1].id;
         }
-        hasMore = page.has_more;
+        more = page.hasMore;
       }
-      if (
-        hasMore
-        && activeUsernameRef.current.toLocaleLowerCase() === targetUsername.toLocaleLowerCase()
-      ) {
-        await loadInitialMessages(targetUsername);
+      if (more && activeTargetRef.current?.key === target.key) {
+        await loadInitialMessages(target);
         return;
       }
       if (nearBottomRef.current) {
@@ -710,7 +1072,7 @@ export function ChatPage() {
       }
     } catch (error) {
       if (!handleSessionError(error)) {
-        await loadInitialMessages(targetUsername).catch(() => undefined);
+        await loadInitialMessages(target).catch(() => undefined);
       }
     } finally {
       syncingRef.current = false;
@@ -745,9 +1107,9 @@ export function ChatPage() {
       setReconnectAttempt(0);
       setConnectionStatus("open");
       void loadConversations(false);
-      const active = activeUsernameRef.current;
-      if (active) {
-        void syncActiveMessages(active);
+      const target = activeTargetRef.current;
+      if (target) {
+        void syncActiveMessages(target);
       }
     };
     socket.onmessage = (event) => {
@@ -758,10 +1120,20 @@ export function ChatPage() {
           if (message) {
             handleIncomingMessage(message);
           }
+        } else if (data?.type === "group.message.created") {
+          const message = parseGroupIncomingMessage(data);
+          if (message) {
+            handleIncomingGroupMessage(message);
+          }
         } else if (data?.type === "messages.read") {
           const readEvent = parseReadEvent(data);
           if (readEvent) {
             handleReadEvent(readEvent);
+          }
+        } else if (data?.type === "group.changed") {
+          const groupEvent = parseGroupChangedEvent(data);
+          if (groupEvent) {
+            handleGroupChanged(groupEvent);
           }
         }
       } catch {
@@ -796,6 +1168,8 @@ export function ChatPage() {
       socket.close();
     };
   }, [
+    handleGroupChanged,
+    handleIncomingGroupMessage,
     handleIncomingMessage,
     handleReadEvent,
     invalidate,
@@ -876,20 +1250,25 @@ export function ChatPage() {
     element.style.height = `${Math.min(element.scrollHeight, 120)}px`;
   }, [draft]);
 
-  async function deliverMessage(message: DisplayMessage, targetUsername: string) {
+  async function deliverMessage(message: DisplayMessage, target: ActiveTarget) {
     try {
-      const response = await api.sendMessage(
-        targetUsername,
-        message.body,
-        message.client_message_id,
-      );
-      const sent = toDisplay(response.message);
-      if (activeUsernameRef.current.toLocaleLowerCase() === targetUsername.toLocaleLowerCase()) {
+      const sent = target.kind === "direct"
+        ? toDirectDisplay((await api.sendMessage(
+          target.username,
+          message.body,
+          message.client_message_id,
+        )).message)
+        : toGroupDisplay((await api.sendGroupMessage(
+          target.groupID,
+          message.body,
+          message.client_message_id,
+        )).message);
+      if (activeTargetRef.current?.key === target.key) {
         setMessages((previous) => mergeMessages(previous, [sent]));
       }
-      if (conversationUsernamesRef.current.has(targetUsername)) {
+      if (conversationKeysRef.current.has(target.key)) {
         setConversations((previous) => sortConversations(previous.map((conversation) =>
-          conversation.user.username.toLocaleLowerCase() === targetUsername.toLocaleLowerCase()
+          conversationKey(conversation) === target.key
             ? { ...conversation, last_message: sent }
             : conversation)));
       } else {
@@ -905,10 +1284,16 @@ export function ChatPage() {
         item.client_message_id === message.client_message_id
           ? { ...item, status: "failed" }
           : item));
-      if (error instanceof ApiError && error.code === "not_friends") {
+      if (
+        target.kind === "direct"
+        && error instanceof ApiError
+        && error.code === "not_friends"
+      ) {
         setNotFriendLocally(true);
         setConversations((previous) => previous.map((conversation) =>
-          conversation.user.username.toLocaleLowerCase() === targetUsername.toLocaleLowerCase()
+          conversation.type === "direct"
+            && conversation.user.username.toLocaleLowerCase()
+              === target.username.toLocaleLowerCase()
             ? { ...conversation, is_friend: false }
             : conversation));
       }
@@ -917,7 +1302,14 @@ export function ChatPage() {
   }
 
   async function submitMessage() {
-    if (!user || !activeConversation || isReadOnly || isReplaced) {
+    const target = activeTarget;
+    if (!user || !target || isReadOnly || isReplaced || activeMissing || messagesLoading) {
+      return;
+    }
+    if (
+      (target.kind === "direct" && !activeDirect)
+      || (target.kind === "group" && !activeGroup)
+    ) {
       return;
     }
     const body = draft.trim();
@@ -929,25 +1321,28 @@ export function ChatPage() {
       return;
     }
 
-    const message: DisplayMessage = {
+    const base = {
       id: 0,
       sender: { username: user.username, nickname: user.nickname },
-      recipient: activeConversation.user,
       body,
       client_message_id: newClientMessageID(),
       created_at: new Date().toISOString(),
-      status: "sending",
+      status: "sending" as const,
     };
+    const message: DisplayMessage = target.kind === "direct"
+      ? { ...base, recipient: activeDirect!.user }
+      : { ...base, group_id: target.groupID };
     setMessages((previous) => mergeMessages(previous, [message]));
     setDraft("");
     setDraftError(null);
     setSendError(null);
     scrollToBottomNextRef.current = true;
-    await deliverMessage(message, activeConversation.user.username);
+    await deliverMessage(message, target);
   }
 
   async function retryMessage(message: DisplayMessage) {
-    if (isReadOnly || isReplaced) {
+    const target = activeTarget;
+    if (!target || isReadOnly || isReplaced) {
       return;
     }
     setMessages((previous) => previous.map((item) =>
@@ -955,7 +1350,7 @@ export function ChatPage() {
         ? { ...item, status: "sending" }
         : item));
     setSendError(null);
-    await deliverMessage({ ...message, status: "sending" }, message.recipient.username);
+    await deliverMessage({ ...message, status: "sending" }, target);
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -986,12 +1381,177 @@ export function ChatPage() {
     navigate("/login", { replace: true });
   }
 
+  function openCreateGroup() {
+    setCreateGroupOpen(true);
+    setCreateGroupName("");
+    setCreateGroupSelection([]);
+    setCreateGroupError(null);
+  }
+
+  function toggleCreateGroupSelection(username: string) {
+    setCreateGroupSelection((previous) =>
+      previous.includes(username)
+        ? previous.filter((item) => item !== username)
+        : [...previous, username]);
+    setCreateGroupError(null);
+  }
+
+  async function submitCreateGroup() {
+    const name = createGroupName.trim();
+    if (!name || [...name].length > MAX_GROUP_NAME_LENGTH) {
+      setCreateGroupError(`群名需要 1–${MAX_GROUP_NAME_LENGTH} 个字符。`);
+      return;
+    }
+    if (createGroupSelection.length === 0) {
+      setCreateGroupError("请至少选择 1 位好友。");
+      return;
+    }
+    setCreateGroupBusy(true);
+    setCreateGroupError(null);
+    try {
+      const detail = await api.createGroup(name, createGroupSelection);
+      const conversation: GroupConversation = {
+        type: "group",
+        group: detail.group,
+        is_owner: detail.is_owner,
+        last_message: null,
+        unread_count: 0,
+      };
+      setConversations((previous) => sortConversations([
+        ...previous.filter((item) =>
+          conversationKey(item) !== groupKey(detail.group.id)),
+        conversation,
+      ]));
+      setGroupDetail(detail);
+      setCreateGroupOpen(false);
+      navigate(`/chat/group/${detail.group.id}`);
+      void loadConversations(false);
+    } catch (error) {
+      if (!handleSessionError(error)) {
+        setCreateGroupError(describeError(error));
+      }
+    } finally {
+      setCreateGroupBusy(false);
+    }
+  }
+
+  function openGroupInfo() {
+    if (!activeGroupID) {
+      return;
+    }
+    setGroupInfoOpen(true);
+    setGroupActionError(null);
+    setConfirmLeave(false);
+    setInviteSelection([]);
+    void loadGroupDetail(activeGroupID);
+  }
+
+  function toggleInviteSelection(username: string) {
+    setInviteSelection((previous) =>
+      previous.includes(username)
+        ? previous.filter((item) => item !== username)
+        : [...previous, username]);
+    setGroupActionError(null);
+  }
+
+  async function renameActiveGroup() {
+    if (!groupDetail?.is_owner || !activeGroupID) {
+      return;
+    }
+    const name = groupNameDraft.trim();
+    if (!name || [...name].length > MAX_GROUP_NAME_LENGTH) {
+      setGroupActionError(`群名需要 1–${MAX_GROUP_NAME_LENGTH} 个字符。`);
+      return;
+    }
+    setGroupActionBusy(true);
+    setGroupActionError(null);
+    try {
+      const detail = await api.renameGroup(activeGroupID, name);
+      setGroupDetail(detail);
+      await loadConversations(false);
+    } catch (error) {
+      if (!handleSessionError(error)) {
+        setGroupActionError(describeError(error));
+      }
+    } finally {
+      setGroupActionBusy(false);
+    }
+  }
+
+  async function inviteSelectedMembers() {
+    if (!activeGroupID || inviteSelection.length === 0) {
+      return;
+    }
+    setGroupActionBusy(true);
+    setGroupActionError(null);
+    try {
+      const detail = await api.inviteGroupMembers(activeGroupID, inviteSelection);
+      setGroupDetail(detail);
+      setInviteSelection([]);
+      await loadConversations(false);
+    } catch (error) {
+      if (!handleSessionError(error)) {
+        setGroupActionError(describeError(error));
+      }
+    } finally {
+      setGroupActionBusy(false);
+    }
+  }
+
+  async function kickMember(username: string) {
+    if (!activeGroupID) {
+      return;
+    }
+    setGroupActionBusy(true);
+    setGroupActionError(null);
+    try {
+      const detail = await api.kickGroupMember(activeGroupID, username);
+      setGroupDetail(detail);
+      await loadConversations(false);
+    } catch (error) {
+      if (!handleSessionError(error)) {
+        setGroupActionError(describeError(error));
+      }
+    } finally {
+      setGroupActionBusy(false);
+    }
+  }
+
+  async function leaveActiveGroup() {
+    if (!activeGroupID) {
+      return;
+    }
+    setGroupActionBusy(true);
+    setGroupActionError(null);
+    const groupID = activeGroupID;
+    const wasOwner = Boolean(groupDetail?.is_owner);
+    try {
+      const result = await api.leaveGroup(groupID);
+      setGroupInfoOpen(false);
+      setConfirmLeave(false);
+      setConversations((previous) => previous.filter((conversation) =>
+        !(conversation.type === "group" && conversation.group.id === groupID)));
+      if (result.dissolved || wasOwner) {
+        setChatNotice("群聊已解散。");
+      } else {
+        setChatNotice("已退出群聊。");
+      }
+      navigate("/");
+    } catch (error) {
+      if (!handleSessionError(error)) {
+        setGroupActionError(describeError(error));
+      }
+    } finally {
+      setGroupActionBusy(false);
+    }
+  }
+
   if (!user) {
     return null;
   }
 
   const draftLength = [...draft].length;
-  const canSend = Boolean(activeConversation)
+  const canSend = Boolean(activeDirect || activeGroup)
     && !isReadOnly
     && !isReplaced
     && !activeMissing
@@ -1004,9 +1564,20 @@ export function ChatPage() {
       : "实时连接已断开。";
   const showReconnectBanner = connectionStatus === "closed"
     || (connectionStatus === "connecting" && reconnectAttempt > 0);
-  const workspaceClass = activeKey
+  const workspaceClass = activeTarget
     ? "chat-workspace chat-workspace--active"
     : "chat-workspace";
+  const inviteCandidates = groupDetail
+    ? friends.filter((friend) => !groupDetail.members.some((member) =>
+      member.user.username.toLocaleLowerCase()
+        === friend.username.toLocaleLowerCase()))
+    : [];
+  const groupDisplayName = groupDetail?.group.name
+    ?? activeGroup?.group.name
+    ?? "群聊";
+  const groupMemberCount = groupDetail?.group.member_count
+    ?? activeGroup?.group.member_count
+    ?? 0;
 
   return (
     <main className="chat-shell">
@@ -1051,6 +1622,19 @@ export function ChatPage() {
           </div>
         ) : null}
 
+        {chatNotice && (
+          <div className="ws-banner ws-banner--notice" id="chat-notice" role="status">
+            <span>{chatNotice}</span>
+            <button
+              className="button button--compact button--secondary"
+              onClick={() => setChatNotice(null)}
+              type="button"
+            >
+              知道了
+            </button>
+          </div>
+        )}
+
         <div className={workspaceClass}>
           <aside className="conversation-pane" aria-label="会话列表">
             <div className="conversation-pane-header">
@@ -1058,7 +1642,17 @@ export function ChatPage() {
                 <p className="eyebrow">消息</p>
                 <h1>聊天</h1>
               </div>
-              <span className="count-badge">{conversations.length}</span>
+              <div className="conversation-pane-actions">
+                <span className="count-badge">{conversations.length}</span>
+                <button
+                  className="button button--compact button--secondary"
+                  id="new-group-button"
+                  onClick={openCreateGroup}
+                  type="button"
+                >
+                  发起群聊
+                </button>
+              </div>
             </div>
 
             {conversationsError && (
@@ -1079,26 +1673,35 @@ export function ChatPage() {
                 <p className="empty-state">正在加载会话…</p>
               ) : conversations.length === 0 ? (
                 <div className="conversation-empty">
-                  <p>还没有好友。</p>
-                  <Link className="text-link" to="/friends">去好友管理添加</Link>
+                  <p>还没有好友或群聊。</p>
+                  <Link className="text-link" to="/friends">去好友管理添加好友</Link>
                 </div>
               ) : (
                 conversations.map((conversation) => {
-                  const isActive = conversation.user.username.toLocaleLowerCase() === activeKey;
+                  const key = conversationKey(conversation);
+                  const isActive = key === activeKey;
+                  const title = conversationTitle(conversation);
+                  const link = conversation.type === "direct"
+                    ? `/chat/${encodeURIComponent(conversation.user.username)}`
+                    : `/chat/group/${conversation.group.id}`;
                   return (
                     <Link
                       aria-current={isActive ? "page" : undefined}
                       className={`conversation-item${isActive ? " conversation-item--active" : ""}${conversation.unread_count > 0 ? " conversation-item--unread" : ""}`}
-                      data-username={conversation.user.username}
-                      key={conversation.user.username}
-                      to={`/chat/${encodeURIComponent(conversation.user.username)}`}
+                      data-group-id={conversation.type === "group" ? conversation.group.id : undefined}
+                      data-username={conversation.type === "direct" ? conversation.user.username : undefined}
+                      key={key}
+                      to={link}
                     >
-                      <div className="avatar avatar--small" aria-hidden="true">
-                        {initialOf(conversation.user.nickname)}
+                      <div
+                        className={`avatar avatar--small${conversation.type === "group" ? " avatar--group" : ""}`}
+                        aria-hidden="true"
+                      >
+                        {initialOf(title)}
                       </div>
                       <div className="conversation-info">
                         <div className="conversation-line">
-                          <span className="conversation-name">{conversation.user.nickname}</span>
+                          <span className="conversation-name">{title}</span>
                           <span className="conversation-meta">
                             {conversation.unread_count > 0 && (
                               <span className="unread-badge">
@@ -1116,9 +1719,11 @@ export function ChatPage() {
                           <span className="conversation-preview">
                             {previewOf(conversation, user.username)}
                           </span>
-                          {!conversation.is_friend && (
+                          {conversation.type === "group" ? (
+                            <span className="chat-badge">群聊</span>
+                          ) : !conversation.is_friend ? (
                             <span className="chat-badge">非好友</span>
-                          )}
+                          ) : null}
                         </div>
                       </div>
                     </Link>
@@ -1139,11 +1744,15 @@ export function ChatPage() {
           </aside>
 
           <section className="message-pane" aria-label="当前对话">
-            {!activeUsername ? (
+            {!activeTarget ? (
               <div className="message-placeholder">
-                <p className="eyebrow">选择会话</p>
-                <h1>开始聊天</h1>
-                <p>从左侧选择一个好友，发送第一条消息。</p>
+                <p className="eyebrow">{invalidGroupRoute ? "链接无效" : "选择会话"}</p>
+                <h1>{invalidGroupRoute ? "找不到这个群聊" : "开始聊天"}</h1>
+                <p>
+                  {invalidGroupRoute
+                    ? "群聊链接不正确，请从左侧会话列表选择。"
+                    : "从左侧选择一个好友或群聊，发送第一条消息。"}
+                </p>
               </div>
             ) : (
               <>
@@ -1153,19 +1762,40 @@ export function ChatPage() {
                       ←
                     </Link>
                     <div>
-                      <h2>{activeUser?.nickname ?? activeUsername}</h2>
-                      <p>@{activeUser?.username ?? activeUsername}</p>
+                      {activeTarget.kind === "direct" ? (
+                        <>
+                          <h2>{activeUser?.nickname ?? activeUsername}</h2>
+                          <p>@{activeUser?.username ?? activeUsername}</p>
+                        </>
+                      ) : (
+                        <>
+                          <h2>{groupDisplayName}</h2>
+                          <p>{groupMemberCount} 位成员</p>
+                        </>
+                      )}
                     </div>
                   </div>
-                  <span className={`connection-state connection-state--${connectionStatus}`}>
-                    {connectionStatus === "open"
-                      ? "实时在线"
-                      : connectionStatus === "connecting"
-                        ? "连接中…"
-                        : connectionStatus === "replaced"
-                          ? "已被接管"
-                          : "实时断开"}
-                  </span>
+                  <div className="message-header-actions">
+                    {activeTarget.kind === "group" && (
+                      <button
+                        className="button button--compact button--secondary"
+                        id="group-info-button"
+                        onClick={openGroupInfo}
+                        type="button"
+                      >
+                        群信息
+                      </button>
+                    )}
+                    <span className={`connection-state connection-state--${connectionStatus}`}>
+                      {connectionStatus === "open"
+                        ? "实时在线"
+                        : connectionStatus === "connecting"
+                          ? "连接中…"
+                          : connectionStatus === "replaced"
+                            ? "已被接管"
+                            : "实时断开"}
+                    </span>
+                  </div>
                 </header>
 
                 {isReadOnly && (
@@ -1174,12 +1804,25 @@ export function ChatPage() {
                   </div>
                 )}
 
+                {activeTarget.kind === "group" && groupDetailError && (
+                  <div className="pane-error pane-error--messages">
+                    <p className="form-error" role="alert">{groupDetailError}</p>
+                    <button
+                      className="button button--compact button--secondary"
+                      onClick={() => void loadGroupDetail(activeGroupID, true)}
+                      type="button"
+                    >
+                      重新加载群信息
+                    </button>
+                  </div>
+                )}
+
                 {messagesError && (
                   <div className="pane-error pane-error--messages">
                     <p className="form-error" role="alert">{messagesError}</p>
                     <button
                       className="button button--compact button--secondary"
-                      onClick={() => void loadInitialMessages(activeUsername)}
+                      onClick={() => void loadInitialMessages(activeTarget)}
                       type="button"
                     >
                       重新加载
@@ -1201,12 +1844,20 @@ export function ChatPage() {
                     <p className="empty-state">正在切换会话…</p>
                   ) : activeMissing ? (
                     <div className="message-placeholder message-placeholder--inline">
-                      <p>找不到这个会话。可能已不是好友，且没有历史消息。</p>
+                      <p>
+                        {activeTarget.kind === "group"
+                          ? "找不到这个群聊。可能已解散，或你已不在群中。"
+                          : "找不到这个会话。可能已不是好友，且没有历史消息。"}
+                      </p>
                       <Link className="text-link" to="/">返回会话列表</Link>
                     </div>
                   ) : messages.length === 0 ? (
                     <div className="message-placeholder message-placeholder--inline">
-                      <p>还没有消息，发一条打个招呼吧。</p>
+                      <p>
+                        {activeTarget.kind === "group"
+                          ? "群里还没有消息，发一条打个招呼吧。"
+                          : "还没有消息，发一条打个招呼吧。"}
+                      </p>
                     </div>
                   ) : (
                     <>
@@ -1217,6 +1868,7 @@ export function ChatPage() {
                         const showDay = !previous
                           || !isSameDay(previous.created_at, message.created_at);
                         const mine = message.sender.username === user.username;
+                        const groupMessage = isGroupMessage(message);
                         return (
                           <Fragment key={message.client_message_id || message.id}>
                             {showDay && (
@@ -1232,6 +1884,9 @@ export function ChatPage() {
                                 {initialOf(message.sender.nickname)}
                               </div>
                               <div className="message-stack">
+                                {groupMessage && !mine && (
+                                  <span className="message-sender">{message.sender.nickname}</span>
+                                )}
                                 <div className={`message-bubble${mine ? " message-bubble--mine" : ""}${message.status === "failed" ? " message-bubble--failed" : ""}`}>
                                   {message.body}
                                 </div>
@@ -1250,6 +1905,7 @@ export function ChatPage() {
                                     </button>
                                   )}
                                   {mine
+                                    && !groupMessage
                                     && message.status === "sent"
                                     && message.id > 0
                                     && message.id === lastOwnSentMessageID && (
@@ -1280,7 +1936,7 @@ export function ChatPage() {
                 >
                   <textarea
                     aria-label="消息内容"
-                    disabled={!activeConversation || isReadOnly || activeMissing || isReplaced}
+                    disabled={!activeTarget || isReadOnly || activeMissing || isReplaced}
                     id="message-input"
                     onChange={(event) => handleComposerChange(event.target.value)}
                     onKeyDown={handleComposerKeyDown}
@@ -1288,7 +1944,9 @@ export function ChatPage() {
                       ? "聊天已在其他窗口打开"
                       : isReadOnly
                         ? "已不是好友，无法发送消息"
-                        : "输入消息，Enter 发送，Shift+Enter 换行"}
+                        : activeTarget.kind === "group"
+                          ? "输入群消息，Enter 发送，Shift+Enter 换行"
+                          : "输入消息，Enter 发送，Shift+Enter 换行"}
                     ref={composerRef}
                     rows={1}
                     value={draft}
@@ -1312,6 +1970,307 @@ export function ChatPage() {
           </section>
         </div>
       </section>
+
+      {createGroupOpen && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !createGroupBusy) {
+              setCreateGroupOpen(false);
+            }
+          }}
+        >
+          <section
+            aria-labelledby="create-group-title"
+            aria-modal="true"
+            className="modal"
+            id="create-group-dialog"
+            role="dialog"
+          >
+            <header className="modal-header">
+              <div>
+                <p className="eyebrow">新会话</p>
+                <h2 id="create-group-title">发起群聊</h2>
+              </div>
+              <button
+                className="text-link text-link--button"
+                disabled={createGroupBusy}
+                onClick={() => setCreateGroupOpen(false)}
+                type="button"
+              >
+                关闭
+              </button>
+            </header>
+
+            <label className="field" htmlFor="group-name-input">
+              <span>群名</span>
+              <input
+                disabled={createGroupBusy}
+                id="group-name-input"
+                maxLength={MAX_GROUP_NAME_LENGTH}
+                onChange={(event) => {
+                  setCreateGroupName(event.target.value);
+                  setCreateGroupError(null);
+                }}
+                placeholder="例如：周末出游"
+                value={createGroupName}
+              />
+            </label>
+
+            <div className="modal-section">
+              <h3>选择好友</h3>
+              <p className="modal-hint">只能邀请自己的好友，至少选择 1 位。</p>
+              {friendsError && (
+                <div className="pane-error">
+                  <p className="form-error" role="alert">{friendsError}</p>
+                  <button
+                    className="button button--compact button--secondary"
+                    onClick={() => void loadFriends()}
+                    type="button"
+                  >
+                    重试
+                  </button>
+                </div>
+              )}
+              {friendsLoading ? (
+                <p className="empty-state">正在加载好友…</p>
+              ) : friends.length === 0 ? (
+                <p className="modal-hint">
+                  还没有好友，先<Link className="text-link" to="/friends">去好友管理添加</Link>。
+                </p>
+              ) : (
+                <div className="friend-choice-list">
+                  {friends.map((friend) => (
+                    <label
+                      className="friend-choice"
+                      data-username={friend.username}
+                      key={friend.username}
+                    >
+                      <input
+                        checked={createGroupSelection.includes(friend.username)}
+                        disabled={createGroupBusy}
+                        onChange={() => toggleCreateGroupSelection(friend.username)}
+                        type="checkbox"
+                      />
+                      <span>{friend.nickname}</span>
+                      <span className="friend-choice-username">@{friend.username}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {createGroupError && (
+              <p className="form-error" role="alert">{createGroupError}</p>
+            )}
+            <div className="modal-actions">
+              <button
+                className="button button--compact"
+                disabled={createGroupBusy}
+                id="create-group-submit"
+                onClick={() => void submitCreateGroup()}
+                type="button"
+              >
+                {createGroupBusy ? "创建中…" : "创建群聊"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {groupInfoOpen && activeGroup && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !groupActionBusy) {
+              setGroupInfoOpen(false);
+            }
+          }}
+        >
+          <section
+            aria-labelledby="group-info-title"
+            aria-modal="true"
+            className="modal modal--wide"
+            id="group-info-panel"
+            role="dialog"
+          >
+            <header className="modal-header">
+              <div>
+                <p className="eyebrow">群信息</p>
+                <h2 id="group-info-title">{groupDisplayName}</h2>
+              </div>
+              <button
+                className="text-link text-link--button"
+                disabled={groupActionBusy}
+                onClick={() => setGroupInfoOpen(false)}
+                type="button"
+              >
+                关闭
+              </button>
+            </header>
+
+            {groupDetailLoading && !groupDetail ? (
+              <p className="empty-state">正在加载群信息…</p>
+            ) : groupDetailError && !groupDetail ? (
+              <div className="pane-error">
+                <p className="form-error" role="alert">{groupDetailError}</p>
+                <button
+                  className="button button--compact button--secondary"
+                  onClick={() => void loadGroupDetail(activeGroupID, true)}
+                  type="button"
+                >
+                  重试
+                </button>
+              </div>
+            ) : groupDetail ? (
+              <>
+                <div className="group-field">
+                  <label htmlFor="group-info-name-input">群名</label>
+                  <div className="group-field-row">
+                    <input
+                      disabled={!groupDetail.is_owner || groupActionBusy}
+                      id="group-info-name-input"
+                      maxLength={MAX_GROUP_NAME_LENGTH}
+                      onChange={(event) => {
+                        setGroupNameDraft(event.target.value);
+                        setGroupActionError(null);
+                      }}
+                      value={groupNameDraft}
+                    />
+                    {groupDetail.is_owner && (
+                      <button
+                        className="button button--compact button--secondary"
+                        disabled={groupActionBusy}
+                        id="group-info-rename"
+                        onClick={() => void renameActiveGroup()}
+                        type="button"
+                      >
+                        保存
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <p className="group-meta">
+                  {groupDetail.group.member_count} 位成员 · 群主 {groupDetail.group.owner.nickname}
+                </p>
+
+                <div className="modal-section">
+                  <h3>成员</h3>
+                  <ul className="group-member-list">
+                    {groupDetail.members.map((member) => (
+                      <li data-username={member.user.username} key={member.user.username}>
+                        <span>
+                          {member.user.nickname}
+                          {member.is_owner ? "（群主）" : ""}
+                        </span>
+                        {groupDetail.is_owner && !member.is_owner && (
+                          <button
+                            className="text-link text-link--button text-link--danger"
+                            disabled={groupActionBusy}
+                            id={`group-info-kick-${member.user.username}`}
+                            onClick={() => void kickMember(member.user.username)}
+                            type="button"
+                          >
+                            移出
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
+                <div className="modal-section">
+                  <h3>邀请好友</h3>
+                  {friendsError && (
+                    <p className="form-error" role="alert">{friendsError}</p>
+                  )}
+                  {friendsLoading ? (
+                    <p className="empty-state">正在加载好友…</p>
+                  ) : inviteCandidates.length === 0 ? (
+                    <p className="modal-hint">没有可邀请的好友。</p>
+                  ) : (
+                    <>
+                      <div className="friend-choice-list">
+                        {inviteCandidates.map((friend) => (
+                          <label
+                            className="friend-choice"
+                            data-username={friend.username}
+                            key={friend.username}
+                          >
+                            <input
+                              checked={inviteSelection.includes(friend.username)}
+                              disabled={groupActionBusy}
+                              onChange={() => toggleInviteSelection(friend.username)}
+                              type="checkbox"
+                            />
+                            <span>{friend.nickname}</span>
+                            <span className="friend-choice-username">@{friend.username}</span>
+                          </label>
+                        ))}
+                      </div>
+                      <button
+                        className="button button--compact"
+                        disabled={groupActionBusy || inviteSelection.length === 0}
+                        id="group-info-invite"
+                        onClick={() => void inviteSelectedMembers()}
+                        type="button"
+                      >
+                        邀请
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                {groupActionError && (
+                  <p className="form-error" role="alert">{groupActionError}</p>
+                )}
+
+                <div className="modal-actions modal-actions--split">
+                  {!confirmLeave ? (
+                    <button
+                      className="button button--compact button--danger"
+                      disabled={groupActionBusy}
+                      id="group-info-leave"
+                      onClick={() => setConfirmLeave(true)}
+                      type="button"
+                    >
+                      {groupDetail.is_owner ? "解散群聊" : "退出群聊"}
+                    </button>
+                  ) : (
+                    <div className="group-confirm">
+                      <span>
+                        {groupDetail.is_owner
+                          ? "解散后所有成员都将无法再查看该群。"
+                          : "退出后将无法再查看群历史。"}
+                      </span>
+                      <div>
+                        <button
+                          className="button button--compact button--danger"
+                          disabled={groupActionBusy}
+                          id="group-info-confirm-leave"
+                          onClick={() => void leaveActiveGroup()}
+                          type="button"
+                        >
+                          确认
+                        </button>
+                        <button
+                          className="button button--compact button--secondary"
+                          disabled={groupActionBusy}
+                          onClick={() => setConfirmLeave(false)}
+                          type="button"
+                        >
+                          取消
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </>
+            ) : null}
+          </section>
+        </div>
+      )}
     </main>
   );
 }

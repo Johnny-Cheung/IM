@@ -59,12 +59,71 @@ export type ChatMessage = {
   created_at: string;
 };
 
-export type Conversation = {
+export type ConversationMessage = {
+  id: number;
+  group_id?: number;
+  sender: PublicUser;
+  recipient?: PublicUser;
+  body: string;
+  client_message_id: string;
+  created_at: string;
+};
+
+export type DirectConversation = {
+  type: "direct";
   user: PublicUser;
   is_friend: boolean;
-  last_message: ChatMessage | null;
+  last_message: ConversationMessage | null;
   unread_count: number;
   peer_last_read_message_id: number;
+};
+
+export type GroupSummary = {
+  id: number;
+  name: string;
+  owner: PublicUser;
+  member_count: number;
+  created_at: string;
+};
+
+export type GroupConversation = {
+  type: "group";
+  group: GroupSummary;
+  is_owner: boolean;
+  last_message: ConversationMessage | null;
+  unread_count: number;
+};
+
+export type Conversation = DirectConversation | GroupConversation;
+
+export type GroupMessage = {
+  id: number;
+  group_id: number;
+  sender: PublicUser;
+  body: string;
+  client_message_id: string;
+  created_at: string;
+};
+
+export type GroupMember = {
+  user: PublicUser;
+  is_owner: boolean;
+  joined_at: string;
+};
+
+export type GroupDetail = {
+  group: GroupSummary;
+  members: GroupMember[];
+  is_owner: boolean;
+};
+
+export type GroupMessagePageResponse = {
+  messages: GroupMessage[];
+  has_more: boolean;
+};
+
+export type SendGroupMessageResponse = {
+  message: GroupMessage;
 };
 
 export type ConversationListResponse = {
@@ -244,6 +303,79 @@ export const api = {
   sendMessage: (username: string, body: string, clientMessageID: string) =>
     request<SendMessageResponse>(
       `/api/conversations/${encodeURIComponent(username)}/messages`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          body,
+          client_message_id: clientMessageID,
+        }),
+      },
+    ),
+
+  createGroup: (name: string, memberUsernames: string[]) =>
+    request<GroupDetail>("/api/groups", {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        member_usernames: memberUsernames,
+      }),
+    }),
+
+  getGroup: (groupID: number) =>
+    request<GroupDetail>(`/api/groups/${groupID}`),
+
+  renameGroup: (groupID: number, name: string) =>
+    request<GroupDetail>(`/api/groups/${groupID}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name }),
+    }),
+
+  inviteGroupMembers: (groupID: number, usernames: string[]) =>
+    request<GroupDetail>(`/api/groups/${groupID}/members`, {
+      method: "POST",
+      body: JSON.stringify({ usernames }),
+    }),
+
+  kickGroupMember: (groupID: number, username: string) =>
+    request<GroupDetail>(
+      `/api/groups/${groupID}/members/${encodeURIComponent(username)}`,
+      { method: "DELETE" },
+    ),
+
+  leaveGroup: (groupID: number) =>
+    request<{ dissolved: boolean }>(`/api/groups/${groupID}/leave`, {
+      method: "POST",
+    }),
+
+  listGroupMessages: (groupID: number, beforeID?: number, limit = 30) => {
+    const params = new URLSearchParams();
+    params.set("limit", String(limit));
+    if (beforeID && beforeID > 0) {
+      params.set("before_id", String(beforeID));
+    }
+    return request<GroupMessagePageResponse>(
+      `/api/groups/${groupID}/messages?${params.toString()}`,
+    );
+  },
+
+  listGroupMessagesAfter: (groupID: number, afterID: number, limit = 50) => {
+    const params = new URLSearchParams();
+    params.set("limit", String(limit));
+    params.set("after_id", String(afterID));
+    return request<GroupMessagePageResponse>(
+      `/api/groups/${groupID}/messages?${params.toString()}`,
+    );
+  },
+
+  markGroupRead: (groupID: number) =>
+    request<{ last_read_message_id: number }>(
+      `/api/groups/${groupID}/read`,
+      { method: "POST" },
+    ),
+
+  sendGroupMessage: (groupID: number, body: string, clientMessageID: string) =>
+    request<SendGroupMessageResponse>(
+      `/api/groups/${groupID}/messages`,
       {
         method: "POST",
         body: JSON.stringify({
