@@ -654,6 +654,7 @@ a:focus-visible {
   display: flex;
   flex-direction: column;
   height: calc(100vh - 40px);
+  height: calc(100dvh - 40px);
   max-width: 1180px;
   min-height: 560px;
   overflow: hidden;
@@ -1145,6 +1146,7 @@ a:focus-visible {
     border: 0;
     border-radius: 0;
     height: 100vh;
+    height: 100dvh;
     max-width: none;
     min-height: 0;
   }
