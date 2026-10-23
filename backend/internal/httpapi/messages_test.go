@@ -24,8 +24,10 @@ func TestListConversations(t *testing.T) {
 	dataStore := authenticatedChatStore()
 	dataStore.conversations = []store.Conversation{
 		{
-			User:     store.PublicUser{Username: "bob", Nickname: "Bob"},
-			IsFriend: true,
+			User:                  store.PublicUser{Username: "bob", Nickname: "Bob"},
+			IsFriend:              true,
+			UnreadCount:           2,
+			PeerLastReadMessageID: 4,
 			LastMessage: &store.Message{
 				ID:              7,
 				SenderID:        1,
@@ -65,7 +67,8 @@ func TestListConversations(t *testing.T) {
 	first := response.Conversations[0]
 	if first.User.Username != "bob" || !first.IsFriend ||
 		first.LastMessage == nil || first.LastMessage.Sender.Username != "alice" ||
-		first.LastMessage.Recipient.Username != "bob" {
+		first.LastMessage.Recipient.Username != "bob" ||
+		first.UnreadCount != 2 || first.PeerLastReadMessageID != 4 {
 		t.Fatalf("first conversation = %#v", first)
 	}
 	if response.Conversations[1].LastMessage != nil {
@@ -152,6 +155,94 @@ func TestListMessagesRejectsInvalidPaging(t *testing.T) {
 				t.Fatalf("error code = %q, want invalid_request", got)
 			}
 		})
+	}
+}
+
+func TestListMessagesAfter(t *testing.T) {
+	now := time.Now().UTC()
+	dataStore := authenticatedChatStore()
+	dataStore.messageAfterPage = store.MessagePage{
+		Messages: []store.Message{{
+			ID:              12,
+			SenderID:        1,
+			RecipientID:     2,
+			ClientMessageID: "client-12345678",
+			Body:            "after cursor",
+			CreatedAt:       now,
+		}},
+		HasMore: true,
+	}
+	router := testRouter(dataStore)
+
+	recorder := doJSON(
+		t, router, http.MethodGet,
+		"/api/conversations/bob/messages?after_id=11&limit=10",
+		nil, authTestCookie(),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if dataStore.listMessagesAfterCall.userID != 1 ||
+		dataStore.listMessagesAfterCall.otherID != 2 ||
+		dataStore.listMessagesAfterCall.afterID != 11 ||
+		dataStore.listMessagesAfterCall.limit != 10 {
+		t.Fatalf("list messages after call = %#v", dataStore.listMessagesAfterCall)
+	}
+	response := decodeBody[messagePageResponse](t, recorder)
+	if !response.HasMore || len(response.Messages) != 1 ||
+		response.Messages[0].Body != "after cursor" {
+		t.Fatalf("response = %#v", response)
+	}
+}
+
+func TestListMessagesRejectsTwoCursors(t *testing.T) {
+	router := testRouter(authenticatedChatStore())
+
+	recorder := doJSON(
+		t, router, http.MethodGet,
+		"/api/conversations/bob/messages?before_id=20&after_id=10",
+		nil, authTestCookie(),
+	)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	if got := errorCode(t, recorder); got != "invalid_request" {
+		t.Fatalf("error code = %q, want invalid_request", got)
+	}
+}
+
+func TestMarkConversationRead(t *testing.T) {
+	dataStore := authenticatedChatStore()
+	dataStore.markReadResult = 42
+	dataStore.markReadAdvanced = true
+	router := testRouter(dataStore)
+
+	recorder := doJSON(t, router, http.MethodPost, "/api/conversations/bob/read", nil, authTestCookie())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if dataStore.markReadCall.userID != 1 ||
+		dataStore.markReadCall.peerID != 2 ||
+		dataStore.markReadCall.now.IsZero() {
+		t.Fatalf("mark read call = %#v", dataStore.markReadCall)
+	}
+	response := decodeBody[readStateResponse](t, recorder)
+	if response.LastReadMessageID != 42 {
+		t.Fatalf("last read message id = %d, want 42", response.LastReadMessageID)
+	}
+}
+
+func TestMarkConversationReadToSelf(t *testing.T) {
+	dataStore := authenticatedChatStore()
+	dataStore.user = store.User{ID: 1, Username: "alice", Nickname: "Alice"}
+	router := testRouter(dataStore)
+
+	recorder := doJSON(t, router, http.MethodPost, "/api/conversations/alice/read", nil, authTestCookie())
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	if got := errorCode(t, recorder); got != "cannot_message_self" {
+		t.Fatalf("error code = %q, want cannot_message_self", got)
 	}
 }
 
@@ -302,6 +393,7 @@ func TestChatEndpointsRequireSession(t *testing.T) {
 		{method: http.MethodGet, path: "/api/conversations"},
 		{method: http.MethodGet, path: "/api/conversations/bob/messages"},
 		{method: http.MethodPost, path: "/api/conversations/bob/messages"},
+		{method: http.MethodPost, path: "/api/conversations/bob/read"},
 		{method: http.MethodGet, path: "/api/ws"},
 	}
 
@@ -376,6 +468,92 @@ func TestWebSocketReceivesSavedMessage(t *testing.T) {
 	}
 	if event.Type != "message.created" || event.Message.ID != 21 ||
 		event.Message.Body != "live hello" {
+		t.Fatalf("event = %#v", event)
+	}
+}
+
+func TestWebSocketReplacesExistingConnection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dataStore := authenticatedChatStore()
+	api := New(dataStore)
+	router := gin.New()
+	api.Register(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	header := http.Header{"Cookie": []string{sessionCookieName + "=token"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/ws"
+
+	first, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial first websocket: %v", err)
+	}
+	defer func() { _ = first.Close() }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for api.hub.activeCount(1) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	second, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial second websocket: %v", err)
+	}
+	defer func() { _ = second.Close() }()
+
+	for api.hub.activeCount(1) != 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if api.hub.activeCount(1) != 1 {
+		t.Fatal("expected one active websocket after replacement")
+	}
+
+	_ = first.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := first.ReadMessage(); !websocket.IsCloseError(err, wsCloseReplaced) {
+		t.Fatalf("first connection error = %v, want close code %d", err, wsCloseReplaced)
+	}
+}
+
+func TestWebSocketReceivesReadEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dataStore := authenticatedChatStore()
+	dataStore.markReadResult = 42
+	dataStore.markReadAdvanced = true
+	api := New(dataStore)
+	router := gin.New()
+	api.Register(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	header := http.Header{"Cookie": []string{sessionCookieName + "=token"}}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for api.hub.activeCount(1) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	recorder := doJSON(t, router, http.MethodPost, "/api/conversations/bob/read", nil, authTestCookie())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("read status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read websocket event: %v", err)
+	}
+	var event wsReadEvent
+	if err := json.Unmarshal(payload, &event); err != nil {
+		t.Fatalf("decode read event: %v", err)
+	}
+	if event.Type != "messages.read" || event.Reader != "alice" ||
+		event.Peer != "bob" || event.LastReadMessageID != 42 {
 		t.Fatalf("event = %#v", event)
 	}
 }

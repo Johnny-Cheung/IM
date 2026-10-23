@@ -77,6 +77,11 @@ type fakeStore struct {
 	conversationsErr  error
 	messagePage       store.MessagePage
 	messagePageErr    error
+	messageAfterPage  store.MessagePage
+	messageAfterErr   error
+	markReadResult    uint64
+	markReadAdvanced  bool
+	markReadErr       error
 	createdMessage    store.Message
 	createdMessageNew bool
 	createMessageErr  error
@@ -92,6 +97,17 @@ type fakeStore struct {
 		otherID  uint64
 		beforeID uint64
 		limit    int
+	}
+	listMessagesAfterCall struct {
+		userID  uint64
+		otherID uint64
+		afterID uint64
+		limit   int
+	}
+	markReadCall struct {
+		userID uint64
+		peerID uint64
+		now    time.Time
 	}
 
 	createdSession struct {
@@ -230,6 +246,29 @@ func (f *fakeStore) ListMessages(
 	f.listMessagesCall.beforeID = beforeID
 	f.listMessagesCall.limit = limit
 	return f.messagePage, f.messagePageErr
+}
+
+func (f *fakeStore) ListMessagesAfter(
+	_ context.Context,
+	userID, otherID, afterID uint64,
+	limit int,
+) (store.MessagePage, error) {
+	f.listMessagesAfterCall.userID = userID
+	f.listMessagesAfterCall.otherID = otherID
+	f.listMessagesAfterCall.afterID = afterID
+	f.listMessagesAfterCall.limit = limit
+	return f.messageAfterPage, f.messageAfterErr
+}
+
+func (f *fakeStore) MarkConversationRead(
+	_ context.Context,
+	userID, peerID uint64,
+	now time.Time,
+) (uint64, bool, error) {
+	f.markReadCall.userID = userID
+	f.markReadCall.peerID = peerID
+	f.markReadCall.now = now
+	return f.markReadResult, f.markReadAdvanced, f.markReadErr
 }
 
 func (f *fakeStore) CreateMessage(

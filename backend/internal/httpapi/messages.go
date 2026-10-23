@@ -32,9 +32,11 @@ type messageResponse struct {
 }
 
 type conversationResponse struct {
-	User        publicUserResponse `json:"user"`
-	IsFriend    bool               `json:"is_friend"`
-	LastMessage *messageResponse   `json:"last_message"`
+	User                  publicUserResponse `json:"user"`
+	IsFriend              bool               `json:"is_friend"`
+	LastMessage           *messageResponse   `json:"last_message"`
+	UnreadCount           int                `json:"unread_count"`
+	PeerLastReadMessageID uint64             `json:"peer_last_read_message_id"`
 }
 
 type conversationListResponse struct {
@@ -53,6 +55,10 @@ type sendMessageRequest struct {
 
 type sendMessageResponse struct {
 	Message messageResponse `json:"message"`
+}
+
+type readStateResponse struct {
+	LastReadMessageID uint64 `json:"last_read_message_id"`
 }
 
 func (a *API) listConversations(c *gin.Context) {
@@ -78,8 +84,10 @@ func (a *API) listConversations(c *gin.Context) {
 			Nickname: conversation.User.Nickname,
 		}
 		item := conversationResponse{
-			User:     other,
-			IsFriend: conversation.IsFriend,
+			User:                  other,
+			IsFriend:              conversation.IsFriend,
+			UnreadCount:           conversation.UnreadCount,
+			PeerLastReadMessageID: conversation.PeerLastReadMessageID,
 		}
 		if conversation.LastMessage != nil {
 			message := toMessageResponse(*conversation.LastMessage, current, other)
@@ -108,19 +116,35 @@ func (a *API) listMessages(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
 		return
 	}
+	afterID, err := parseAfterID(c.Query("after_id"))
+	if err != nil || (beforeID > 0 && afterID > 0) {
+		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
+		return
+	}
 	limit, err := parseMessageLimit(c.Query("limit"))
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
 		return
 	}
 
-	page, err := a.store.ListMessages(
-		c.Request.Context(),
-		current.ID,
-		target.ID,
-		beforeID,
-		limit,
-	)
+	var page store.MessagePage
+	if afterID > 0 {
+		page, err = a.store.ListMessagesAfter(
+			c.Request.Context(),
+			current.ID,
+			target.ID,
+			afterID,
+			limit,
+		)
+	} else {
+		page, err = a.store.ListMessages(
+			c.Request.Context(),
+			current.ID,
+			target.ID,
+			beforeID,
+			limit,
+		)
+	}
 	if err != nil {
 		log.Printf("list messages: %v", err)
 		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
@@ -200,6 +224,45 @@ func (a *API) sendMessage(c *gin.Context) {
 	c.JSON(status, sendMessageResponse{Message: response})
 }
 
+func (a *API) markConversationRead(c *gin.Context) {
+	current, ok := currentUser(c)
+	if !ok {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
+		return
+	}
+
+	target, ok := a.findUser(c, c.Param("username"))
+	if !ok {
+		return
+	}
+	if target.ID == current.ID {
+		writeError(c, http.StatusBadRequest, "cannot_message_self", "不能给自己标记已读")
+		return
+	}
+
+	lastReadMessageID, advanced, err := a.store.MarkConversationRead(
+		c.Request.Context(),
+		current.ID,
+		target.ID,
+		time.Now().UTC(),
+	)
+	if err != nil {
+		a.writeMessageError(c, err)
+		return
+	}
+	if advanced {
+		a.PublishRead(
+			current.ID,
+			target.ID,
+			current.Username,
+			target.Username,
+			lastReadMessageID,
+		)
+	}
+
+	c.JSON(http.StatusOK, readStateResponse{LastReadMessageID: lastReadMessageID})
+}
+
 func (a *API) writeMessageError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFriends):
@@ -223,6 +286,10 @@ func parseBeforeID(raw string) (uint64, error) {
 		return 0, err
 	}
 	return value, nil
+}
+
+func parseAfterID(raw string) (uint64, error) {
+	return parseBeforeID(raw)
 }
 
 func parseMessageLimit(raw string) (int, error) {

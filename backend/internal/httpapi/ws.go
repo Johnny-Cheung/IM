@@ -19,6 +19,9 @@ const (
 	wsPongWait   = 60 * time.Second
 	wsPingPeriod = 25 * time.Second
 	wsSendBuffer = 32
+
+	wsCloseReplaced = 4001
+	wsCloseSession  = 4002
 )
 
 var wsUpgrader = websocket.Upgrader{
@@ -32,6 +35,13 @@ type wsEvent struct {
 	Message any    `json:"message,omitempty"`
 }
 
+type wsReadEvent struct {
+	Type              string `json:"type"`
+	Reader            string `json:"reader"`
+	Peer              string `json:"peer"`
+	LastReadMessageID uint64 `json:"last_read_message_id"`
+}
+
 type wsClient struct {
 	userID    uint64
 	conn      *websocket.Conn
@@ -40,11 +50,23 @@ type wsClient struct {
 	closeOnce sync.Once
 }
 
-func (c *wsClient) close() {
+func (c *wsClient) closeWith(code int, reason string) {
 	c.closeOnce.Do(func() {
+		if code == 0 {
+			code = websocket.CloseNormalClosure
+		}
+		_ = c.conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(code, reason),
+			time.Now().Add(time.Second),
+		)
 		close(c.done)
 		_ = c.conn.Close()
 	})
+}
+
+func (c *wsClient) close() {
+	c.closeWith(websocket.CloseNormalClosure, "")
 }
 
 func (c *wsClient) enqueue(payload []byte) {
@@ -84,41 +106,48 @@ func (c *wsClient) writeLoop() {
 	}
 }
 
-// Hub manages authenticated WebSocket clients by user ID.
+// Hub manages authenticated WebSocket clients by user ID. Each user has at
+// most one active chat connection.
 type Hub struct {
 	mu      sync.RWMutex
-	clients map[uint64]map[*wsClient]struct{}
+	clients map[uint64]*wsClient
 }
 
 func NewHub() *Hub {
-	return &Hub{clients: make(map[uint64]map[*wsClient]struct{})}
+	return &Hub{clients: make(map[uint64]*wsClient)}
 }
 
 func (h *Hub) add(client *wsClient) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.clients[client.userID] == nil {
-		h.clients[client.userID] = make(map[*wsClient]struct{})
+	old := h.clients[client.userID]
+	h.clients[client.userID] = client
+	h.mu.Unlock()
+
+	if old != nil && old != client {
+		old.closeWith(wsCloseReplaced, "replaced")
 	}
-	h.clients[client.userID][client] = struct{}{}
 }
 
 func (h *Hub) remove(client *wsClient) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	clients := h.clients[client.userID]
-	delete(clients, client)
-	if len(clients) == 0 {
+	if h.clients[client.userID] == client {
 		delete(h.clients, client.userID)
 	}
 }
 
-// CloseUser closes all active connections for a user.
+// CloseUser closes the active connection for a user with a normal close code.
 func (h *Hub) CloseUser(userID uint64) {
+	h.CloseUserWith(userID, 0, "")
+}
+
+// CloseUserWith closes the active connection for a user with a specific code.
+func (h *Hub) CloseUserWith(userID uint64, code int, reason string) {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
-	for client := range h.clients[userID] {
-		client.close()
+	client := h.clients[userID]
+	h.mu.RUnlock()
+	if client != nil {
+		client.closeWith(code, reason)
 	}
 }
 
@@ -132,7 +161,7 @@ func (h *Hub) Broadcast(userIDs []uint64, payload []byte) {
 			continue
 		}
 		seen[userID] = struct{}{}
-		for client := range h.clients[userID] {
+		if client := h.clients[userID]; client != nil {
 			client.enqueue(payload)
 		}
 	}
@@ -141,7 +170,10 @@ func (h *Hub) Broadcast(userIDs []uint64, payload []byte) {
 func (h *Hub) activeCount(userID uint64) int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return len(h.clients[userID])
+	if h.clients[userID] != nil {
+		return 1
+	}
+	return 0
 }
 
 func (a *API) websocket(c *gin.Context) {
@@ -177,7 +209,9 @@ func (h *Hub) serve(c *gin.Context, userID uint64, expiresAt time.Time) {
 		if remaining <= 0 {
 			return
 		}
-		timer := time.AfterFunc(remaining, client.close)
+		timer := time.AfterFunc(remaining, func() {
+			client.closeWith(wsCloseSession, "session_expired")
+		})
 		defer timer.Stop()
 	}
 
@@ -238,4 +272,23 @@ func (a *API) PublishMessage(senderID, recipientID uint64, message any) {
 		return
 	}
 	a.hub.Broadcast([]uint64{senderID, recipientID}, payload)
+}
+
+// PublishRead sends an updated read position to both participants.
+func (a *API) PublishRead(
+	readerID, peerID uint64,
+	reader, peer string,
+	lastReadMessageID uint64,
+) {
+	payload, err := json.Marshal(wsReadEvent{
+		Type:              "messages.read",
+		Reader:            reader,
+		Peer:              peer,
+		LastReadMessageID: lastReadMessageID,
+	})
+	if err != nil {
+		log.Printf("marshal websocket read event: %v", err)
+		return
+	}
+	a.hub.Broadcast([]uint64{readerID, peerID}, payload)
 }

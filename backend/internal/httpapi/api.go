@@ -71,6 +71,16 @@ type Store interface {
 		userID, otherID, beforeID uint64,
 		limit int,
 	) (store.MessagePage, error)
+	ListMessagesAfter(
+		ctx context.Context,
+		userID, otherID, afterID uint64,
+		limit int,
+	) (store.MessagePage, error)
+	MarkConversationRead(
+		ctx context.Context,
+		userID, peerID uint64,
+		now time.Time,
+	) (uint64, bool, error)
 	CreateMessage(
 		ctx context.Context,
 		senderID, recipientID uint64,
@@ -112,6 +122,7 @@ func (a *API) Register(router *gin.Engine) {
 	authed.GET("/conversations", a.listConversations)
 	authed.GET("/conversations/:username/messages", a.listMessages)
 	authed.POST("/conversations/:username/messages", a.sendMessage)
+	authed.POST("/conversations/:username/read", a.markConversationRead)
 	authed.GET("/ws", a.websocket)
 }
 
@@ -265,7 +276,7 @@ func (a *API) logout(c *gin.Context) {
 	if token, err := c.Cookie(sessionCookieName); err == nil && token != "" {
 		tokenHash := auth.HashSessionToken(token)
 		if session, err := a.store.GetSessionWithUser(c.Request.Context(), tokenHash); err == nil {
-			a.hub.CloseUser(session.User.ID)
+			a.hub.CloseUserWith(session.User.ID, wsCloseSession, "session_revoked")
 		}
 		if err := a.store.RevokeSession(
 			c.Request.Context(),
@@ -370,7 +381,7 @@ func (a *API) updatePassword(c *gin.Context) {
 		return
 	}
 
-	a.hub.CloseUser(user.ID)
+	a.hub.CloseUserWith(user.ID, wsCloseSession, "session_password_changed")
 	clearSessionCookie(c)
 	c.Status(http.StatusNoContent)
 }
@@ -453,7 +464,7 @@ func (a *API) startSession(c *gin.Context, userID uint64) error {
 	); err != nil {
 		return err
 	}
-	a.hub.CloseUser(userID)
+	a.hub.CloseUserWith(userID, wsCloseSession, "session_replaced")
 	setSessionCookie(c, token)
 	return nil
 }
