@@ -66,6 +66,7 @@ type fakeStore struct {
 	rejectedFriendRequest struct {
 		userID    uint64
 		requestID uint64
+		now       time.Time
 	}
 	deletedFriend struct {
 		userID   uint64
@@ -177,9 +178,11 @@ func (f *fakeStore) AcceptFriendRequest(
 func (f *fakeStore) RejectFriendRequest(
 	_ context.Context,
 	userID, requestID uint64,
+	now time.Time,
 ) error {
 	f.rejectedFriendRequest.userID = userID
 	f.rejectedFriendRequest.requestID = requestID
+	f.rejectedFriendRequest.now = now
 	return f.rejectFriendErr
 }
 

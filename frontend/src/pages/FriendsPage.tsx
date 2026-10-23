@@ -11,6 +11,7 @@ import {
   describeError,
   isSessionError,
   type FriendRequest,
+  type FriendRequestStatus,
   type FriendRequests,
   type PublicUser,
   type Relationship,
@@ -27,6 +28,26 @@ const relationshipLabels: Record<Relationship, string> = {
   none: "可以添加好友",
 };
 
+const historyStatusLabels: Record<FriendRequestStatus, string> = {
+  pending: "未处理",
+  accepted: "已通过",
+  rejected: "已拒绝",
+};
+
+const dateTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : dateTimeFormatter.format(date);
+}
+
 function initialOf(name: string): string {
   return [...name][0] ?? "?";
 }
@@ -39,6 +60,7 @@ export function FriendsPage() {
   const [requests, setRequests] = useState<FriendRequests>({
     incoming: [],
     outgoing: [],
+    history: [],
   });
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -432,6 +454,49 @@ export function FriendsPage() {
                           </button>
                         )}
                       </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+
+            <section
+              className="friends-section"
+              id="friend-request-history"
+              aria-labelledby="history-heading"
+            >
+              <div className="section-heading">
+                <h2 id="history-heading">好友记录</h2>
+                <span className="count-badge">{requests.history.length}</span>
+              </div>
+
+              {requests.history.length === 0 ? (
+                <p className="empty-state">还没有好友记录。</p>
+              ) : (
+                <ul className="people-list">
+                  {requests.history.map((record) => (
+                    <li className="person" data-request-id={record.id} key={record.id}>
+                      <div className="avatar avatar--small" aria-hidden="true">
+                        {initialOf(record.user.nickname)}
+                      </div>
+                      <div className="person-info">
+                        <p className="person-name">{record.user.nickname}</p>
+                        <p className="person-username">@{record.user.username}</p>
+                        <p className="history-meta">
+                          {record.direction === "outgoing" ? "我发出" : "收到"} ·{" "}
+                          <time dateTime={record.created_at}>
+                            {formatDateTime(record.created_at)}
+                          </time>
+                        </p>
+                      </div>
+                      <span
+                        className={`status-chip status-chip--${record.status}`}
+                        title={record.handled_at
+                          ? `处理时间：${formatDateTime(record.handled_at)}`
+                          : undefined}
+                      >
+                        {historyStatusLabels[record.status]}
+                      </span>
                     </li>
                   ))}
                 </ul>

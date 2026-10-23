@@ -18,14 +18,18 @@ func TestMigrationsAreEmbedded(t *testing.T) {
 			names = append(names, entry.Name())
 		}
 	}
-	if len(names) != 4 {
-		t.Fatalf("migration count = %d (%v), want 4", len(names), names)
+	if len(names) != 8 {
+		t.Fatalf("migration count = %d (%v), want 8", len(names), names)
 	}
 	want := []string{
 		"001_create_users.sql",
 		"002_create_sessions.sql",
 		"003_create_friend_requests.sql",
 		"004_create_friendships.sql",
+		"005_add_friend_request_history.sql",
+		"006_add_pending_friend_request_unique.sql",
+		"007_backfill_pending_friend_requests.sql",
+		"008_drop_friend_request_direction_unique.sql",
 	}
 	for i, name := range want {
 		if names[i] != name {

@@ -59,7 +59,11 @@ type Store interface {
 		userID, requestID uint64,
 		now time.Time,
 	) (store.PublicUser, error)
-	RejectFriendRequest(ctx context.Context, userID, requestID uint64) error
+	RejectFriendRequest(
+		ctx context.Context,
+		userID, requestID uint64,
+		now time.Time,
+	) error
 	DeleteFriend(ctx context.Context, userID, friendID uint64) error
 }
 

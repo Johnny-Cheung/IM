@@ -40,10 +40,38 @@ type FriendRequest struct {
 	CreatedAt time.Time
 }
 
-// FriendRequests contains requests received and sent by a user.
+// FriendRequestStatus is the lifecycle state of a friend request.
+type FriendRequestStatus string
+
+const (
+	FriendRequestStatusPending  FriendRequestStatus = "pending"
+	FriendRequestStatusAccepted FriendRequestStatus = "accepted"
+	FriendRequestStatusRejected FriendRequestStatus = "rejected"
+)
+
+// FriendRequestDirection tells whether the current user sent or received a request.
+type FriendRequestDirection string
+
+const (
+	FriendRequestDirectionIncoming FriendRequestDirection = "incoming"
+	FriendRequestDirectionOutgoing FriendRequestDirection = "outgoing"
+)
+
+// FriendRequestRecord is a historical request with its current state.
+type FriendRequestRecord struct {
+	ID        uint64
+	User      PublicUser
+	Direction FriendRequestDirection
+	Status    FriendRequestStatus
+	CreatedAt time.Time
+	HandledAt *time.Time
+}
+
+// FriendRequests contains pending requests and the complete request history.
 type FriendRequests struct {
 	Incoming []FriendRequest
 	Outgoing []FriendRequest
+	History  []FriendRequestRecord
 }
 
 // FriendRequestResult is returned after sending a request. Accepted is true
@@ -64,8 +92,10 @@ func (s *Store) GetRelationship(ctx context.Context, viewerID, targetID uint64) 
 	err := s.db.QueryRowContext(ctx,
 		`SELECT
 		   EXISTS(SELECT 1 FROM friendships WHERE user_id = ? AND friend_user_id = ?),
-		   EXISTS(SELECT 1 FROM friend_requests WHERE from_user_id = ? AND to_user_id = ?),
-		   EXISTS(SELECT 1 FROM friend_requests WHERE from_user_id = ? AND to_user_id = ?)`,
+		   EXISTS(SELECT 1 FROM friend_requests
+		          WHERE from_user_id = ? AND to_user_id = ? AND status = 'pending'),
+		   EXISTS(SELECT 1 FROM friend_requests
+		          WHERE from_user_id = ? AND to_user_id = ? AND status = 'pending')`,
 		viewerID, targetID,
 		viewerID, targetID,
 		targetID, viewerID,
@@ -115,18 +145,20 @@ func (s *Store) ListFriends(ctx context.Context, userID uint64) ([]PublicUser, e
 	return friends, nil
 }
 
-// ListFriendRequests returns incoming and outgoing pending requests, newest first.
+// ListFriendRequests returns pending incoming and outgoing requests plus the
+// complete request history, newest first.
 func (s *Store) ListFriendRequests(ctx context.Context, userID uint64) (FriendRequests, error) {
 	result := FriendRequests{
 		Incoming: make([]FriendRequest, 0),
 		Outgoing: make([]FriendRequest, 0),
+		History:  make([]FriendRequestRecord, 0),
 	}
 
 	incomingRows, err := s.db.QueryContext(ctx,
 		`SELECT r.id, u.username, u.nickname, r.created_at
 		 FROM friend_requests r
 		 JOIN users u ON u.id = r.from_user_id
-		 WHERE r.to_user_id = ?
+		 WHERE r.to_user_id = ? AND r.status = 'pending'
 		 ORDER BY r.created_at DESC, r.id DESC`,
 		userID,
 	)
@@ -143,7 +175,7 @@ func (s *Store) ListFriendRequests(ctx context.Context, userID uint64) (FriendRe
 		`SELECT r.id, u.username, u.nickname, r.created_at
 		 FROM friend_requests r
 		 JOIN users u ON u.id = r.to_user_id
-		 WHERE r.from_user_id = ?
+		 WHERE r.from_user_id = ? AND r.status = 'pending'
 		 ORDER BY r.created_at DESC, r.id DESC`,
 		userID,
 	)
@@ -155,6 +187,25 @@ func (s *Store) ListFriendRequests(ctx context.Context, userID uint64) (FriendRe
 		return FriendRequests{}, err
 	}
 	result.Outgoing = outgoing
+
+	historyRows, err := s.db.QueryContext(ctx,
+		`SELECT r.id, r.from_user_id, r.status, r.created_at, r.handled_at,
+		        u.username, u.nickname
+		 FROM friend_requests r
+		 JOIN users u
+		   ON u.id = CASE WHEN r.from_user_id = ? THEN r.to_user_id ELSE r.from_user_id END
+		 WHERE r.from_user_id = ? OR r.to_user_id = ?
+		 ORDER BY r.created_at DESC, r.id DESC`,
+		userID, userID, userID,
+	)
+	if err != nil {
+		return FriendRequests{}, fmt.Errorf("list friend request history: %w", err)
+	}
+	history, err := scanFriendRequestRecords(historyRows, userID)
+	if err != nil {
+		return FriendRequests{}, err
+	}
+	result.History = history
 
 	return result, nil
 }
@@ -193,7 +244,7 @@ func (s *Store) CreateFriendRequest(
 	var existingID uint64
 	err = tx.QueryRowContext(ctx,
 		`SELECT id FROM friend_requests
-		 WHERE from_user_id = ? AND to_user_id = ? FOR UPDATE`,
+		 WHERE from_user_id = ? AND to_user_id = ? AND status = 'pending' FOR UPDATE`,
 		fromID, toID,
 	).Scan(&existingID)
 	if err == nil {
@@ -206,7 +257,7 @@ func (s *Store) CreateFriendRequest(
 	var reverseID uint64
 	err = tx.QueryRowContext(ctx,
 		`SELECT id FROM friend_requests
-		 WHERE from_user_id = ? AND to_user_id = ? FOR UPDATE`,
+		 WHERE from_user_id = ? AND to_user_id = ? AND status = 'pending' FOR UPDATE`,
 		toID, fromID,
 	).Scan(&reverseID)
 	if err == nil {
@@ -214,12 +265,23 @@ func (s *Store) CreateFriendRequest(
 			return FriendRequestResult{}, err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM friend_requests
-			 WHERE (from_user_id = ? AND to_user_id = ?)
-			    OR (from_user_id = ? AND to_user_id = ?)`,
-			fromID, toID, toID, fromID,
+			`INSERT INTO friend_requests
+			   (from_user_id, to_user_id, status, created_at, handled_at)
+			 VALUES (?, ?, 'accepted', ?, ?)`,
+			fromID, toID, now, now,
 		); err != nil {
-			return FriendRequestResult{}, fmt.Errorf("delete mutual friend requests: %w", err)
+			return FriendRequestResult{}, fmt.Errorf("record mutual friend request: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE friend_requests
+			 SET status = 'accepted', handled_at = ?,
+			     pending_from_user_id = NULL, pending_to_user_id = NULL
+			 WHERE status = 'pending'
+			   AND ((from_user_id = ? AND to_user_id = ?)
+			     OR (from_user_id = ? AND to_user_id = ?))`,
+			now, fromID, toID, toID, fromID,
+		); err != nil {
+			return FriendRequestResult{}, fmt.Errorf("mark mutual friend requests accepted: %w", err)
 		}
 		friend, err := publicUserByID(ctx, tx, toID)
 		if err != nil {
@@ -235,9 +297,11 @@ func (s *Store) CreateFriendRequest(
 	}
 
 	result, err := tx.ExecContext(ctx,
-		`INSERT INTO friend_requests (from_user_id, to_user_id, created_at)
-		 VALUES (?, ?, ?)`,
-		fromID, toID, now,
+		`INSERT INTO friend_requests
+		   (from_user_id, to_user_id, status,
+		    pending_from_user_id, pending_to_user_id, created_at)
+		 VALUES (?, ?, 'pending', ?, ?, ?)`,
+		fromID, toID, fromID, toID, now,
 	)
 	if err != nil {
 		return FriendRequestResult{}, fmt.Errorf("insert friend request: %w", err)
@@ -252,7 +316,8 @@ func (s *Store) CreateFriendRequest(
 	return FriendRequestResult{RequestID: uint64(id)}, nil
 }
 
-// AcceptFriendRequest creates a mutual friendship and removes related requests.
+// AcceptFriendRequest creates a mutual friendship and marks related pending
+// requests accepted while keeping them in history.
 func (s *Store) AcceptFriendRequest(
 	ctx context.Context,
 	userID, requestID uint64,
@@ -266,7 +331,8 @@ func (s *Store) AcceptFriendRequest(
 
 	var fromID uint64
 	err = tx.QueryRowContext(ctx,
-		`SELECT from_user_id FROM friend_requests WHERE id = ? AND to_user_id = ?`,
+		`SELECT from_user_id FROM friend_requests
+		 WHERE id = ? AND to_user_id = ? AND status = 'pending'`,
 		requestID, userID,
 	).Scan(&fromID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -283,7 +349,7 @@ func (s *Store) AcceptFriendRequest(
 	var lockedFromID uint64
 	err = tx.QueryRowContext(ctx,
 		`SELECT from_user_id FROM friend_requests
-		 WHERE id = ? AND to_user_id = ? FOR UPDATE`,
+		 WHERE id = ? AND to_user_id = ? AND status = 'pending' FOR UPDATE`,
 		requestID, userID,
 	).Scan(&lockedFromID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -299,11 +365,14 @@ func (s *Store) AcceptFriendRequest(
 	}
 
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM friend_requests
-		 WHERE id = ? OR (from_user_id = ? AND to_user_id = ?)`,
-		requestID, userID, fromID,
+		`UPDATE friend_requests
+		 SET status = 'accepted', handled_at = ?,
+		     pending_from_user_id = NULL, pending_to_user_id = NULL
+		 WHERE status = 'pending'
+		   AND (id = ? OR (from_user_id = ? AND to_user_id = ?))`,
+		now, requestID, userID, fromID,
 	); err != nil {
-		return PublicUser{}, fmt.Errorf("delete accepted request: %w", err)
+		return PublicUser{}, fmt.Errorf("mark accepted request: %w", err)
 	}
 
 	friend, err := publicUserByID(ctx, tx, fromID)
@@ -316,11 +385,18 @@ func (s *Store) AcceptFriendRequest(
 	return friend, nil
 }
 
-// RejectFriendRequest deletes a pending request addressed to the user.
-func (s *Store) RejectFriendRequest(ctx context.Context, userID, requestID uint64) error {
+// RejectFriendRequest marks a pending request rejected while keeping it in history.
+func (s *Store) RejectFriendRequest(
+	ctx context.Context,
+	userID, requestID uint64,
+	now time.Time,
+) error {
 	result, err := s.db.ExecContext(ctx,
-		`DELETE FROM friend_requests WHERE id = ? AND to_user_id = ?`,
-		requestID, userID,
+		`UPDATE friend_requests
+		 SET status = 'rejected', handled_at = ?,
+		     pending_from_user_id = NULL, pending_to_user_id = NULL
+		 WHERE id = ? AND to_user_id = ? AND status = 'pending'`,
+		now, requestID, userID,
 	)
 	if err != nil {
 		return fmt.Errorf("reject friend request: %w", err)
@@ -335,7 +411,7 @@ func (s *Store) RejectFriendRequest(ctx context.Context, userID, requestID uint6
 	return nil
 }
 
-// DeleteFriend removes both directions of a friendship and related requests.
+// DeleteFriend removes both directions of a friendship. Request history is kept.
 func (s *Store) DeleteFriend(ctx context.Context, userID, friendID uint64) error {
 	if userID == friendID {
 		return ErrFriendNotFound
@@ -366,15 +442,6 @@ func (s *Store) DeleteFriend(ctx context.Context, userID, friendID uint64) error
 	}
 	if affected == 0 {
 		return ErrFriendNotFound
-	}
-
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM friend_requests
-		 WHERE (from_user_id = ? AND to_user_id = ?)
-		    OR (from_user_id = ? AND to_user_id = ?)`,
-		userID, friendID, friendID, userID,
-	); err != nil {
-		return fmt.Errorf("delete friend requests after unfriend: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -456,4 +523,42 @@ func scanFriendRequests(rows *sql.Rows) ([]FriendRequest, error) {
 		return nil, fmt.Errorf("iterate friend requests: %w", err)
 	}
 	return requests, nil
+}
+
+func scanFriendRequestRecords(rows *sql.Rows, userID uint64) ([]FriendRequestRecord, error) {
+	defer func() { _ = rows.Close() }()
+
+	records := make([]FriendRequestRecord, 0)
+	for rows.Next() {
+		var record FriendRequestRecord
+		var fromID uint64
+		var status string
+		var handledAt sql.NullTime
+		if err := rows.Scan(
+			&record.ID,
+			&fromID,
+			&status,
+			&record.CreatedAt,
+			&handledAt,
+			&record.User.Username,
+			&record.User.Nickname,
+		); err != nil {
+			return nil, fmt.Errorf("scan friend request record: %w", err)
+		}
+		if fromID == userID {
+			record.Direction = FriendRequestDirectionOutgoing
+		} else {
+			record.Direction = FriendRequestDirectionIncoming
+		}
+		record.Status = FriendRequestStatus(status)
+		if handledAt.Valid {
+			handled := handledAt.Time
+			record.HandledAt = &handled
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate friend request records: %w", err)
+	}
+	return records, nil
 }

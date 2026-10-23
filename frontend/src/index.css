@@ -515,6 +515,36 @@ a:focus-visible {
   text-align: right;
 }
 
+.history-meta {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 4px 0 0;
+}
+
+.status-chip {
+  border-radius: 999px;
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 4px 10px;
+  white-space: nowrap;
+}
+
+.status-chip--pending {
+  background: #fff4e5;
+  color: #9a5b00;
+}
+
+.status-chip--accepted {
+  background: #e8f7ee;
+  color: #18794e;
+}
+
+.status-chip--rejected {
+  background: #fdecec;
+  color: #b42318;
+}
+
 .outgoing-block {
   border-top: 1px dashed #e4e9f2;
   margin-top: 18px;

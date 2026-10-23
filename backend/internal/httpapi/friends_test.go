@@ -171,6 +171,7 @@ func TestSendFriendRequestErrors(t *testing.T) {
 
 func TestListFriendRequests(t *testing.T) {
 	now := time.Now().UTC()
+	handled := now.Add(time.Minute)
 	dataStore := authenticatedFriendStore()
 	dataStore.friendRequests = store.FriendRequests{
 		Incoming: []store.FriendRequest{{
@@ -183,6 +184,14 @@ func TestListFriendRequests(t *testing.T) {
 			User:      store.PublicUser{Username: "carol", Nickname: "Carol"},
 			CreatedAt: now,
 		}},
+		History: []store.FriendRequestRecord{{
+			ID:        7,
+			User:      store.PublicUser{Username: "dave", Nickname: "Dave"},
+			Direction: store.FriendRequestDirectionOutgoing,
+			Status:    store.FriendRequestStatusRejected,
+			CreatedAt: now,
+			HandledAt: &handled,
+		}},
 	}
 	router := testRouter(dataStore)
 
@@ -194,6 +203,15 @@ func TestListFriendRequests(t *testing.T) {
 	if len(response.Incoming) != 1 || response.Incoming[0].ID != 5 ||
 		len(response.Outgoing) != 1 || response.Outgoing[0].ID != 6 {
 		t.Fatalf("response = %#v, want incoming 5 and outgoing 6", response)
+	}
+	if len(response.History) != 1 {
+		t.Fatalf("history length = %d, want 1", len(response.History))
+	}
+	record := response.History[0]
+	if record.ID != 7 || record.User.Username != "dave" ||
+		record.Direction != "outgoing" || record.Status != "rejected" ||
+		record.HandledAt == nil || !record.HandledAt.Equal(handled) {
+		t.Fatalf("history record = %#v, want dave/outgoing/rejected", record)
 	}
 }
 
@@ -249,8 +267,10 @@ func TestRejectFriendRequest(t *testing.T) {
 	if recorder.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
 	}
-	if dataStore.rejectedFriendRequest.userID != 1 || dataStore.rejectedFriendRequest.requestID != 5 {
-		t.Fatalf("rejected request = %#v, want user 1 request 5", dataStore.rejectedFriendRequest)
+	if dataStore.rejectedFriendRequest.userID != 1 || dataStore.rejectedFriendRequest.requestID != 5 ||
+		dataStore.rejectedFriendRequest.now.IsZero() {
+		t.Fatalf("rejected request = %#v, want user 1 request 5 with timestamp",
+			dataStore.rejectedFriendRequest)
 	}
 }
 

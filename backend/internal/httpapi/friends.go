@@ -29,9 +29,19 @@ type friendRequestResponse struct {
 	CreatedAt time.Time          `json:"created_at"`
 }
 
+type friendRequestRecordResponse struct {
+	ID        uint64             `json:"id"`
+	User      publicUserResponse `json:"user"`
+	Direction string             `json:"direction"`
+	Status    string             `json:"status"`
+	CreatedAt time.Time          `json:"created_at"`
+	HandledAt *time.Time         `json:"handled_at,omitempty"`
+}
+
 type friendRequestsResponse struct {
-	Incoming []friendRequestResponse `json:"incoming"`
-	Outgoing []friendRequestResponse `json:"outgoing"`
+	Incoming []friendRequestResponse       `json:"incoming"`
+	Outgoing []friendRequestResponse       `json:"outgoing"`
+	History  []friendRequestRecordResponse `json:"history"`
 }
 
 type friendsResponse struct {
@@ -147,12 +157,16 @@ func (a *API) listFriendRequests(c *gin.Context) {
 	response := friendRequestsResponse{
 		Incoming: make([]friendRequestResponse, 0, len(requests.Incoming)),
 		Outgoing: make([]friendRequestResponse, 0, len(requests.Outgoing)),
+		History:  make([]friendRequestRecordResponse, 0, len(requests.History)),
 	}
 	for _, request := range requests.Incoming {
 		response.Incoming = append(response.Incoming, toFriendRequestResponse(request))
 	}
 	for _, request := range requests.Outgoing {
 		response.Outgoing = append(response.Outgoing, toFriendRequestResponse(request))
+	}
+	for _, record := range requests.History {
+		response.History = append(response.History, toFriendRequestRecordResponse(record))
 	}
 
 	c.JSON(http.StatusOK, response)
@@ -196,7 +210,12 @@ func (a *API) rejectFriendRequest(c *gin.Context) {
 		return
 	}
 
-	if err := a.store.RejectFriendRequest(c.Request.Context(), current.ID, requestID); err != nil {
+	if err := a.store.RejectFriendRequest(
+		c.Request.Context(),
+		current.ID,
+		requestID,
+		time.Now().UTC(),
+	); err != nil {
 		a.writeFriendError(c, err)
 		return
 	}
@@ -303,5 +322,16 @@ func toFriendRequestResponse(request store.FriendRequest) friendRequestResponse 
 		ID:        request.ID,
 		User:      toPublicUserResponse(request.User),
 		CreatedAt: request.CreatedAt,
+	}
+}
+
+func toFriendRequestRecordResponse(record store.FriendRequestRecord) friendRequestRecordResponse {
+	return friendRequestRecordResponse{
+		ID:        record.ID,
+		User:      toPublicUserResponse(record.User),
+		Direction: string(record.Direction),
+		Status:    string(record.Status),
+		CreatedAt: record.CreatedAt,
+		HandledAt: record.HandledAt,
 	}
 }

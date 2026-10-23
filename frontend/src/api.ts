@@ -25,9 +25,23 @@ export type FriendRequest = {
   created_at: string;
 };
 
+export type FriendRequestStatus = "pending" | "accepted" | "rejected";
+
+export type FriendRequestDirection = "incoming" | "outgoing";
+
+export type FriendRequestRecord = {
+  id: number;
+  user: PublicUser;
+  direction: FriendRequestDirection;
+  status: FriendRequestStatus;
+  created_at: string;
+  handled_at?: string;
+};
+
 export type FriendRequests = {
   incoming: FriendRequest[];
   outgoing: FriendRequest[];
+  history: FriendRequestRecord[];
 };
 
 export type SendFriendRequestResult = {
