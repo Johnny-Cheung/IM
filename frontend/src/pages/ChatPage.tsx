@@ -489,6 +489,7 @@ export function ChatPage() {
   const pendingOlderScrollRef = useRef<ScrollPosition | null>(null);
   const messagesRequestRef = useRef(0);
   const conversationVersionRef = useRef(0);
+  const conversationRequestRef = useRef(0);
   const groupDetailRequestRef = useRef(0);
   const friendsRequestRef = useRef(0);
 
@@ -521,20 +522,54 @@ export function ChatPage() {
     return true;
   }, [invalidate, navigate]);
 
+  const isCurrentConversation = useCallback((key: string, version: number) =>
+    activeTargetRef.current?.key === key && conversationVersionRef.current === version,
+  []);
+
+  const loseGroupAccess = useCallback((groupID: number, notice: string) => {
+    conversationRequestRef.current += 1;
+    setConversationsLoading(false);
+    setConversations((previous) => previous.filter((conversation) =>
+      !(conversation.type === "group" && conversation.group.id === groupID)));
+    const target = activeTargetRef.current;
+    if (target?.kind !== "group" || target.groupID !== groupID) {
+      return;
+    }
+    activeTargetRef.current = null;
+    conversationVersionRef.current += 1;
+    messagesRequestRef.current += 1;
+    groupDetailRequestRef.current += 1;
+    setGroupDetail(null);
+    setGroupDetailError(null);
+    setGroupDetailLoading(false);
+    setGroupInfoOpen(false);
+    setMessages([]);
+    setMessagesKey("");
+    setMessagesError(null);
+    setMessagesLoading(false);
+    setDraft("");
+    setChatNotice(notice);
+    navigate("/", { replace: true });
+  }, [navigate]);
+
   const loadConversations = useCallback(async (initial = false) => {
+    const requestID = ++conversationRequestRef.current;
     if (initial) {
       setConversationsLoading(true);
     }
     try {
       const response = await api.listConversations();
+      if (requestID !== conversationRequestRef.current) {
+        return;
+      }
       setConversations(sortConversations(response.conversations));
       setConversationsError(null);
     } catch (error) {
-      if (!handleSessionError(error)) {
+      if (!handleSessionError(error) && requestID === conversationRequestRef.current) {
         setConversationsError(describeError(error));
       }
     } finally {
-      if (initial) {
+      if (requestID === conversationRequestRef.current) {
         setConversationsLoading(false);
       }
     }
@@ -565,29 +600,28 @@ export function ChatPage() {
   }, [handleSessionError]);
 
   const loadGroupDetail = useCallback(async (groupID: number, showLoading = false) => {
+    const version = conversationVersionRef.current;
     const requestID = ++groupDetailRequestRef.current;
+    const isCurrent = () => requestID === groupDetailRequestRef.current
+      && isCurrentConversation(groupKey(groupID), version);
     if (showLoading) {
       setGroupDetailLoading(true);
     }
     try {
       const detail = await api.getGroup(groupID);
-      if (requestID !== groupDetailRequestRef.current) {
-        return;
-      }
-      if (
-        activeTargetRef.current?.kind !== "group"
-        || activeTargetRef.current.groupID !== groupID
-      ) {
+      if (!isCurrent()) {
         return;
       }
       setGroupDetail(detail);
       setGroupDetailError(null);
       setGroupNameDraft(detail.group.name);
     } catch (error) {
-      if (requestID !== groupDetailRequestRef.current) {
+      if (handleSessionError(error) || !isCurrent()) {
         return;
       }
-      if (!handleSessionError(error)) {
+      if (error instanceof ApiError && error.status === 404 && error.code === "group_not_found") {
+        loseGroupAccess(groupID, "群聊已解散或你已不在群中。");
+      } else {
         setGroupDetailError(describeError(error));
       }
     } finally {
@@ -595,10 +629,16 @@ export function ChatPage() {
         setGroupDetailLoading(false);
       }
     }
-  }, [handleSessionError]);
+  }, [handleSessionError, isCurrentConversation, loseGroupAccess]);
 
   const loadInitialMessages = useCallback(async (target: ActiveTarget) => {
+    if (activeTargetRef.current?.key !== target.key) {
+      return;
+    }
+    const version = conversationVersionRef.current;
     const requestID = ++messagesRequestRef.current;
+    const isCurrent = () => requestID === messagesRequestRef.current
+      && isCurrentConversation(target.key, version);
     setMessagesKey(target.key);
     setMessagesLoading(true);
     setMessagesError(null);
@@ -613,44 +653,32 @@ export function ChatPage() {
 
     try {
       const page = await fetchInitialPage(target);
-      if (requestID !== messagesRequestRef.current) {
+      if (!isCurrent()) {
         return;
       }
       setMessages(page.messages);
       setHasMore(page.hasMore);
       scrollToBottomNextRef.current = true;
     } catch (error) {
-      if (requestID !== messagesRequestRef.current) {
+      if (handleSessionError(error) || !isCurrent()) {
         return;
       }
-      if (!handleSessionError(error)) {
+      if (target.kind === "group" && error instanceof ApiError
+        && error.status === 404 && error.code === "group_not_found") {
+        loseGroupAccess(target.groupID, "群聊已解散或你已不在群中。");
+      } else {
         setMessagesError(describeError(error));
       }
     } finally {
-      if (requestID === messagesRequestRef.current) {
+      if (isCurrent()) {
         setMessagesLoading(false);
       }
     }
-  }, [handleSessionError]);
+  }, [handleSessionError, isCurrentConversation, loseGroupAccess]);
 
   useEffect(() => {
     void loadConversations(true);
   }, [loadConversations]);
-
-  useEffect(() => {
-    if (!activeGroupID) {
-      groupDetailRequestRef.current += 1;
-      setGroupDetail(null);
-      setGroupDetailError(null);
-      setGroupDetailLoading(false);
-      setGroupInfoOpen(false);
-      return;
-    }
-    setGroupDetail(null);
-    setGroupDetailError(null);
-    setGroupNameDraft("");
-    void loadGroupDetail(activeGroupID, true);
-  }, [activeGroupID, loadGroupDetail]);
 
   useEffect(() => {
     if (groupDetail) {
@@ -687,6 +715,19 @@ export function ChatPage() {
     }
     void loadInitialMessages(target);
   }, [activeKey, activeUsername, activeGroupID, loadInitialMessages]);
+
+  useEffect(() => {
+    groupDetailRequestRef.current += 1;
+    setGroupDetail(null);
+    setGroupDetailError(null);
+    setGroupNameDraft("");
+    if (activeGroupID) {
+      void loadGroupDetail(activeGroupID, true);
+    } else {
+      setGroupDetailLoading(false);
+      setGroupInfoOpen(false);
+    }
+  }, [activeGroupID, loadGroupDetail]);
 
   const activeDirect = useMemo(
     () => activeTarget?.kind === "direct"
@@ -972,16 +1013,9 @@ export function ChatPage() {
 
   const handleGroupChanged = useCallback((event: GroupChangedEvent) => {
     if (event.action === "removed" || event.action === "dissolved") {
-      setConversations((previous) => previous.filter((conversation) =>
-        !(conversation.type === "group" && conversation.group.id === event.groupID)));
-      const target = activeTargetRef.current;
-      if (target?.kind === "group" && target.groupID === event.groupID) {
-        setGroupInfoOpen(false);
-        setChatNotice(event.action === "dissolved"
-          ? "该群聊已解散。"
-          : "你已被移出群聊。");
-        navigate("/", { replace: true });
-      }
+      loseGroupAccess(event.groupID, event.action === "dissolved"
+        ? "该群聊已解散。"
+        : "你已被移出群聊。");
       return;
     }
     void loadConversations(false);
@@ -991,7 +1025,7 @@ export function ChatPage() {
     ) {
       void loadGroupDetail(event.groupID);
     }
-  }, [loadConversations, loadGroupDetail, navigate]);
+  }, [loadConversations, loadGroupDetail, loseGroupAccess]);
 
   const scheduleReconnect = useCallback(() => {
     if (!mountedRef.current || replacedRef.current) {
@@ -1021,63 +1055,66 @@ export function ChatPage() {
   }, []);
 
   const syncActiveMessages = useCallback(async (target: ActiveTarget) => {
-    if (syncingRef.current) {
+    const version = conversationVersionRef.current;
+    const isCurrent = () => isCurrentConversation(target.key, version);
+    if (syncingRef.current || !isCurrent()) {
       return;
     }
-    const newestID = messagesRef.current.reduce(
-      (newest, message) => message.id > 0 ? Math.max(newest, message.id) : newest,
-      0,
-    );
-    if (newestID === 0) {
-      try {
+    const newestID = messagesRef.current.reduce((newest, message) => {
+      const belongs = target.kind === "group"
+        ? isGroupMessage(message) && message.group_id === target.groupID
+        : !isGroupMessage(message)
+          && (message.sender.username.toLocaleLowerCase() === target.username.toLocaleLowerCase()
+            || message.recipient.username.toLocaleLowerCase() === target.username.toLocaleLowerCase());
+      return belongs ? Math.max(newest, message.id) : newest;
+    }, 0);
+
+    syncingRef.current = true;
+    try {
+      if (newestID === 0) {
         const page = await fetchInitialPage(target);
-        if (activeTargetRef.current?.key !== target.key) {
+        if (!isCurrent()) {
           return;
         }
         setMessages((previous) => mergeMessages(previous, page.messages));
         setHasMore(page.hasMore);
         setMessagesError(null);
-        if (nearBottomRef.current) {
-          scrollToBottomNextRef.current = true;
+      } else {
+        let afterID = newestID;
+        let more = true;
+        for (let pageIndex = 0; pageIndex < 10 && more; pageIndex += 1) {
+          const page = await fetchAfterPage(target, afterID);
+          if (!isCurrent()) {
+            return;
+          }
+          if (page.messages.length > 0) {
+            setMessages((previous) => mergeMessages(previous, page.messages));
+            afterID = page.messages[page.messages.length - 1].id;
+          }
+          more = page.hasMore;
         }
-      } catch (error) {
-        if (!handleSessionError(error)) {
-          setMessagesError(describeError(error));
-        }
-      }
-      return;
-    }
-
-    syncingRef.current = true;
-    try {
-      let afterID = newestID;
-      let more = true;
-      for (let pageIndex = 0; pageIndex < 10 && more; pageIndex += 1) {
-        const page = await fetchAfterPage(target, afterID);
-        if (activeTargetRef.current?.key !== target.key) {
+        if (more && isCurrent()) {
+          await loadInitialMessages(target);
           return;
         }
-        if (page.messages.length > 0) {
-          setMessages((previous) => mergeMessages(previous, page.messages));
-          afterID = page.messages[page.messages.length - 1].id;
-        }
-        more = page.hasMore;
       }
-      if (more && activeTargetRef.current?.key === target.key) {
-        await loadInitialMessages(target);
-        return;
-      }
-      if (nearBottomRef.current) {
+      if (isCurrent() && nearBottomRef.current) {
         scrollToBottomNextRef.current = true;
       }
     } catch (error) {
-      if (!handleSessionError(error)) {
-        await loadInitialMessages(target).catch(() => undefined);
+      if (handleSessionError(error) || !isCurrent()) {
+        return;
+      }
+      if (target.kind === "group" && error instanceof ApiError
+        && error.status === 404 && error.code === "group_not_found") {
+        loseGroupAccess(target.groupID, "群聊已解散或你已不在群中。");
+      } else {
+        await loadInitialMessages(target);
       }
     } finally {
       syncingRef.current = false;
     }
-  }, [handleSessionError, loadInitialMessages]);
+  }, [handleSessionError, isCurrentConversation, loadInitialMessages, loseGroupAccess]);
 
   const connectWebSocket = useCallback((resetAttempts = false) => {
     if (resetAttempts) {
@@ -1109,6 +1146,9 @@ export function ChatPage() {
       void loadConversations(false);
       const target = activeTargetRef.current;
       if (target) {
+        if (target.kind === "group") {
+          void loadGroupDetail(target.groupID);
+        }
         void syncActiveMessages(target);
       }
     };
@@ -1174,6 +1214,7 @@ export function ChatPage() {
     handleReadEvent,
     invalidate,
     loadConversations,
+    loadGroupDetail,
     navigate,
     scheduleReconnect,
     syncActiveMessages,
@@ -1251,6 +1292,8 @@ export function ChatPage() {
   }, [draft]);
 
   async function deliverMessage(message: DisplayMessage, target: ActiveTarget) {
+    const version = conversationVersionRef.current;
+    const isCurrent = () => isCurrentConversation(target.key, version);
     try {
       const sent = target.kind === "direct"
         ? toDirectDisplay((await api.sendMessage(
@@ -1263,33 +1306,32 @@ export function ChatPage() {
           message.body,
           message.client_message_id,
         )).message);
-      if (activeTargetRef.current?.key === target.key) {
+      if (isCurrent()) {
         setMessages((previous) => mergeMessages(previous, [sent]));
+        setSendError(null);
+        composerRef.current?.focus();
       }
       if (conversationKeysRef.current.has(target.key)) {
         setConversations((previous) => sortConversations(previous.map((conversation) =>
           conversationKey(conversation) === target.key
+            && (!conversation.last_message || conversation.last_message.id <= sent.id)
             ? { ...conversation, last_message: sent }
             : conversation)));
       } else {
         void loadConversations(false);
       }
-      setSendError(null);
-      composerRef.current?.focus();
     } catch (error) {
       if (handleSessionError(error)) {
         return;
       }
-      setMessages((previous) => previous.map((item) =>
-        item.client_message_id === message.client_message_id
-          ? { ...item, status: "failed" }
-          : item));
       if (
         target.kind === "direct"
         && error instanceof ApiError
         && error.code === "not_friends"
       ) {
-        setNotFriendLocally(true);
+        if (isCurrent()) {
+          setNotFriendLocally(true);
+        }
         setConversations((previous) => previous.map((conversation) =>
           conversation.type === "direct"
             && conversation.user.username.toLocaleLowerCase()
@@ -1297,7 +1339,13 @@ export function ChatPage() {
             ? { ...conversation, is_friend: false }
             : conversation));
       }
-      setSendError(describeError(error));
+      if (isCurrent()) {
+        setMessages((previous) => previous.map((item) =>
+          item.client_message_id === message.client_message_id
+            ? { ...item, status: "failed" }
+            : item));
+        setSendError(describeError(error));
+      }
     }
   }
 
@@ -1786,9 +1834,12 @@ export function ChatPage() {
                         群信息
                       </button>
                     )}
-                    <span className={`connection-state connection-state--${connectionStatus}`}>
+                    <span
+                      className={`connection-state connection-state--${connectionStatus}`}
+                      title="当前窗口与服务器的实时连接状态"
+                    >
                       {connectionStatus === "open"
-                        ? "实时在线"
+                        ? "实时连接正常"
                         : connectionStatus === "connecting"
                           ? "连接中…"
                           : connectionStatus === "replaced"

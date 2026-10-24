@@ -1,0 +1,112 @@
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export class ApiError extends Error {
+  constructor(status, code) {
+    super(`HTTP ${status}: ${code}`);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export class TestRun {
+  constructor(label) {
+    this.base = new URL(process.env.BASE_URL ?? "http://10.12.75.191:8199").origin;
+    this.id = randomBytes(4).toString("hex");
+    this.prefix = `v7_${this.id}`;
+    this.password = randomBytes(24).toString("hex");
+    this.users = new Map();
+    this.cookies = new Map();
+    this.groups = [];
+    this.checks = 0;
+    this.reportDir = process.env.REPORT_DIR ?? join(tmpdir(), `im-${label}-${this.id}`);
+  }
+
+  check(name, condition) {
+    assert.ok(condition, name);
+    this.checks += 1;
+    console.log(`PASS ${name}`);
+  }
+
+  async request(user, method, path, body) {
+    const headers = {};
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    if (this.cookies.has(user)) headers.Cookie = this.cookies.get(user);
+    const response = await fetch(this.base + path, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(15000),
+    });
+    const cookie = response.headers.getSetCookie()
+      .map((value) => value.split(";")[0])
+      .find((value) => value.startsWith("im_session="));
+    if (cookie && user) this.cookies.set(user, cookie);
+    const text = await response.text();
+    let payload;
+    try { payload = text ? JSON.parse(text) : undefined; } catch { payload = text; }
+    if (!response.ok) throw new ApiError(response.status, payload?.error?.code ?? "request_failed");
+    return payload;
+  }
+
+  async expectError(name, user, method, path, body, status, code) {
+    await assert.rejects(
+      () => this.request(user, method, path, body),
+      (error) => error instanceof ApiError && error.status === status && error.code === code,
+      name,
+    );
+    this.check(name, true);
+  }
+
+  async register(key) {
+    const user = { username: `${this.prefix}_${key}`, nickname: `验证 ${key}` };
+    this.users.set(key, user);
+    await this.save();
+    await this.request(key, "POST", "/api/auth/register", { ...user, password: this.password });
+    this.check(`register ${key}`, true);
+    return user;
+  }
+
+  async befriend(first, second) {
+    const username = this.users.get(second).username;
+    await this.request(first, "POST", "/api/friend-requests", { username });
+    const requests = await this.request(second, "GET", "/api/friend-requests");
+    const pending = requests.incoming.find((item) => item.user.username === this.users.get(first).username);
+    assert.ok(pending, "incoming friend request exists");
+    await this.request(second, "POST", `/api/friend-requests/${pending.id}/accept`);
+  }
+
+  async group(owner, name, members) {
+    const detail = await this.request(owner, "POST", "/api/groups", {
+      name,
+      member_usernames: members.map((key) => this.users.get(key).username),
+    });
+    this.groups.push(detail.group.id);
+    await this.save();
+    return detail.group.id;
+  }
+
+  async save() {
+    await mkdir(this.reportDir, { recursive: true });
+    await writeFile(join(this.reportDir, "manifest.json"), JSON.stringify({
+      base: this.base,
+      run_id: this.id,
+      usernames: [...this.users.values()].map((user) => user.username),
+      group_ids: this.groups,
+      checks: this.checks,
+    }, null, 2), { mode: 0o600 });
+  }
+
+  async finish() {
+    for (const key of this.cookies.keys()) {
+      await this.request(key, "POST", "/api/auth/logout").catch(() => undefined);
+    }
+    await this.save();
+    console.log(`Checks: ${this.checks}; cleanup manifest: ${join(this.reportDir, "manifest.json")}`);
+  }
+}

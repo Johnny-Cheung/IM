@@ -1,0 +1,176 @@
+#!/usr/bin/env node
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
+import { Browser } from "./lib/browser.mjs";
+import { delay, TestRun } from "./lib/test-client.mjs";
+
+const run = new TestRun("browser-smoke");
+const browser = new Browser();
+let tab;
+let failures = 0;
+const name = (key) => run.users.get(key).username;
+const memberSelector = (id) => `.conversation-item[data-group-id="${id}"]`;
+const directSelector = (key) => `.conversation-item[data-username="${name(key)}"]`;
+const textAt = (selector) => `document.querySelector(${JSON.stringify(selector)})?.textContent`;
+
+async function scenario(title, action) {
+  try {
+    await action();
+    console.log(`SCENARIO PASS ${title}`);
+  } catch (error) {
+    failures += 1;
+    console.error(`SCENARIO FAIL ${title}: ${error.message}`);
+    await tab.shot(join(run.reportDir, `failed-${failures}.png`)).catch(() => undefined);
+  }
+}
+
+async function openGroup(id) {
+  await tab.evaluate("document.querySelector('#group-info-panel .modal-header button')?.click()");
+  await tab.select(memberSelector(id), `/chat/group/${id}`);
+  await tab.waitFor("!!document.querySelector('.connection-state--open')");
+  await tab.click("#group-info-button");
+  await tab.waitFor("!!document.querySelector('#group-info-panel') && !!document.querySelector('#group-info-name-input')");
+}
+
+async function offline() {
+  await tab.send("Network.emulateNetworkConditions", { offline: true, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+  // Close the real app connection after preventing its automatic retry.
+  await tab.evaluate("window.__imTestSockets.forEach(socket => socket.close())");
+  await tab.waitFor("!document.querySelector('.connection-state--open')");
+}
+
+async function online() {
+  await tab.send("Network.emulateNetworkConditions", { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+  await tab.evaluate("window.dispatchEvent(new Event('online'))");
+}
+
+async function main() {
+  console.log(`Browser smoke ${run.id}: ${run.base}`);
+  for (const key of ["a", "b", "c"]) await run.register(key);
+  await run.befriend("b", "a");
+  await run.befriend("b", "c");
+  await run.befriend("a", "c");
+  const renamed = await run.group("b", "断线改名前", ["a", "c"]);
+  const kicked = await run.group("b", "断线移除", ["a", "c"]);
+  const dissolved = await run.group("b", "断线解散", ["a", "c"]);
+  const live = await run.group("b", "实时消息与未读", ["a", "c"]);
+  await browser.start();
+  tab = await browser.tab(run.base);
+  await tab.send("Page.addScriptToEvaluateOnNewDocument", { source: `
+    window.__imTestSockets = [];
+    window.WebSocket = class extends WebSocket {
+      constructor(...args) { super(...args); window.__imTestSockets.push(this); }
+    };
+  ` });
+  await tab.login(name("a"), run.password);
+  await tab.waitFor(`!!document.querySelector('#conversation-list ${memberSelector(live)}')`);
+
+  await scenario("delayed send failure stays in originating chat", async () => {
+    await tab.select(directSelector("b"), `/chat/${name("b")}`);
+    let resolvePaused;
+    const paused = new Promise((resolve) => { resolvePaused = resolve; });
+    const off = tab.on("Fetch.requestPaused", resolvePaused);
+    await tab.send("Fetch.enable", { patterns: [{ urlPattern: `*/api/conversations/${name("b")}/messages`, requestStage: "Request" }] });
+    try {
+      await tab.setValue("#message-input", "延迟失败");
+      await tab.click("#send-message");
+      const request = await Promise.race([paused, delay(5000).then(() => { throw new Error("send was not intercepted"); })]);
+      await tab.select(directSelector("c"), `/chat/${name("c")}`);
+      await tab.send("Fetch.fulfillRequest", {
+        requestId: request.requestId,
+        responseCode: 403,
+        responseHeaders: [{ name: "Content-Type", value: "application/json" }],
+        body: Buffer.from(JSON.stringify({ error: { code: "not_friends", message: "验证用延迟失败" } })).toString("base64"),
+      });
+      await delay(350);
+      run.check("new chat has no old error", !await tab.evaluate("document.body.innerText.includes('验证用延迟失败')"));
+      run.check("new chat remains writable", !await tab.evaluate("document.querySelector('#message-input').disabled || !!document.querySelector('#chat-readonly')"));
+    } finally {
+      off();
+      await tab.send("Fetch.disable");
+    }
+  });
+
+  await scenario("offline rename refreshes detail on reconnect", async () => {
+    await openGroup(renamed);
+    await offline();
+    try {
+      await run.request("b", "PATCH", `/api/groups/${renamed}`, { name: "恢复后新群名" });
+    } finally { await online(); }
+    await tab.waitFor("!!document.querySelector('.connection-state--open')");
+    await tab.waitFor(`${textAt('.message-header h2')} === '恢复后新群名'`, 5000);
+    await tab.waitFor("document.querySelector('#group-info-name-input')?.value === '恢复后新群名'", 5000);
+    run.check("reconnect updates group name and open panel", true);
+  });
+
+  for (const [id, action] of [[kicked, "kick"], [dissolved, "dissolve"]]) {
+    await scenario(`offline ${action} removes stale group`, async () => {
+      await openGroup(id);
+      await offline();
+      try {
+        if (action === "kick") await run.request("b", "DELETE", `/api/groups/${id}/members/${name("a")}`);
+        else await run.request("b", "POST", `/api/groups/${id}/leave`);
+      } finally { await online(); }
+      await tab.waitFor("location.pathname === '/'", 5000);
+      run.check(`${action} clears details and messages`, !await tab.evaluate("!!document.querySelector('#group-info-panel') || !!document.querySelector('#message-list .message-row')"));
+      run.check(`${action} removes conversation`, !await tab.evaluate(`!!document.querySelector('#conversation-list ${memberSelector(id)}')`));
+      run.check(`${action} explains lost access`, await tab.evaluate("document.querySelector('#chat-notice')?.textContent.includes('群聊已解散或你已不在群中')"));
+    });
+  }
+
+  await scenario("real-time group unread, background, history and mobile", async () => {
+    await tab.evaluate("document.querySelector('#group-info-panel .modal-header button')?.click()");
+    await tab.select(directSelector("c"), `/chat/${name("c")}`);
+    const firstBody = `实时推送 ${run.id}`;
+    await run.request("b", "POST", `/api/groups/${live}/messages`, { body: firstBody, client_message_id: randomUUID() });
+    await tab.waitFor(`document.querySelector('#conversation-list ${memberSelector(live)} .unread-badge')?.textContent === '1'`);
+    run.check("group unread arrives through WebSocket", true);
+    await tab.select(memberSelector(live), `/chat/group/${live}`);
+    await tab.waitFor(`document.querySelector('#message-list')?.innerText.includes(${JSON.stringify(firstBody)})`);
+    await tab.waitFor(`!document.querySelector('#conversation-list ${memberSelector(live)} .unread-badge')`);
+    run.check("opening group clears unread", true);
+    run.check("group has no read receipt", !await tab.evaluate("!!document.querySelector('#message-list .read-state')"));
+    await tab.evaluate("Object.defineProperty(document, 'visibilityState', {configurable:true, get:()=>window.__imHidden ? 'hidden' : 'visible'}); window.__imHidden=true; document.dispatchEvent(new Event('visibilitychange'))");
+    await run.request("b", "POST", `/api/groups/${live}/messages`, { body: "后台未读", client_message_id: randomUUID() });
+    await tab.waitFor(`document.querySelector('#conversation-list ${memberSelector(live)} .unread-badge')?.textContent === '1'`);
+    run.check("hidden group keeps unread", true);
+    await tab.evaluate("window.__imHidden=false; document.dispatchEvent(new Event('visibilitychange'))");
+    await tab.waitFor(`!document.querySelector('#conversation-list ${memberSelector(live)} .unread-badge')`);
+    run.check("returning to foreground clears unread", true);
+    for (let index = 0; index < 32; index += 1) await run.request("b", "POST", `/api/groups/${live}/messages`, { body: `历史 ${index}`, client_message_id: randomUUID() });
+    await tab.goto(`/chat/group/${live}`);
+    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length === 30");
+    run.check("refresh restores group and latest page", true);
+    await tab.evaluate("const el=document.querySelector('#message-list'); el.scrollTop=0; el.dispatchEvent(new Event('scroll'))");
+    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length === 34");
+    run.check("scroll loads older group messages", true);
+    await tab.viewport(390, 844);
+    run.check("mobile page stays within viewport", await tab.evaluate("document.documentElement.scrollWidth <= innerWidth+1"));
+    run.check("mobile input stays visible", await tab.evaluate("document.querySelector('#message-input').getBoundingClientRect().bottom <= innerHeight+1"));
+    await tab.click("#group-info-button");
+    await tab.waitFor("!!document.querySelector('#group-info-name-input')");
+    run.check("mobile group panel fits", await tab.evaluate("document.querySelector('#group-info-panel').getBoundingClientRect().width <= innerWidth+1"));
+    await tab.shot(join(run.reportDir, "mobile-group.png"));
+    await tab.evaluate("document.querySelector('#group-info-panel .modal-header button').click()");
+    await tab.viewport(1280, 900);
+  });
+
+  await scenario("same-session new window replaces old chat connection", async () => {
+    const replacement = await browser.tab(run.base);
+    const { cookies } = await tab.send("Network.getCookies", { urls: [run.base] });
+    const cookie = cookies.find((item) => item.name === "im_session");
+    await replacement.send("Network.setCookie", { name: cookie.name, value: cookie.value, url: run.base, httpOnly: true });
+    await replacement.goto("/");
+    await replacement.waitFor("!!document.querySelector('#conversation-list .conversation-item')");
+    await tab.waitFor("!!document.querySelector('#ws-replaced')");
+    run.check("replaced composer is disabled", await tab.evaluate("!!document.querySelector('#message-input')?.disabled"));
+    run.check("replaced window keeps history", await tab.evaluate("document.querySelectorAll('#message-list .message-row').length > 0"));
+    await tab.click("#ws-replaced button");
+    await tab.waitFor("location.pathname === '/login' && !!document.querySelector('input[name=username]')");
+    run.check("relogin returns to login page", true);
+  });
+  run.check("no browser runtime exception", tab.exceptions.length === 0);
+  if (failures) throw new Error(`${failures} browser scenarios failed`);
+}
+
+try { await main(); } catch (error) { console.error(`FAIL ${error.message}`); process.exitCode = 1; } finally { await browser.close(); await run.finish(); }
