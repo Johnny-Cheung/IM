@@ -9,7 +9,60 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Johnny-Cheung/IM/backend/internal/infra"
 )
+
+type fakeInfraStatus struct {
+	snapshot infra.Snapshot
+}
+
+func (f fakeInfraStatus) Snapshot() infra.Snapshot {
+	return f.snapshot
+}
+
+func TestInfraStatusExposesSnapshotWithoutChangingReadiness(t *testing.T) {
+	router, err := newRouter("", func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatalf("newRouter() error = %v", err)
+	}
+	registerInfraStatus(router, fakeInfraStatus{snapshot: infra.Snapshot{
+		Redis:    infra.ComponentStatus{Enabled: true, Connected: true},
+		RabbitMQ: infra.ComponentStatus{Enabled: true, Connected: false},
+	}})
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ops/infra", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var snapshot infra.Snapshot
+	if err := json.Unmarshal(recorder.Body.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !snapshot.Redis.Connected || snapshot.RabbitMQ.Connected {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+
+	ready := httptest.NewRecorder()
+	router.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if ready.Code != http.StatusOK {
+		t.Fatalf("ready status = %d, want %d", ready.Code, http.StatusOK)
+	}
+}
+
+func TestInfraStatusAbsentWhenNotRegistered(t *testing.T) {
+	router, err := newRouter("", nil)
+	if err != nil {
+		t.Fatalf("newRouter() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ops/infra", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
+}
 
 func TestHealth(t *testing.T) {
 	router, err := newRouter("", nil)

@@ -13,6 +13,7 @@ import (
 
 	"github.com/Johnny-Cheung/IM/backend/internal/config"
 	"github.com/Johnny-Cheung/IM/backend/internal/httpapi"
+	"github.com/Johnny-Cheung/IM/backend/internal/infra"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/gin-gonic/gin"
 )
@@ -52,9 +53,30 @@ func main() {
 	}
 	log.Printf("MySQL ready; migrations applied")
 
+	infraConfig, err := config.LoadInfra()
+	if err != nil {
+		log.Fatalf("load optional infrastructure configuration: %v", err)
+	}
+	infraManager, err := infra.New(infraConfig)
+	if err != nil {
+		log.Fatalf("configure optional infrastructure: %v", err)
+	}
+	if infraManager != nil {
+		infraManager.Start(context.Background())
+		defer func() {
+			if err := infraManager.Close(); err != nil {
+				log.Printf("close optional infrastructure: %v", err)
+			}
+		}()
+		log.Printf("optional infrastructure enabled")
+	}
+
 	router, err := newRouter(options.webDir, dataStore.Ping)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if infraManager != nil {
+		registerInfraStatus(router, infraManager)
 	}
 	httpapi.New(dataStore).Register(router)
 
@@ -62,6 +84,16 @@ func main() {
 	if err := http.ListenAndServe(options.addr, router); err != nil {
 		log.Fatal(err)
 	}
+}
+
+type infraStatusProvider interface {
+	Snapshot() infra.Snapshot
+}
+
+func registerInfraStatus(router *gin.Engine, provider infraStatusProvider) {
+	router.GET("/ops/infra", func(c *gin.Context) {
+		c.JSON(http.StatusOK, provider.Snapshot())
+	})
 }
 
 func newRouter(webDir string, ready func(context.Context) error) (*gin.Engine, error) {
