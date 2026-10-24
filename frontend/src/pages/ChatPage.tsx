@@ -9,7 +9,7 @@ import {
   type FormEvent,
   type KeyboardEvent,
 } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams, type NavigateOptions, type To } from "react-router-dom";
 import {
   api,
   ApiError,
@@ -414,7 +414,14 @@ async function fetchAfterPage(
 
 export function ChatPage() {
   const { user, logout, invalidate } = useAuth();
-  const navigate = useNavigate();
+  const routeNavigate = useNavigate();
+  // Route changes must not restart workspace loading or its WebSocket.
+  const navigateRef = useRef(routeNavigate);
+  useLayoutEffect(() => {
+    navigateRef.current = routeNavigate;
+  }, [routeNavigate]);
+  const navigate = useCallback((to: To, options?: NavigateOptions) =>
+    navigateRef.current(to, options), []);
   const params = useParams<{ username?: string; groupId?: string }>();
   const routeGroupIDText = params.groupId ?? "";
   const routeGroupID = Number(routeGroupIDText);

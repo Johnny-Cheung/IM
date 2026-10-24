@@ -94,6 +94,64 @@ async function main() {
   await tab.login(name("a"), run.password);
   await tab.waitFor(`!!document.querySelector('#conversation-list ${memberSelector(live)}')`);
 
+  await scenario("switching conversations preserves sidebar and live connection", async () => {
+    await tab.waitFor("window.__imTestSockets.some(socket => socket.readyState === WebSocket.OPEN)");
+    await delay(350);
+    let listRequests = 0;
+    let newSockets = 0;
+    const offRequests = tab.on("Network.requestWillBeSent", ({ request }) => {
+      if (new URL(request.url).pathname === "/api/conversations") listRequests += 1;
+    });
+    const offSockets = tab.on("Network.webSocketCreated", () => { newSockets += 1; });
+    await tab.evaluate(`(() => {
+      const list = document.querySelector('#conversation-list');
+      window.__imSidebar = { list, first: list.querySelector('.conversation-item'), style: list.getAttribute('style'), flashes: 0 };
+      list.style.flex = '0 0 80px';
+      list.style.maxHeight = '80px';
+      list.scrollTop = 90;
+      window.__imSidebar.top = list.scrollTop;
+      window.__imSidebar.observer = new MutationObserver(() => {
+        if (list.innerText.includes('正在加载会话')) window.__imSidebar.flashes += 1;
+      });
+      window.__imSidebar.observer.observe(list, { childList: true, subtree: true });
+    })()`);
+    try {
+      for (const [selector, path] of [
+        [directSelector("b"), `/chat/${name("b")}`],
+        [directSelector("c"), `/chat/${name("c")}`],
+        [memberSelector(renamed), `/chat/group/${renamed}`],
+        [memberSelector(live), `/chat/group/${live}`],
+        [directSelector("b"), `/chat/${name("b")}`],
+      ]) await tab.select(selector, path);
+      await delay(200);
+      const state = await tab.evaluate(`(() => {
+        const saved = window.__imSidebar;
+        const list = document.querySelector('#conversation-list');
+        return { sameList: list === saved.list, sameFirst: list.querySelector('.conversation-item') === saved.first,
+          flashes: saved.flashes, before: saved.top, after: list.scrollTop,
+          selected: list.querySelectorAll('[aria-current="page"]').length };
+      })()`);
+      console.log(`Sidebar switch metrics: ${JSON.stringify({ ...state, listRequests, newSockets })}`);
+      run.check("sidebar element survives route changes", state.sameList);
+      run.check("sidebar rows are retained", state.sameFirst);
+      run.check("sidebar never re-enters loading state", state.flashes === 0);
+      run.check("sidebar scroll position is preserved", state.before > 0 && state.before === state.after);
+      run.check("empty-chat switches do not refetch conversations", listRequests === 0);
+      run.check("chat switches keep the existing WebSocket", newSockets === 0);
+      run.check("selected conversation highlight updates", state.selected === 1);
+    } finally {
+      offRequests();
+      offSockets();
+      await tab.evaluate(`(() => {
+        const saved = window.__imSidebar;
+        saved.observer.disconnect();
+        const list = document.querySelector('#conversation-list');
+        if (saved.style === null) list.removeAttribute('style');
+        else list.setAttribute('style', saved.style);
+      })()`);
+    }
+  });
+
   await scenario("delayed send failure stays in originating chat", async () => {
     await tab.select(directSelector("b"), `/chat/${name("b")}`);
     let resolvePaused;
