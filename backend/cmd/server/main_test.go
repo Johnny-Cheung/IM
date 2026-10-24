@@ -221,6 +221,28 @@ func TestSPAFallbackDoesNotHandleAPI(t *testing.T) {
 	}
 }
 
+func TestSPAFallbackDoesNotHandleOps(t *testing.T) {
+	webDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(webDir, "index.html"), []byte("app shell"), 0o644); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	router, err := newRouter(webDir, nil)
+	if err != nil {
+		t.Fatalf("newRouter() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/ops/infra", nil)
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
+	if recorder.Body.String() == "app shell" {
+		t.Fatal("ops route returned the SPA shell")
+	}
+}
+
 func TestSPAFallbackLeavesMissingAssets404(t *testing.T) {
 	webDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(webDir, "index.html"), []byte("app shell"), 0o644); err != nil {

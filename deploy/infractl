@@ -20,7 +20,7 @@ REDIS_DATA="${INFRA_ROOT}/redis/data"
 REDIS_CONF="${INFRA_ROOT}/redis/redis.conf"
 
 RABBIT_NAME=im-v11-rabbitmq
-RABBIT_PORT=25673
+RABBIT_PORT=25676
 RABBIT_EPMD_PORT=14369
 RABBIT_DIST_PORT=25675
 RABBIT_DATA="${INFRA_ROOT}/rabbitmq/data"
@@ -28,20 +28,9 @@ RABBIT_CONF="${INFRA_ROOT}/rabbitmq/rabbitmq.conf"
 
 IMAGES_DIR="${INFRA_ROOT}/images"
 SECRETS_DIR="${INFRA_ROOT}/secrets"
+RABBIT_SECRETS_CONF="${SECRETS_DIR}/rabbitmq-defaults.conf"
 REDIS_PASSWORD_SECRET="${SECRETS_DIR}/redis-password"
 RABBIT_PASSWORD_SECRET="${SECRETS_DIR}/rabbitmq-password"
-
-CONFIG_DIR="${INFRA_ROOT}/config"
-REDIS_PASSWORD_CONFIG="${CONFIG_DIR}/redis-password"
-RABBIT_URL_CONFIG="${CONFIG_DIR}/rabbitmq-url"
-
-VERIFY_APP="${INFRA_ROOT}/verify-app"
-VERIFY_UNIT=im-rebuild-v11-verify
-VERIFY_PORT=8200
-MYSQL_PORT=13307
-MYSQL_DB=im_v07_verify
-MYSQL_USER=im_v07_verify
-MYSQL_PASSWORD_FILE="${ROOT}/canary-v07/mysql-app"
 
 D() { "${DOCKER_BIN}" --host "${RUNTIME_SOCK}" "$@"; }
 
@@ -122,20 +111,20 @@ EOF
   chmod 0644 "${REDIS_CONF}"
 
   cat > "${RABBIT_CONF}" <<'EOF'
-listeners.tcp.default = 127.0.0.1:25673
+listeners.tcp.default = 127.0.0.1:25676
+prometheus.tcp.ip = 127.0.0.1
+prometheus.tcp.port = 25677
+total_memory_available_override_value = 512m
+vm_memory_high_watermark.relative = 0.5
 EOF
   chmod 0644 "${RABBIT_CONF}"
-}
 
-prepare_backend_config() {
-  install -d -m 0755 "${CONFIG_DIR}"
-  install -o nobody -g root -m 0400 "${REDIS_PASSWORD_SECRET}" "${REDIS_PASSWORD_CONFIG}"
   local rabbit_password
   rabbit_password="$(cat "${RABBIT_PASSWORD_SECRET}")"
-  ( umask 077
-    printf 'amqp://im_v11:%s@127.0.0.1:%s/im_v11\n' "${rabbit_password}" "${RABBIT_PORT}" > "${RABBIT_URL_CONFIG}" )
-  chown nobody:root "${RABBIT_URL_CONFIG}"
-  chmod 0400 "${RABBIT_URL_CONFIG}"
+  ( umask 022
+    printf 'default_user = im_v11\ndefault_pass = %s\ndefault_vhost = im_v11\n' "${rabbit_password}" \
+      > "${RABBIT_SECRETS_CONF}" )
+  chmod 0444 "${RABBIT_SECRETS_CONF}"
 }
 
 load_images() {
@@ -215,13 +204,10 @@ rabbit_start() {
   else
     port_check "${RABBIT_PORT}"
     D run -d --name "${RABBIT_NAME}" --network host --restart=no --hostname im-v11-rabbit \
-      --cpus 0.5 --memory 384m --memory-swap 384m --pids-limit 256 \
+      --cpus 0.5 --memory 512m --memory-swap 512m --pids-limit 256 \
       --mount "type=bind,src=${RABBIT_CONF},dst=/etc/rabbitmq/rabbitmq.conf,readonly" \
+      --mount "type=bind,src=${RABBIT_SECRETS_CONF},dst=/etc/rabbitmq/conf.d/10-defaults.conf,readonly" \
       --mount "type=bind,src=${RABBIT_DATA},dst=/var/lib/rabbitmq" \
-      --mount "type=bind,src=${RABBIT_PASSWORD_SECRET},dst=/run/secrets/rabbitmq-password,readonly" \
-      --env RABBITMQ_DEFAULT_USER=im_v11 \
-      --env RABBITMQ_DEFAULT_PASS_FILE=/run/secrets/rabbitmq-password \
-      --env RABBITMQ_DEFAULT_VHOST=im_v11 \
       --env ERL_EPMD_PORT="${RABBIT_EPMD_PORT}" \
       --env RABBITMQ_DIST_PORT="${RABBIT_DIST_PORT}" \
       --log-driver=json-file --log-opt max-size=10m --log-opt max-file=2 \
@@ -244,57 +230,27 @@ rabbit_stop() {
   fi
 }
 
+rabbit_recreate() {
+  rabbit_stop
+  if D info >/dev/null 2>&1 && D container inspect "${RABBIT_NAME}" >/dev/null 2>&1; then
+    D rm --force "${RABBIT_NAME}" >/dev/null
+  fi
+  prepare_layout
+  rabbit_start
+}
+
+redis_recreate() {
+  redis_stop
+  if D info >/dev/null 2>&1 && D container inspect "${REDIS_NAME}" >/dev/null 2>&1; then
+    D rm --force "${REDIS_NAME}" >/dev/null
+  fi
+  prepare_layout
+  redis_start
+}
+
 rabbit_health() {
-  D exec "${RABBIT_NAME}" rabbitmq-diagnostics -q ping >/dev/null
-}
-
-verify_backend_start() {
-  runtime_start
-  if systemctl is-active --quiet "${VERIFY_UNIT}"; then
-    log "v1.1 verify backend is already running on port ${VERIFY_PORT}"
-    return 0
-  fi
-  if systemctl is-failed --quiet "${VERIFY_UNIT}"; then
-    systemctl reset-failed "${VERIFY_UNIT}"
-  fi
-  port_check "${VERIFY_PORT}"
-  test -x "${VERIFY_APP}/bin/im-server"
-  test -s "${MYSQL_PASSWORD_FILE}"
-  prepare_backend_config
-  systemd-run --unit="${VERIFY_UNIT}" --description="IM v1.1 infrastructure verification backend" \
-    --uid=nobody --gid=nobody \
-    --property=CPUAccounting=yes --property=CPUQuota=25% \
-    --property=MemoryAccounting=yes --property=MemoryLimit=134217728 \
-    /usr/bin/env \
-      IM_MYSQL_HOST=127.0.0.1 \
-      IM_MYSQL_PORT="${MYSQL_PORT}" \
-      IM_MYSQL_DB="${MYSQL_DB}" \
-      IM_MYSQL_USER="${MYSQL_USER}" \
-      IM_MYSQL_PASSWORD_FILE="${MYSQL_PASSWORD_FILE}" \
-      IM_REDIS_URL="redis://127.0.0.1:${REDIS_PORT}/0" \
-      IM_REDIS_PASSWORD_FILE="${REDIS_PASSWORD_CONFIG}" \
-      IM_RABBITMQ_URL_FILE="${RABBIT_URL_CONFIG}" \
-    "${VERIFY_APP}/bin/im-server" -addr "0.0.0.0:${VERIFY_PORT}"
-  local attempt code
-  for attempt in $(seq 1 40); do
-    code="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 2 "http://127.0.0.1:${VERIFY_PORT}/ready" || true)"
-    if [ "${code}" = "200" ]; then
-      log "v1.1 verify backend is ready on port ${VERIFY_PORT}"
-      return 0
-    fi
-    sleep 0.5
-  done
-  journalctl -u "${VERIFY_UNIT}" --no-pager -n 40 >&2 || true
-  return 1
-}
-
-verify_backend_stop() {
-  if systemctl is-active --quiet "${VERIFY_UNIT}"; then
-    systemctl stop "${VERIFY_UNIT}"
-  fi
-  if systemctl is-failed --quiet "${VERIFY_UNIT}"; then
-    systemctl reset-failed "${VERIFY_UNIT}"
-  fi
+  D exec "${RABBIT_NAME}" rabbitmq-diagnostics -q ping >/dev/null \
+    && ss -lnt | awk '{print $4}' | grep -q ":${RABBIT_PORT}\$"
 }
 
 start() {
@@ -307,7 +263,6 @@ start() {
 }
 
 stop() {
-  verify_backend_stop
   rabbit_stop
   redis_stop
   runtime_stop
@@ -327,11 +282,6 @@ status() {
       log "${name}: not created"
     fi
   done
-  if systemctl is-active --quiet "${VERIFY_UNIT}"; then
-    log "verify backend: running on ${VERIFY_PORT}"
-  else
-    log "verify backend: stopped"
-  fi
 }
 
 health() {
@@ -361,8 +311,7 @@ logs() {
     redis) D logs --tail "${lines}" "${REDIS_NAME}" ;;
     rabbitmq) D logs --tail "${lines}" "${RABBIT_NAME}" ;;
     runtime) journalctl -u "${RUNTIME_UNIT}" --no-pager -n "${lines}" ;;
-    verify) journalctl -u "${VERIFY_UNIT}" --no-pager -n "${lines}" ;;
-    *) echo "Usage: $0 logs [redis|rabbitmq|runtime|verify] [lines]" >&2; return 2 ;;
+    *) echo "Usage: $0 logs [redis|rabbitmq|runtime] [lines]" >&2; return 2 ;;
   esac
 }
 
@@ -382,12 +331,9 @@ main() {
     rabbitmq-start) prepare_layout; rabbit_start ;;
     rabbitmq-stop) rabbit_stop ;;
     rabbitmq-restart) rabbit_stop; prepare_layout; rabbit_start ;;
-    verify-backend-start) verify_backend_start ;;
-    verify-backend-stop) verify_backend_stop ;;
-    verify-backend-restart) verify_backend_stop; verify_backend_start ;;
-    verify-health)
-      curl --fail --silent --show-error "http://127.0.0.1:${VERIFY_PORT}/ops/infra" && echo ;;
-    *) echo "Usage: $0 {init|start|stop|restart|status|health|logs|images|redis-start|redis-stop|redis-restart|rabbitmq-start|rabbitmq-stop|rabbitmq-restart|verify-backend-start|verify-backend-stop|verify-backend-restart|verify-health}" >&2; return 2 ;;
+    rabbitmq-recreate) runtime_start; rabbit_recreate ;;
+    redis-recreate) runtime_start; redis_recreate ;;
+    *) echo "Usage: $0 {init|start|stop|restart|status|health|logs|images|redis-start|redis-stop|redis-restart|redis-recreate|rabbitmq-start|rabbitmq-stop|rabbitmq-restart|rabbitmq-recreate}" >&2; return 2 ;;
   esac
 }
 

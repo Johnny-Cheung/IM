@@ -52,12 +52,11 @@ start >/dev/null
 check "start prepares layout before runtime, images and brokers" test "${order}" = "layout runtime images redis rabbit "
 
 order=""
-verify_backend_stop() { order+="backend "; }
 rabbit_stop() { order+="rabbit "; }
 redis_stop() { order+="redis "; }
 runtime_stop() { order+="runtime "; }
 stop >/dev/null
-check "stop stops backend before brokers and runtime" test "${order}" = "backend rabbit redis runtime "
+check "stop stops brokers before the runtime" test "${order}" = "rabbit redis runtime "
 
 check "unknown command returns usage error" expect_fail main bogus
 
@@ -82,10 +81,17 @@ else
   echo "PASS Redis password is not passed through the backend environment"
 fi
 
-if grep -q 'amqp://im_v11:%s@' "${HERE}/infractl"; then
-  echo "PASS RabbitMQ URL is built from the protected secret without echoing it"
+if grep -q 'RABBITMQ_DEFAULT_' "${HERE}/infractl"; then
+  echo "FAIL RabbitMQ credentials are passed through legacy environment variables"
+  failures=$((failures + 1))
 else
-  echo "FAIL RabbitMQ URL construction is missing"
+  echo "PASS RabbitMQ credentials are not passed through the environment"
+fi
+
+if grep -q '10-defaults.conf,readonly' "${HERE}/infractl"; then
+  echo "PASS RabbitMQ default credentials are mounted from a protected config file"
+else
+  echo "FAIL RabbitMQ default credential config is missing"
   failures=$((failures + 1))
 fi
 

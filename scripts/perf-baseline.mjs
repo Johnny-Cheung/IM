@@ -71,6 +71,19 @@ async function prepare() {
   return { groupID };
 }
 
+async function verifyUnread(groupID) {
+  const direct = await sendDirect("a", "b", "baseline private verify");
+  const group = await sendGroup("a", groupID, "baseline group verify");
+  const list = await listConversations("b");
+  run.check(
+    "private unread visible",
+    (directConversation(list, run.users.get("a").username)?.unread_count ?? 0) >= 1,
+  );
+  run.check("group unread visible", (groupConversation(list, groupID)?.unread_count ?? 0) >= 1);
+  await run.request("b", "POST", `${directPath("a")}/read?through_id=${direct.message.id}`);
+  await run.request("b", "POST", `/api/groups/${groupID}/read?through_id=${group.message.id}`);
+}
+
 async function sampleRound(groupID, enabled) {
   const direct = await measure(
     "direct_send",
@@ -83,12 +96,7 @@ async function sampleRound(groupID, enabled) {
     () => sendGroup("a", groupID, "baseline group sample"),
   );
 
-  const list = await measure("conversations", enabled, () => listConversations("b"));
-  run.check(
-    "private unread visible",
-    (directConversation(list, run.users.get("a").username)?.unread_count ?? 0) >= 1,
-  );
-  run.check("group unread visible", (groupConversation(list, groupID)?.unread_count ?? 0) >= 1);
+  await measure("conversations", enabled, () => listConversations("b"));
 
   await measure(
     "direct_history",
@@ -135,6 +143,7 @@ async function main() {
   }
 
   const { groupID } = await prepare();
+  await verifyUnread(groupID);
   for (let index = 0; index < WARMUP_ROUNDS; index += 1) await sampleRound(groupID, false);
   for (let index = 0; index < SAMPLE_ROUNDS; index += 1) await sampleRound(groupID, true);
 

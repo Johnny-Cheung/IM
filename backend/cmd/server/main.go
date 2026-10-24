@@ -152,7 +152,8 @@ func newRouter(webDir string, ready func(context.Context) error) (*gin.Engine, e
 			return
 		}
 		requestPath := c.Request.URL.Path
-		if requestPath == "/api" || strings.HasPrefix(requestPath, "/api/") {
+		if requestPath == "/api" || strings.HasPrefix(requestPath, "/api/") ||
+			requestPath == "/ops" || strings.HasPrefix(requestPath, "/ops/") {
 			c.Status(http.StatusNotFound)
 			return
 		}
