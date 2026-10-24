@@ -235,6 +235,32 @@ func TestMarkConversationRead(t *testing.T) {
 	}
 }
 
+func TestReadPositionBounds(t *testing.T) {
+	for _, path := range []string{"/api/conversations/bob/read", "/api/groups/7/read"} {
+		t.Run(path, func(t *testing.T) {
+			dataStore := authenticatedChatStore()
+			router := testRouter(dataStore)
+			recorder := doJSON(t, router, http.MethodPost, path+"?through_id=21", nil, authTestCookie())
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("bounded read status = %d", recorder.Code)
+			}
+			if strings.Contains(path, "/groups/") {
+				if dataStore.markGroupReadThrough != 21 {
+					t.Fatalf("group bound = %d, want 21", dataStore.markGroupReadThrough)
+				}
+			} else if dataStore.markReadCall.throughID != 21 {
+				t.Fatalf("private bound = %d, want 21", dataStore.markReadCall.throughID)
+			}
+			for _, bound := range []string{"-1", "abc", "18446744073709551616"} {
+				recorder = doJSON(t, router, http.MethodPost, path+"?through_id="+bound, nil, authTestCookie())
+				if recorder.Code != http.StatusBadRequest || errorCode(t, recorder) != "invalid_request" {
+					t.Fatalf("bound %q status = %d, body = %s", bound, recorder.Code, recorder.Body.String())
+				}
+			}
+		})
+	}
+}
+
 func TestMarkConversationReadToSelf(t *testing.T) {
 	dataStore := authenticatedChatStore()
 	dataStore.user = store.User{ID: 1, Username: "alice", Nickname: "Alice"}

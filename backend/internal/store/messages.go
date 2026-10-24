@@ -421,10 +421,11 @@ func (s *Store) ListMessagesAfter(
 }
 
 // MarkConversationRead advances the user's read position to the latest
-// incoming message from peer. The returned bool reports whether it advanced.
+// incoming message from peer, capped at throughID when nonzero. The returned
+// bool reports whether it advanced.
 func (s *Store) MarkConversationRead(
 	ctx context.Context,
-	userID, peerID uint64,
+	userID, peerID, throughID uint64,
 	now time.Time,
 ) (uint64, bool, error) {
 	if userID == peerID {
@@ -435,8 +436,9 @@ func (s *Store) MarkConversationRead(
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT COALESCE(MAX(id), 0)
 		 FROM messages
-		 WHERE sender_id = ? AND recipient_id = ?`,
-		peerID, userID,
+		 WHERE sender_id = ? AND recipient_id = ?
+		   AND (? = 0 OR id <= ?)`,
+		peerID, userID, throughID, throughID,
 	).Scan(&latest); err != nil {
 		return 0, false, fmt.Errorf("find latest incoming message: %w", err)
 	}

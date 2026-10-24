@@ -105,9 +105,10 @@ type fakeStore struct {
 		limit   int
 	}
 	markReadCall struct {
-		userID uint64
-		peerID uint64
-		now    time.Time
+		userID    uint64
+		peerID    uint64
+		throughID uint64
+		now       time.Time
 	}
 
 	groupConversations    []store.GroupConversation
@@ -149,6 +150,7 @@ type fakeStore struct {
 		body            string
 		now             time.Time
 	}
+	markGroupReadThrough  uint64
 	markGroupReadResult   uint64
 	markGroupReadAdvanced bool
 	markGroupReadErr      error
@@ -312,11 +314,12 @@ func (f *fakeStore) ListMessagesAfter(
 
 func (f *fakeStore) MarkConversationRead(
 	_ context.Context,
-	userID, peerID uint64,
+	userID, peerID, throughID uint64,
 	now time.Time,
 ) (uint64, bool, error) {
 	f.markReadCall.userID = userID
 	f.markReadCall.peerID = peerID
+	f.markReadCall.throughID = throughID
 	f.markReadCall.now = now
 	return f.markReadResult, f.markReadAdvanced, f.markReadErr
 }
@@ -423,7 +426,8 @@ func (f *fakeStore) CreateGroupMessage(
 	return f.createdGroupMessage, f.createdGroupMessageNew, f.createGroupMessageErr
 }
 
-func (f *fakeStore) MarkGroupRead(context.Context, uint64, uint64) (uint64, bool, error) {
+func (f *fakeStore) MarkGroupRead(_ context.Context, _, _, throughID uint64) (uint64, bool, error) {
+	f.markGroupReadThrough = throughID
 	return f.markGroupReadResult, f.markGroupReadAdvanced, f.markGroupReadErr
 }
 

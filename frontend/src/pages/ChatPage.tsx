@@ -776,27 +776,19 @@ export function ChatPage() {
     return 0;
   }, [activeKey, messages, messagesBelongToActive, user]);
 
-  const markRead = useCallback(async (target: ActiveTarget) => {
+  const markRead = useCallback(async (target: ActiveTarget, throughID: number) => {
     try {
       if (target.kind === "direct") {
-        await api.markConversationRead(target.username);
-        setConversations((previous) => previous.map((conversation) =>
-          conversation.type === "direct"
-            && conversation.user.username.toLocaleLowerCase()
-              === target.username.toLocaleLowerCase()
-            ? { ...conversation, unread_count: 0 }
-            : conversation));
+        await api.markConversationRead(target.username, throughID);
       } else {
-        await api.markGroupRead(target.groupID);
-        setConversations((previous) => previous.map((conversation) =>
-          conversation.type === "group" && conversation.group.id === target.groupID
-            ? { ...conversation, unread_count: 0 }
-            : conversation));
+        await api.markGroupRead(target.groupID, throughID);
       }
+      // New messages may have arrived while this read request was in flight.
+      await loadConversations(false);
     } catch (error) {
       handleSessionError(error);
     }
-  }, [handleSessionError]);
+  }, [handleSessionError, loadConversations]);
 
   useEffect(() => {
     const target = activeTargetRef.current;
@@ -809,12 +801,16 @@ export function ChatPage() {
     if (!pageVisible || connectionStatus === "replaced") {
       return;
     }
+    const throughID = messages.reduce((latest, message) => Math.max(latest, message.id), 0);
+    if (throughID === 0) {
+      return;
+    }
     if (readTimerRef.current !== null) {
       window.clearTimeout(readTimerRef.current);
     }
     readTimerRef.current = window.setTimeout(() => {
       readTimerRef.current = null;
-      void markRead(target);
+      void markRead(target, throughID);
     }, READ_DEBOUNCE_MS);
     return () => {
       if (readTimerRef.current !== null) {
@@ -991,10 +987,7 @@ export function ChatPage() {
       return;
     }
     if (event.reader === currentUser.username) {
-      setConversations((previous) => previous.map((conversation) =>
-        conversation.type === "direct" && conversation.user.username === event.peer
-          ? { ...conversation, unread_count: 0 }
-          : conversation));
+      void loadConversations(false);
       return;
     }
     if (event.peer === currentUser.username) {
@@ -1009,7 +1002,7 @@ export function ChatPage() {
           }
           : conversation));
     }
-  }, []);
+  }, [loadConversations]);
 
   const handleGroupChanged = useCallback((event: GroupChangedEvent) => {
     if (event.action === "removed" || event.action === "dissolved") {

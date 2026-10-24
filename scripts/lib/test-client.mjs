@@ -21,6 +21,7 @@ export class TestRun {
     this.prefix = `v7_${this.id}`;
     this.password = randomBytes(24).toString("hex");
     this.users = new Map();
+    this.createdUsers = new Set();
     this.cookies = new Map();
     this.groups = [];
     this.checks = 0;
@@ -66,8 +67,9 @@ export class TestRun {
   async register(key) {
     const user = { username: `${this.prefix}_${key}`, nickname: `验证 ${key}` };
     this.users.set(key, user);
-    await this.save();
     await this.request(key, "POST", "/api/auth/register", { ...user, password: this.password });
+    this.createdUsers.add(user.username);
+    await this.save();
     this.check(`register ${key}`, true);
     return user;
   }
@@ -96,7 +98,7 @@ export class TestRun {
     await writeFile(join(this.reportDir, "manifest.json"), JSON.stringify({
       base: this.base,
       run_id: this.id,
-      usernames: [...this.users.values()].map((user) => user.username),
+      usernames: [...this.createdUsers],
       group_ids: this.groups,
       checks: this.checks,
     }, null, 2), { mode: 0o600 });

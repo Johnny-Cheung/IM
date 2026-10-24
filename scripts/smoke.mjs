@@ -57,6 +57,13 @@ async function main() {
   run.check("private history pages without overlap", newest.has_more && newest.messages.length === 30 && older.messages.length === 3 && older.messages.at(-1).id < newest.messages[0].id);
   const directAfter = await run.request("b", "GET", `${directPath("a")}/messages?after_id=${first.message.id}&limit=50`);
   run.check("private reconnect cursor catches up", directAfter.messages.length === 32);
+  await run.request("b", "POST", `${directPath("a")}/read?through_id=${first.message.id}`);
+  run.check("bounded private read preserves newer unread", directOf(await list("b"), run.users.get("a").username).unread_count === 32);
+  const directLatest = newest.messages.at(-1).id;
+  await run.request("b", "POST", `${directPath("a")}/read?through_id=${directLatest}`);
+  const directOldRead = await run.request("b", "POST", `${directPath("a")}/read?through_id=${first.message.id}`);
+  run.check("private read position cannot rewind", directOldRead.last_read_message_id === directLatest && directOf(await list("b"), run.users.get("a").username).unread_count === 0);
+  await run.expectError("invalid private read bound rejected", "b", "POST", `${directPath("a")}/read?through_id=-1`, undefined, 400, "invalid_request");
 
   await run.expectError("group needs members", "a", "POST", "/api/groups", { name: "empty", member_usernames: [] }, 400, "invalid_members");
   await run.expectError("group needs valid name", "a", "POST", "/api/groups", { name: "群".repeat(31), member_usernames: [run.users.get("b").username] }, 400, "invalid_group_name");
@@ -89,6 +96,13 @@ async function main() {
   run.check("group history pages without overlap", groupPage.has_more && groupPage.messages.length === 30 && groupOlder.messages.length === 6 && groupOlder.messages.at(-1).id < groupPage.messages[0].id);
   const groupAfter = await run.request("b", "GET", `/api/groups/${id}/messages?limit=50&after_id=${groupFirst.message.id}`);
   run.check("group reconnect cursor catches up", groupAfter.messages.length === 35);
+  await run.request("b", "POST", `/api/groups/${id}/read?through_id=${groupFirst.message.id}`);
+  run.check("bounded group read preserves newer unread", groupOf(await list("b"), id).unread_count === 35);
+  const groupLatest = groupPage.messages.at(-1).id;
+  await run.request("b", "POST", `/api/groups/${id}/read?through_id=${groupLatest}`);
+  const groupOldRead = await run.request("b", "POST", `/api/groups/${id}/read?through_id=${groupFirst.message.id}`);
+  run.check("group read position cannot rewind", groupOldRead.last_read_message_id === groupLatest && groupOf(await list("b"), id).unread_count === 0);
+  await run.expectError("invalid group read bound rejected", "b", "POST", `/api/groups/${id}/read?through_id=-1`, undefined, 400, "invalid_request");
   await run.expectError("conflicting group cursors rejected", "a", "GET", `/api/groups/${id}/messages?before_id=10&after_id=1`, undefined, 400, "invalid_request");
   await run.request("a", "DELETE", `/api/groups/${id}/members/${run.users.get("c").username}`);
   await run.expectError("kicked member loses history", "c", "GET", `/api/groups/${id}/messages`, undefined, 404, "group_not_found");

@@ -429,8 +429,12 @@ func (a *API) markGroupRead(c *gin.Context) {
 		return
 	}
 
+	throughID, ok := parseReadThroughID(c)
+	if !ok {
+		return
+	}
 	lastReadMessageID, _, err := a.store.MarkGroupRead(
-		c.Request.Context(), current.ID, groupID,
+		c.Request.Context(), current.ID, groupID, throughID,
 	)
 	if err != nil {
 		a.writeGroupError(c, err)

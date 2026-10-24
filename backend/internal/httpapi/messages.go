@@ -364,10 +364,15 @@ func (a *API) markConversationRead(c *gin.Context) {
 		return
 	}
 
+	throughID, ok := parseReadThroughID(c)
+	if !ok {
+		return
+	}
 	lastReadMessageID, advanced, err := a.store.MarkConversationRead(
 		c.Request.Context(),
 		current.ID,
 		target.ID,
+		throughID,
 		time.Now().UTC(),
 	)
 	if err != nil {
@@ -414,6 +419,15 @@ func parseBeforeID(raw string) (uint64, error) {
 
 func parseAfterID(raw string) (uint64, error) {
 	return parseBeforeID(raw)
+}
+
+func parseReadThroughID(c *gin.Context) (uint64, bool) {
+	throughID, err := parseBeforeID(c.Query("through_id"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_request", "已读消息位置不正确")
+		return 0, false
+	}
+	return throughID, true
 }
 
 func parseMessageLimit(raw string) (int, error) {

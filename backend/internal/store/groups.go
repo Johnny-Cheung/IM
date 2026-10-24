@@ -795,10 +795,11 @@ func (s *Store) CreateGroupMessage(
 }
 
 // MarkGroupRead advances the member's read position to the latest group
-// message. The returned bool reports whether it advanced.
+// message, capped at throughID when nonzero. The returned bool reports whether
+// it advanced.
 func (s *Store) MarkGroupRead(
 	ctx context.Context,
-	userID, groupID uint64,
+	userID, groupID, throughID uint64,
 ) (uint64, bool, error) {
 	if err := s.ensureGroupMember(ctx, userID, groupID); err != nil {
 		return 0, false, err
@@ -806,8 +807,9 @@ func (s *Store) MarkGroupRead(
 
 	var latest uint64
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(id), 0) FROM group_messages WHERE group_id = ?`,
-		groupID,
+		`SELECT COALESCE(MAX(id), 0) FROM group_messages
+		 WHERE group_id = ? AND (? = 0 OR id <= ?)`,
+		groupID, throughID, throughID,
 	).Scan(&latest); err != nil {
 		return 0, false, fmt.Errorf("find latest group message: %w", err)
 	}

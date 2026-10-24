@@ -78,7 +78,7 @@ type Store interface {
 	) (store.MessagePage, error)
 	MarkConversationRead(
 		ctx context.Context,
-		userID, peerID uint64,
+		userID, peerID, throughID uint64,
 		now time.Time,
 	) (uint64, bool, error)
 	CreateMessage(
@@ -125,7 +125,7 @@ type Store interface {
 		clientMessageID, body string,
 		now time.Time,
 	) (store.GroupMessage, bool, error)
-	MarkGroupRead(ctx context.Context, userID, groupID uint64) (uint64, bool, error)
+	MarkGroupRead(ctx context.Context, userID, groupID, throughID uint64) (uint64, bool, error)
 }
 
 // API registers the versioned JSON endpoints.

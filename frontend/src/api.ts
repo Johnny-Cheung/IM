@@ -294,9 +294,9 @@ export const api = {
     );
   },
 
-  markConversationRead: (username: string) =>
+  markConversationRead: (username: string, throughID: number) =>
     request<{ last_read_message_id: number }>(
-      `/api/conversations/${encodeURIComponent(username)}/read`,
+      `/api/conversations/${encodeURIComponent(username)}/read?through_id=${throughID}`,
       { method: "POST" },
     ),
 
@@ -367,9 +367,9 @@ export const api = {
     );
   },
 
-  markGroupRead: (groupID: number) =>
+  markGroupRead: (groupID: number, throughID: number) =>
     request<{ last_read_message_id: number }>(
-      `/api/groups/${groupID}/read`,
+      `/api/groups/${groupID}/read?through_id=${throughID}`,
       { method: "POST" },
     ),
 

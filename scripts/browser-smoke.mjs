@@ -44,6 +44,35 @@ async function online() {
   await tab.evaluate("window.dispatchEvent(new Event('online'))");
 }
 
+async function readWhileHiding(pattern, send, unreadSelector) {
+  await delay(400);
+  let resolveRead;
+  const paused = new Promise((resolve) => { resolveRead = resolve; });
+  const offRead = tab.on("Fetch.requestPaused", resolveRead);
+  await tab.send("Fetch.enable", { patterns: [{ urlPattern: pattern, requestStage: "Request" }] });
+  try {
+    await send("前台已看到");
+    const read = await Promise.race([paused, delay(5000).then(() => { throw new Error("read request was not intercepted"); })]);
+    await tab.evaluate("Object.defineProperty(document, 'visibilityState', {configurable:true, get:()=>window.__imHidden ? 'hidden' : 'visible'}); window.__imHidden=true; document.dispatchEvent(new Event('visibilitychange'))");
+    await send("后台未读");
+    await tab.waitFor(`document.querySelector(${JSON.stringify(unreadSelector)})?.textContent === '1'`);
+    let resolveCompleted;
+    const completed = new Promise((resolve) => { resolveCompleted = resolve; });
+    const offCompleted = tab.on("Network.loadingFinished", (event) => { if (event.requestId === read.networkId) resolveCompleted(); });
+    try {
+      await tab.send("Fetch.continueRequest", { requestId: read.requestId });
+      await Promise.race([completed, delay(5000).then(() => { throw new Error("read request did not finish"); })]);
+      await delay(250);
+      run.check(`in-flight read preserves background unread (${unreadSelector})`, await tab.evaluate(`document.querySelector(${JSON.stringify(unreadSelector)})?.textContent === '1'`));
+      run.check("read request captures viewed message position", Number(new URL(read.request.url).searchParams.get("through_id")) > 0);
+    } finally { offCompleted(); }
+  } finally {
+    offRead();
+    await tab.send("Fetch.disable");
+    await tab.evaluate("window.__imHidden=false; document.dispatchEvent(new Event('visibilitychange'))");
+  }
+}
+
 async function main() {
   console.log(`Browser smoke ${run.id}: ${run.base}`);
   for (const key of ["a", "b", "c"]) await run.register(key);
@@ -130,11 +159,11 @@ async function main() {
     await tab.waitFor(`!document.querySelector('#conversation-list ${memberSelector(live)} .unread-badge')`);
     run.check("opening group clears unread", true);
     run.check("group has no read receipt", !await tab.evaluate("!!document.querySelector('#message-list .read-state')"));
-    await tab.evaluate("Object.defineProperty(document, 'visibilityState', {configurable:true, get:()=>window.__imHidden ? 'hidden' : 'visible'}); window.__imHidden=true; document.dispatchEvent(new Event('visibilitychange'))");
-    await run.request("b", "POST", `/api/groups/${live}/messages`, { body: "后台未读", client_message_id: randomUUID() });
-    await tab.waitFor(`document.querySelector('#conversation-list ${memberSelector(live)} .unread-badge')?.textContent === '1'`);
-    run.check("hidden group keeps unread", true);
-    await tab.evaluate("window.__imHidden=false; document.dispatchEvent(new Event('visibilitychange'))");
+    await readWhileHiding(
+      `*/api/groups/${live}/read*`,
+      (body) => run.request("b", "POST", `/api/groups/${live}/messages`, { body, client_message_id: randomUUID() }),
+      `#conversation-list ${memberSelector(live)} .unread-badge`,
+    );
     await tab.waitFor(`!document.querySelector('#conversation-list ${memberSelector(live)} .unread-badge')`);
     run.check("returning to foreground clears unread", true);
     for (let index = 0; index < 32; index += 1) await run.request("b", "POST", `/api/groups/${live}/messages`, { body: `历史 ${index}`, client_message_id: randomUUID() });
@@ -142,7 +171,7 @@ async function main() {
     await tab.waitFor("document.querySelectorAll('#message-list .message-row').length === 30");
     run.check("refresh restores group and latest page", true);
     await tab.evaluate("const el=document.querySelector('#message-list'); el.scrollTop=0; el.dispatchEvent(new Event('scroll'))");
-    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length === 34");
+    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length === 35");
     run.check("scroll loads older group messages", true);
     await tab.viewport(390, 844);
     run.check("mobile page stays within viewport", await tab.evaluate("document.documentElement.scrollWidth <= innerWidth+1"));
@@ -153,6 +182,20 @@ async function main() {
     await tab.shot(join(run.reportDir, "mobile-group.png"));
     await tab.evaluate("document.querySelector('#group-info-panel .modal-header button').click()");
     await tab.viewport(1280, 900);
+  });
+
+  await scenario("private read in flight cannot consume unseen messages", async () => {
+    await tab.select(directSelector("b"), `/chat/${name("b")}`);
+    const unread = `#conversation-list ${directSelector("b")} .unread-badge`;
+    await readWhileHiding(
+      `*/api/conversations/${name("b")}/read*`,
+      (body) => run.request("b", "POST", `/api/conversations/${name("a")}/messages`, { body, client_message_id: randomUUID() }),
+      unread,
+    );
+    await tab.waitFor(`!document.querySelector(${JSON.stringify(unread)})`);
+    run.check("private foreground restoration clears unread", true);
+    await tab.select(memberSelector(live), `/chat/group/${live}`);
+    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length > 0");
   });
 
   await scenario("same-session new window replaces old chat connection", async () => {
