@@ -11,7 +11,7 @@
 
 ## 当前状态
 
-项目正在 `refactor/im` 分支从基础工程开始重构。[v0.1 基础工程](docs/versions/v0.1.md)、[v0.2 用户体系](docs/versions/v0.2.md) 和 [v0.3 好友体系](docs/versions/v0.3.md)（含好友记录）均已通过验收；[v0.4 文本私聊](docs/versions/v0.4.md) 和 [v0.5 消息体验补全](docs/versions/v0.5.md) 已通过联合验收；[v0.6 基础群聊](docs/versions/v0.6.md) 已通过验收。先建设 v0.x 基础 IM，后续再根据实际结果推进 v1.x 和 v2.x。
+项目正在 `refactor/im` 分支从基础工程开始重构。[v0.1 基础工程](docs/versions/v0.1.md)、[v0.2 用户体系](docs/versions/v0.2.md) 和 [v0.3 好友体系](docs/versions/v0.3.md)（含好友记录）均已通过验收；[v0.4 文本私聊](docs/versions/v0.4.md) 和 [v0.5 消息体验补全](docs/versions/v0.5.md) 已通过联合验收；[v0.6 基础群聊](docs/versions/v0.6.md) 已通过验收；[v0.7 整体联调与部署](docs/versions/v0.7.md) 已部署验证，等待验收。先建设 v0.x 基础 IM，后续再根据实际结果推进 v1.x 和 v2.x。
 
 ## 路线图
 

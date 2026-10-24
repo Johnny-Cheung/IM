@@ -205,6 +205,21 @@ API 和浏览器脚本使用 Node 26；浏览器脚本默认使用 `/Application
 
 脚本随机生成本轮账号和密码，密码只在进程内存中使用。完成后打印独立报告目录，`manifest.json` 只记录服务地址、本轮账号名、群 ID 和检查数；失败截图不包含登录表单。脚本退出非零表示检查未通过；账号清理需按本轮清单执行，不使用宽泛用户名通配符，不操作 `demo_*`。正式发布后的少量写入检查也必须使用本轮独立账号并按清单清理，不重置演示账号或它们的未读位置。
 
+清理脚本先生成 SQL，不直接连接数据库；它只接受已登记的随机测试账号名，并核对清单服务端口与所选数据库一致：
+
+```bash
+node scripts/cleanup-test-data.mjs im_v07_verify /tmp/im-cleanup.sql /path/to/manifest.json
+# 多轮清单可依次追加；正式8198的本轮清单需显式选择 im
+```
+
+输出文件不会覆盖已有文件。核对 SQL 中的数据库和账号清单后，用既有 relay 流程上传到开发机，再在开发机执行（示例使用已上传的文件）：
+
+```bash
+bash -c 'source /opt/IM-Rebuild/imctl; mysql_command mysql < /opt/IM-Rebuild/canary-v07/reports/cleanup.sql'
+```
+
+SQL 仅按明确用户名删除，表名包含固定数据库前缀，删除账号会级联清理这些账号的测试关系、消息和群；不会按用户名通配符清理，也不会修改真实账号或演示账号。
+
 ## 凭据和演示数据
 
 - 应用数据库密码使用已有受保护文件，不写进命令行、环境变量值、发布包、备份清单或对话。生产密码文件为 `/opt/IM-Rebuild/mysql/secrets/mysql-app`；`imctl restart` 会把它复制为 `/opt/IM-Rebuild/config/mysql-app`（`nobody`，0400），后端通过 `IM_MYSQL_PASSWORD_FILE` 引用。canary 使用自己的 `/opt/IM-Rebuild/canary-v07/mysql-app`。
