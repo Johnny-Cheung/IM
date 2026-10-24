@@ -2,8 +2,21 @@
 # Control script for the isolated IM rebuild deployment.
 set -euo pipefail
 ROOT=/opt/IM-Rebuild
+APP_ROOT="${ROOT}"
 UNIT=im-rebuild
 PORT=8198
+VERIFY_MODE=0
+MYSQL_DB=im
+MYSQL_USER=im_app
+if [ "${1:-}" = "--verify" ]; then
+  shift
+  VERIFY_MODE=1
+  APP_ROOT="${ROOT}/canary-v07"
+  UNIT=im-rebuild-verify
+  PORT=8199
+  MYSQL_DB=im_v07_verify
+  MYSQL_USER=im_v07_verify
+fi
 ADDR="0.0.0.0:${PORT}"
 BASELINE="${ROOT}/preflight/host.before"
 
@@ -19,6 +32,9 @@ MYSQL_ROOT_SECRET="${MYSQL_SECRETS}/mysql-root"
 MYSQL_APP_SECRET="${MYSQL_SECRETS}/mysql-app"
 CONFIG_DIR="${ROOT}/config"
 BACKEND_APP_SECRET="${CONFIG_DIR}/mysql-app"
+if [ "${VERIFY_MODE}" = "1" ]; then
+  BACKEND_APP_SECRET="${APP_ROOT}/mysql-app"
+fi
 
 D() { "${RUNTIME_DIR}/docker" --host "${DOCKER_SOCK}" "$@"; }
 
@@ -35,11 +51,6 @@ wait_ready() {
     code="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 2 "http://127.0.0.1:${PORT}/ready" || true)"
     if [ "${code}" = "200" ]; then
       return 0
-    fi
-    if [ "${code}" = "404" ]; then
-      if curl --fail --silent --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null; then
-        return 0
-      fi
     fi
     sleep 0.5
   done
@@ -86,6 +97,10 @@ runtime_stop() {
 }
 
 prepare_backend_config() {
+  if [ "${VERIFY_MODE}" = "1" ]; then
+    test -s "${BACKEND_APP_SECRET}"
+    return
+  fi
   mkdir -p "${CONFIG_DIR}"
   chmod 755 "${CONFIG_DIR}"
   install -o nobody -g root -m 0400 "${MYSQL_APP_SECRET}" "${BACKEND_APP_SECRET}"
@@ -163,13 +178,14 @@ backend_stop() {
 backend_start() {
   if systemctl is-active --quiet "${UNIT}"; then
     echo "backend is already running on port ${PORT}"
-    return 0
+    wait_ready
+    return
   fi
   if systemctl is-failed --quiet "${UNIT}"; then
     systemctl reset-failed "${UNIT}"
   fi
-  test -x "${ROOT}/bin/im-server"
-  test -f "${ROOT}/web/index.html"
+  test -x "${APP_ROOT}/bin/im-server"
+  test -f "${APP_ROOT}/web/index.html"
   local listeners
   listeners="$(ss -lnt | awk '{print $4}')"
   if grep -q ":${PORT}\$" <<<"${listeners}"; then
@@ -186,11 +202,11 @@ backend_start() {
     --property=MemoryAccounting=yes --property=MemoryLimit=134217728 \
     /usr/bin/env \
       IM_MYSQL_HOST=127.0.0.1 \
-      IM_MYSQL_PORT=13307 \
-      IM_MYSQL_DB=im \
-      IM_MYSQL_USER=im_app \
+      IM_MYSQL_PORT="${MYSQL_PORT}" \
+      IM_MYSQL_DB="${MYSQL_DB}" \
+      IM_MYSQL_USER="${MYSQL_USER}" \
       IM_MYSQL_PASSWORD_FILE="${BACKEND_APP_SECRET}" \
-    "${ROOT}/bin/im-server" -addr "${ADDR}" -web-dir "${ROOT}/web"
+    "${APP_ROOT}/bin/im-server" -addr "${ADDR}" -web-dir "${APP_ROOT}/web"
   if wait_ready; then
     echo "IM rebuild backend is ready on port ${PORT}"
   else
@@ -200,16 +216,47 @@ backend_start() {
 }
 
 start() {
-  runtime_start
-  mysql_start
+  if [ "${VERIFY_MODE}" = "1" ]; then
+    D info >/dev/null
+    test "$(D inspect -f '{{.State.Running}}' "${MYSQL_NAME}")" = "true"
+  else
+    mysql_start
+  fi
   backend_start
 }
 
 stop() {
   backend_stop
-  mysql_stop
-  runtime_stop
+  if [ "${VERIFY_MODE}" != "1" ]; then
+    mysql_stop
+    runtime_stop
+  fi
   echo "IM rebuild stopped; files and MySQL data are kept."
+}
+
+restart() {
+  if [ "${VERIFY_MODE}" = "1" ]; then
+    backend_stop
+    start
+  else
+    mysql_start
+    backend_stop
+    backend_start
+  fi
+}
+
+health() {
+  local endpoint code failed=0
+  for endpoint in health ready; do
+    if code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 3 "http://127.0.0.1:${PORT}/${endpoint}")"; then
+      printf '%s: HTTP %s\n' "${endpoint}" "${code}"
+      if [ "${code}" != "200" ]; then failed=1; fi
+    else
+      printf '%s: unreachable\n' "${endpoint}" >&2
+      failed=1
+    fi
+  done
+  return "${failed}"
 }
 
 status() {
@@ -231,8 +278,8 @@ status() {
   else
     echo "docker: stopped"
   fi
-  if [ -f "${ROOT}/RELEASE" ]; then
-    sed 's/^/  /' "${ROOT}/RELEASE"
+  if [ -f "${APP_ROOT}/RELEASE" ]; then
+    sed 's/^/  /' "${APP_ROOT}/RELEASE"
   fi
 }
 
@@ -260,18 +307,128 @@ verify_host() {
   fi
 }
 
-case "${1:-status}" in
-  baseline) mkdir -p "${ROOT}/preflight"; snapshot > "${BASELINE}"; echo "baseline recorded" ;;
-  start) start ;;
-  stop) stop ;;
-  restart) backend_stop; prepare_backend_config; backend_start ;;
-  status) status ;;
-  mysql-start) mysql_start ;;
-  mysql-stop) mysql_stop ;;
-  mysql-status) mysql_status ;;
-  runtime-start) runtime_start ;;
-  runtime-stop) runtime_stop ;;
-  verify-host) verify_host ;;
-  logs) logs "${2:-backend}" "${3:-80}" ;;
-  *) echo "Usage: $0 {baseline|start|stop|restart|status|mysql-start|mysql-stop|mysql-status|runtime-start|runtime-stop|verify-host|logs [backend|mysql|runtime] [lines]}" >&2; exit 2 ;;
-esac
+# Credentials stay in a short-lived option file inside the existing container.
+# stdin is left available for SQL/dump data, and the trap removes the option file.
+mysql_command() {
+  D exec -i "${MYSQL_NAME}" sh -c '
+    set -eu
+    umask 077
+    config=$(mktemp /tmp/im-admin.XXXXXX)
+    trap '\''rm -f "$config"'\'' EXIT
+    password=$(sed '\''s/\\/\\\\/g; s/"/\\"/g'\'' /run/secrets/mysql-root)
+    printf '\''[client]\nuser=root\npassword="%s"\nhost=127.0.0.1\nport=%s\nprotocol=tcp\n'\'' "$password" "$1" > "$config"
+    unset password
+    shift
+    command=$1
+    shift
+    "$command" --defaults-extra-file="$config" "$@"
+  ' im-admin "${MYSQL_PORT}" "$@"
+}
+
+backup() (
+  set -euo pipefail
+  umask 077
+  local destination
+  mkdir -p "${APP_ROOT}/backups"
+  chmod 700 "${APP_ROOT}/backups"
+  destination="$(mktemp -d "${APP_ROOT}/backups/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
+  touch "${destination}/.incomplete"
+  mysql_command mysqldump --single-transaction --skip-extended-insert \
+    --skip-comments --skip-add-locks --no-tablespaces --set-gtid-purged=OFF \
+    --hex-blob "${MYSQL_DB}" > "${destination}/database.sql"
+  awk '
+    /^CREATE TABLE `/ { table=$3; gsub(/`/, "", table); counts[table]=0 }
+    /^INSERT INTO `/ { table=$3; gsub(/`/, "", table); counts[table]++ }
+    END { for (table in counts) print table "\t" counts[table] }
+  ' "${destination}/database.sql" | LC_ALL=C sort > "${destination}/counts.tsv"
+  test -s "${destination}/counts.tsv"
+  mysql_command mysql --batch --skip-column-names "${MYSQL_DB}" \
+    -e 'SELECT version FROM schema_migrations ORDER BY version' > "${destination}/migrations.tsv"
+  mkdir "${destination}/bin"
+  cp -p "${APP_ROOT}/bin/im-server" "${destination}/bin/im-server"
+  cp -a "${APP_ROOT}/web" "${destination}/web"
+  cp -p "${APP_ROOT}/RELEASE" "${destination}/RELEASE"
+  printf 'database=%s\ncreated_at=%s\n' "${MYSQL_DB}" "$(date -u +%FT%TZ)" > "${destination}/source.txt"
+  (
+    cd "${destination}"
+    find . -type f ! -name SHA256SUMS ! -name .incomplete -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS
+  )
+  rm "${destination}/.incomplete"
+  printf '%s\n' "${destination}"
+)
+
+restore_check() (
+  set -euo pipefail
+  umask 077
+  local source scratch created=0 table expected actual table_count backup_root
+  source="${1:?Usage: imctl restore-check <backup>}"
+  source="$(cd "${source}" && pwd -P)"
+  backup_root="$(cd "${APP_ROOT}/backups" && pwd -P)"
+  case "${source}" in
+    "${backup_root}/"*) ;;
+    *) echo 'Backup must be under the selected application backup directory.' >&2; exit 2 ;;
+  esac
+  test ! -e "${source}/.incomplete"
+  test -s "${source}/database.sql"
+  test -s "${source}/counts.tsv"
+  (cd "${source}" && sha256sum --check --strict SHA256SUMS >/dev/null) || exit 1
+  if grep -Eiq '^(CREATE|DROP|ALTER)[[:space:]]+DATABASE|^USE[[:space:]]|^/\*![0-9]+[[:space:]]+(CREATE|DROP|ALTER)[[:space:]]+DATABASE|^/\*![0-9]+[[:space:]]+USE[[:space:]]' "${source}/database.sql"; then
+    echo 'Dump contains database selection or database DDL; refusing restore.' >&2
+    exit 2
+  fi
+  scratch="im_restore_$(date -u +%Y%m%d%H%M%S)_$$_${RANDOM}"
+  trap 'if [ "${created}" = "1" ]; then mysql_command mysql -e "DROP DATABASE \`${scratch}\`"; fi' EXIT
+  mysql_command mysql -e "CREATE DATABASE \`${scratch}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci" || exit 1
+  created=1
+  mysql_command mysql "${scratch}" < "${source}/database.sql" || exit 1
+  table_count="$(mysql_command mysql --batch --skip-column-names -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${scratch}'")"
+  test "${table_count}" = "$(wc -l < "${source}/counts.tsv" | tr -d ' ')" || exit 1
+  while IFS=$'\t' read -r table expected; do
+    if [[ ! "${table}" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ || ! "${expected}" =~ ^[0-9]+$ ]]; then
+      echo 'Invalid table/count manifest.' >&2
+      exit 2
+    fi
+    actual="$(mysql_command mysql --batch --skip-column-names "${scratch}" -e "SELECT COUNT(*) FROM \`${table}\`")"
+    if [ "${actual}" != "${expected}" ]; then
+      echo "Restored count mismatch for ${table}." >&2
+      exit 1
+    fi
+  done < "${source}/counts.tsv"
+  mysql_command mysql --batch --skip-column-names "${scratch}" \
+    -e 'SELECT version FROM schema_migrations ORDER BY version' | cmp -s "${source}/migrations.tsv" - || exit 1
+  mysql_command mysql -e "DROP DATABASE \`${scratch}\`" || exit 1
+  created=0
+  printf 'Restore verified: %s tables and migration versions; temporary database %s removed.\n' "${table_count}" "${scratch}"
+)
+
+main() {
+  if [ "${VERIFY_MODE}" = "1" ]; then
+    case "${1:-status}" in
+      mysql-stop|runtime-stop|baseline) echo 'Shared infrastructure cannot be stopped/reset in verification mode.' >&2; return 2 ;;
+    esac
+  fi
+  case "${1:-status}" in
+    baseline) mkdir -p "${ROOT}/preflight"; snapshot > "${BASELINE}"; echo "baseline recorded" ;;
+    start) start ;;
+    stop) stop ;;
+    restart) restart ;;
+    backend-start) backend_start ;;
+    backend-stop) backend_stop ;;
+    health) health ;;
+    status) status ;;
+    backup) backup ;;
+    restore-check) restore_check "${2:-}" ;;
+    mysql-start) mysql_start ;;
+    mysql-stop) mysql_stop ;;
+    mysql-status) mysql_status ;;
+    runtime-start) runtime_start ;;
+    runtime-stop) runtime_stop ;;
+    verify-host) verify_host ;;
+    logs) logs "${2:-backend}" "${3:-80}" ;;
+    *) echo "Usage: $0 [--verify] {start|stop|restart|backend-start|backend-stop|health|status|backup|restore-check <backup>|mysql-start|mysql-stop|mysql-status|runtime-start|runtime-stop|verify-host|logs [backend|mysql|runtime] [lines]}" >&2; return 2 ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
