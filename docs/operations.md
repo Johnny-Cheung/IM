@@ -190,6 +190,22 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 
 恢复 v0.6 基线时，把 `bin/im-server-v06` 复制为 `bin/im-server`、把 `web-v06` 恢复为 `web`，再执行 `imctl --verify restart`。验证结束后用 `imctl --verify stop` 只停止 canary 应用；不要停止共享 runtime/MySQL。临时单元由 `imctl --verify start` 在需要时重建，不影响生产 `8198`。
 
+## v1.1 基础设施（未接业务）
+
+- 独立目录 `/opt/IM-Rebuild/infra-v11`，使用独立私有 Docker runtime、systemd 单元 `im-infra-docker` 和独立凭据；不影响正式 `8198`、v0.7 runtime/MySQL 或旧 `/opt/IM`。
+- Redis `127.0.0.1:26379`（96 MiB），RabbitMQ `127.0.0.1:25676`（512 MiB）；凭据在 `infra-v11/secrets`，离线镜像在 `infra-v11/images`。
+- 管理命令：
+
+```bash
+/opt/IM-Rebuild/infra-v11/infractl start
+/opt/IM-Rebuild/infra-v11/infractl status
+/opt/IM-Rebuild/infra-v11/infractl health
+/opt/IM-Rebuild/infra-v11/infractl stop
+```
+
+- 单组件重启使用 `redis-restart`、`rabbitmq-restart`；日志使用 `logs redis|rabbitmq|runtime`。
+- 当前未接入私聊、群聊、已读或正式后端，不配置开机自启；开发机重启后手动执行 `infractl start`。
+
 ## 回归检查
 
 以下命令在 Mac 仓库根目录执行，默认目标为 `8199` 的独立验证库：
@@ -198,10 +214,12 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 node scripts/smoke.mjs
 node scripts/browser-smoke.mjs
 node scripts/capacity-smoke.mjs
+node scripts/perf-baseline.mjs
 bash deploy/imctl_test.sh
+bash deploy/infractl_test.sh
 ```
 
-API 和浏览器脚本使用 Node 26；浏览器脚本默认使用 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`，可通过 `CHROME_PATH` 指定本机 Chrome。通过 `BASE_URL` 指定其他已确认的验证地址。容量脚本会创建 101 个独立账号并验证 100 人边界，仅用于隔离验证库。
+API 和浏览器脚本使用 Node 26；浏览器脚本默认使用 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`，可通过 `CHROME_PATH` 指定本机 Chrome。通过 `BASE_URL` 指定其他已确认的验证地址。容量脚本会创建 101 个独立账号并验证 100 人边界，仅用于隔离验证库。性能基线脚本串行采样现有 API，只输出 p50/p95/max，不设阈值，也不做压力测试。
 
 脚本随机生成本轮账号和密码，密码只在进程内存中使用。完成后打印独立报告目录，`manifest.json` 只记录服务地址、本轮账号名、群 ID 和检查数；失败截图不包含登录表单。脚本退出非零表示检查未通过；账号清理需按本轮清单执行，不使用宽泛用户名通配符，不操作 `demo_*`。正式发布后的少量写入检查也必须使用本轮独立账号并按清单清理，不重置演示账号或它们的未读位置。
 
