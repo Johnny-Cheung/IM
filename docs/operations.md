@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前基线是已验收的 v0.7 单实例运行方式：MySQL、正式 `8198` 和验证 `8199`。v1.1 已完成基础设施准备，v1.2 及后续版本尚未开始；Redis/RabbitMQ 的业务接入、高可用的实现方式、消息确认语义、容量方案和部署拓扑均未确认；本手册不代表 v1.x 的目标运行方案。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式基线仍是已验收的 v0.7 单实例运行方式：MySQL、正式 `8198` 和验证 `8199`。v1.1 基础设施已就绪，v1.2 私聊消息链路已进入开发并在隔离实例验证；v1.3 及后续版本尚未开始。v1.2 的业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、完整读取优化、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -190,7 +190,7 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 
 恢复 v0.6 基线时，把 `bin/im-server-v06` 复制为 `bin/im-server`、把 `web-v06` 恢复为 `web`，再执行 `imctl --verify restart`。验证结束后用 `imctl --verify stop` 只停止 canary 应用；不要停止共享 runtime/MySQL。临时单元由 `imctl --verify start` 在需要时重建，不影响生产 `8198`。
 
-## v1.1 基础设施（未接业务）
+## v1.1 基础设施
 
 - 独立目录 `/opt/IM-Rebuild/infra-v11`，使用独立私有 Docker runtime、systemd 单元 `im-infra-docker` 和独立凭据；不影响正式 `8198`、v0.7 runtime/MySQL 或旧 `/opt/IM`。
 - Redis `127.0.0.1:26379`（96 MiB），RabbitMQ `127.0.0.1:25676`（512 MiB）；凭据在 `infra-v11/secrets`，离线镜像在 `infra-v11/images`。
@@ -204,7 +204,15 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 ```
 
 - 单组件重启使用 `redis-restart`、`rabbitmq-restart`；日志使用 `logs redis|rabbitmq|runtime`。
-- 当前未接入私聊、群聊、已读或正式后端，不配置开机自启；开发机重启后手动执行 `infractl start`。
+- 当前正式 `8198` 未接入私聊、群聊或已读消息链路，不配置开机自启；开发机重启后手动执行 `infractl start`。
+
+## v1.2 私聊消息链路（开发中）
+
+- v1.2 后端只有在 Redis 和 RabbitMQ 同时通过 `_FILE` 配置时才启用新链路；未配置时继续使用 MySQL 直写路径。
+- `deploy/imctl` 会把 `/opt/IM-Rebuild/infra-v11/secrets` 中的应用凭据复制到 `/opt/IM-Rebuild/config/infra-v11`，以 `nobody:root`、0400 权限提供 `IM_REDIS_URL_FILE`、`IM_REDIS_PASSWORD_FILE`、`IM_RABBITMQ_URL_FILE` 和 `IM_RABBITMQ_PASSWORD_FILE`。凭据不写入命令行、日志或仓库。
+- 新链路使用 Redis Lua 接纳、Redis Stream、RabbitMQ 异步落库和服务端消息号；`/ready` 仍只检查 MySQL，基础设施状态通过 `/ops/infra` 观察。
+- v1.2 隔离验证使用临时 systemd 单元和独立 `im_v07_verify` 数据库；验证结束后停止临时单元并按 manifest 清理测试数据。正式 `8198` 未更新、未重启。
+- v1.2 不配置开机自启，不做高可用故障转移、压力测试或容量调优。
 
 ## 回归检查
 
