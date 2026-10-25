@@ -7,13 +7,17 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/config"
 	"github.com/Johnny-Cheung/IM/backend/internal/httpapi"
 	"github.com/Johnny-Cheung/IM/backend/internal/infra"
+	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/gin-gonic/gin"
 )
@@ -34,32 +38,38 @@ func main() {
 	flag.StringVar(&options.webDir, "web-dir", "", "directory containing the frontend build")
 	flag.Parse()
 
+	if err := run(options); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run(options serverOptions) error {
 	dsn, err := config.MySQLDSN()
 	if err != nil {
-		log.Fatalf("load MySQL configuration: %v", err)
+		return fmt.Errorf("load MySQL configuration: %w", err)
 	}
 
-	startupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelStartup()
 
 	dataStore, err := store.Open(startupCtx, dsn)
 	if err != nil {
-		log.Fatalf("connect MySQL: %v", err)
+		return fmt.Errorf("connect MySQL: %w", err)
 	}
 	defer dataStore.Close()
 
 	if err := dataStore.Migrate(startupCtx); err != nil {
-		log.Fatalf("migrate MySQL: %v", err)
+		return fmt.Errorf("migrate MySQL: %w", err)
 	}
 	log.Printf("MySQL ready; migrations applied")
 
 	infraConfig, err := config.LoadInfra()
 	if err != nil {
-		log.Fatalf("load optional infrastructure configuration: %v", err)
+		return fmt.Errorf("load optional infrastructure configuration: %w", err)
 	}
 	infraManager, err := infra.New(infraConfig)
 	if err != nil {
-		log.Fatalf("configure optional infrastructure: %v", err)
+		return fmt.Errorf("configure optional infrastructure: %w", err)
 	}
 	if infraManager != nil {
 		infraManager.Start(context.Background())
@@ -71,18 +81,97 @@ func main() {
 		log.Printf("optional infrastructure enabled")
 	}
 
+	var directAcceptor *messaging.RedisAcceptor
+	var workerContext context.Context
+	var cancelWorkers context.CancelFunc
+	var workers sync.WaitGroup
+	if infraManager != nil && infraManager.RedisEnabled() && infraConfig.RabbitMQ.Enabled() {
+		seedFloor, err := dataStore.MaxServerMessageID(startupCtx)
+		if err != nil {
+			return fmt.Errorf("seed direct message ID: %w", err)
+		}
+		projection := messaging.NewFriendshipProjection(infraManager.Redis())
+		pairs, err := dataStore.ListFriendshipPairs(startupCtx)
+		if err != nil {
+			return fmt.Errorf("load friendship projection: %w", err)
+		}
+		if err := projection.Rebuild(startupCtx, pairs); err != nil {
+			return fmt.Errorf("rebuild friendship projection: %w", err)
+		}
+		directAcceptor = messaging.NewRedisAcceptor(
+			infraManager.Redis(),
+			messaging.RedisAcceptorOptions{SeedFloor: seedFloor},
+		)
+
+		workerContext, cancelWorkers = context.WithCancel(context.Background())
+		defer func() {
+			cancelWorkers()
+			workers.Wait()
+		}()
+
+		relay := messaging.NewStreamRelay(
+			infraManager.Redis(),
+			infraConfig.RabbitMQ,
+			infra.DialRabbit,
+		)
+		consumer := messaging.NewRabbitMessageConsumer(
+			infraConfig.RabbitMQ,
+			infra.DialRabbit,
+			dataStore,
+		)
+		workers.Add(2)
+		go func() {
+			defer workers.Done()
+			if err := relay.Run(workerContext); err != nil && workerContext.Err() == nil {
+				log.Printf("direct message stream relay stopped: %v", err)
+			}
+		}()
+		go func() {
+			defer workers.Done()
+			if err := consumer.Run(workerContext); err != nil && workerContext.Err() == nil {
+				log.Printf("direct message consumer stopped: %v", err)
+			}
+		}()
+		log.Printf("direct message pipeline enabled")
+	} else if infraManager != nil && (infraManager.RedisEnabled() || infraConfig.RabbitMQ.Enabled()) {
+		log.Printf("direct message pipeline disabled: Redis and RabbitMQ must both be configured")
+	}
+
 	router, err := newRouter(options.webDir, dataStore.Ping)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	if infraManager != nil {
 		registerInfraStatus(router, infraManager)
 	}
-	httpapi.New(dataStore).Register(router)
+	apiOptions := make([]httpapi.Option, 0, 1)
+	if directAcceptor != nil {
+		apiOptions = append(apiOptions, httpapi.WithDirectMessageAcceptor(directAcceptor))
+	}
+	httpapi.New(dataStore, apiOptions...).Register(router)
 
-	log.Printf("%s listening on %s", serviceName, options.addr)
-	if err := http.ListenAndServe(options.addr, router); err != nil {
-		log.Fatal(err)
+	server := &http.Server{Addr: options.addr, Handler: router}
+	serverErrors := make(chan error, 1)
+	go func() {
+		log.Printf("%s listening on %s", serviceName, options.addr)
+		serverErrors <- server.ListenAndServe()
+	}()
+
+	stopContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	select {
+	case err := <-serverErrors:
+		if err != nil && err != http.ErrServerClosed {
+			return fmt.Errorf("serve HTTP: %w", err)
+		}
+		return nil
+	case <-stopContext.Done():
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelShutdown()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("shutdown HTTP: %w", err)
+		}
+		return nil
 	}
 }
 
