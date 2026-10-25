@@ -112,6 +112,20 @@ func (m *Manager) Snapshot() Snapshot {
 	return m.status.snapshotCopy()
 }
 
+// Redis returns the manager-owned Redis client for business integrations.
+// The client is safe for concurrent use and is closed by Manager.Close.
+func (m *Manager) Redis() *redis.Client {
+	if m == nil {
+		return nil
+	}
+	return m.redis
+}
+
+// RedisEnabled reports whether a Redis client was configured.
+func (m *Manager) RedisEnabled() bool {
+	return m != nil && m.redis != nil
+}
+
 func (m *Manager) redisLoop(ctx context.Context) {
 	defer m.workers.Done()
 	for {
@@ -185,8 +199,12 @@ func newRedisClient(config config.RedisConfig) (*redis.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	options.Password = config.Password
-	options.DB = config.DB
+	if config.Password != "" {
+		options.Password = config.Password
+	}
+	if config.DB != 0 {
+		options.DB = config.DB
+	}
 	options.DialTimeout = config.DialTimeout
 	options.ReadTimeout = config.ReadTimeout
 	options.WriteTimeout = config.WriteTimeout
