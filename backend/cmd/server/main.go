@@ -82,6 +82,7 @@ func run(options serverOptions) error {
 	}
 
 	var directAcceptor *messaging.RedisAcceptor
+	var friendshipProjector *messaging.FriendshipProjection
 	var workerContext context.Context
 	var cancelWorkers context.CancelFunc
 	var workers sync.WaitGroup
@@ -90,12 +91,12 @@ func run(options serverOptions) error {
 		if err != nil {
 			return fmt.Errorf("seed direct message ID: %w", err)
 		}
-		projection := messaging.NewFriendshipProjection(infraManager.Redis())
+		friendshipProjector = messaging.NewFriendshipProjection(infraManager.Redis())
 		pairs, err := dataStore.ListFriendshipPairs(startupCtx)
 		if err != nil {
 			return fmt.Errorf("load friendship projection: %w", err)
 		}
-		if err := projection.Rebuild(startupCtx, pairs); err != nil {
+		if err := friendshipProjector.Rebuild(startupCtx, pairs); err != nil {
 			return fmt.Errorf("rebuild friendship projection: %w", err)
 		}
 		directAcceptor = messaging.NewRedisAcceptor(
@@ -144,9 +145,12 @@ func run(options serverOptions) error {
 	if infraManager != nil {
 		registerInfraStatus(router, infraManager)
 	}
-	apiOptions := make([]httpapi.Option, 0, 1)
+	apiOptions := make([]httpapi.Option, 0, 2)
 	if directAcceptor != nil {
 		apiOptions = append(apiOptions, httpapi.WithDirectMessageAcceptor(directAcceptor))
+	}
+	if friendshipProjector != nil {
+		apiOptions = append(apiOptions, httpapi.WithFriendshipProjector(friendshipProjector))
 	}
 	httpapi.New(dataStore, apiOptions...).Register(router)
 

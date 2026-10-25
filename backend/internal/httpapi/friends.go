@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net/http"
@@ -126,6 +127,7 @@ func (a *API) sendFriendRequest(c *gin.Context) {
 	}
 
 	if result.Accepted {
+		a.ensureFriendshipProjection(c.Request.Context(), current.ID, target.ID)
 		friend := toPublicUserResponse(result.Friend)
 		c.JSON(http.StatusOK, sendFriendRequestResponse{
 			Status: "accepted",
@@ -193,6 +195,14 @@ func (a *API) acceptFriendRequest(c *gin.Context) {
 		a.writeFriendError(c, err)
 		return
 	}
+	if friendUser, lookupErr := a.store.GetUserByUsernameKey(
+		c.Request.Context(),
+		auth.UsernameKey(friend.Username),
+	); lookupErr != nil {
+		log.Printf("load accepted friend for projection: %v", lookupErr)
+	} else {
+		a.ensureFriendshipProjection(c.Request.Context(), current.ID, friendUser.ID)
+	}
 
 	c.JSON(http.StatusOK, acceptFriendResponse{
 		Friend: toPublicUserResponse(friend),
@@ -258,7 +268,26 @@ func (a *API) deleteFriend(c *gin.Context) {
 		a.writeFriendError(c, err)
 		return
 	}
+	a.removeFriendshipProjection(c.Request.Context(), current.ID, target.ID)
 	c.Status(http.StatusNoContent)
+}
+
+func (a *API) ensureFriendshipProjection(ctx context.Context, userID, friendUserID uint64) {
+	if a.friendshipProject == nil {
+		return
+	}
+	if err := a.friendshipProject.EnsurePair(ctx, userID, friendUserID); err != nil {
+		log.Printf("update friendship projection: %v", err)
+	}
+}
+
+func (a *API) removeFriendshipProjection(ctx context.Context, userID, friendUserID uint64) {
+	if a.friendshipProject == nil {
+		return
+	}
+	if err := a.friendshipProject.RemovePair(ctx, userID, friendUserID); err != nil {
+		log.Printf("remove friendship projection: %v", err)
+	}
 }
 
 func (a *API) findUser(c *gin.Context, username string) (store.User, bool) {

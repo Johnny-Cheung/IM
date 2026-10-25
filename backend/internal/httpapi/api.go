@@ -134,11 +134,18 @@ type DirectMessageAcceptor interface {
 	Accept(context.Context, messaging.DirectMessageRequest) (messaging.DirectMessageResult, error)
 }
 
+// FriendshipProjector mirrors committed MySQL friendship changes in Redis.
+type FriendshipProjector interface {
+	EnsurePair(context.Context, uint64, uint64) error
+	RemovePair(context.Context, uint64, uint64) error
+}
+
 // API registers the versioned JSON endpoints.
 type API struct {
-	store          Store
-	hub            *Hub
-	directAcceptor DirectMessageAcceptor
+	store             Store
+	hub               *Hub
+	directAcceptor    DirectMessageAcceptor
+	friendshipProject FriendshipProjector
 }
 
 type Option func(*API)
@@ -146,6 +153,12 @@ type Option func(*API)
 func WithDirectMessageAcceptor(acceptor DirectMessageAcceptor) Option {
 	return func(api *API) {
 		api.directAcceptor = acceptor
+	}
+}
+
+func WithFriendshipProjector(projector FriendshipProjector) Option {
+	return func(api *API) {
+		api.friendshipProject = projector
 	}
 }
 
