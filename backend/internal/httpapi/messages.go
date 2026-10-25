@@ -268,6 +268,31 @@ func (a *API) listMessages(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
 		return
 	}
+	if a.directReader != nil {
+		var hotPage store.MessagePage
+		if afterID > 0 {
+			hotPage, err = a.directReader.ListMessagesAfter(
+				c.Request.Context(),
+				current.ID,
+				target.ID,
+				afterID,
+				limit,
+			)
+		} else {
+			hotPage, err = a.directReader.ListMessages(
+				c.Request.Context(),
+				current.ID,
+				target.ID,
+				beforeID,
+				limit,
+			)
+		}
+		if err != nil {
+			log.Printf("read hot messages: %v", err)
+		} else {
+			page = mergeMessagePages(page, hotPage, beforeID > 0 || afterID == 0, limit)
+		}
+	}
 
 	other := publicUserResponse{Username: target.Username, Nickname: target.Nickname}
 	response := messagePageResponse{
@@ -278,6 +303,34 @@ func (a *API) listMessages(c *gin.Context) {
 		response.Messages = append(response.Messages, toMessageResponse(message, current, other))
 	}
 	c.JSON(http.StatusOK, response)
+}
+
+func mergeMessagePages(primary, hot store.MessagePage, beforeDirection bool, limit int) store.MessagePage {
+	byID := make(map[uint64]store.Message, len(primary.Messages)+len(hot.Messages))
+	for _, message := range primary.Messages {
+		byID[message.ID] = message
+	}
+	for _, message := range hot.Messages {
+		if _, exists := byID[message.ID]; !exists {
+			byID[message.ID] = message
+		}
+	}
+
+	messages := make([]store.Message, 0, len(byID))
+	for _, message := range byID {
+		messages = append(messages, message)
+	}
+	sort.Slice(messages, func(i, j int) bool { return messages[i].ID < messages[j].ID })
+
+	hasMore := primary.HasMore || hot.HasMore || len(messages) > limit
+	if len(messages) > limit {
+		if beforeDirection {
+			messages = messages[len(messages)-limit:]
+		} else {
+			messages = messages[:limit]
+		}
+	}
+	return store.MessagePage{Messages: messages, HasMore: hasMore}
 }
 
 func (a *API) sendMessage(c *gin.Context) {

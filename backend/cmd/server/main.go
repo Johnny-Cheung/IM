@@ -82,6 +82,7 @@ func run(options serverOptions) error {
 	}
 
 	var directAcceptor *messaging.RedisAcceptor
+	var directReader *messaging.RedisMessageReader
 	var friendshipProjector *messaging.FriendshipProjection
 	var workerContext context.Context
 	var cancelWorkers context.CancelFunc
@@ -103,6 +104,7 @@ func run(options serverOptions) error {
 			infraManager.Redis(),
 			messaging.RedisAcceptorOptions{SeedFloor: seedFloor},
 		)
+		directReader = messaging.NewRedisMessageReader(infraManager.Redis())
 
 		workerContext, cancelWorkers = context.WithCancel(context.Background())
 		defer func() {
@@ -151,6 +153,9 @@ func run(options serverOptions) error {
 	}
 	if friendshipProjector != nil {
 		apiOptions = append(apiOptions, httpapi.WithFriendshipProjector(friendshipProjector))
+	}
+	if directReader != nil {
+		apiOptions = append(apiOptions, httpapi.WithDirectMessageReader(directReader))
 	}
 	httpapi.New(dataStore, apiOptions...).Register(router)
 

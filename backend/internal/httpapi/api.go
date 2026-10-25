@@ -140,11 +140,18 @@ type FriendshipProjector interface {
 	RemovePair(context.Context, uint64, uint64) error
 }
 
+// DirectMessageReader reads the bounded Redis hot-message window.
+type DirectMessageReader interface {
+	ListMessages(context.Context, uint64, uint64, uint64, int) (store.MessagePage, error)
+	ListMessagesAfter(context.Context, uint64, uint64, uint64, int) (store.MessagePage, error)
+}
+
 // API registers the versioned JSON endpoints.
 type API struct {
 	store             Store
 	hub               *Hub
 	directAcceptor    DirectMessageAcceptor
+	directReader      DirectMessageReader
 	friendshipProject FriendshipProjector
 }
 
@@ -159,6 +166,12 @@ func WithDirectMessageAcceptor(acceptor DirectMessageAcceptor) Option {
 func WithFriendshipProjector(projector FriendshipProjector) Option {
 	return func(api *API) {
 		api.friendshipProject = projector
+	}
+}
+
+func WithDirectMessageReader(reader DirectMessageReader) Option {
+	return func(api *API) {
+		api.directReader = reader
 	}
 }
 
