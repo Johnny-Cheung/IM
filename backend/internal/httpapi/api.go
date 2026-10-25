@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/auth"
+	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/gin-gonic/gin"
 )
@@ -128,14 +129,32 @@ type Store interface {
 	MarkGroupRead(ctx context.Context, userID, groupID, throughID uint64) (uint64, bool, error)
 }
 
-// API registers the versioned JSON endpoints.
-type API struct {
-	store Store
-	hub   *Hub
+// DirectMessageAcceptor is the optional v1.2 message acceptance path.
+type DirectMessageAcceptor interface {
+	Accept(context.Context, messaging.DirectMessageRequest) (messaging.DirectMessageResult, error)
 }
 
-func New(dataStore Store) *API {
-	return &API{store: dataStore, hub: NewHub()}
+// API registers the versioned JSON endpoints.
+type API struct {
+	store          Store
+	hub            *Hub
+	directAcceptor DirectMessageAcceptor
+}
+
+type Option func(*API)
+
+func WithDirectMessageAcceptor(acceptor DirectMessageAcceptor) Option {
+	return func(api *API) {
+		api.directAcceptor = acceptor
+	}
+}
+
+func New(dataStore Store, options ...Option) *API {
+	api := &API{store: dataStore, hub: NewHub()}
+	for _, option := range options {
+		option(api)
+	}
+	return api
 }
 
 // Register mounts authentication and current-user routes under /api.

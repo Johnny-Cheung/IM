@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/gin-gonic/gin"
 )
@@ -300,14 +301,33 @@ func (a *API) sendMessage(c *gin.Context) {
 		return
 	}
 
-	message, created, err := a.store.CreateMessage(
-		c.Request.Context(),
-		current.ID,
-		target.ID,
-		clientMessageID,
-		body,
-		time.Now().UTC(),
-	)
+	var message store.Message
+	var created bool
+	var err error
+	if a.directAcceptor != nil {
+		result, acceptErr := a.directAcceptor.Accept(
+			c.Request.Context(),
+			messaging.DirectMessageRequest{
+				SenderID:        current.ID,
+				RecipientID:     target.ID,
+				ClientMessageID: clientMessageID,
+				Body:            body,
+				CreatedAt:       time.Now().UTC(),
+			},
+		)
+		message = result.Message
+		created = result.Created
+		err = acceptErr
+	} else {
+		message, created, err = a.store.CreateMessage(
+			c.Request.Context(),
+			current.ID,
+			target.ID,
+			clientMessageID,
+			body,
+			time.Now().UTC(),
+		)
+	}
 	if err != nil {
 		a.writeMessageError(c, err)
 		return
@@ -400,6 +420,12 @@ func (a *API) writeMessageError(c *gin.Context, err error) {
 		writeError(c, http.StatusBadRequest, "cannot_message_self", "不能给自己发送消息")
 	case errors.Is(err, store.ErrUserNotFound):
 		writeError(c, http.StatusNotFound, "user_not_found", "未找到该用户")
+	case errors.Is(err, store.ErrMessageConflict):
+		writeError(c, http.StatusConflict, "client_message_id_conflict", "消息标识对应的内容不一致")
+	case errors.Is(err, store.ErrMessageIDExhausted):
+		writeError(c, http.StatusServiceUnavailable, "message_id_exhausted", "消息服务暂时不可用")
+	case errors.Is(err, messaging.ErrMessageServiceUnavailable):
+		writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂时不可用")
 	default:
 		log.Printf("message operation: %v", err)
 		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")

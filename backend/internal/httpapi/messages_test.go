@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -17,6 +19,109 @@ func authenticatedChatStore() *fakeStore {
 	dataStore := authenticatedFriendStore()
 	dataStore.user = store.User{ID: 2, Username: "bob", Nickname: "Bob"}
 	return dataStore
+}
+
+type directMessageAcceptorStub struct {
+	request messaging.DirectMessageRequest
+	result  messaging.DirectMessageResult
+	err     error
+}
+
+func (s *directMessageAcceptorStub) Accept(
+	_ context.Context,
+	request messaging.DirectMessageRequest,
+) (messaging.DirectMessageResult, error) {
+	s.request = request
+	return s.result, s.err
+}
+
+func TestSendMessageUsesDirectAcceptor(t *testing.T) {
+	dataStore := authenticatedFriendStore()
+	dataStore.usersByKey = map[string]store.User{
+		"bob": {ID: 2, Username: "bob", Nickname: "Bob"},
+	}
+	acceptor := &directMessageAcceptorStub{
+		result: messaging.DirectMessageResult{
+			Created: true,
+			Message: store.Message{
+				ID:              42,
+				SenderID:        1,
+				RecipientID:     2,
+				ClientMessageID: "client-12345678",
+				Body:            "hello",
+				CreatedAt:       time.UnixMilli(1700000000123).UTC(),
+			},
+		},
+	}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	New(dataStore, WithDirectMessageAcceptor(acceptor)).Register(router)
+
+	recorder := doJSON(
+		t,
+		router,
+		http.MethodPost,
+		"/api/conversations/bob/messages",
+		map[string]string{
+			"body":              "hello",
+			"client_message_id": "client-12345678",
+		},
+		authTestCookie(),
+	)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusCreated)
+	}
+	if acceptor.request.SenderID != 1 || acceptor.request.RecipientID != 2 ||
+		acceptor.request.ClientMessageID != "client-12345678" || acceptor.request.Body != "hello" {
+		t.Fatalf("accept request = %#v", acceptor.request)
+	}
+	response := decodeBody[sendMessageResponse](t, recorder)
+	if response.Message.ID != 42 || response.Message.Body != "hello" {
+		t.Fatalf("response message = %#v", response.Message)
+	}
+}
+
+func TestSendMessageMapsDirectAcceptorErrors(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		statusCode int
+		code       string
+	}{
+		{name: "conflict", err: store.ErrMessageConflict, statusCode: http.StatusConflict, code: "client_message_id_conflict"},
+		{name: "unavailable", err: messaging.ErrMessageServiceUnavailable, statusCode: http.StatusServiceUnavailable, code: "message_service_unavailable"},
+		{name: "id exhausted", err: store.ErrMessageIDExhausted, statusCode: http.StatusServiceUnavailable, code: "message_id_exhausted"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			dataStore := authenticatedFriendStore()
+			dataStore.usersByKey = map[string]store.User{
+				"bob": {ID: 2, Username: "bob", Nickname: "Bob"},
+			}
+			acceptor := &directMessageAcceptorStub{err: testCase.err}
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			New(dataStore, WithDirectMessageAcceptor(acceptor)).Register(router)
+
+			recorder := doJSON(
+				t,
+				router,
+				http.MethodPost,
+				"/api/conversations/bob/messages",
+				map[string]string{
+					"body":              "hello",
+					"client_message_id": "client-12345678",
+				},
+				authTestCookie(),
+			)
+			if recorder.Code != testCase.statusCode {
+				t.Fatalf("status = %d, want %d", recorder.Code, testCase.statusCode)
+			}
+			if got := errorCode(t, recorder); got != testCase.code {
+				t.Fatalf("error code = %q, want %q", got, testCase.code)
+			}
+		})
+	}
 }
 
 func TestListConversations(t *testing.T) {
