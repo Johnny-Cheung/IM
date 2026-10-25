@@ -238,6 +238,11 @@ func (a *API) inviteGroupMembers(c *gin.Context) {
 		}
 		a.PublishGroupChanged(allIDs, groupID, "members_changed")
 	} else {
+		if a.groupProjector != nil {
+			if err := a.groupProjector.Replace(c.Request.Context(), groupID, allIDs, false); err != nil {
+				log.Printf("project invited group %d: %v", groupID, err)
+			}
+		}
 		existing := userIDSet(existingIDs)
 		newMemberIDs := make([]uint64, 0, len(allIDs))
 		for _, memberID := range allIDs {
