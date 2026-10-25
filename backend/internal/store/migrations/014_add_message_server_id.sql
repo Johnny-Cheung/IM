@@ -1,0 +1,1 @@
+ALTER TABLE messages ADD COLUMN server_message_id BIGINT UNSIGNED NULL AFTER id;

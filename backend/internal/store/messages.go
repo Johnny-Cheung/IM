@@ -10,12 +10,17 @@ import (
 	"time"
 )
 
+const MaxSafeMessageID uint64 = 1<<53 - 1
+
 var (
-	ErrNotFriends        = errors.New("not friends")
-	ErrCannotMessageSelf = errors.New("cannot message self")
+	ErrNotFriends         = errors.New("not friends")
+	ErrCannotMessageSelf  = errors.New("cannot message self")
+	ErrMessageConflict    = errors.New("message conflict")
+	ErrMessageIDExhausted = errors.New("message ID exhausted")
 )
 
-// Message is a persisted one-to-one chat message.
+// Message is a persisted one-to-one chat message. ID is the public server
+// message ID; the MySQL auto-increment primary key is internal only.
 type Message struct {
 	ID              uint64
 	SenderID        uint64
@@ -77,18 +82,18 @@ func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Convers
 	}
 
 	latestRows, err := s.db.QueryContext(ctx,
-		`SELECT m.id, m.sender_id, m.recipient_id, m.client_message_id,
+		`SELECT m.server_message_id, m.sender_id, m.recipient_id, m.client_message_id,
 		        m.body, m.created_at, u.username, u.nickname
 		 FROM messages m
 		 JOIN users u
 		   ON u.id = CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END
-		 WHERE m.id IN (
-		     SELECT MAX(id)
+		 WHERE m.server_message_id IN (
+		     SELECT MAX(server_message_id)
 		     FROM messages
 		     WHERE sender_id = ? OR recipient_id = ?
 		     GROUP BY CASE WHEN sender_id = ? THEN recipient_id ELSE sender_id END
 		 )
-		 ORDER BY m.id DESC`,
+		 ORDER BY m.server_message_id DESC`,
 		userID, userID, userID, userID,
 	)
 	if err != nil {
@@ -142,7 +147,7 @@ func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Convers
 		 LEFT JOIN conversation_reads r
 		   ON r.user_id = ? AND r.peer_user_id = m.sender_id
 		 WHERE m.recipient_id = ?
-		   AND m.id > COALESCE(r.last_read_message_id, 0)
+		   AND m.server_message_id > COALESCE(r.last_read_message_id, 0)
 		 GROUP BY u.username`,
 		userID, userID,
 	)
@@ -225,16 +230,16 @@ func (s *Store) ListMessages(
 	userID, otherID, beforeID uint64,
 	limit int,
 ) (MessagePage, error) {
-	query := `SELECT id, sender_id, recipient_id, client_message_id, body, created_at
+	query := `SELECT server_message_id, sender_id, recipient_id, client_message_id, body, created_at
 	          FROM messages
 	          WHERE ((sender_id = ? AND recipient_id = ?)
 	              OR (sender_id = ? AND recipient_id = ?))`
 	args := []any{userID, otherID, otherID, userID}
 	if beforeID > 0 {
-		query += ` AND id < ?`
+		query += ` AND server_message_id < ?`
 		args = append(args, beforeID)
 	}
-	query += ` ORDER BY id DESC LIMIT ?`
+	query += ` ORDER BY server_message_id DESC LIMIT ?`
 	args = append(args, limit+1)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -297,6 +302,9 @@ func (s *Store) CreateMessage(
 
 	existing, err := loadMessageByClientID(ctx, tx, senderID, recipientID, clientMessageID)
 	if err == nil {
+		if existing.Body != body {
+			return Message{}, false, ErrMessageConflict
+		}
 		if err := tx.Commit(); err != nil {
 			return Message{}, false, fmt.Errorf("commit existing message: %w", err)
 		}
@@ -317,30 +325,172 @@ func (s *Store) CreateMessage(
 		return Message{}, false, ErrNotFriends
 	}
 
-	result, err := tx.ExecContext(ctx,
-		`INSERT INTO messages
-		   (sender_id, recipient_id, client_message_id, body, created_at)
-		 VALUES (?, ?, ?, ?, ?)`,
-		senderID, recipientID, clientMessageID, body, now,
-	)
+	serverMessageID, err := nextDirectMessageID(ctx, tx)
 	if err != nil {
-		return Message{}, false, fmt.Errorf("insert message: %w", err)
+		return Message{}, false, err
 	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return Message{}, false, fmt.Errorf("read message id: %w", err)
+	if serverMessageID > MaxSafeMessageID {
+		return Message{}, false, ErrMessageIDExhausted
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO messages
+		   (server_message_id, sender_id, recipient_id, client_message_id, body, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		serverMessageID, senderID, recipientID, clientMessageID, body, now,
+	); err != nil {
+		return Message{}, false, fmt.Errorf("insert message: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return Message{}, false, fmt.Errorf("commit message: %w", err)
 	}
 	return Message{
-		ID:              uint64(id),
+		ID:              serverMessageID,
 		SenderID:        senderID,
 		RecipientID:     recipientID,
 		ClientMessageID: clientMessageID,
 		Body:            body,
 		CreatedAt:       now,
 	}, true, nil
+}
+
+func nextDirectMessageID(ctx context.Context, tx *sql.Tx) (uint64, error) {
+	result, err := tx.ExecContext(ctx,
+		`UPDATE message_id_sequences
+		 SET last_value = last_value + 1
+		 WHERE scope = 'direct'`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("advance direct message sequence: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read direct message sequence result: %w", err)
+	}
+	if rows != 1 {
+		return 0, fmt.Errorf("direct message sequence is not initialized")
+	}
+
+	var id uint64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT last_value
+		 FROM message_id_sequences
+		 WHERE scope = 'direct'
+		 FOR UPDATE`,
+	).Scan(&id); err != nil {
+		return 0, fmt.Errorf("read direct message sequence: %w", err)
+	}
+	return id, nil
+}
+
+// MaxServerMessageID returns the highest public message ID currently stored.
+func (s *Store) MaxServerMessageID(ctx context.Context) (uint64, error) {
+	var id uint64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(server_message_id), 0) FROM messages`,
+	).Scan(&id); err != nil {
+		return 0, fmt.Errorf("max server message id: %w", err)
+	}
+	return id, nil
+}
+
+// PersistMessage inserts an asynchronously accepted message idempotently.
+// It does not re-check friendship because that decision was made at acceptance.
+func (s *Store) PersistMessage(ctx context.Context, message Message) (bool, error) {
+	if message.ID == 0 || message.ID > MaxSafeMessageID {
+		return false, ErrMessageIDExhausted
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin persist message transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx,
+		`INSERT INTO messages
+		   (server_message_id, sender_id, recipient_id, client_message_id, body, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE id = id`,
+		message.ID,
+		message.SenderID,
+		message.RecipientID,
+		message.ClientMessageID,
+		message.Body,
+		message.CreatedAt,
+	)
+	if err != nil {
+		return false, fmt.Errorf("persist message: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read persist message result: %w", err)
+	}
+	if rows == 1 {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit persisted message: %w", err)
+		}
+		return true, nil
+	}
+	if rows != 0 {
+		return false, fmt.Errorf("unexpected persist message rows affected: %d", rows)
+	}
+
+	existing, err := loadMessageByServerID(ctx, tx, message.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		existing, err = loadMessageByClientID(
+			ctx,
+			tx,
+			message.SenderID,
+			message.RecipientID,
+			message.ClientMessageID,
+		)
+	}
+	if err != nil {
+		return false, fmt.Errorf("load duplicate persisted message: %w", err)
+	}
+	if !sameMessage(existing, message) {
+		return false, ErrMessageConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit duplicate persisted message: %w", err)
+	}
+	return false, nil
+}
+
+func sameMessage(left, right Message) bool {
+	return left.ID == right.ID &&
+		left.SenderID == right.SenderID &&
+		left.RecipientID == right.RecipientID &&
+		left.ClientMessageID == right.ClientMessageID &&
+		left.Body == right.Body &&
+		left.CreatedAt.Truncate(time.Millisecond).Equal(right.CreatedAt.Truncate(time.Millisecond))
+}
+
+func loadMessageByServerID(ctx context.Context, tx *sql.Tx, serverMessageID uint64) (Message, error) {
+	var message Message
+	err := tx.QueryRowContext(ctx,
+		`SELECT server_message_id, sender_id, recipient_id, client_message_id, body, created_at
+		 FROM messages
+		 WHERE server_message_id = ?
+		 FOR UPDATE`,
+		serverMessageID,
+	).Scan(
+		&message.ID,
+		&message.SenderID,
+		&message.RecipientID,
+		&message.ClientMessageID,
+		&message.Body,
+		&message.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Message{}, sql.ErrNoRows
+	}
+	if err != nil {
+		return Message{}, fmt.Errorf("load message by server id: %w", err)
+	}
+	return message, nil
 }
 
 func loadMessageByClientID(
@@ -351,7 +501,7 @@ func loadMessageByClientID(
 ) (Message, error) {
 	var message Message
 	err := tx.QueryRowContext(ctx,
-		`SELECT id, sender_id, recipient_id, client_message_id, body, created_at
+		`SELECT server_message_id, sender_id, recipient_id, client_message_id, body, created_at
 		 FROM messages
 		 WHERE sender_id = ? AND recipient_id = ? AND client_message_id = ?
 		 FOR UPDATE`,
@@ -380,12 +530,12 @@ func (s *Store) ListMessagesAfter(
 	limit int,
 ) (MessagePage, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, sender_id, recipient_id, client_message_id, body, created_at
+		`SELECT server_message_id, sender_id, recipient_id, client_message_id, body, created_at
 		 FROM messages
 		 WHERE ((sender_id = ? AND recipient_id = ?)
 		     OR (sender_id = ? AND recipient_id = ?))
-		   AND id > ?
-		 ORDER BY id ASC
+		   AND server_message_id > ?
+		 ORDER BY server_message_id ASC
 		 LIMIT ?`,
 		userID, otherID, otherID, userID, afterID, limit+1,
 	)
@@ -434,10 +584,10 @@ func (s *Store) MarkConversationRead(
 
 	var latest uint64
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(id), 0)
+		`SELECT COALESCE(MAX(server_message_id), 0)
 		 FROM messages
 		 WHERE sender_id = ? AND recipient_id = ?
-		   AND (? = 0 OR id <= ?)`,
+		   AND (? = 0 OR server_message_id <= ?)`,
 		peerID, userID, throughID, throughID,
 	).Scan(&latest); err != nil {
 		return 0, false, fmt.Errorf("find latest incoming message: %w", err)

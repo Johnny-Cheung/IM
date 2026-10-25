@@ -18,8 +18,8 @@ func TestMigrationsAreEmbedded(t *testing.T) {
 			names = append(names, entry.Name())
 		}
 	}
-	if len(names) != 13 {
-		t.Fatalf("migration count = %d (%v), want 13", len(names), names)
+	if len(names) != 18 {
+		t.Fatalf("migration count = %d (%v), want 18", len(names), names)
 	}
 	want := []string{
 		"001_create_users.sql",
@@ -35,6 +35,11 @@ func TestMigrationsAreEmbedded(t *testing.T) {
 		"011_create_chat_groups.sql",
 		"012_create_group_members.sql",
 		"013_create_group_messages.sql",
+		"014_add_message_server_id.sql",
+		"015_backfill_message_server_id.sql",
+		"016_finalize_message_server_id.sql",
+		"017_create_message_id_sequences.sql",
+		"018_seed_message_id_sequences.sql",
 	}
 	for i, name := range want {
 		if names[i] != name {
