@@ -204,7 +204,7 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 ```
 
 - 单组件重启使用 `redis-restart`、`rabbitmq-restart`；日志使用 `logs redis|rabbitmq|runtime`。
-- 当前正式 `8198` 已接入 v1.2 私聊消息链路，群聊和已读仍按路线留在后续版本；不配置开机自启，开发机重启后手动执行 `infractl start` 和 `imctl restart`。
+- 当前正式 `8198` 已接入 v1.2 私聊和 v1.3 群聊消息链路，群聊已读仍按路线留在 v1.6；不配置开机自启，开发机重启后手动执行 `infractl start` 和 `imctl restart`。
 
 ## v1.2 私聊消息链路（已切换正式）
 
@@ -214,14 +214,16 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 - v1.2 隔离验证使用临时 systemd 单元和独立 `im_v07_verify` 数据库；验证结束后停止临时单元并按 manifest 清理测试数据。隔离验证通过后，正式 `8198` 已切换到 v1.2，正式 API 回归使用独立账号并按 manifest 清理。
 - v1.2 不配置开机自启，不做高可用故障转移、压力测试或容量调优。
 
-## v1.3 群聊消息链路（已开发完成，隔离验证通过）
+## v1.3 群聊消息链路（已切换正式）
 
 - 群聊与私聊共享消息号规则、accepted/persisted 语义和基础 worker 骨架，但使用独立的群 Lua、群成员投影、群统一信箱、群消息表、群 Stream 和群 RabbitMQ 拓扑。
 - `deploy/imctl --verify` 现在必须注入隔离基础设施：Redis DB 1、RabbitMQ vhost `im_v13_verify`、namespace `im:v13-verify`，并强制 `IM_MESSAGING_REQUIRED=true`。验证实例缺少这些配置时拒绝启动，不再静默回落 MySQL。
 - `deploy/infractl` 在 RabbitMQ 启动后幂等创建验证 vhost 并授予 `im_v11` 用户最小可用权限；只新增 vhost，不修改正式 `im_v11` vhost、Redis 数据或生产队列。
-- 正式 `8198` 的 `deploy/imctl` 启动参数增加 `IM_GROUP_MESSAGING_ENABLED=true` 和 namespace `im:v12`；未部署 v1.3 前正式实例仍运行 v1.2，群链路参数不会被旧二进制读取。
-- v1.3 隔离验证使用临时单元 `im-rebuild-verify`、`im_v07_verify` 数据库和验证命名空间；验证结束后停止临时单元，按 manifest 清理测试账号，并只删除 `im:v13-verify:*` 键。
-- v1.3 未切换正式 `8198`，不做群聊已读、高可用故障转移、pending 接管、死信、对账、压力测试或容量调优。
+- 正式 `8198` 的 `deploy/imctl` 启动参数包含 `IM_GROUP_MESSAGING_ENABLED=true` 和 namespace `im:v12`；正式库迁移到 022 后，私聊与群聊共用消息号水位，分别写入 `messages` 和 `group_messages`。
+- 正式 `im_v11` vhost 目前同时存在 `im.v12.messages.persist`（私聊）和 `im.v12.group.messages.persist`（群聊）两个队列；验证只在 `im_v13_verify` vhost 内使用独立群/私聊队列。
+- 正式切换前需用 `imctl backup` 备份数据库和应用文件；群消息对外编号从内部自增 ID 切换为共享服务端消息号，属不可逆数据格式变更，应用回滚应使用上一个 v1.3 构建，不要直接回滚到 v1.2 二进制。
+- v1.3 隔离验证使用临时单元 `im-rebuild-verify`、`im_v07_verify` 数据库和验证命名空间；验证结束后停止临时单元，按 manifest 清理测试账号、群 ID 对应的 Redis 投影键，并只删除 `im:v13-verify:*` 键。
+- v1.3 不做群聊已读、高可用故障转移、pending 接管、死信、对账、压力测试或容量调优。
 
 ## 回归检查
 
