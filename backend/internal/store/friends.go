@@ -27,6 +27,12 @@ const (
 	RelationshipNone            Relationship = "none"
 )
 
+// FriendshipPair is one directed row from the friendships table.
+type FriendshipPair struct {
+	UserID       uint64
+	FriendUserID uint64
+}
+
 // PublicUser is the user information safe to expose to other users.
 type PublicUser struct {
 	Username string
@@ -114,6 +120,44 @@ func (s *Store) GetRelationship(ctx context.Context, viewerID, targetID uint64) 
 	default:
 		return RelationshipNone, nil
 	}
+}
+
+// AreFriends reports whether the directed friendship row exists.
+func (s *Store) AreFriends(ctx context.Context, userID, friendUserID uint64) (bool, error) {
+	var exists int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM friendships WHERE user_id = ? AND friend_user_id = ?
+		)`,
+		userID, friendUserID,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check friendship: %w", err)
+	}
+	return exists == 1, nil
+}
+
+// ListFriendshipPairs returns every directed friendship row.
+func (s *Store) ListFriendshipPairs(ctx context.Context) ([]FriendshipPair, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT user_id, friend_user_id FROM friendships`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list friendship pairs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	pairs := make([]FriendshipPair, 0)
+	for rows.Next() {
+		var pair FriendshipPair
+		if err := rows.Scan(&pair.UserID, &pair.FriendUserID); err != nil {
+			return nil, fmt.Errorf("scan friendship pair: %w", err)
+		}
+		pairs = append(pairs, pair)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate friendship pairs: %w", err)
+	}
+	return pairs, nil
 }
 
 // ListFriends returns the user's friends ordered by nickname and username.
