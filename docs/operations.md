@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式基线仍是已验收的 v0.7 单实例运行方式：MySQL、正式 `8198` 和验证 `8199`。v1.1 基础设施已就绪，v1.2 私聊消息链路已进入开发并在隔离实例验证；v1.3 及后续版本尚未开始。v1.2 的业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、完整读取优化、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例已切换为 v1.2 私聊消息链路：MySQL、正式 `8198` 和验证 `8199`。v1.1 基础设施已就绪，v1.2 已完成正式切换；v1.3 及后续版本尚未开始。v1.2 的业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、完整读取优化、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -204,14 +204,14 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 ```
 
 - 单组件重启使用 `redis-restart`、`rabbitmq-restart`；日志使用 `logs redis|rabbitmq|runtime`。
-- 当前正式 `8198` 未接入私聊、群聊或已读消息链路，不配置开机自启；开发机重启后手动执行 `infractl start`。
+- 当前正式 `8198` 已接入 v1.2 私聊消息链路，群聊和已读仍按路线留在后续版本；不配置开机自启，开发机重启后手动执行 `infractl start` 和 `imctl restart`。
 
-## v1.2 私聊消息链路（开发中）
+## v1.2 私聊消息链路（已切换正式）
 
 - v1.2 后端只有在 Redis 和 RabbitMQ 同时通过 `_FILE` 配置时才启用新链路；未配置时继续使用 MySQL 直写路径。
 - `deploy/imctl` 会把 `/opt/IM-Rebuild/infra-v11/secrets` 中的应用凭据复制到 `/opt/IM-Rebuild/config/infra-v11`，以 `nobody:root`、0400 权限提供 `IM_REDIS_URL_FILE`、`IM_REDIS_PASSWORD_FILE`、`IM_RABBITMQ_URL_FILE` 和 `IM_RABBITMQ_PASSWORD_FILE`。凭据不写入命令行、日志或仓库。
 - 新链路使用 Redis Lua 接纳、Redis Stream、RabbitMQ 异步落库和服务端消息号；`/ready` 仍只检查 MySQL，基础设施状态通过 `/ops/infra` 观察。
-- v1.2 隔离验证使用临时 systemd 单元和独立 `im_v07_verify` 数据库；验证结束后停止临时单元并按 manifest 清理测试数据。正式 `8198` 未更新、未重启。
+- v1.2 隔离验证使用临时 systemd 单元和独立 `im_v07_verify` 数据库；验证结束后停止临时单元并按 manifest 清理测试数据。隔离验证通过后，正式 `8198` 已切换到 v1.2，正式 API 回归使用独立账号并按 manifest 清理。
 - v1.2 不配置开机自启，不做高可用故障转移、压力测试或容量调优。
 
 ## 回归检查
