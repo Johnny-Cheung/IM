@@ -2,32 +2,94 @@ package messaging
 
 import "fmt"
 
-const redisPrefix = "im:v12:"
+const redisPrefix = DefaultMessagingNamespace + ":"
+
+var defaultKeyspace = NewKeyspace(DefaultNamespace())
 
 func counterKey() string {
-	return redisPrefix + "messages:next_id"
+	return defaultKeyspace.counterKey()
 }
 
 func friendshipKey(userID uint64) string {
-	return fmt.Sprintf("%sfriends:%d", redisPrefix, userID)
+	return defaultKeyspace.friendshipKey(userID)
 }
 
 func dedupKey(senderID, recipientID uint64, clientMessageID string) string {
-	return fmt.Sprintf("%sdedup:%d:%d:%s", redisPrefix, senderID, recipientID, clientMessageID)
+	return defaultKeyspace.dedupKey(senderID, recipientID, clientMessageID)
 }
 
 func messageKey(messageID uint64) string {
-	return fmt.Sprintf("%smessages:%d", redisPrefix, messageID)
+	return defaultKeyspace.messageKey(messageID)
 }
 
 func outboxKey(userID uint64) string {
-	return fmt.Sprintf("%soutbox:%d", redisPrefix, userID)
+	return defaultKeyspace.outboxKey(userID)
 }
 
 func inboxKey(userID uint64) string {
-	return fmt.Sprintf("%sinbox:%d", redisPrefix, userID)
+	return defaultKeyspace.inboxKey(userID)
 }
 
 func messageStreamKey() string {
-	return redisPrefix + "messages:stream"
+	return defaultKeyspace.messageStreamKey()
+}
+
+func (k Keyspace) counterKey() string {
+	return k.prefixOrDefault() + "messages:next_id"
+}
+
+func (k Keyspace) friendshipKey(userID uint64) string {
+	return fmt.Sprintf("%sfriends:%d", k.prefixOrDefault(), userID)
+}
+
+func (k Keyspace) dedupKey(senderID, recipientID uint64, clientMessageID string) string {
+	return fmt.Sprintf("%sdedup:%d:%d:%s", k.prefixOrDefault(), senderID, recipientID, clientMessageID)
+}
+
+func (k Keyspace) messageKey(messageID uint64) string {
+	return fmt.Sprintf("%smessages:%d", k.prefixOrDefault(), messageID)
+}
+
+func (k Keyspace) outboxKey(userID uint64) string {
+	return fmt.Sprintf("%soutbox:%d", k.prefixOrDefault(), userID)
+}
+
+func (k Keyspace) inboxKey(userID uint64) string {
+	return fmt.Sprintf("%sinbox:%d", k.prefixOrDefault(), userID)
+}
+
+func (k Keyspace) messageStreamKey() string {
+	return k.prefixOrDefault() + "messages:stream"
+}
+
+func (k Keyspace) groupMembersKey(groupID uint64) string {
+	return fmt.Sprintf("%sgroup:%d:members", k.prefixOrDefault(), groupID)
+}
+
+func (k Keyspace) groupDissolvedKey(groupID uint64) string {
+	return fmt.Sprintf("%sgroup:%d:dissolved", k.prefixOrDefault(), groupID)
+}
+
+func (k Keyspace) groupSyncRequiredKey(groupID uint64) string {
+	return fmt.Sprintf("%sgroup:%d:sync_required", k.prefixOrDefault(), groupID)
+}
+
+func (k Keyspace) groupInboxKey(groupID uint64) string {
+	return fmt.Sprintf("%sgroup:%d:inbox", k.prefixOrDefault(), groupID)
+}
+
+func (k Keyspace) groupLastAcceptedKey(groupID uint64) string {
+	return fmt.Sprintf("%sgroup:%d:last_accepted_id", k.prefixOrDefault(), groupID)
+}
+
+func (k Keyspace) groupDedupKey(groupID, senderID uint64, clientMessageID string) string {
+	return fmt.Sprintf("%sgroup-dedup:%d:%d:%s", k.prefixOrDefault(), groupID, senderID, clientMessageID)
+}
+
+func (k Keyspace) groupMessageKey(messageID uint64) string {
+	return fmt.Sprintf("%sgroup-messages:%d", k.prefixOrDefault(), messageID)
+}
+
+func (k Keyspace) groupMessageStreamKey() string {
+	return k.prefixOrDefault() + "group-messages:stream"
 }

@@ -13,11 +13,16 @@ import (
 
 // RedisMessageReader reads the bounded hot-message window for one conversation.
 type RedisMessageReader struct {
-	client redis.UniversalClient
+	client   redis.UniversalClient
+	keyspace Keyspace
 }
 
 func NewRedisMessageReader(client redis.UniversalClient) *RedisMessageReader {
-	return &RedisMessageReader{client: client}
+	return NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
+}
+
+func NewRedisMessageReaderWithKeyspace(client redis.UniversalClient, keyspace Keyspace) *RedisMessageReader {
+	return &RedisMessageReader{client: client, keyspace: keyspace}
 }
 
 func (r *RedisMessageReader) ListMessages(
@@ -49,20 +54,28 @@ func (r *RedisMessageReader) list(
 	}
 
 	ids := make(map[uint64]struct{}, (limit+1)*2)
-	for _, key := range []string{inboxKey(userID), outboxKey(userID)} {
+	for _, key := range []string{r.keyspace.inboxKey(userID), r.keyspace.outboxKey(userID)} {
 		var values []string
 		var err error
-		if beforeID > 0 {
+		switch {
+		case beforeID > 0:
 			values, err = r.client.ZRevRangeByScore(ctx, key, &redis.ZRangeBy{
 				Max:    exclusiveMax(beforeID),
 				Min:    "-inf",
 				Offset: 0,
 				Count:  int64(limit + 1),
 			}).Result()
-		} else {
+		case afterID > 0:
 			values, err = r.client.ZRangeByScore(ctx, key, &redis.ZRangeBy{
 				Min:    exclusiveMin(afterID),
 				Max:    "+inf",
+				Offset: 0,
+				Count:  int64(limit + 1),
+			}).Result()
+		default:
+			values, err = r.client.ZRevRangeByScore(ctx, key, &redis.ZRangeBy{
+				Max:    "+inf",
+				Min:    "-inf",
 				Offset: 0,
 				Count:  int64(limit + 1),
 			}).Result()
@@ -100,7 +113,7 @@ func (r *RedisMessageReader) list(
 
 	hasMore := len(messages) > limit
 	if hasMore {
-		if beforeID > 0 {
+		if beforeID > 0 || afterID == 0 {
 			messages = messages[len(messages)-limit:]
 		} else {
 			messages = messages[:limit]
@@ -110,7 +123,7 @@ func (r *RedisMessageReader) list(
 }
 
 func (r *RedisMessageReader) loadMessage(ctx context.Context, id uint64) (store.Message, bool, error) {
-	values, err := r.client.HMGet(ctx, messageKey(id),
+	values, err := r.client.HMGet(ctx, r.keyspace.messageKey(id),
 		"id", "sender_id", "recipient_id", "client_message_id", "body", "created_at_ms",
 	).Result()
 	if err != nil {

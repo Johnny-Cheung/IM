@@ -325,7 +325,7 @@ func (s *Store) CreateMessage(
 		return Message{}, false, ErrNotFriends
 	}
 
-	serverMessageID, err := nextDirectMessageID(ctx, tx)
+	serverMessageID, err := nextMessageID(ctx, tx)
 	if err != nil {
 		return Message{}, false, err
 	}
@@ -354,31 +354,45 @@ func (s *Store) CreateMessage(
 	}, true, nil
 }
 
-func nextDirectMessageID(ctx context.Context, tx *sql.Tx) (uint64, error) {
-	result, err := tx.ExecContext(ctx,
-		`UPDATE message_id_sequences
-		 SET last_message_id = last_message_id + 1
-		 WHERE scope = 'direct'`,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("advance direct message sequence: %w", err)
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("read direct message sequence result: %w", err)
-	}
-	if rows != 1 {
-		return 0, fmt.Errorf("direct message sequence is not initialized")
-	}
-
-	var id uint64
+func nextMessageID(ctx context.Context, tx *sql.Tx) (uint64, error) {
+	var sequenceID, directMax, groupMax uint64
 	if err := tx.QueryRowContext(ctx,
 		`SELECT last_message_id
 		 FROM message_id_sequences
 		 WHERE scope = 'direct'
 		 FOR UPDATE`,
-	).Scan(&id); err != nil {
-		return 0, fmt.Errorf("read direct message sequence: %w", err)
+	).Scan(&sequenceID); err != nil {
+		return 0, fmt.Errorf("read message sequence: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(server_message_id), 0) FROM messages`,
+	).Scan(&directMax); err != nil {
+		return 0, fmt.Errorf("read direct message watermark: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(server_message_id), 0) FROM group_messages`,
+	).Scan(&groupMax); err != nil {
+		return 0, fmt.Errorf("read group message watermark: %w", err)
+	}
+
+	id := sequenceID
+	if directMax > id {
+		id = directMax
+	}
+	if groupMax > id {
+		id = groupMax
+	}
+	if id >= MaxSafeMessageID {
+		return 0, ErrMessageIDExhausted
+	}
+	id++
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE message_id_sequences
+		 SET last_message_id = ?
+		 WHERE scope = 'direct'`,
+		id,
+	); err != nil {
+		return 0, fmt.Errorf("advance message sequence: %w", err)
 	}
 	return id, nil
 }
@@ -387,7 +401,11 @@ func nextDirectMessageID(ctx context.Context, tx *sql.Tx) (uint64, error) {
 func (s *Store) MaxServerMessageID(ctx context.Context) (uint64, error) {
 	var id uint64
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(server_message_id), 0) FROM messages`,
+		`SELECT GREATEST(
+			COALESCE((SELECT MAX(server_message_id) FROM messages), 0),
+			COALESCE((SELECT MAX(server_message_id) FROM group_messages), 0),
+			COALESCE((SELECT last_message_id FROM message_id_sequences WHERE scope = 'direct'), 0)
+		)`,
 	).Scan(&id); err != nil {
 		return 0, fmt.Errorf("max server message id: %w", err)
 	}

@@ -21,11 +21,19 @@ return 1
 
 // FriendshipProjection mirrors the directed friendship rows needed by Lua.
 type FriendshipProjection struct {
-	client redis.UniversalClient
+	client   redis.UniversalClient
+	keyspace Keyspace
 }
 
 func NewFriendshipProjection(client redis.UniversalClient) *FriendshipProjection {
-	return &FriendshipProjection{client: client}
+	return NewFriendshipProjectionWithKeyspace(client, defaultKeyspace)
+}
+
+func NewFriendshipProjectionWithKeyspace(
+	client redis.UniversalClient,
+	keyspace Keyspace,
+) *FriendshipProjection {
+	return &FriendshipProjection{client: client, keyspace: keyspace}
 }
 
 // EnsurePair adds both directions of a friendship atomically in Redis.
@@ -36,7 +44,7 @@ func (p *FriendshipProjection) EnsurePair(ctx context.Context, userID, friendUse
 	return ensureFriendshipScript.Run(
 		ctx,
 		p.client,
-		[]string{friendshipKey(userID), friendshipKey(friendUserID)},
+		[]string{p.keyspace.friendshipKey(userID), p.keyspace.friendshipKey(friendUserID)},
 		userID,
 		friendUserID,
 	).Err()
@@ -50,7 +58,7 @@ func (p *FriendshipProjection) RemovePair(ctx context.Context, userID, friendUse
 	return removeFriendshipScript.Run(
 		ctx,
 		p.client,
-		[]string{friendshipKey(userID), friendshipKey(friendUserID)},
+		[]string{p.keyspace.friendshipKey(userID), p.keyspace.friendshipKey(friendUserID)},
 		userID,
 		friendUserID,
 	).Err()
@@ -61,7 +69,7 @@ func (p *FriendshipProjection) IsFriend(ctx context.Context, userID, friendUserI
 	if p == nil || p.client == nil {
 		return false, ErrMessageServiceUnavailable
 	}
-	return p.client.SIsMember(ctx, friendshipKey(userID), friendUserID).Result()
+	return p.client.SIsMember(ctx, p.keyspace.friendshipKey(userID), friendUserID).Result()
 }
 
 // Rebuild replaces all v1.2 friendship projection keys from MySQL rows.
@@ -72,7 +80,7 @@ func (p *FriendshipProjection) Rebuild(ctx context.Context, pairs []store.Friend
 
 	var cursor uint64
 	for {
-		keys, next, err := p.client.Scan(ctx, cursor, redisPrefix+"friends:*", 0).Result()
+		keys, next, err := p.client.Scan(ctx, cursor, p.keyspace.prefixOrDefault()+"friends:*", 0).Result()
 		if err != nil {
 			return err
 		}
@@ -89,7 +97,7 @@ func (p *FriendshipProjection) Rebuild(ctx context.Context, pairs []store.Friend
 
 	pipe := p.client.Pipeline()
 	for _, pair := range pairs {
-		pipe.SAdd(ctx, friendshipKey(pair.UserID), pair.FriendUserID)
+		pipe.SAdd(ctx, p.keyspace.friendshipKey(pair.UserID), pair.FriendUserID)
 	}
 	_, err := pipe.Exec(ctx)
 	return err

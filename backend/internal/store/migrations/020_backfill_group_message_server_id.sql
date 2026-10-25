@@ -1,0 +1,1 @@
+UPDATE group_messages SET server_message_id = id WHERE server_message_id IS NULL;

@@ -146,13 +146,40 @@ type DirectMessageReader interface {
 	ListMessagesAfter(context.Context, uint64, uint64, uint64, int) (store.MessagePage, error)
 }
 
+// GroupMessageAcceptor is the optional Redis group acceptance path.
+type GroupMessageAcceptor interface {
+	Accept(context.Context, messaging.GroupMessageRequest) (messaging.GroupMessageResult, error)
+}
+
+// GroupMessageReader reads the bounded Redis hot-message window for one group.
+type GroupMessageReader interface {
+	ListGroupMessages(context.Context, uint64, uint64, uint64, int) (store.GroupMessagePage, error)
+	ListGroupMessagesAfter(context.Context, uint64, uint64, uint64, int) (store.GroupMessagePage, error)
+}
+
+// GroupAcceptedWatermarkReader reads the highest group message accepted by Redis.
+type GroupAcceptedWatermarkReader interface {
+	LastAcceptedID(context.Context, uint64) (uint64, error)
+}
+
+// GroupProjector mirrors committed group membership changes in Redis.
+type GroupProjector interface {
+	Replace(context.Context, uint64, []uint64, bool) error
+	BeginMutation(context.Context, uint64) error
+	EndMutation(context.Context, uint64) error
+}
+
 // API registers the versioned JSON endpoints.
 type API struct {
-	store             Store
-	hub               *Hub
-	directAcceptor    DirectMessageAcceptor
-	directReader      DirectMessageReader
-	friendshipProject FriendshipProjector
+	store                Store
+	hub                  *Hub
+	directAcceptor       DirectMessageAcceptor
+	directReader         DirectMessageReader
+	friendshipProject    FriendshipProjector
+	groupAcceptor        GroupMessageAcceptor
+	groupReader          GroupMessageReader
+	groupWatermarkReader GroupAcceptedWatermarkReader
+	groupProjector       GroupProjector
 }
 
 type Option func(*API)
@@ -172,6 +199,30 @@ func WithFriendshipProjector(projector FriendshipProjector) Option {
 func WithDirectMessageReader(reader DirectMessageReader) Option {
 	return func(api *API) {
 		api.directReader = reader
+	}
+}
+
+func WithGroupMessageAcceptor(acceptor GroupMessageAcceptor) Option {
+	return func(api *API) {
+		api.groupAcceptor = acceptor
+	}
+}
+
+func WithGroupMessageReader(reader GroupMessageReader) Option {
+	return func(api *API) {
+		api.groupReader = reader
+	}
+}
+
+func WithGroupAcceptedWatermarkReader(reader GroupAcceptedWatermarkReader) Option {
+	return func(api *API) {
+		api.groupWatermarkReader = reader
+	}
+}
+
+func WithGroupProjector(projector GroupProjector) Option {
+	return func(api *API) {
+		api.groupProjector = projector
 	}
 }
 

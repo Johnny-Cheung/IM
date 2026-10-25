@@ -215,6 +215,7 @@ rabbit_start() {
   local attempt
   for attempt in $(seq 1 90); do
     if rabbit_health >/dev/null 2>&1; then
+      rabbit_prepare_verify_vhost
       return 0
     fi
     sleep 1
@@ -227,6 +228,13 @@ rabbit_stop() {
   if D info >/dev/null 2>&1 && D container inspect "${RABBIT_NAME}" >/dev/null 2>&1; then
     D stop "${RABBIT_NAME}" >/dev/null || true
   fi
+}
+
+rabbit_prepare_verify_vhost() {
+  D exec "${RABBIT_NAME}" rabbitmqctl list_vhosts -q \
+    | awk '{print $1}' | grep -qx 'im_v13_verify' \
+    || D exec "${RABBIT_NAME}" rabbitmqctl add_vhost im_v13_verify >/dev/null
+  D exec "${RABBIT_NAME}" rabbitmqctl set_permissions -p im_v13_verify im_v11 '.*' '.*' '.*' >/dev/null
 }
 
 rabbit_recreate() {

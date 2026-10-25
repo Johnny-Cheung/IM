@@ -25,7 +25,15 @@ pass() { TEST_COUNT=$((TEST_COUNT+1)); printf 'PASS %s\n' "$1"; }
 sleep() { :; }
 journalctl() { :; }
 ss() { printf 'State Recv-Q Send-Q LocalAddress PeerAddress\n'; }
-prepare_backend_config() { :; }
+prepare_backend_config() {
+  if [ "${VERIFY_MODE}" = "1" ]; then
+    mkdir -p "${INFRA_CONFIG_DIR}"
+    printf '%s\n' redis > "${INFRA_REDIS_URL_FILE}"
+    printf '%s\n' redis-password > "${INFRA_REDIS_PASSWORD_FILE}"
+    printf '%s\n' rabbit > "${INFRA_RABBITMQ_URL_FILE}"
+    printf '%s\n' rabbit-password > "${INFRA_RABBITMQ_PASSWORD_FILE}"
+  fi
+}
 curl() {
   local url="${*: -1}"
   if [ "${TEST_NETWORK}" = 1 ]; then return 7; fi
@@ -57,6 +65,11 @@ restart >/dev/null
 test "$(tr '\n' ' ' < "${TEST_DIR}/calls")" = 'dependencies create dependencies stop create '
 pass 'restart running backend recreates transient unit without stopping MySQL'
 VERIFY_MODE=1
+INFRA_CONFIG_DIR="${APP_ROOT}/config/infra-v13-verify"
+INFRA_REDIS_URL_FILE="${INFRA_CONFIG_DIR}/redis-url"
+INFRA_REDIS_PASSWORD_FILE="${INFRA_CONFIG_DIR}/redis-password"
+INFRA_RABBITMQ_URL_FILE="${INFRA_CONFIG_DIR}/rabbitmq-url"
+INFRA_RABBITMQ_PASSWORD_FILE="${INFRA_CONFIG_DIR}/rabbitmq-password"
 : > "${TEST_DIR}/calls"
 stop >/dev/null
 test "$(tr '\n' ' ' < "${TEST_DIR}/calls")" = 'stop '

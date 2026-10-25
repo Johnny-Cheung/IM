@@ -9,13 +9,23 @@ import (
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 )
 
-const (
-	directExchangeName = "im.v12.messages"
-	directQueueName    = "im.v12.messages.persist"
-	directRoutingKey   = "direct.persist"
-	directConsumerName = "im-v12-direct"
-	directRelayGroup   = "im-v12-relay"
-)
+const directRoutingKey = "direct.persist"
+
+func directExchangeName(namespace Namespace) string {
+	return namespace.RabbitPrefix() + ".messages"
+}
+
+func directQueueName(namespace Namespace) string {
+	return namespace.RabbitPrefix() + ".messages.persist"
+}
+
+func directConsumerName(namespace Namespace) string {
+	return namespace.ConsumerPrefix() + "-direct"
+}
+
+func directRelayGroup(namespace Namespace) string {
+	return namespace.ConsumerPrefix() + "-relay"
+}
 
 type directMessageEnvelope struct {
 	ServerMessageID uint64 `json:"server_message_id"`

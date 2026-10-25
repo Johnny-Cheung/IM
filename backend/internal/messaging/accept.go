@@ -35,6 +35,7 @@ type RedisAcceptor struct {
 // RedisAcceptorOptions controls bounded Redis message storage.
 type RedisAcceptorOptions struct {
 	SeedFloor    uint64
+	Keyspace     Keyspace
 	EntityTTL    time.Duration
 	DedupTTL     time.Duration
 	InboxKeep    int64
@@ -78,13 +79,14 @@ func (a *RedisAcceptor) Accept(ctx context.Context, request DirectMessageRequest
 	}
 	createdAt := request.CreatedAt.UTC().Truncate(time.Millisecond)
 	bodyHash := hashMessageBody(request.Body)
+	keyspace := a.options.Keyspace
 	keys := []string{
-		counterKey(),
-		friendshipKey(request.SenderID),
-		dedupKey(request.SenderID, request.RecipientID, request.ClientMessageID),
-		outboxKey(request.SenderID),
-		inboxKey(request.RecipientID),
-		messageStreamKey(),
+		keyspace.counterKey(),
+		keyspace.friendshipKey(request.SenderID),
+		keyspace.dedupKey(request.SenderID, request.RecipientID, request.ClientMessageID),
+		keyspace.outboxKey(request.SenderID),
+		keyspace.inboxKey(request.RecipientID),
+		keyspace.messageStreamKey(),
 	}
 	args := []interface{}{
 		request.SenderID,
@@ -100,7 +102,7 @@ func (a *RedisAcceptor) Accept(ctx context.Context, request DirectMessageRequest
 		a.options.InboxKeep,
 		a.options.OutboxKeep,
 		a.options.StreamMaxLen,
-		redisPrefix + "messages:",
+		keyspace.prefixOrDefault() + "messages:",
 	}
 	values, err := acceptScript.Run(ctx, a.client, keys, args...).Slice()
 	if err != nil {

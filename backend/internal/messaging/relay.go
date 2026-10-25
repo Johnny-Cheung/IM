@@ -15,9 +15,11 @@ type RabbitDialer func(config.RabbitMQConfig) (*amqp091.Connection, error)
 
 // StreamRelay moves accepted Redis Stream messages into RabbitMQ.
 type StreamRelay struct {
-	redis  redis.UniversalClient
-	config config.RabbitMQConfig
-	dialer RabbitDialer
+	redis     redis.UniversalClient
+	config    config.RabbitMQConfig
+	dialer    RabbitDialer
+	keyspace  Keyspace
+	namespace Namespace
 }
 
 func NewStreamRelay(
@@ -25,7 +27,17 @@ func NewStreamRelay(
 	rabbitConfig config.RabbitMQConfig,
 	dialer RabbitDialer,
 ) *StreamRelay {
-	return &StreamRelay{redis: client, config: rabbitConfig, dialer: dialer}
+	return NewStreamRelayWithNamespace(client, rabbitConfig, dialer, defaultKeyspace, DefaultNamespace())
+}
+
+func NewStreamRelayWithNamespace(
+	client redis.UniversalClient,
+	rabbitConfig config.RabbitMQConfig,
+	dialer RabbitDialer,
+	keyspace Keyspace,
+	namespace Namespace,
+) *StreamRelay {
+	return &StreamRelay{redis: client, config: rabbitConfig, dialer: dialer, keyspace: keyspace, namespace: namespace}
 }
 
 // Run blocks until the context is canceled. It reconnects after basic
@@ -61,22 +73,22 @@ func (r *StreamRelay) runConnection(ctx context.Context) error {
 		return fmt.Errorf("open RabbitMQ relay channel: %w", err)
 	}
 	defer channel.Close()
-	if err := declareDirectTopology(channel); err != nil {
+	if err := declareDirectTopology(channel, r.namespace); err != nil {
 		return err
 	}
 	if err := channel.Confirm(false); err != nil {
 		return fmt.Errorf("enable RabbitMQ publisher confirms: %w", err)
 	}
 	confirms := channel.NotifyPublish(make(chan amqp091.Confirmation, 1))
-	if err := ensureRelayGroup(ctx, r.redis); err != nil {
+	if err := ensureRelayGroup(ctx, r.redis, r.keyspace, r.namespace); err != nil {
 		return err
 	}
 
 	for {
 		streams, err := r.redis.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    directRelayGroup,
-			Consumer: directConsumerName,
-			Streams:  []string{messageStreamKey(), ">"},
+			Group:    directRelayGroup(r.namespace),
+			Consumer: directConsumerName(r.namespace),
+			Streams:  []string{r.keyspace.messageStreamKey(), ">"},
 			Count:    10,
 			Block:    2 * time.Second,
 		}).Result()
@@ -106,10 +118,10 @@ func (r *StreamRelay) relayEntry(
 	if err != nil {
 		// Entries are produced by our own Lua script. A malformed entry cannot
 		// be retried successfully, so acknowledge and remove it after logging.
-		if ackErr := r.redis.XAck(ctx, messageStreamKey(), directRelayGroup, entry.ID).Err(); ackErr != nil {
+		if ackErr := r.redis.XAck(ctx, r.keyspace.messageStreamKey(), directRelayGroup(r.namespace), entry.ID).Err(); ackErr != nil {
 			return fmt.Errorf("ack malformed stream entry %s: %w", entry.ID, ackErr)
 		}
-		if delErr := r.redis.XDel(ctx, messageStreamKey(), entry.ID).Err(); delErr != nil {
+		if delErr := r.redis.XDel(ctx, r.keyspace.messageStreamKey(), entry.ID).Err(); delErr != nil {
 			return fmt.Errorf("delete malformed stream entry %s: %w", entry.ID, delErr)
 		}
 		return nil
@@ -118,7 +130,7 @@ func (r *StreamRelay) relayEntry(
 	if err != nil {
 		return err
 	}
-	if err := channel.PublishWithContext(ctx, directExchangeName, directRoutingKey, false, false, amqp091.Publishing{
+	if err := channel.PublishWithContext(ctx, directExchangeName(r.namespace), directRoutingKey, false, false, amqp091.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp091.Persistent,
 		MessageId:    fmt.Sprintf("%d", message.ID),
@@ -134,31 +146,33 @@ func (r *StreamRelay) relayEntry(
 	case <-ctx.Done():
 		return nil
 	}
-	if err := r.redis.XAck(ctx, messageStreamKey(), directRelayGroup, entry.ID).Err(); err != nil {
+	if err := r.redis.XAck(ctx, r.keyspace.messageStreamKey(), directRelayGroup(r.namespace), entry.ID).Err(); err != nil {
 		return fmt.Errorf("ack stream message %s: %w", entry.ID, err)
 	}
-	if err := r.redis.XDel(ctx, messageStreamKey(), entry.ID).Err(); err != nil {
+	if err := r.redis.XDel(ctx, r.keyspace.messageStreamKey(), entry.ID).Err(); err != nil {
 		return fmt.Errorf("delete stream message %s: %w", entry.ID, err)
 	}
 	return nil
 }
 
-func ensureRelayGroup(ctx context.Context, client redis.UniversalClient) error {
-	err := client.XGroupCreateMkStream(ctx, messageStreamKey(), directRelayGroup, "0-0").Err()
+func ensureRelayGroup(ctx context.Context, client redis.UniversalClient, keyspace Keyspace, namespace Namespace) error {
+	err := client.XGroupCreateMkStream(ctx, keyspace.messageStreamKey(), directRelayGroup(namespace), "0-0").Err()
 	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
 		return fmt.Errorf("create Redis relay group: %w", err)
 	}
 	return nil
 }
 
-func declareDirectTopology(channel *amqp091.Channel) error {
-	if err := channel.ExchangeDeclare(directExchangeName, "direct", true, false, false, false, nil); err != nil {
+func declareDirectTopology(channel *amqp091.Channel, namespace Namespace) error {
+	exchange := directExchangeName(namespace)
+	queue := directQueueName(namespace)
+	if err := channel.ExchangeDeclare(exchange, "direct", true, false, false, false, nil); err != nil {
 		return fmt.Errorf("declare direct message exchange: %w", err)
 	}
-	if _, err := channel.QueueDeclare(directQueueName, true, false, false, false, nil); err != nil {
+	if _, err := channel.QueueDeclare(queue, true, false, false, false, nil); err != nil {
 		return fmt.Errorf("declare direct message queue: %w", err)
 	}
-	if err := channel.QueueBind(directQueueName, directRoutingKey, directExchangeName, false, nil); err != nil {
+	if err := channel.QueueBind(queue, directRoutingKey, exchange, false, nil); err != nil {
 		return fmt.Errorf("bind direct message queue: %w", err)
 	}
 	return nil

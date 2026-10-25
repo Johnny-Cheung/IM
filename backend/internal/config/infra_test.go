@@ -17,6 +17,24 @@ func TestLoadInfraDisabledByDefault(t *testing.T) {
 	if config.Redis.Enabled() || config.RabbitMQ.Enabled() {
 		t.Fatalf("config = %#v, want both components disabled", config)
 	}
+	if config.MessagingNamespace != DefaultMessagingNamespace || config.MessagingRequired || config.GroupMessagingEnabled {
+		t.Fatalf("messaging config = %#v, want default disabled settings", config)
+	}
+}
+
+func TestLoadInfraReadsMessagingSettings(t *testing.T) {
+	clearInfraEnv(t)
+	t.Setenv("IM_MESSAGING_NAMESPACE", "im:v13-verify")
+	t.Setenv("IM_MESSAGING_REQUIRED", "true")
+	t.Setenv("IM_GROUP_MESSAGING_ENABLED", "1")
+
+	config, err := LoadInfra()
+	if err != nil {
+		t.Fatalf("LoadInfra() error = %v", err)
+	}
+	if config.MessagingNamespace != "im:v13-verify" || !config.MessagingRequired || !config.GroupMessagingEnabled {
+		t.Fatalf("messaging config = %#v", config)
+	}
 }
 
 func TestLoadInfraReadsFilesAndDefaults(t *testing.T) {
@@ -135,6 +153,7 @@ func clearInfraEnv(t *testing.T) {
 	for _, key := range []string{
 		"IM_REDIS_URL", "IM_REDIS_URL_FILE", "IM_REDIS_PASSWORD", "IM_REDIS_PASSWORD_FILE", "IM_REDIS_DB",
 		"IM_REDIS_DIAL_TIMEOUT", "IM_REDIS_READ_TIMEOUT", "IM_REDIS_WRITE_TIMEOUT",
+		"IM_MESSAGING_NAMESPACE", "IM_MESSAGING_REQUIRED", "IM_GROUP_MESSAGING_ENABLED",
 		"IM_RABBITMQ_URL", "IM_RABBITMQ_URL_FILE", "IM_RABBITMQ_PASSWORD", "IM_RABBITMQ_PASSWORD_FILE", "IM_RABBITMQ_DIAL_TIMEOUT", "IM_RABBITMQ_HEARTBEAT",
 	} {
 		t.Setenv(key, "")

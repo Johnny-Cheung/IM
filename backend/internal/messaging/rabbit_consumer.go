@@ -21,6 +21,7 @@ type RabbitMessageConsumer struct {
 	config    config.RabbitMQConfig
 	dialer    RabbitDialer
 	persister MessagePersister
+	namespace Namespace
 }
 
 func NewRabbitMessageConsumer(
@@ -28,10 +29,20 @@ func NewRabbitMessageConsumer(
 	dialer RabbitDialer,
 	persister MessagePersister,
 ) *RabbitMessageConsumer {
+	return NewRabbitMessageConsumerWithNamespace(rabbitConfig, dialer, persister, DefaultNamespace())
+}
+
+func NewRabbitMessageConsumerWithNamespace(
+	rabbitConfig config.RabbitMQConfig,
+	dialer RabbitDialer,
+	persister MessagePersister,
+	namespace Namespace,
+) *RabbitMessageConsumer {
 	return &RabbitMessageConsumer{
 		config:    rabbitConfig,
 		dialer:    dialer,
 		persister: persister,
+		namespace: namespace,
 	}
 }
 
@@ -67,15 +78,15 @@ func (c *RabbitMessageConsumer) runConnection(ctx context.Context) error {
 		return fmt.Errorf("open RabbitMQ consumer channel: %w", err)
 	}
 	defer channel.Close()
-	if err := declareDirectTopology(channel); err != nil {
+	if err := declareDirectTopology(channel, c.namespace); err != nil {
 		return err
 	}
 	if err := channel.Qos(1, 0, false); err != nil {
 		return fmt.Errorf("set RabbitMQ consumer qos: %w", err)
 	}
 	deliveries, err := channel.Consume(
-		directQueueName,
-		directConsumerName,
+		directQueueName(c.namespace),
+		directConsumerName(c.namespace),
 		false,
 		false,
 		false,

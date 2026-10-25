@@ -81,18 +81,31 @@ func run(options serverOptions) error {
 		log.Printf("optional infrastructure enabled")
 	}
 
+	namespace, err := messaging.NewNamespace(infraConfig.MessagingNamespace)
+	if err != nil {
+		return fmt.Errorf("configure messaging namespace: %w", err)
+	}
+	keyspace := messaging.NewKeyspace(namespace)
+	pipelineEnabled := infraManager != nil && infraManager.RedisEnabled() && infraConfig.RabbitMQ.Enabled()
+	if (infraConfig.MessagingRequired || infraConfig.GroupMessagingEnabled) && !pipelineEnabled {
+		return fmt.Errorf("message pipeline is required but Redis and RabbitMQ are not both configured")
+	}
+
 	var directAcceptor *messaging.RedisAcceptor
 	var directReader *messaging.RedisMessageReader
 	var friendshipProjector *messaging.FriendshipProjection
+	var groupAcceptor *messaging.GroupRedisAcceptor
+	var groupReader *messaging.GroupMessageReader
+	var groupProjector *messaging.GroupProjection
 	var workerContext context.Context
 	var cancelWorkers context.CancelFunc
 	var workers sync.WaitGroup
-	if infraManager != nil && infraManager.RedisEnabled() && infraConfig.RabbitMQ.Enabled() {
+	if pipelineEnabled {
 		seedFloor, err := dataStore.MaxServerMessageID(startupCtx)
 		if err != nil {
-			return fmt.Errorf("seed direct message ID: %w", err)
+			return fmt.Errorf("seed message ID: %w", err)
 		}
-		friendshipProjector = messaging.NewFriendshipProjection(infraManager.Redis())
+		friendshipProjector = messaging.NewFriendshipProjectionWithKeyspace(infraManager.Redis(), keyspace)
 		pairs, err := dataStore.ListFriendshipPairs(startupCtx)
 		if err != nil {
 			return fmt.Errorf("load friendship projection: %w", err)
@@ -102,9 +115,34 @@ func run(options serverOptions) error {
 		}
 		directAcceptor = messaging.NewRedisAcceptor(
 			infraManager.Redis(),
-			messaging.RedisAcceptorOptions{SeedFloor: seedFloor},
+			messaging.RedisAcceptorOptions{SeedFloor: seedFloor, Keyspace: keyspace},
 		)
-		directReader = messaging.NewRedisMessageReader(infraManager.Redis())
+		directReader = messaging.NewRedisMessageReaderWithKeyspace(infraManager.Redis(), keyspace)
+
+		if infraConfig.GroupMessagingEnabled {
+			groupProjector = messaging.NewGroupProjection(infraManager.Redis(), keyspace)
+			storedGroups, err := dataStore.ListGroupMembershipProjections(startupCtx)
+			if err != nil {
+				return fmt.Errorf("load group membership projections: %w", err)
+			}
+			projections := make([]messaging.GroupMembershipProjection, 0, len(storedGroups))
+			for _, group := range storedGroups {
+				projections = append(projections, messaging.GroupMembershipProjection{
+					GroupID:   group.GroupID,
+					MemberIDs: group.MemberIDs,
+					Dissolved: group.Dissolved,
+				})
+			}
+			if err := groupProjector.Rebuild(startupCtx, projections); err != nil {
+				return fmt.Errorf("rebuild group projection: %w", err)
+			}
+			groupAcceptor = messaging.NewGroupRedisAcceptor(
+				infraManager.Redis(),
+				keyspace,
+				messaging.RedisAcceptorOptions{SeedFloor: seedFloor, Keyspace: keyspace},
+			)
+			groupReader = messaging.NewGroupMessageReader(infraManager.Redis(), keyspace)
+		}
 
 		workerContext, cancelWorkers = context.WithCancel(context.Background())
 		defer func() {
@@ -112,15 +150,11 @@ func run(options serverOptions) error {
 			workers.Wait()
 		}()
 
-		relay := messaging.NewStreamRelay(
-			infraManager.Redis(),
-			infraConfig.RabbitMQ,
-			infra.DialRabbit,
+		relay := messaging.NewStreamRelayWithNamespace(
+			infraManager.Redis(), infraConfig.RabbitMQ, infra.DialRabbit, keyspace, namespace,
 		)
-		consumer := messaging.NewRabbitMessageConsumer(
-			infraConfig.RabbitMQ,
-			infra.DialRabbit,
-			dataStore,
+		consumer := messaging.NewRabbitMessageConsumerWithNamespace(
+			infraConfig.RabbitMQ, infra.DialRabbit, dataStore, namespace,
 		)
 		workers.Add(2)
 		go func() {
@@ -135,9 +169,32 @@ func run(options serverOptions) error {
 				log.Printf("direct message consumer stopped: %v", err)
 			}
 		}()
-		log.Printf("direct message pipeline enabled")
+		log.Printf("direct message pipeline enabled namespace=%s", namespace.Base())
+
+		if infraConfig.GroupMessagingEnabled {
+			groupRelay := messaging.NewGroupStreamRelay(
+				infraManager.Redis(), infraConfig.RabbitMQ, infra.DialRabbit, keyspace, namespace,
+			)
+			groupConsumer := messaging.NewGroupMessageConsumer(
+				infraConfig.RabbitMQ, infra.DialRabbit, dataStore, namespace,
+			)
+			workers.Add(2)
+			go func() {
+				defer workers.Done()
+				if err := groupRelay.Run(workerContext); err != nil && workerContext.Err() == nil {
+					log.Printf("group message stream relay stopped: %v", err)
+				}
+			}()
+			go func() {
+				defer workers.Done()
+				if err := groupConsumer.Run(workerContext); err != nil && workerContext.Err() == nil {
+					log.Printf("group message consumer stopped: %v", err)
+				}
+			}()
+			log.Printf("group message pipeline enabled namespace=%s", namespace.Base())
+		}
 	} else if infraManager != nil && (infraManager.RedisEnabled() || infraConfig.RabbitMQ.Enabled()) {
-		log.Printf("direct message pipeline disabled: Redis and RabbitMQ must both be configured")
+		log.Printf("message pipeline disabled: Redis and RabbitMQ must both be configured")
 	}
 
 	router, err := newRouter(options.webDir, dataStore.Ping)
@@ -156,6 +213,18 @@ func run(options serverOptions) error {
 	}
 	if directReader != nil {
 		apiOptions = append(apiOptions, httpapi.WithDirectMessageReader(directReader))
+	}
+	if groupAcceptor != nil {
+		apiOptions = append(apiOptions, httpapi.WithGroupMessageAcceptor(groupAcceptor))
+	}
+	if groupReader != nil {
+		apiOptions = append(apiOptions, httpapi.WithGroupMessageReader(groupReader))
+	}
+	if groupProjector != nil {
+		apiOptions = append(apiOptions,
+			httpapi.WithGroupProjector(groupProjector),
+			httpapi.WithGroupAcceptedWatermarkReader(groupProjector),
+		)
 	}
 	httpapi.New(dataStore, apiOptions...).Register(router)
 

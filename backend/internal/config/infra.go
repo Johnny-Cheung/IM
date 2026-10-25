@@ -9,8 +9,9 @@ import (
 )
 
 const (
-	defaultInfraTimeout    = 5 * time.Second
-	defaultRabbitHeartbeat = 10 * time.Second
+	defaultInfraTimeout       = 5 * time.Second
+	defaultRabbitHeartbeat    = 10 * time.Second
+	DefaultMessagingNamespace = "im:v12"
 )
 
 type RedisConfig struct {
@@ -38,11 +39,27 @@ func (c RabbitMQConfig) Enabled() bool {
 }
 
 type InfraConfig struct {
-	Redis    RedisConfig
-	RabbitMQ RabbitMQConfig
+	Redis                 RedisConfig
+	RabbitMQ              RabbitMQConfig
+	MessagingNamespace    string
+	MessagingRequired     bool
+	GroupMessagingEnabled bool
 }
 
 func LoadInfra() (InfraConfig, error) {
+	namespace, err := messagingNamespace()
+	if err != nil {
+		return InfraConfig{}, err
+	}
+	messagingRequired, err := optionalBool("IM_MESSAGING_REQUIRED", false)
+	if err != nil {
+		return InfraConfig{}, err
+	}
+	groupMessagingEnabled, err := optionalBool("IM_GROUP_MESSAGING_ENABLED", false)
+	if err != nil {
+		return InfraConfig{}, err
+	}
+
 	redisURL, err := valueOrFile("IM_REDIS_URL", "IM_REDIS_URL_FILE")
 	if err != nil {
 		return InfraConfig{}, err
@@ -52,7 +69,11 @@ func LoadInfra() (InfraConfig, error) {
 		return InfraConfig{}, err
 	}
 
-	config := InfraConfig{}
+	config := InfraConfig{
+		MessagingNamespace:    namespace,
+		MessagingRequired:     messagingRequired,
+		GroupMessagingEnabled: groupMessagingEnabled,
+	}
 	if redisURL != "" {
 		redisPassword, err := valueOrFile("IM_REDIS_PASSWORD", "IM_REDIS_PASSWORD_FILE")
 		if err != nil {
@@ -167,4 +188,40 @@ func optionalDuration(key string, fallback time.Duration) (time.Duration, error)
 		return 0, fmt.Errorf("%s must be a positive duration", key)
 	}
 	return parsed, nil
+}
+
+func optionalBool(key string, fallback bool) (bool, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean", key)
+	}
+	return parsed, nil
+}
+
+func messagingNamespace() (string, error) {
+	value := strings.TrimSpace(os.Getenv("IM_MESSAGING_NAMESPACE"))
+	if value == "" {
+		return DefaultMessagingNamespace, nil
+	}
+	if len(value) > 64 {
+		return "", fmt.Errorf("IM_MESSAGING_NAMESPACE is too long")
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') ||
+			character == ':' || character == '-' || character == '_' {
+			continue
+		}
+		return "", fmt.Errorf("IM_MESSAGING_NAMESPACE contains invalid characters")
+	}
+	value = strings.TrimSuffix(value, ":")
+	if value == "" {
+		return "", fmt.Errorf("IM_MESSAGING_NAMESPACE is empty")
+	}
+	return value, nil
 }
