@@ -32,6 +32,13 @@ MYSQL_ROOT_SECRET="${MYSQL_SECRETS}/mysql-root"
 MYSQL_APP_SECRET="${MYSQL_SECRETS}/mysql-app"
 CONFIG_DIR="${ROOT}/config"
 BACKEND_APP_SECRET="${CONFIG_DIR}/mysql-app"
+INFRA_ROOT="${ROOT}/infra-v11"
+INFRA_SECRETS="${INFRA_ROOT}/secrets"
+INFRA_CONFIG_DIR="${CONFIG_DIR}/infra-v11"
+INFRA_REDIS_URL_FILE="${INFRA_CONFIG_DIR}/redis-url"
+INFRA_REDIS_PASSWORD_FILE="${INFRA_CONFIG_DIR}/redis-password"
+INFRA_RABBITMQ_URL_FILE="${INFRA_CONFIG_DIR}/rabbitmq-url"
+INFRA_RABBITMQ_PASSWORD_FILE="${INFRA_CONFIG_DIR}/rabbitmq-password"
 if [ "${VERIFY_MODE}" = "1" ]; then
   BACKEND_APP_SECRET="${APP_ROOT}/mysql-app"
 fi
@@ -96,14 +103,34 @@ runtime_stop() {
   fi
 }
 
+write_protected_file() {
+  local content="$1" target="$2" temporary
+  temporary="$(mktemp "${target}.tmp.XXXXXX")"
+  printf '%s\n' "${content}" > "${temporary}"
+  install -o nobody -g root -m 0400 "${temporary}" "${target}"
+  rm -f "${temporary}"
+}
+
 prepare_backend_config() {
   if [ "${VERIFY_MODE}" = "1" ]; then
     test -s "${BACKEND_APP_SECRET}"
     return
   fi
-  mkdir -p "${CONFIG_DIR}"
-  chmod 755 "${CONFIG_DIR}"
+  mkdir -p "${CONFIG_DIR}" "${INFRA_CONFIG_DIR}"
+  chmod 755 "${CONFIG_DIR}" "${INFRA_CONFIG_DIR}"
   install -o nobody -g root -m 0400 "${MYSQL_APP_SECRET}" "${BACKEND_APP_SECRET}"
+
+  if [ -s "${INFRA_SECRETS}/redis-password" ] \
+    && [ -s "${INFRA_SECRETS}/rabbitmq-password" ]; then
+    install -o nobody -g root -m 0400 \
+      "${INFRA_SECRETS}/redis-password" "${INFRA_REDIS_PASSWORD_FILE}"
+    install -o nobody -g root -m 0400 \
+      "${INFRA_SECRETS}/rabbitmq-password" "${INFRA_RABBITMQ_PASSWORD_FILE}"
+    write_protected_file \
+      "redis://127.0.0.1:26379/0" "${INFRA_REDIS_URL_FILE}"
+    write_protected_file \
+      "amqp://im_v11@127.0.0.1:25676/im_v11" "${INFRA_RABBITMQ_URL_FILE}"
+  fi
 }
 
 mysql_start() {
@@ -196,16 +223,30 @@ backend_start() {
     snapshot > "${BASELINE}"
   fi
   prepare_backend_config
+  local -a env_args=(
+    "IM_MYSQL_HOST=127.0.0.1"
+    "IM_MYSQL_PORT=${MYSQL_PORT}"
+    "IM_MYSQL_DB=${MYSQL_DB}"
+    "IM_MYSQL_USER=${MYSQL_USER}"
+    "IM_MYSQL_PASSWORD_FILE=${BACKEND_APP_SECRET}"
+  )
+  if [ "${VERIFY_MODE}" = "0" ] \
+    && [ -s "${INFRA_REDIS_URL_FILE}" ] \
+    && [ -s "${INFRA_REDIS_PASSWORD_FILE}" ] \
+    && [ -s "${INFRA_RABBITMQ_URL_FILE}" ] \
+    && [ -s "${INFRA_RABBITMQ_PASSWORD_FILE}" ]; then
+    env_args+=(
+      "IM_REDIS_URL_FILE=${INFRA_REDIS_URL_FILE}"
+      "IM_REDIS_PASSWORD_FILE=${INFRA_REDIS_PASSWORD_FILE}"
+      "IM_RABBITMQ_URL_FILE=${INFRA_RABBITMQ_URL_FILE}"
+      "IM_RABBITMQ_PASSWORD_FILE=${INFRA_RABBITMQ_PASSWORD_FILE}"
+    )
+  fi
   systemd-run --unit="${UNIT}" --description="IM rebuild backend" \
     --uid=nobody --gid=nobody \
     --property=CPUAccounting=yes --property=CPUQuota=25% \
     --property=MemoryAccounting=yes --property=MemoryLimit=134217728 \
-    /usr/bin/env \
-      IM_MYSQL_HOST=127.0.0.1 \
-      IM_MYSQL_PORT="${MYSQL_PORT}" \
-      IM_MYSQL_DB="${MYSQL_DB}" \
-      IM_MYSQL_USER="${MYSQL_USER}" \
-      IM_MYSQL_PASSWORD_FILE="${BACKEND_APP_SECRET}" \
+    /usr/bin/env "${env_args[@]}" \
     "${APP_ROOT}/bin/im-server" -addr "${ADDR}" -web-dir "${APP_ROOT}/web"
   if wait_ready; then
     echo "IM rebuild backend is ready on port ${PORT}"

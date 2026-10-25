@@ -87,7 +87,6 @@ prepare_layout() {
   install -d -m 0755 "${INFRA_ROOT}" "${IMAGES_DIR}" "${INFRA_ROOT}/logs"
   install -d -m 0755 "${INFRA_ROOT}/redis" "${REDIS_DATA}" "${INFRA_ROOT}/rabbitmq" "${RABBIT_DATA}"
   install -d -m 0700 "${SECRETS_DIR}"
-  install -d -m 0755 "${CONFIG_DIR}"
 
   if [ ! -s "${REDIS_PASSWORD_SECRET}" ]; then
     ( umask 077; openssl rand -hex 24 > "${REDIS_PASSWORD_SECRET}" )

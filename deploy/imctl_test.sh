@@ -78,6 +78,15 @@ if health >/dev/null 2>&1; then exit 1; fi
 pass 'health rejects transport failures'
 TEST_NETWORK=0
 TEST_READY=200
+if grep -q 'IM_REDIS_URL_FILE' "${SCRIPT_DIR}/imctl" \
+  && grep -q 'IM_REDIS_PASSWORD_FILE' "${SCRIPT_DIR}/imctl" \
+  && grep -q 'IM_RABBITMQ_URL_FILE' "${SCRIPT_DIR}/imctl" \
+  && grep -q 'IM_RABBITMQ_PASSWORD_FILE' "${SCRIPT_DIR}/imctl"; then
+  pass 'backend wiring uses protected Redis and RabbitMQ file configuration'
+else
+  echo 'FAIL backend wiring is missing protected infrastructure file configuration'
+  exit 1
+fi
 
 mysql_command() {
   local tool="$1" query="${*: -1}"

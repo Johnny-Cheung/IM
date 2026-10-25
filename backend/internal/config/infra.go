@@ -28,6 +28,7 @@ func (c RedisConfig) Enabled() bool {
 
 type RabbitMQConfig struct {
 	URL         string
+	Password    string
 	DialTimeout time.Duration
 	Heartbeat   time.Duration
 }
@@ -76,6 +77,10 @@ func LoadInfra() (InfraConfig, error) {
 	}
 
 	if rabbitURL != "" {
+		rabbitPassword, err := valueOrFile("IM_RABBITMQ_PASSWORD", "IM_RABBITMQ_PASSWORD_FILE")
+		if err != nil {
+			return InfraConfig{}, err
+		}
 		dialTimeout, err := optionalDuration("IM_RABBITMQ_DIAL_TIMEOUT", defaultInfraTimeout)
 		if err != nil {
 			return InfraConfig{}, err
@@ -86,6 +91,7 @@ func LoadInfra() (InfraConfig, error) {
 		}
 		config.RabbitMQ = RabbitMQConfig{
 			URL:         rabbitURL,
+			Password:    rabbitPassword,
 			DialTimeout: dialTimeout,
 			Heartbeat:   heartbeat,
 		}

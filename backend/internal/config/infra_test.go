@@ -50,6 +50,25 @@ func TestLoadInfraReadsFilesAndDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadInfraReadsRabbitPasswordFile(t *testing.T) {
+	clearInfraEnv(t)
+	dir := t.TempDir()
+	passwordFile := filepath.Join(dir, "rabbit-password")
+	if err := os.WriteFile(passwordFile, []byte("rabbit-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("IM_RABBITMQ_URL", "amqp://im_v11@127.0.0.1:5672/im-v11")
+	t.Setenv("IM_RABBITMQ_PASSWORD_FILE", passwordFile)
+
+	config, err := LoadInfra()
+	if err != nil {
+		t.Fatalf("LoadInfra() error = %v", err)
+	}
+	if config.RabbitMQ.Password != "rabbit-secret" {
+		t.Fatalf("RabbitMQ password = %q, want rabbit-secret", config.RabbitMQ.Password)
+	}
+}
+
 func TestLoadInfraRejectsInvalidSettings(t *testing.T) {
 	tests := []struct {
 		name string
@@ -116,7 +135,7 @@ func clearInfraEnv(t *testing.T) {
 	for _, key := range []string{
 		"IM_REDIS_URL", "IM_REDIS_URL_FILE", "IM_REDIS_PASSWORD", "IM_REDIS_PASSWORD_FILE", "IM_REDIS_DB",
 		"IM_REDIS_DIAL_TIMEOUT", "IM_REDIS_READ_TIMEOUT", "IM_REDIS_WRITE_TIMEOUT",
-		"IM_RABBITMQ_URL", "IM_RABBITMQ_URL_FILE", "IM_RABBITMQ_DIAL_TIMEOUT", "IM_RABBITMQ_HEARTBEAT",
+		"IM_RABBITMQ_URL", "IM_RABBITMQ_URL_FILE", "IM_RABBITMQ_PASSWORD", "IM_RABBITMQ_PASSWORD_FILE", "IM_RABBITMQ_DIAL_TIMEOUT", "IM_RABBITMQ_HEARTBEAT",
 	} {
 		t.Setenv(key, "")
 	}

@@ -67,6 +67,13 @@ else
   echo "PASS no placeholder text"
 fi
 
+if grep -q 'CONFIG_DIR' "${HERE}/infractl"; then
+  echo "FAIL infrastructure script references undefined CONFIG_DIR"
+  failures=$((failures + 1))
+else
+  echo "PASS infrastructure script has no undefined CONFIG_DIR"
+fi
+
 if grep -q -- '--requirepass "\$(cat /run/secrets/redis-password)"' "${HERE}/infractl"; then
   echo "PASS Redis password is read from the mounted secret inside the container"
 else

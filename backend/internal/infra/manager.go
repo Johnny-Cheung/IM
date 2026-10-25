@@ -149,7 +149,7 @@ func (m *Manager) rabbitLoop(ctx context.Context) {
 	for {
 		connection, err := dialRabbit(m.config.RabbitMQ)
 		if err != nil {
-			m.status.failure(componentRabbitMQ, safeError(err, m.config.RabbitMQ.URL))
+			m.status.failure(componentRabbitMQ, safeError(err, m.config.RabbitMQ.URL, m.config.RabbitMQ.Password))
 			if !waitFor(ctx, reconnectInterval) {
 				return
 			}
@@ -168,7 +168,7 @@ func (m *Manager) rabbitLoop(ctx context.Context) {
 			if err == nil {
 				m.status.failure(componentRabbitMQ, fmt.Errorf("connection closed"))
 			} else {
-				m.status.failure(componentRabbitMQ, safeError(err, m.config.RabbitMQ.URL))
+				m.status.failure(componentRabbitMQ, safeError(err, m.config.RabbitMQ.URL, m.config.RabbitMQ.Password))
 			}
 			m.closeRabbit()
 			if !waitFor(ctx, reconnectInterval) {
@@ -217,7 +217,18 @@ func DialRabbit(config config.RabbitMQConfig) (*amqp091.Connection, error) {
 }
 
 func dialRabbit(config config.RabbitMQConfig) (*amqp091.Connection, error) {
-	return amqp091.DialConfig(config.URL, amqp091.Config{
+	rabbitURL := config.URL
+	if config.Password != "" {
+		if parsed, err := url.Parse(config.URL); err == nil {
+			username := "im_v11"
+			if parsed.User != nil && parsed.User.Username() != "" {
+				username = parsed.User.Username()
+			}
+			parsed.User = url.UserPassword(username, config.Password)
+			rabbitURL = parsed.String()
+		}
+	}
+	return amqp091.DialConfig(rabbitURL, amqp091.Config{
 		Heartbeat: config.Heartbeat,
 		Dial: func(network, address string) (net.Conn, error) {
 			return net.DialTimeout(network, address, config.DialTimeout)
@@ -233,7 +244,7 @@ func validateRabbitURL(raw string) error {
 	return nil
 }
 
-func safeError(err error, rawURL string) error {
+func safeError(err error, rawURL string, secrets ...string) error {
 	if err == nil {
 		return nil
 	}
@@ -242,6 +253,11 @@ func safeError(err error, rawURL string) error {
 		message = strings.ReplaceAll(message, parsed.User.String(), "<credentials>")
 	}
 	message = strings.ReplaceAll(message, rawURL, "<redacted-url>")
+	for _, secret := range secrets {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "<credential>")
+		}
+	}
 	return fmt.Errorf("%s", message)
 }
 
