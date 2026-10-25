@@ -211,6 +211,11 @@ func newRedisClient(config config.RedisConfig) (*redis.Client, error) {
 	return redis.NewClient(options), nil
 }
 
+// DialRabbit opens a RabbitMQ connection using the configured dial timeout.
+func DialRabbit(config config.RabbitMQConfig) (*amqp091.Connection, error) {
+	return dialRabbit(config)
+}
+
 func dialRabbit(config config.RabbitMQConfig) (*amqp091.Connection, error) {
 	return amqp091.DialConfig(config.URL, amqp091.Config{
 		Heartbeat: config.Heartbeat,
