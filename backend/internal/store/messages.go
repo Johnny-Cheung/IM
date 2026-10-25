@@ -357,7 +357,7 @@ func (s *Store) CreateMessage(
 func nextDirectMessageID(ctx context.Context, tx *sql.Tx) (uint64, error) {
 	result, err := tx.ExecContext(ctx,
 		`UPDATE message_id_sequences
-		 SET last_value = last_value + 1
+		 SET last_message_id = last_message_id + 1
 		 WHERE scope = 'direct'`,
 	)
 	if err != nil {
@@ -373,7 +373,7 @@ func nextDirectMessageID(ctx context.Context, tx *sql.Tx) (uint64, error) {
 
 	var id uint64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT last_value
+		`SELECT last_message_id
 		 FROM message_id_sequences
 		 WHERE scope = 'direct'
 		 FOR UPDATE`,
