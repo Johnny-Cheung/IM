@@ -194,9 +194,21 @@ describe("applyBootstrapToCache", () => {
       complete: false,
     });
 
-    await applyBootstrapToCache(payload);
+    await applyBootstrapToCache(payload, 4);
 
     expect((await readSyncState("alice")).directComplete).toBe(false);
+  });
+
+  it("trusts the first sync because there was no cache to distrust", async () => {
+    const payload = bootstrapPayload({
+      messages: [directMessage(8, bob, alice)],
+      cursor: 8,
+      complete: false,
+    });
+
+    await applyBootstrapToCache(payload, 0);
+
+    expect((await readSyncState("alice")).directComplete).toBe(true);
   });
 
   it("does not overwrite conversations when that section is partial", async () => {

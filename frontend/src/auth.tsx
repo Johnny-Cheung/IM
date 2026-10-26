@@ -75,13 +75,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null);
 
-  const applyBootstrap = useCallback((payload: BootstrapResponse) => {
+  const applyBootstrap = useCallback((payload: BootstrapResponse, previousAfterID = 0) => {
     setUser(payload.user);
     setBootstrap(payload);
     setStatus("authenticated");
     setNotice(null);
     void setActiveUser(payload.user);
-    void applyBootstrapToCache(payload);
+    void applyBootstrapToCache(payload, previousAfterID);
   }, []);
 
   useEffect(() => {
@@ -92,7 +92,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       try {
         const payload = await loadBootstrap(hints.sync);
         if (cancelled) return;
-        applyBootstrap(payload);
+        applyBootstrap(payload, hints.sync?.afterID ?? 0);
       } catch (error: unknown) {
         if (cancelled) return;
         if (error instanceof ApiError && error.status === 401) {
@@ -132,7 +132,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       const hints = await readHints();
       const sync = hints.user?.username === current.username ? hints.sync : null;
-      applyBootstrap(await loadBootstrap(sync));
+      applyBootstrap(await loadBootstrap(sync), sync?.afterID ?? 0);
     } catch {
       setUser(current);
       setStatus("authenticated");
@@ -143,7 +143,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const current = await api.register(input);
     setNotice(null);
     try {
-      applyBootstrap(await loadBootstrap(null));
+      applyBootstrap(await loadBootstrap(null), 0);
     } catch {
       setUser(current);
       setStatus("authenticated");

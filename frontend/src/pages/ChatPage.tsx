@@ -431,7 +431,10 @@ async function fetchAfterPage(
 
 export function ChatPage() {
   const { user, logout, invalidate, bootstrap, status } = useAuth();
-  const offline = status === "offline";
+  const coldOffline = status === "offline";
+  const [networkOnline, setNetworkOnline] = useState(() => navigator.onLine);
+  const offline = coldOffline || !networkOnline;
+  const offlineRef = useRef(offline);
   const bootConversations = bootstrap !== null
     && !bootstrap.partial.includes("conversations")
     ? bootstrap.conversations
@@ -518,6 +521,8 @@ export function ChatPage() {
   const replacedRef = useRef(false);
   const mountedRef = useRef(true);
   const skipInitialConversationsRef = useRef(bootConversations !== null);
+  const skipSocketConversationRefreshRef = useRef(bootConversations !== null);
+  const skipInitialSocketSyncRef = useRef(bootConversations !== null);
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptRef = useRef(0);
   const connectRef = useRef<() => void>(() => {});
@@ -531,6 +536,20 @@ export function ChatPage() {
   const conversationRequestRef = useRef(0);
   const groupDetailRequestRef = useRef(0);
   const friendsRequestRef = useRef(0);
+
+  useEffect(() => {
+    offlineRef.current = offline;
+  }, [offline]);
+
+  useEffect(() => {
+    const update = () => setNetworkOnline(navigator.onLine);
+    window.addEventListener("online", update);
+    window.addEventListener("offline", update);
+    return () => {
+      window.removeEventListener("online", update);
+      window.removeEventListener("offline", update);
+    };
+  }, []);
 
   useEffect(() => {
     activeTargetRef.current = activeTarget;
@@ -731,7 +750,7 @@ export function ChatPage() {
       setHasMore(true);
       scrollToBottomNextRef.current = true;
     }
-    if (offline) {
+    if (offlineRef.current) {
       setMessagesLoading(false);
       if (cached.length === 0) {
         setMessagesError("当前离线，这个会话没有缓存。");
@@ -806,7 +825,6 @@ export function ChatPage() {
     handleSessionError,
     isCurrentConversation,
     loseGroupAccess,
-    offline,
     user?.username,
   ]);
 
@@ -1339,9 +1357,15 @@ export function ChatPage() {
       reconnectAttemptRef.current = 0;
       setReconnectAttempt(0);
       setConnectionStatus("open");
-      void loadConversations(false);
+      if (skipSocketConversationRefreshRef.current) {
+        skipSocketConversationRefreshRef.current = false;
+      } else {
+        void loadConversations(false);
+      }
       const target = activeTargetRef.current;
-      if (target) {
+      const skipInitialSync = skipInitialSocketSyncRef.current;
+      skipInitialSocketSyncRef.current = false;
+      if (target && !skipInitialSync) {
         if (target.kind === "group") {
           void loadGroupDetail(target.groupID);
         }
@@ -1465,7 +1489,7 @@ export function ChatPage() {
       }
     };
     const handleOnline = () => {
-      if (offline) {
+      if (coldOffline) {
         window.location.reload();
         return;
       }
@@ -1484,7 +1508,7 @@ export function ChatPage() {
       window.removeEventListener("focus", handleFocus);
       window.removeEventListener("online", handleOnline);
     };
-  }, [loadConversations, offline]);
+  }, [coldOffline, loadConversations, offline]);
 
   function manualReconnect() {
     connectWebSocket(true);
@@ -1861,7 +1885,7 @@ export function ChatPage() {
 
         {offline && (
           <div className="ws-banner ws-banner--offline" id="offline-banner" role="alert">
-            <span>当前离线，只能查看已缓存的消息。重新联网后会自动刷新。</span>
+            <span>当前离线，只能查看已缓存的消息。重新联网后会自动恢复。</span>
           </div>
         )}
 

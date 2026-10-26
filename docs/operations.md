@@ -244,6 +244,7 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 ```bash
 node scripts/smoke.mjs
 node scripts/browser-smoke.mjs
+node scripts/cache-smoke.mjs
 node scripts/capacity-smoke.mjs
 node scripts/perf-baseline.mjs
 bash deploy/imctl_test.sh

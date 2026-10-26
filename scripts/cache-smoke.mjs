@@ -1,0 +1,180 @@
+#!/usr/bin/env node
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
+import { Browser } from "./lib/browser.mjs";
+import { delay, TestRun } from "./lib/test-client.mjs";
+
+const run = new TestRun("cache-smoke");
+const browser = new Browser();
+let tab;
+let failures = 0;
+const name = (key) => run.users.get(key).username;
+const directSelector = (key) => `.conversation-item[data-username="${name(key)}"]`;
+
+async function scenario(title, action) {
+  try {
+    await action();
+    console.log(`SCENARIO PASS ${title}`);
+  } catch (error) {
+    failures += 1;
+    console.error(`SCENARIO FAIL ${title}: ${error.message}`);
+    await tab.shot(join(run.reportDir, `failed-${failures}.png`)).catch(() => undefined);
+  }
+}
+
+async function setOffline(offline) {
+  await tab.send("Network.emulateNetworkConditions", {
+    offline,
+    latency: 0,
+    downloadThroughput: -1,
+    uploadThroughput: -1,
+  });
+}
+
+async function cacheState(user) {
+  return tab.evaluate(`(async () => {
+    const db = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("im-cache");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    if (!db.objectStoreNames.contains("meta") || !db.objectStoreNames.contains("messages")) {
+      db.close();
+      return { active: null, messages: 0 };
+    }
+    const result = await new Promise((resolve) => {
+      const transaction = db.transaction(["meta", "messages"], "readonly");
+      const active = transaction.objectStore("meta").get("active-user");
+      const keys = transaction.objectStore("messages").getAllKeys();
+      transaction.oncomplete = () => resolve({
+        active: active.result ?? null,
+        messages: (keys.result ?? []).filter((key) => Array.isArray(key) && key[0] === ${JSON.stringify(user)}).length,
+      });
+    });
+    db.close();
+    return result;
+  })()`);
+}
+
+async function main() {
+  console.log(`Cache smoke ${run.id}: ${run.base}`);
+  for (const key of ["a", "b", "c"]) await run.register(key);
+  await run.befriend("b", "a");
+  await run.befriend("a", "c");
+
+  await browser.start();
+  tab = await browser.tab(run.base);
+  await tab.login(name("a"), run.password);
+  await tab.waitFor("!!document.querySelector('#conversation-list .conversation-item')");
+
+  const fromB = `缓存测试 B→A ${run.id}`;
+  const fromC = `仅 A 与 C ${run.id}`;
+  await run.request("b", "POST", `/api/conversations/${name("a")}/messages`, {
+    body: fromB,
+    client_message_id: randomUUID(),
+  });
+  await run.request("c", "POST", `/api/conversations/${name("a")}/messages`, {
+    body: fromC,
+    client_message_id: randomUUID(),
+  });
+  await tab.waitFor(`!!document.querySelector('#conversation-list ${directSelector("b")}')`);
+  await tab.waitFor(`!!document.querySelector('#conversation-list ${directSelector("c")}')`);
+
+  await scenario("cold reload renders the cached conversation with one bootstrap", async () => {
+    await tab.select(directSelector("b"), `/chat/${name("b")}`);
+    await tab.waitFor(`document.querySelector('#message-list').innerText.includes(${JSON.stringify(fromB)})`);
+
+    const requests = [];
+    const off = tab.on("Network.requestWillBeSent", ({ request }) => {
+      try {
+        const url = new URL(request.url);
+        if (url.origin === run.base && url.pathname.startsWith("/api/")) {
+          requests.push(url.pathname);
+        }
+      } catch {
+        // Ignore non-URL requests.
+      }
+    });
+    try {
+      await tab.send("Page.reload");
+      await tab.waitFor("document.readyState === 'complete'");
+      await tab.waitFor("!!document.querySelector('#conversation-list .conversation-item')");
+      await tab.waitFor(`document.querySelector('#message-list')?.innerText.includes(${JSON.stringify(fromB)})`, 5000);
+      await delay(800);
+    } finally {
+      off();
+    }
+    console.log(`Cold start API requests: ${JSON.stringify(requests)}`);
+    run.check("cold start sends one bootstrap request", requests.filter((path) => path === "/api/bootstrap").length === 1);
+    run.check("cold start does not refetch conversations", !requests.includes("/api/conversations"));
+    run.check("cold start does not refetch friends", !requests.includes("/api/friends"));
+    run.check(
+      "cold start does not refetch the open conversation",
+      !requests.some((path) => path === `/api/conversations/${name("b")}/messages`),
+    );
+  });
+
+  await scenario("offline mode stays readable and disables sending", async () => {
+    await setOffline(true);
+    await tab.waitFor("!!document.querySelector('#offline-banner')", 5000);
+    run.check(
+      "cached messages stay visible offline",
+      await tab.evaluate(`document.querySelector('#message-list').innerText.includes(${JSON.stringify(fromB)})`),
+    );
+    run.check(
+      "composer is disabled offline",
+      await tab.evaluate("document.querySelector('#message-input').disabled"),
+    );
+    await tab.evaluate(`document.querySelector('#conversation-list ${directSelector("c")}').click()`);
+    await tab.waitFor(`location.pathname === "/chat/${name("c")}"`);
+    await tab.waitFor(`document.querySelector('#message-list').innerText.includes(${JSON.stringify(fromC)})`);
+    run.check("another cached conversation opens offline", true);
+  });
+
+  await scenario("reconnecting restores the live connection", async () => {
+    await setOffline(false);
+    await tab.evaluate("window.dispatchEvent(new Event('online'))");
+    await tab.waitFor("!document.querySelector('#offline-banner')", 5000);
+    await tab.waitFor("!!document.querySelector('.connection-state--open')", 10000);
+    run.check("composer becomes editable again", !await tab.evaluate("document.querySelector('#message-input').disabled"));
+  });
+
+  await scenario("logout clears this account's cache", async () => {
+    await tab.evaluate(
+      "[...document.querySelectorAll('.chat-nav button')].find((button) => button.textContent.includes('退出'))?.click()",
+    );
+    await tab.waitFor("location.pathname === '/login'", 5000);
+    await delay(300);
+    const state = await cacheState(name("a"));
+    console.log(`Cache after logout: ${JSON.stringify(state)}`);
+    run.check("logout clears the active user hint", state.active === null);
+    run.check("logout clears cached messages", state.messages === 0);
+  });
+
+  await scenario("another account cannot read the previous cache", async () => {
+    await tab.login(name("b"), run.password);
+    await tab.waitFor("!!document.querySelector('#conversation-list .conversation-item')");
+    await delay(400);
+    run.check(
+      "previous account's private message is not shown",
+      !await tab.evaluate(`document.body.innerText.includes(${JSON.stringify(fromC)})`),
+    );
+    run.check(
+      "previous account's conversation is not shown",
+      !await tab.evaluate(`!!document.querySelector('#conversation-list ${directSelector("c")}')`),
+    );
+  });
+
+  run.check("no browser runtime exception", tab.exceptions.length === 0);
+  if (failures) throw new Error(`${failures} cache scenarios failed`);
+}
+
+try {
+  await main();
+} catch (error) {
+  console.error(`FAIL ${error.message}`);
+  process.exitCode = 1;
+} finally {
+  await browser.close();
+  await run.finish();
+}

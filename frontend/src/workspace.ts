@@ -121,6 +121,7 @@ async function cacheGroupDeltas(
 // of rendering: callers may start it and forget it.
 export async function applyBootstrapToCache(
   payload: BootstrapResponse,
+  previousAfterID = 0,
 ): Promise<void> {
   const user = payload.user.username;
 
@@ -128,7 +129,9 @@ export async function applyBootstrapToCache(
     await cacheDirectMessages(user, payload.direct.messages);
     await patchSyncState(user, {
       afterID: payload.direct.cursor,
-      directComplete: payload.direct.complete,
+      // With no previous sync point there is no local cache to distrust: the
+      // feed gap lies below the index epoch and was never cached.
+      directComplete: payload.direct.complete || previousAfterID === 0,
     });
   }
 

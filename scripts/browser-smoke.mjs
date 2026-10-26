@@ -226,10 +226,11 @@ async function main() {
     run.check("returning to foreground clears unread", true);
     for (let index = 0; index < 32; index += 1) await run.request("b", "POST", `/api/groups/${live}/messages`, { body: `历史 ${index}`, client_message_id: randomUUID() });
     await tab.goto(`/chat/group/${live}`);
-    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length === 30");
+    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length >= 30");
     run.check("refresh restores group and latest page", true);
+    const cachedRows = await tab.evaluate("document.querySelectorAll('#message-list .message-row').length");
     await tab.evaluate("const el=document.querySelector('#message-list'); el.scrollTop=0; el.dispatchEvent(new Event('scroll'))");
-    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length === 35");
+    await tab.waitFor(`document.querySelectorAll('#message-list .message-row').length > ${cachedRows}`);
     run.check("scroll loads older group messages", true);
     await tab.viewport(390, 844);
     run.check("mobile page stays within viewport", await tab.evaluate("document.documentElement.scrollWidth <= innerWidth+1"));
