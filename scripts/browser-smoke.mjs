@@ -225,12 +225,43 @@ async function main() {
     await tab.waitFor(`!document.querySelector('#conversation-list ${memberSelector(live)} .unread-badge')`);
     run.check("returning to foreground clears unread", true);
     for (let index = 0; index < 32; index += 1) await run.request("b", "POST", `/api/groups/${live}/messages`, { body: `历史 ${index}`, client_message_id: randomUUID() });
+    // Drop this group's local cache so the refresh still exercises the
+    // network pagination path instead of serving everything from IndexedDB.
+    await tab.evaluate(`(async () => {
+      const db = await new Promise((resolve, reject) => {
+        const request = indexedDB.open("im-cache");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const key = ${JSON.stringify(`group:${live}`)};
+      const user = ${JSON.stringify(name("a"))};
+      await new Promise((resolve) => {
+        const transaction = db.transaction(["messages", "meta"], "readwrite");
+        const messages = transaction.objectStore("messages");
+        const keys = messages.getAllKeys();
+        keys.onsuccess = () => {
+          for (const item of keys.result) {
+            if (Array.isArray(item) && item[0] === user && item[1] === key) messages.delete(item);
+          }
+        };
+        const meta = transaction.objectStore("meta");
+        const sync = meta.get(user + ":sync");
+        sync.onsuccess = () => {
+          const state = sync.result;
+          if (state && state.groups) {
+            delete state.groups[${live}];
+            meta.put(state, user + ":sync");
+          }
+        };
+        transaction.oncomplete = resolve;
+      });
+      db.close();
+    })()`);
     await tab.goto(`/chat/group/${live}`);
-    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length >= 30");
+    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length === 30");
     run.check("refresh restores group and latest page", true);
-    const cachedRows = await tab.evaluate("document.querySelectorAll('#message-list .message-row').length");
     await tab.evaluate("const el=document.querySelector('#message-list'); el.scrollTop=0; el.dispatchEvent(new Event('scroll'))");
-    await tab.waitFor(`document.querySelectorAll('#message-list .message-row').length > ${cachedRows}`);
+    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length === 35");
     run.check("scroll loads older group messages", true);
     await tab.viewport(390, 844);
     run.check("mobile page stays within viewport", await tab.evaluate("document.documentElement.scrollWidth <= innerWidth+1"));
