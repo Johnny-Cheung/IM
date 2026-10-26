@@ -661,11 +661,25 @@ export async function removeGroupCursor(
   });
 }
 
+export async function removeMessages(
+  user: string,
+  conversation: string,
+): Promise<void> {
+  await runWrite(async (db) => {
+    await runTransaction(db, [MESSAGES_STORE], "readwrite", async (transaction) => {
+      await requestToPromise(
+        transaction
+          .objectStore(MESSAGES_STORE)
+          .delete(conversationMessagesRange(user, conversation)),
+      );
+    });
+  });
+}
+
 export async function removeConversation(
   user: string,
   key: string,
-): Promise<void> {
-  await runWrite(async (db) => {
+): Promise<void> {  await runWrite(async (db) => {
     await runTransaction(
       db,
       [CONVERSATIONS_STORE, MESSAGES_STORE, META_STORE],

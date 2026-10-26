@@ -1,8 +1,16 @@
 import { api } from "./api";
-import type { BootstrapResponse, ChatMessage } from "./api";
+import type {
+  BootstrapGroupDelta,
+  BootstrapResponse,
+  ChatMessage,
+} from "./api";
 import {
+  enforceUserLimits,
+  groupKey,
   messageConversationKey,
   patchSyncState,
+  removeConversation,
+  setGroupCursor,
   writeConversations,
   writeFriends,
   writeMessages,
@@ -10,6 +18,8 @@ import {
 
 const FEED_PAGE_SIZE = 200;
 const FEED_DRAIN_ROUNDS = 10;
+const GROUP_PAGE_SIZE = 50;
+const GROUP_DRAIN_ROUNDS = 4;
 
 async function cacheDirectMessages(
   user: string,
@@ -55,6 +65,58 @@ async function drainDirectFeed(
   }
 }
 
+async function drainGroupFeed(
+  user: string,
+  groupID: number,
+  startCursor: number,
+): Promise<void> {
+  let cursor = startCursor;
+  for (let round = 0; round < GROUP_DRAIN_ROUNDS; round += 1) {
+    let page;
+    try {
+      page = await api.listGroupMessagesAfter(groupID, cursor, GROUP_PAGE_SIZE);
+    } catch {
+      return;
+    }
+    if (page.messages.length === 0) {
+      return;
+    }
+    await writeMessages(user, groupKey(groupID), page.messages);
+    const newest = page.messages.reduce(
+      (latest, message) => Math.max(latest, message.id),
+      cursor,
+    );
+    if (newest <= cursor) {
+      return;
+    }
+    await setGroupCursor(user, groupID, newest);
+    cursor = newest;
+    if (!page.has_more) {
+      return;
+    }
+  }
+}
+
+async function cacheGroupDeltas(
+  user: string,
+  deltas: BootstrapGroupDelta[],
+): Promise<void> {
+  for (const delta of deltas) {
+    const key = groupKey(delta.group_id);
+    if (!delta.complete) {
+      // The delta does not cover the cached cursor. Drop the local copy so the
+      // next open loads a fresh page instead of stitching over a gap.
+      await removeConversation(user, key);
+      continue;
+    }
+    await writeMessages(user, key, delta.messages);
+    await setGroupCursor(user, delta.group_id, delta.cursor);
+    if (delta.has_more) {
+      await drainGroupFeed(user, delta.group_id, delta.cursor);
+    }
+  }
+}
+
 // applyBootstrapToCache persists the first-screen payload. It is independent
 // of rendering: callers may start it and forget it.
 export async function applyBootstrapToCache(
@@ -70,6 +132,10 @@ export async function applyBootstrapToCache(
     });
   }
 
+  if (!payload.partial.includes("groups") && payload.groups.length > 0) {
+    await cacheGroupDeltas(user, payload.groups);
+  }
+
   if (!payload.partial.includes("conversations")) {
     // Runs after the messages so conversations that disappeared on the server
     // also lose their cached messages.
@@ -83,4 +149,6 @@ export async function applyBootstrapToCache(
   if (!payload.partial.includes("direct") && payload.direct.has_more) {
     await drainDirectFeed(user, payload.direct.cursor);
   }
+
+  await enforceUserLimits(user);
 }

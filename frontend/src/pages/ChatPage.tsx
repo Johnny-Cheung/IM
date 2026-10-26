@@ -24,8 +24,19 @@ import {
   type GroupMessage,
   type PublicUser,
 } from "../api";
-import { useAuth } from "../auth";
+import {
+  readConversations,
+  readFriends,
+  readMessages,
+  readSyncState,
+  removeMessages,
+  writeConversations,
+  writeFriends,
+  writeMessages,
+} from "../cache";
+import type { CachedMessage } from "../cache";
 import { Brand } from "../components/Brand";
+import { useAuth } from "../auth";
 
 const PAGE_SIZE = 30;
 const MAX_MESSAGE_LENGTH = 2000;
@@ -126,6 +137,12 @@ function toDirectDisplay(message: ChatMessage): DirectDisplayMessage {
 
 function toGroupDisplay(message: GroupMessage): GroupDisplayMessage {
   return { ...message, status: "sent" };
+}
+
+function toDisplayMessage(message: CachedMessage): DisplayMessage {
+  return "group_id" in message
+    ? toGroupDisplay(message)
+    : toDirectDisplay(message);
 }
 
 function sortMessages(messages: DisplayMessage[]): DisplayMessage[] {
@@ -491,6 +508,7 @@ export function ChatPage() {
   const activeTargetRef = useRef<ActiveTarget | null>(activeTarget);
   const userRef = useRef(user);
   const conversationKeysRef = useRef<Set<string>>(new Set());
+  const conversationLastIDsRef = useRef<Map<string, number>>(new Map());
   const messageListRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const websocketRef = useRef<WebSocket | null>(null);
@@ -524,6 +542,11 @@ export function ChatPage() {
 
   useEffect(() => {
     conversationKeysRef.current = new Set(conversations.map(conversationKey));
+    const lastIDs = new Map<string, number>();
+    for (const conversation of conversations) {
+      lastIDs.set(conversationKey(conversation), conversation.last_message?.id ?? 0);
+    }
+    conversationLastIDsRef.current = lastIDs;
   }, [conversations]);
 
   useEffect(() => {
@@ -597,6 +620,9 @@ export function ChatPage() {
   }, [handleSessionError]);
 
   const loadFriends = useCallback(async () => {
+    if (offline) {
+      return;
+    }
     const requestID = ++friendsRequestRef.current;
     setFriendsLoading(true);
     try {
@@ -606,6 +632,9 @@ export function ChatPage() {
       }
       setFriends(response.friends);
       setFriendsError(null);
+      if (user) {
+        void writeFriends(user.username, response.friends);
+      }
     } catch (error) {
       if (requestID !== friendsRequestRef.current) {
         return;
@@ -618,9 +647,12 @@ export function ChatPage() {
         setFriendsLoading(false);
       }
     }
-  }, [handleSessionError]);
+  }, [handleSessionError, offline, user]);
 
   const loadGroupDetail = useCallback(async (groupID: number, showLoading = false) => {
+    if (offline) {
+      return;
+    }
     const version = conversationVersionRef.current;
     const requestID = ++groupDetailRequestRef.current;
     const isCurrent = () => requestID === groupDetailRequestRef.current
@@ -650,7 +682,7 @@ export function ChatPage() {
         setGroupDetailLoading(false);
       }
     }
-  }, [handleSessionError, isCurrentConversation, loseGroupAccess]);
+  }, [handleSessionError, isCurrentConversation, loseGroupAccess, offline]);
 
   const loadInitialMessages = useCallback(async (target: ActiveTarget) => {
     if (activeTargetRef.current?.key !== target.key) {
@@ -661,9 +693,9 @@ export function ChatPage() {
     const isCurrent = () => requestID === messagesRequestRef.current
       && isCurrentConversation(target.key, version);
     setMessagesKey(target.key);
+    setMessages([]);
     setMessagesLoading(true);
     setMessagesError(null);
-    setMessages([]);
     setHasMore(false);
     setLoadingOlder(false);
     setDraftError(null);
@@ -672,14 +704,89 @@ export function ChatPage() {
     nearBottomRef.current = true;
     pendingOlderScrollRef.current = null;
 
-    try {
-      const page = await fetchInitialPage(target);
-      if (!isCurrent()) {
-        return;
-      }
-      setMessages(page.messages);
-      setHasMore(page.hasMore);
+    const username = user?.username ?? "";
+    let cached: CachedMessage[] = [];
+    let directComplete = true;
+    if (username !== "") {
+      const [stored, syncState] = await Promise.all([
+        readMessages(username, target.key),
+        readSyncState(username),
+      ]);
+      cached = stored;
+      directComplete = syncState.directComplete;
+    }
+    if (!isCurrent()) {
+      return;
+    }
+    const staleDirect = target.kind === "direct" && !directComplete;
+    if (staleDirect && cached.length > 0 && username !== "") {
+      // The global feed had a gap, so this conversation's cache cannot be
+      // stitched. Reload a fresh page instead.
+      void removeMessages(username, target.key);
+      cached = [];
+    }
+    if (cached.length > 0) {
+      setMessages(cached.map(toDisplayMessage));
+      setMessagesLoading(false);
+      setHasMore(true);
       scrollToBottomNextRef.current = true;
+    }
+    if (offline) {
+      setMessagesLoading(false);
+      if (cached.length === 0) {
+        setMessagesError("当前离线，这个会话没有缓存。");
+      }
+      return;
+    }
+
+    try {
+      const newest = cached.reduce(
+        (latest, message) => Math.max(latest, message.id),
+        0,
+      );
+      const knownLast = conversationLastIDsRef.current.get(target.key) ?? 0;
+      if (newest > 0 && knownLast > 0 && knownLast <= newest) {
+        if (nearBottomRef.current) {
+          scrollToBottomNextRef.current = true;
+        }
+      } else if (newest === 0) {
+        const page = await fetchInitialPage(target);
+        if (!isCurrent()) {
+          return;
+        }
+        setMessages(page.messages);
+        setHasMore(page.hasMore);
+        scrollToBottomNextRef.current = true;
+        if (username !== "") {
+          void writeMessages(username, target.key, page.messages);
+        }
+      } else {
+        let after = newest;
+        for (let round = 0; round < 10; round += 1) {
+          const page = await fetchAfterPage(target, after);
+          if (!isCurrent()) {
+            return;
+          }
+          if (page.messages.length === 0) {
+            break;
+          }
+          setMessages((previous) => mergeMessages(previous, page.messages));
+          if (username !== "") {
+            void writeMessages(username, target.key, page.messages);
+          }
+          const nextAfter = page.messages[page.messages.length - 1].id;
+          if (nextAfter <= after) {
+            break;
+          }
+          after = nextAfter;
+          if (!page.hasMore) {
+            break;
+          }
+        }
+        if (nearBottomRef.current) {
+          scrollToBottomNextRef.current = true;
+        }
+      }
     } catch (error) {
       if (handleSessionError(error) || !isCurrent()) {
         return;
@@ -687,7 +794,7 @@ export function ChatPage() {
       if (target.kind === "group" && error instanceof ApiError
         && error.status === 404 && error.code === "group_not_found") {
         loseGroupAccess(target.groupID, "群聊已解散或你已不在群中。");
-      } else {
+      } else if (cached.length === 0) {
         setMessagesError(describeError(error));
       }
     } finally {
@@ -695,15 +802,57 @@ export function ChatPage() {
         setMessagesLoading(false);
       }
     }
-  }, [handleSessionError, isCurrentConversation, loseGroupAccess]);
+  }, [
+    handleSessionError,
+    isCurrentConversation,
+    loseGroupAccess,
+    offline,
+    user?.username,
+  ]);
 
   useEffect(() => {
     if (skipInitialConversationsRef.current) {
       skipInitialConversationsRef.current = false;
       return;
     }
+    if (offline) {
+      setConversationsLoading(false);
+      return;
+    }
     void loadConversations(true);
-  }, [loadConversations]);
+  }, [loadConversations, offline]);
+
+  useEffect(() => {
+    if (!user || bootstrap !== null) {
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const [cachedConversations, cachedFriends] = await Promise.all([
+        readConversations(user.username),
+        readFriends(user.username),
+      ]);
+      if (cancelled) {
+        return;
+      }
+      setConversations(sortConversations(cachedConversations));
+      setConversationsLoading(false);
+      setFriends(cachedFriends);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [bootstrap, user]);
+
+  useEffect(() => {
+    if (!user || conversationsLoading || offline) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void writeConversations(user.username, conversations);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [conversations, conversationsLoading, offline, user]);
 
   useEffect(() => {
     if (groupDetail) {
@@ -802,6 +951,9 @@ export function ChatPage() {
   }, [activeKey, messages, messagesBelongToActive, user]);
 
   const markRead = useCallback(async (target: ActiveTarget, throughID: number) => {
+    if (offline) {
+      return;
+    }
     try {
       if (target.kind === "direct") {
         await api.markConversationRead(target.username, throughID);
@@ -813,7 +965,7 @@ export function ChatPage() {
     } catch (error) {
       handleSessionError(error);
     }
-  }, [handleSessionError, loadConversations]);
+  }, [handleSessionError, loadConversations, offline]);
 
   useEffect(() => {
     const target = activeTargetRef.current;
@@ -874,6 +1026,9 @@ export function ChatPage() {
       }
       pendingOlderScrollRef.current = { height: previousHeight, top: previousTop };
       setMessages((previous) => mergeMessages(previous, page.messages));
+      if (user) {
+        void writeMessages(user.username, target.key, page.messages);
+      }
       setHasMore(page.hasMore);
       setMessagesError(null);
     } catch (error) {
@@ -894,6 +1049,7 @@ export function ChatPage() {
     loadingOlder,
     messages,
     messagesLoading,
+    user,
   ]);
 
   const handleScroll = useCallback(() => {
@@ -938,6 +1094,11 @@ export function ChatPage() {
     }
     const otherUser = sentByCurrent ? message.recipient : message.sender;
     const incoming = receivedByCurrent;
+    void writeMessages(
+      currentUser.username,
+      directKey(otherUser.username),
+      [message],
+    );
     const target = activeTargetRef.current;
     const targetMatches = target?.kind === "direct"
       && target.username.toLocaleLowerCase() === otherUser.username.toLocaleLowerCase();
@@ -981,6 +1142,11 @@ export function ChatPage() {
       && target.groupID === message.group_id
       && pageVisibleRef.current
       && !replacedRef.current;
+    void writeMessages(
+      currentUser.username,
+      groupKey(message.group_id),
+      [message],
+    );
 
     if (conversationKeysRef.current.has(groupKey(message.group_id))) {
       setConversations((previous) => sortConversations(previous.map((conversation) =>
@@ -1097,6 +1263,9 @@ export function ChatPage() {
         setMessages((previous) => mergeMessages(previous, page.messages));
         setHasMore(page.hasMore);
         setMessagesError(null);
+        if (user) {
+          void writeMessages(user.username, target.key, page.messages);
+        }
       } else {
         let afterID = newestID;
         let more = true;
@@ -1107,6 +1276,9 @@ export function ChatPage() {
           }
           if (page.messages.length > 0) {
             setMessages((previous) => mergeMessages(previous, page.messages));
+            if (user) {
+              void writeMessages(user.username, target.key, page.messages);
+            }
             afterID = page.messages[page.messages.length - 1].id;
           }
           more = page.hasMore;
@@ -1132,7 +1304,13 @@ export function ChatPage() {
     } finally {
       syncingRef.current = false;
     }
-  }, [handleSessionError, isCurrentConversation, loadInitialMessages, loseGroupAccess]);
+  }, [
+    handleSessionError,
+    isCurrentConversation,
+    loadInitialMessages,
+    loseGroupAccess,
+    user,
+  ]);
 
   const connectWebSocket = useCallback((resetAttempts = false) => {
     if (resetAttempts) {
@@ -1336,6 +1514,9 @@ export function ChatPage() {
           message.body,
           message.client_message_id,
         )).message);
+      if (user) {
+        void writeMessages(user.username, target.key, [sent]);
+      }
       if (isCurrent()) {
         setMessages((previous) => mergeMessages(previous, [sent]));
         setSendError(null);
