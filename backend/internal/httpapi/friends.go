@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -239,18 +240,29 @@ func (a *API) listFriends(c *gin.Context) {
 		return
 	}
 
-	friends, err := a.store.ListFriends(c.Request.Context(), current.ID)
+	friends, err := a.buildFriends(c.Request.Context(), current)
 	if err != nil {
 		log.Printf("list friends: %v", err)
 		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
 		return
 	}
+	c.JSON(http.StatusOK, friendsResponse{Friends: friends})
+}
 
-	response := friendsResponse{Friends: make([]publicUserResponse, 0, len(friends))}
-	for _, friend := range friends {
-		response.Friends = append(response.Friends, toPublicUserResponse(friend))
+func (a *API) buildFriends(
+	ctx context.Context,
+	current store.User,
+) ([]publicUserResponse, error) {
+	friends, err := a.store.ListFriends(ctx, current.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list friends: %w", err)
 	}
-	c.JSON(http.StatusOK, response)
+
+	response := make([]publicUserResponse, 0, len(friends))
+	for _, friend := range friends {
+		response = append(response, toPublicUserResponse(friend))
+	}
+	return response, nil
 }
 
 func (a *API) deleteFriend(c *gin.Context) {

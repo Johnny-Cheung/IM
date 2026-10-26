@@ -260,6 +260,7 @@ func (a *API) Register(router *gin.Engine) {
 	authed.POST("/friend-requests/:id/reject", a.rejectFriendRequest)
 	authed.GET("/conversations", a.listConversations)
 	authed.GET("/messages/sync", a.syncMessages)
+	authed.POST("/bootstrap", a.bootstrap)
 	authed.GET("/conversations/:username/messages", a.listMessages)
 	authed.POST("/conversations/:username/messages", a.sendMessage)
 	authed.POST("/conversations/:username/read", a.markConversationRead)
