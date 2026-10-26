@@ -413,7 +413,16 @@ async function fetchAfterPage(
 }
 
 export function ChatPage() {
-  const { user, logout, invalidate } = useAuth();
+  const { user, logout, invalidate, bootstrap, status } = useAuth();
+  const offline = status === "offline";
+  const bootConversations = bootstrap !== null
+    && !bootstrap.partial.includes("conversations")
+    ? bootstrap.conversations
+    : null;
+  const bootFriends = bootstrap !== null
+    && !bootstrap.partial.includes("friends")
+    ? bootstrap.friends
+    : null;
   const routeNavigate = useNavigate();
   // Route changes must not restart workspace loading or its WebSocket.
   const navigateRef = useRef(routeNavigate);
@@ -439,8 +448,12 @@ export function ChatPage() {
   const activeUsername = activeTarget?.kind === "direct" ? activeTarget.username : "";
   const activeGroupID = activeTarget?.kind === "group" ? activeTarget.groupID : 0;
 
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [conversationsLoading, setConversationsLoading] = useState(true);
+  const [conversations, setConversations] = useState<Conversation[]>(
+    () => bootConversations ?? [],
+  );
+  const [conversationsLoading, setConversationsLoading] = useState(
+    bootConversations === null,
+  );
   const [conversationsError, setConversationsError] = useState<string | null>(null);
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [messagesKey, setMessagesKey] = useState("");
@@ -471,7 +484,7 @@ export function ChatPage() {
   const [createGroupSelection, setCreateGroupSelection] = useState<string[]>([]);
   const [createGroupError, setCreateGroupError] = useState<string | null>(null);
   const [createGroupBusy, setCreateGroupBusy] = useState(false);
-  const [friends, setFriends] = useState<PublicUser[]>([]);
+  const [friends, setFriends] = useState<PublicUser[]>(() => bootFriends ?? []);
   const [friendsLoading, setFriendsLoading] = useState(false);
   const [friendsError, setFriendsError] = useState<string | null>(null);
 
@@ -486,6 +499,7 @@ export function ChatPage() {
   const pageVisibleRef = useRef(pageVisible);
   const replacedRef = useRef(false);
   const mountedRef = useRef(true);
+  const skipInitialConversationsRef = useRef(bootConversations !== null);
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptRef = useRef(0);
   const connectRef = useRef<() => void>(() => {});
@@ -684,6 +698,10 @@ export function ChatPage() {
   }, [handleSessionError, isCurrentConversation, loseGroupAccess]);
 
   useEffect(() => {
+    if (skipInitialConversationsRef.current) {
+      skipInitialConversationsRef.current = false;
+      return;
+    }
     void loadConversations(true);
   }, [loadConversations]);
 
@@ -1226,7 +1244,9 @@ export function ChatPage() {
 
   useEffect(() => {
     mountedRef.current = true;
-    connectWebSocket(true);
+    if (!offline) {
+      connectWebSocket(true);
+    }
     return () => {
       mountedRef.current = false;
       if (reconnectTimerRef.current !== null) {
@@ -1239,13 +1259,19 @@ export function ChatPage() {
         socket.close();
       }
     };
-  }, [connectWebSocket]);
+  }, [connectWebSocket, offline]);
+
+  useEffect(() => {
+    if (offline) {
+      setConnectionStatus("closed");
+    }
+  }, [offline]);
 
   useEffect(() => {
     const handleVisibility = () => {
       const visible = document.visibilityState === "visible";
       setPageVisible(visible);
-      if (!visible) {
+      if (!visible || offline) {
         return;
       }
       void loadConversations(false);
@@ -1256,11 +1282,15 @@ export function ChatPage() {
       }
     };
     const handleFocus = () => {
-      if (document.visibilityState === "visible") {
+      if (document.visibilityState === "visible" && !offline) {
         void loadConversations(false);
       }
     };
     const handleOnline = () => {
+      if (offline) {
+        window.location.reload();
+        return;
+      }
       if (replacedRef.current || websocketRef.current !== null) {
         return;
       }
@@ -1276,7 +1306,7 @@ export function ChatPage() {
       window.removeEventListener("focus", handleFocus);
       window.removeEventListener("online", handleOnline);
     };
-  }, [loadConversations]);
+  }, [loadConversations, offline]);
 
   function manualReconnect() {
     connectWebSocket(true);
@@ -1602,6 +1632,7 @@ export function ChatPage() {
   const canSend = Boolean(activeDirect || activeGroup)
     && !isReadOnly
     && !isReplaced
+    && !offline
     && !activeMissing
     && !messagesLoading;
   const reconnectExhausted = reconnectAttempt >= MAX_RECONNECT_ATTEMPTS;
@@ -1610,8 +1641,9 @@ export function ChatPage() {
     : reconnectExhausted
       ? "实时连接已断开，自动重连未成功。"
       : "实时连接已断开。";
-  const showReconnectBanner = connectionStatus === "closed"
-    || (connectionStatus === "connecting" && reconnectAttempt > 0);
+  const showReconnectBanner = !offline
+    && (connectionStatus === "closed"
+      || (connectionStatus === "connecting" && reconnectAttempt > 0));
   const workspaceClass = activeTarget
     ? "chat-workspace chat-workspace--active"
     : "chat-workspace";
@@ -1645,6 +1677,12 @@ export function ChatPage() {
             </button>
           </nav>
         </header>
+
+        {offline && (
+          <div className="ws-banner ws-banner--offline" id="offline-banner" role="alert">
+            <span>当前离线，只能查看已缓存的消息。重新联网后会自动刷新。</span>
+          </div>
+        )}
 
         {connectionStatus === "replaced" ? (
           <div className="ws-banner ws-banner--replaced" id="ws-replaced" role="alert">
@@ -1987,17 +2025,19 @@ export function ChatPage() {
                 >
                   <textarea
                     aria-label="消息内容"
-                    disabled={!activeTarget || isReadOnly || activeMissing || isReplaced}
+                    disabled={!activeTarget || isReadOnly || offline || activeMissing || isReplaced}
                     id="message-input"
                     onChange={(event) => handleComposerChange(event.target.value)}
                     onKeyDown={handleComposerKeyDown}
-                    placeholder={isReplaced
-                      ? "聊天已在其他窗口打开"
-                      : isReadOnly
-                        ? "已不是好友，无法发送消息"
-                        : activeTarget.kind === "group"
-                          ? "输入群消息，Enter 发送，Shift+Enter 换行"
-                          : "输入消息，Enter 发送，Shift+Enter 换行"}
+                    placeholder={offline
+                      ? "当前离线，无法发送消息"
+                      : isReplaced
+                        ? "聊天已在其他窗口打开"
+                        : isReadOnly
+                          ? "已不是好友，无法发送消息"
+                          : activeTarget.kind === "group"
+                            ? "输入群消息，Enter 发送，Shift+Enter 换行"
+                            : "输入消息，Enter 发送，Shift+Enter 换行"}
                     ref={composerRef}
                     rows={1}
                     value={draft}

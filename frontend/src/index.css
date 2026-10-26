@@ -1269,6 +1269,11 @@ a:focus-visible {
   color: var(--ink);
 }
 
+.ws-banner--offline {
+  background: #f1f4f9;
+  color: var(--ink);
+}
+
 .conversation-pane-actions {
   align-items: center;
   display: flex;

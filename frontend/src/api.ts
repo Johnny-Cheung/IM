@@ -135,6 +135,41 @@ export type MessagePageResponse = {
   has_more: boolean;
 };
 
+export type BootstrapGroupCursor = {
+  group_id: number;
+  after_id: number;
+};
+
+export type BootstrapDirect = {
+  messages: ChatMessage[];
+  has_more: boolean;
+  complete: boolean;
+  cursor: number;
+};
+
+export type BootstrapGroupDelta = {
+  group_id: number;
+  messages: GroupMessage[];
+  has_more: boolean;
+  complete: boolean;
+  cursor: number;
+};
+
+export type BootstrapResponse = {
+  user: User;
+  conversations: Conversation[];
+  friends: PublicUser[];
+  direct: BootstrapDirect;
+  groups: BootstrapGroupDelta[];
+  partial: string[];
+};
+
+export type BootstrapInput = {
+  afterID: number;
+  groups: BootstrapGroupCursor[];
+  limit?: number;
+};
+
 export type SendMessageResponse = {
   message: ChatMessage;
 };
@@ -208,6 +243,16 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export const api = {
   me: () => request<User>("/api/me"),
+
+  bootstrap: (input: BootstrapInput) =>
+    request<BootstrapResponse>("/api/bootstrap", {
+      method: "POST",
+      body: JSON.stringify({
+        after_id: input.afterID,
+        groups: input.groups,
+        limit: input.limit ?? 200,
+      }),
+    }),
 
   register: (input: RegisterInput) =>
     request<User>("/api/auth/register", {

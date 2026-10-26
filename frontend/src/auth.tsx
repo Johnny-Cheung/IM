@@ -11,16 +11,27 @@ import { Navigate, useLocation } from "react-router-dom";
 import {
   api,
   ApiError,
+  type BootstrapGroupCursor,
+  type BootstrapResponse,
   type RegisterInput,
   type User,
 } from "./api";
+import {
+  clearUser,
+  readHints,
+  setActiveUser,
+  writeConversations,
+  writeFriends,
+} from "./cache";
+import type { SyncState } from "./cache";
 
-type AuthStatus = "loading" | "authenticated" | "guest";
+type AuthStatus = "loading" | "authenticated" | "guest" | "offline";
 
 type AuthContextValue = {
   user: User | null;
   status: AuthStatus;
   notice: string | null;
+  bootstrap: BootstrapResponse | null;
   login: (username: string, password: string) => Promise<void>;
   register: (input: RegisterInput) => Promise<void>;
   logout: () => Promise<void>;
@@ -38,64 +49,139 @@ const sessionNotices: Record<string, string> = {
   session_revoked: "登录已失效，请重新登录。",
 };
 
+function groupCursors(sync: SyncState | null): BootstrapGroupCursor[] {
+  if (sync === null) {
+    return [];
+  }
+  return Object.entries(sync.groups)
+    .map(([groupID, afterID]) => ({
+      group_id: Number(groupID),
+      after_id: afterID,
+    }))
+    .filter((cursor) => cursor.group_id > 0 && cursor.after_id > 0)
+    .slice(0, 200);
+}
+
+async function loadBootstrap(sync: SyncState | null): Promise<BootstrapResponse> {
+  return api.bootstrap({
+    afterID: sync?.afterID ?? 0,
+    groups: groupCursors(sync),
+    limit: 200,
+  });
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [status, setStatus] = useState<AuthStatus>("loading");
   const [notice, setNotice] = useState<string | null>(null);
+  const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null);
+
+  const applyBootstrap = useCallback((payload: BootstrapResponse) => {
+    setUser(payload.user);
+    setBootstrap(payload);
+    setStatus("authenticated");
+    setNotice(null);
+    void setActiveUser(payload.user);
+    if (!payload.partial.includes("conversations")) {
+      void writeConversations(payload.user.username, payload.conversations);
+    }
+    if (!payload.partial.includes("friends")) {
+      void writeFriends(payload.user.username, payload.friends);
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
 
-    api.me()
-      .then((current) => {
+    void (async () => {
+      const hints = await readHints();
+      try {
+        const payload = await loadBootstrap(hints.sync);
         if (cancelled) return;
-        setUser(current);
-        setStatus("authenticated");
-      })
-      .catch((error: unknown) => {
+        applyBootstrap(payload);
+      } catch (error: unknown) {
         if (cancelled) return;
-        setUser(null);
-        setStatus("guest");
-        if (error instanceof ApiError && sessionNotices[error.code]) {
-          setNotice(sessionNotices[error.code]);
+        if (error instanceof ApiError && error.status === 401) {
+          setUser(null);
+          setBootstrap(null);
+          setStatus("guest");
+          if (sessionNotices[error.code]) {
+            setNotice(sessionNotices[error.code]);
+          }
+          return;
         }
-      });
+        if (hints.user !== null) {
+          setUser(hints.user);
+          setBootstrap(null);
+          setStatus("offline");
+          return;
+        }
+        setUser(null);
+        setBootstrap(null);
+        setStatus("guest");
+        setNotice(
+          error instanceof ApiError
+            ? error.message
+            : "无法连接服务器，请检查网络后重试。",
+        );
+      }
+    })();
 
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [applyBootstrap]);
 
   const login = useCallback(async (username: string, password: string) => {
     const current = await api.login(username, password);
-    setUser(current);
-    setStatus("authenticated");
     setNotice(null);
-  }, []);
+    try {
+      const hints = await readHints();
+      const sync = hints.user?.username === current.username ? hints.sync : null;
+      applyBootstrap(await loadBootstrap(sync));
+    } catch {
+      setUser(current);
+      setStatus("authenticated");
+    }
+  }, [applyBootstrap]);
 
   const register = useCallback(async (input: RegisterInput) => {
     const current = await api.register(input);
-    setUser(current);
-    setStatus("authenticated");
     setNotice(null);
-  }, []);
+    try {
+      applyBootstrap(await loadBootstrap(null));
+    } catch {
+      setUser(current);
+      setStatus("authenticated");
+    }
+  }, [applyBootstrap]);
 
   const logout = useCallback(async () => {
+    const username = user?.username ?? null;
     try {
       await api.logout();
     } finally {
+      if (username !== null) {
+        await clearUser(username);
+      }
       setUser(null);
+      setBootstrap(null);
       setStatus("guest");
       setNotice(null);
     }
-  }, []);
+  }, [user]);
 
   const updateUser = useCallback((current: User) => {
     setUser(current);
+    setBootstrap((previous) => previous === null
+      ? previous
+      : { ...previous, user: current });
+    void setActiveUser(current);
   }, []);
 
   const invalidate = useCallback((code: string) => {
     setUser(null);
+    setBootstrap(null);
     setStatus("guest");
     setNotice(sessionNotices[code] ?? "登录已失效，请重新登录。");
   }, []);
@@ -108,6 +194,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     user,
     status,
     notice,
+    bootstrap,
     login,
     register,
     logout,
@@ -118,6 +205,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     user,
     status,
     notice,
+    bootstrap,
     login,
     register,
     logout,
