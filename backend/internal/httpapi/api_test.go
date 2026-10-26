@@ -113,11 +113,18 @@ type fakeStore struct {
 
 	groupConversations    []store.GroupConversation
 	groupConversationsErr error
-	usersByKey            map[string]store.User
-	groupDetail           store.GroupDetail
-	groupDetailErr        error
-	createGroupErr        error
-	createGroupCall       struct {
+	groupMember           bool
+	groupMessageCall      struct {
+		userID   uint64
+		groupID  uint64
+		beforeID uint64
+		limit    int
+	}
+	usersByKey      map[string]store.User
+	groupDetail     store.GroupDetail
+	groupDetailErr  error
+	createGroupErr  error
+	createGroupCall struct {
 		ownerID   uint64
 		name      string
 		memberIDs []uint64
@@ -416,16 +423,18 @@ func (f *fakeStore) IsGroupMember(
 	uint64,
 	uint64,
 ) (bool, error) {
-	return true, nil
+	return f.groupMember, nil
 }
 
 func (f *fakeStore) ListGroupMessages(
-	context.Context,
-	uint64,
-	uint64,
-	uint64,
-	int,
+	_ context.Context,
+	userID, groupID, beforeID uint64,
+	limit int,
 ) (store.GroupMessagePage, error) {
+	f.groupMessageCall.userID = userID
+	f.groupMessageCall.groupID = groupID
+	f.groupMessageCall.beforeID = beforeID
+	f.groupMessageCall.limit = limit
 	return f.groupMessagePage, f.groupMessagePageErr
 }
 
