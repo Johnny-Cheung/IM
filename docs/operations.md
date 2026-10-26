@@ -204,7 +204,7 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 ```
 
 - 单组件重启使用 `redis-restart`、`rabbitmq-restart`；日志使用 `logs redis|rabbitmq|runtime`。
-- 当前正式 `8198` 已接入 v1.2 私聊和 v1.3 群聊消息链路，群聊已读仍按路线留在 v1.6；不配置开机自启，开发机重启后手动执行 `infractl start` 和 `imctl restart`。
+- 当前正式 `8198` 已接入 v1.2 私聊和 v1.3 群聊消息链路，群聊已读仍按路线留在 v1.7；不配置开机自启，开发机重启后手动执行 `infractl start` 和 `imctl restart`。
 
 ## v1.2 私聊消息链路（已切换正式）
 
