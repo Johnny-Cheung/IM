@@ -109,6 +109,47 @@ function readFriendsValue(value: unknown): PublicUser[] | null {
   return friends;
 }
 
+function isValidConversationRecord(
+  value: unknown,
+): value is CachedConversation {
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (typeof value.user !== "string" || typeof value.key !== "string") {
+    return false;
+  }
+  if (typeof value.updatedAt !== "number") {
+    return false;
+  }
+  const conversation = value.conversation;
+  if (!isRecord(conversation)) {
+    return false;
+  }
+  if (conversation.type === "direct") {
+    return isRecord(conversation.user);
+  }
+  if (conversation.type === "group") {
+    return isRecord(conversation.group);
+  }
+  return false;
+}
+
+function isValidMessageRecord(value: unknown): value is CachedMessageRecord {
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (typeof value.user !== "string" || typeof value.conversation !== "string") {
+    return false;
+  }
+  if (typeof value.id !== "number" || value.id <= 0) {
+    return false;
+  }
+  if (!isRecord(value.message)) {
+    return false;
+  }
+  return value.message.id === value.id;
+}
+
 function readValue(
   store: IDBObjectStore,
   key: IDBValidKey,
@@ -131,6 +172,11 @@ function conversationMessagesRange(
   );
 }
 
+function userMessagesRange(user: string): IDBKeyRange {
+  // [user, []] sorts after every [user, conversation, id] key.
+  return IDBKeyRange.bound([user], [user, []]);
+}
+
 function normalizeLimit(value: number | undefined, fallback: number): number {
   if (value === undefined || !Number.isFinite(value)) {
     return fallback;
@@ -143,6 +189,25 @@ function normalizeCursor(value: number | undefined, fallback: number): number {
     return fallback;
   }
   return Math.floor(value);
+}
+
+function mergeGroupCursors(
+  current: Record<number, number>,
+  incoming: Record<number, number>,
+): Record<number, number> {
+  const merged = { ...current };
+  for (const [key, cursor] of Object.entries(incoming)) {
+    const groupID = Number(key);
+    if (
+      Number.isInteger(groupID) &&
+      groupID > 0 &&
+      Number.isInteger(cursor) &&
+      cursor > 0
+    ) {
+      merged[groupID] = Math.max(merged[groupID] ?? 0, cursor);
+    }
+  }
+  return merged;
 }
 
 function disableCache(context: string, error: unknown): void {
@@ -291,6 +356,7 @@ export async function readConversations(
             transaction.objectStore(CONVERSATIONS_STORE),
           );
           return records
+            .filter(isValidConversationRecord)
             .filter((record) => record.user === user)
             .map((record) => record.conversation);
         },
@@ -422,7 +488,7 @@ export async function readMessages(
           conversationMessagesRange(user, conversation),
         );
         const sorted = sortMessagesByID(
-          records.map((record) => record.message),
+          records.filter(isValidMessageRecord).map((record) => record.message),
         );
         if (sorted.length <= effectiveLimit) {
           return sorted;
@@ -502,7 +568,14 @@ export async function readSyncState(user: string): Promise<SyncState> {
           transaction.objectStore(META_STORE),
           syncKey(user),
         );
-        return readSyncStateValue(value) ?? emptySyncState();
+        if (value === undefined) {
+          return emptySyncState();
+        }
+        // A corrupt record must not silently restore trust in the cache.
+        return readSyncStateValue(value) ?? {
+          ...emptySyncState(),
+          directComplete: false,
+        };
       }),
   );
 }
@@ -513,9 +586,19 @@ export async function writeSyncState(
 ): Promise<void> {
   await runWrite(async (db) => {
     await runTransaction(db, [META_STORE], "readwrite", async (transaction) => {
-      await requestToPromise(
-        transaction.objectStore(META_STORE).put(state, syncKey(user)),
-      );
+      const store = transaction.objectStore(META_STORE);
+      const current = readSyncStateValue(await readValue(store, syncKey(user)))
+        ?? emptySyncState();
+      const next: SyncState = {
+        afterID: Math.max(
+          current.afterID,
+          normalizeCursor(state.afterID, current.afterID),
+        ),
+        directComplete: state.directComplete,
+        groups: mergeGroupCursors(current.groups, state.groups),
+        savedAt: state.savedAt === "" ? new Date().toISOString() : state.savedAt,
+      };
+      await requestToPromise(store.put(next, syncKey(user)));
     });
   });
 }
@@ -531,7 +614,9 @@ export async function patchSyncState(
         normalizeCursor(patch.afterID, current.afterID),
       ),
       directComplete: patch.directComplete ?? current.directComplete,
-      groups: patch.groups !== undefined ? { ...patch.groups } : current.groups,
+      groups: patch.groups !== undefined
+        ? mergeGroupCursors(current.groups, patch.groups)
+        : current.groups,
       savedAt: new Date().toISOString(),
     }));
   });
@@ -620,6 +705,20 @@ export async function removeConversation(
 }
 
 export async function clearUser(user: string): Promise<void> {
+  // Drop the offline hint first: even if clearing messages fails, the next
+  // person at this machine must not be shown the signed-out account's cache.
+  await runWrite(async (db) => {
+    await runTransaction(db, [META_STORE], "readwrite", async (transaction) => {
+      const metaStore = transaction.objectStore(META_STORE);
+      const activeUser = readUserValue(
+        await readValue(metaStore, ACTIVE_USER_KEY),
+      );
+      if (activeUser?.username === user) {
+        await requestToPromise(metaStore.delete(ACTIVE_USER_KEY));
+      }
+    });
+  });
+
   await runWrite(async (db) => {
     await runTransaction(
       db,
@@ -636,26 +735,19 @@ export async function clearUser(user: string): Promise<void> {
         );
         for (const key of conversationKeys) {
           if (Array.isArray(key) && key[0] === user) {
-            void conversationStore.delete(key);
+            await requestToPromise(conversationStore.delete(key));
           }
         }
 
         const messageKeys = await requestToPromise(messageStore.getAllKeys());
         for (const key of messageKeys) {
           if (Array.isArray(key) && key[0] === user) {
-            void messageStore.delete(key);
+            await requestToPromise(messageStore.delete(key));
           }
         }
 
         await requestToPromise(friendsStore.delete([user]));
         await requestToPromise(metaStore.delete(syncKey(user)));
-
-        const activeUser = readUserValue(
-          await readValue(metaStore, ACTIVE_USER_KEY),
-        );
-        if (activeUser?.username === user) {
-          await requestToPromise(metaStore.delete(ACTIVE_USER_KEY));
-        }
       },
     );
   });
@@ -698,27 +790,19 @@ export async function enforceUserLimits(
   await runWrite(async (db) => {
     await runTransaction(
       db,
-      [MESSAGES_STORE, CONVERSATIONS_STORE, META_STORE],
+      [MESSAGES_STORE, META_STORE],
       "readwrite",
       async (transaction) => {
         const messageStore = transaction.objectStore(MESSAGES_STORE);
-        const conversationStore = transaction.objectStore(CONVERSATIONS_STORE);
         const metaStore = transaction.objectStore(META_STORE);
 
-        const conversationRecords = await readAll<CachedConversation>(
-          conversationStore,
+        const messageRecords = await readAll<CachedMessageRecord>(
+          messageStore,
+          userMessagesRange(user),
         );
-        const updatedAt = new Map<string, number>();
-        for (const record of conversationRecords) {
-          if (record.user === user) {
-            updatedAt.set(record.key, record.updatedAt);
-          }
-        }
-
-        const messageRecords = await readAll<CachedMessageRecord>(messageStore);
         const stats = new Map<string, { count: number; maxID: number }>();
         for (const record of messageRecords) {
-          if (record.user !== user) {
+          if (!isValidMessageRecord(record) || record.user !== user) {
             continue;
           }
           const entry = stats.get(record.conversation) ?? { count: 0, maxID: 0 };
@@ -734,30 +818,10 @@ export async function enforceUserLimits(
         for (const entry of stats.values()) {
           messageCount += entry.count;
         }
-
-        const removedGroups: number[] = [];
-        for (const key of Array.from(stats.keys())) {
-          if (updatedAt.has(key)) {
-            continue;
-          }
-          const entry = stats.get(key) ?? { count: 0, maxID: 0 };
-          await requestToPromise(
-            messageStore.delete(conversationMessagesRange(user, key)),
-          );
-          stats.delete(key);
-          conversationCount -= 1;
-          messageCount -= entry.count;
-          const groupID = groupIDFromKey(key);
-          if (groupID !== null) {
-            removedGroups.push(groupID);
-          }
-        }
-
         if (
           conversationCount <= maxConversations &&
           messageCount <= maxMessages
         ) {
-          await dropGroupCursors(metaStore, user, removedGroups);
           return;
         }
 
@@ -773,6 +837,7 @@ export async function enforceUserLimits(
           return left.localeCompare(right);
         });
 
+        const removedGroups: number[] = [];
         for (const key of candidates) {
           if (
             conversationCount <= maxConversations &&

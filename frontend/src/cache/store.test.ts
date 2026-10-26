@@ -241,7 +241,7 @@ describe("messages", () => {
     expect(cached[1].body).toBe("updated");
   });
 
-  it("dedupes by client id when the server id changes", async () => {
+  it("keeps two confirmed messages that share a client id", async () => {
     const conversation = "direct:bob";
     await writeMessages("alice", conversation, [
       directMessage(1, { client_message_id: "shared" }),
@@ -252,8 +252,7 @@ describe("messages", () => {
     ]);
 
     const cached = await readMessages("alice", conversation);
-    expect(cached).toHaveLength(1);
-    expect(cached[0]).toMatchObject({ id: 4, body: "server copy" });
+    expect(idsOf(cached)).toEqual([1, 4]);
   });
 
   it("returns ascending by id and the newest messages for a limit", async () => {
@@ -394,9 +393,7 @@ describe("clearUser", () => {
 });
 
 describe("enforceUserLimits", () => {
-  it("drops messages whose conversation record is gone first", async () => {
-    await writeConversations("alice", [groupConversation(1, 10)]);
-    await writeMessages("alice", "group:1", [groupMessage(1, 10)]);
+  it("keeps messages whose conversation record is not cached yet", async () => {
     await writeMessages("alice", "group:9", [groupMessage(9, 90)]);
 
     await enforceUserLimits("alice", {
@@ -404,8 +401,7 @@ describe("enforceUserLimits", () => {
       maxConversations: 100,
     });
 
-    expect(await readMessages("alice", "group:1")).toHaveLength(1);
-    expect(await readMessages("alice", "group:9")).toEqual([]);
+    expect(idsOf(await readMessages("alice", "group:9"))).toEqual([90]);
   });
 
   it("evicts whole conversations and their cursors by newest message id", async () => {
@@ -571,13 +567,13 @@ describe("storage guarantees", () => {
     expect((await readSyncState("alice")).groups).toEqual({ 1: 100 });
   });
 
-  it("drops group cursors for orphaned message caches", async () => {
+  it("drops group cursors when their messages are evicted", async () => {
     await writeMessages("alice", "group:9", [groupMessage(9, 90)]);
     await setGroupCursor("alice", 9, 90);
 
     await enforceUserLimits("alice", {
       maxMessages: 10_000,
-      maxConversations: 100,
+      maxConversations: 0,
     });
 
     expect(await readMessages("alice", "group:9")).toEqual([]);
@@ -636,7 +632,7 @@ describe("storage guarantees", () => {
     expect(idsOf(await readMessages("alice", "direct:carol"))).toEqual([11]);
   });
 
-  it("keeps groups on a partial patch and replaces them when supplied", async () => {
+  it("keeps groups on a partial patch and merges them when supplied", async () => {
     await patchSyncState("alice", {
       afterID: 10,
       directComplete: true,
@@ -651,6 +647,6 @@ describe("storage guarantees", () => {
 
     await patchSyncState("alice", { groups: { 3: 7 } });
     state = await readSyncState("alice");
-    expect(state.groups).toEqual({ 3: 7 });
+    expect(state.groups).toEqual({ 1: 5, 2: 6, 3: 7 });
   });
 });

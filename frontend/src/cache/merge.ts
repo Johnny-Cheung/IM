@@ -2,8 +2,10 @@ import type { Conversation } from "../api";
 import type { CachedMessage, GroupSyncRequest } from "./types";
 
 function sameMessage(left: CachedMessage, right: CachedMessage): boolean {
-  if (left.id !== 0 && left.id === right.id) {
-    return true;
+  if (left.id > 0 && right.id > 0) {
+    // Two confirmed messages are the same only when the server says so. Client
+    // message ids are not unique across senders, so they must not merge them.
+    return left.id === right.id;
   }
   return (
     left.client_message_id !== "" &&
@@ -21,12 +23,21 @@ export function mergeMessages(
 ): CachedMessage[] {
   const merged = existing.slice();
   for (const message of incoming) {
-    for (let index = merged.length - 1; index >= 0; index -= 1) {
-      if (sameMessage(merged[index], message)) {
-        merged.splice(index, 1);
+    let replaced = false;
+    for (let index = 0; index < merged.length; index += 1) {
+      if (!sameMessage(merged[index], message)) {
+        continue;
       }
+      // Never let an unconfirmed copy replace a server-confirmed one.
+      if (message.id >= merged[index].id) {
+        merged[index] = message;
+      }
+      replaced = true;
+      break;
     }
-    merged.push(message);
+    if (!replaced) {
+      merged.push(message);
+    }
   }
   return sortMessagesByID(merged);
 }
@@ -39,6 +50,9 @@ export function trimMessageIDs(ids: number[], limit: number): number[] {
   return ids.slice(0, removeCount);
 }
 
+// planGroupSync must be called with a freshly fetched conversation list. A
+// cached list is stale by definition and would drop the groups that received
+// messages since the last session.
 export function planGroupSync(
   conversations: Conversation[],
   cursors: Record<number, number>,

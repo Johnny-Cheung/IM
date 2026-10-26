@@ -101,7 +101,7 @@ describe("mergeMessages", () => {
     expect(merged[1].body).toBe("new");
   });
 
-  it("deduplicates by client_message_id when ids differ", () => {
+  it("keeps two confirmed messages even when client ids collide", () => {
     const existing = [
       directMessage(1, { client_message_id: "shared-client" }),
     ];
@@ -111,25 +111,35 @@ describe("mergeMessages", () => {
 
     const merged = mergeMessages(existing, incoming);
 
-    expect(merged).toHaveLength(1);
-    expect(merged[0].id).toBe(2);
-    expect(merged[0].body).toBe("new");
+    // Client message ids are only unique per sender, so two server-confirmed
+    // messages must never collapse into one.
+    expect(merged.map((message) => message.id)).toEqual([1, 2]);
   });
 
-  it("collapses duplicates inside incoming", () => {
+  it("does not let an unconfirmed copy replace a confirmed message", () => {
+    const existing = [
+      directMessage(1, { client_message_id: "shared-client", body: "confirmed" }),
+    ];
+    const incoming = [
+      directMessage(0, { client_message_id: "shared-client", body: "optimistic" }),
+    ];
+
+    const merged = mergeMessages(existing, incoming);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({ id: 1, body: "confirmed" });
+  });
+
+  it("collapses exact duplicates inside incoming", () => {
     const incoming = [
       directMessage(5, { body: "first" }),
       directMessage(5, { body: "second" }),
-      directMessage(6, {
-        client_message_id: "direct-client-5",
-        body: "third",
-      }),
     ];
 
     const merged = mergeMessages([], incoming);
 
     expect(merged).toHaveLength(1);
-    expect(merged[0]).toMatchObject({ id: 6, body: "third" });
+    expect(merged[0]).toMatchObject({ id: 5, body: "second" });
   });
 
   it("does not collapse distinct messages with empty client ids", () => {

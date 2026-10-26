@@ -50,33 +50,60 @@ export function openCacheDB(): Promise<IDBDatabase> {
 
   const opening = new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      dbPromise = null;
+      reject(new Error("The cache database open request timed out"));
+    }, 3000);
+    const fail = (error: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      dbPromise = null;
+      reject(error);
+    };
 
     request.onupgradeneeded = () => {
       createStores(request.result);
     };
 
+    request.onblocked = () => {
+      fail(new Error("The cache database is blocked by another tab"));
+    };
+
     request.onsuccess = () => {
+      if (settled) {
+        request.result.close();
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
       const db = request.result;
       openDB = db;
       db.onversionchange = () => {
         db.close();
         if (openDB === db) {
           openDB = null;
+          dbPromise = null;
         }
-        dbPromise = null;
       };
       db.onclose = () => {
         if (openDB === db) {
           openDB = null;
+          dbPromise = null;
         }
-        dbPromise = null;
       };
       resolve(db);
     };
 
     request.onerror = () => {
-      dbPromise = null;
-      reject(request.error ?? new Error("Failed to open the cache database"));
+      fail(request.error ?? new Error("Failed to open the cache database"));
     };
   });
 
