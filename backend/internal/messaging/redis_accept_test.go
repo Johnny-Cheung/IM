@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -22,10 +23,7 @@ func TestRedisAcceptorAcceptsAndDeduplicates(t *testing.T) {
 	}
 	acceptor := NewRedisAcceptor(client, RedisAcceptorOptions{
 		SeedFloor:    41,
-		EntityTTL:    time.Hour,
 		DedupTTL:     time.Hour,
-		InboxKeep:    10,
-		OutboxKeep:   10,
 		StreamMaxLen: 10,
 	})
 	createdAt := time.UnixMilli(1700000000123).UTC()
@@ -102,6 +100,45 @@ func TestRedisAcceptorRejectsBeforeAllocatingID(t *testing.T) {
 	request.RecipientID = request.SenderID
 	if _, err := acceptor.Accept(context.Background(), request); !errors.Is(err, store.ErrCannotMessageSelf) {
 		t.Fatalf("self-message error = %v, want ErrCannotMessageSelf", err)
+	}
+}
+
+func TestRedisAcceptorKeepsIndexAndEntitiesAligned(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+	if err := client.SAdd(ctx, friendshipKey(1), 2).Err(); err != nil {
+		t.Fatalf("seed friendship: %v", err)
+	}
+	acceptor := NewRedisAcceptor(client, RedisAcceptorOptions{})
+
+	const total = 12
+	for index := 1; index <= total; index++ {
+		if _, err := acceptor.Accept(ctx, DirectMessageRequest{
+			SenderID:        1,
+			RecipientID:     2,
+			ClientMessageID: fmt.Sprintf("client-%03d", index),
+			Body:            "hello",
+		}); err != nil {
+			t.Fatalf("accept message %d: %v", index, err)
+		}
+	}
+
+	if got := client.ZCard(ctx, outboxKey(1)).Val(); got != total {
+		t.Fatalf("outbox size = %d, want %d (indexes must not be trimmed)", got, total)
+	}
+	if got := client.ZCard(ctx, inboxKey(2)).Val(); got != total {
+		t.Fatalf("inbox size = %d, want %d (indexes must not be trimmed)", got, total)
+	}
+	for id := uint64(1); id <= total; id++ {
+		if got := client.Exists(ctx, messageKey(id)).Val(); got != 1 {
+			t.Fatalf("entity %d missing for indexed message", id)
+		}
+		if ttl := client.TTL(ctx, messageKey(id)).Val(); ttl != -1 {
+			t.Fatalf("entity %d ttl = %v, want no expiry", id, ttl)
+		}
 	}
 }
 

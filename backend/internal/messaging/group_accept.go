@@ -43,14 +43,8 @@ func NewGroupRedisAcceptor(
 	keyspace Keyspace,
 	options RedisAcceptorOptions,
 ) *GroupRedisAcceptor {
-	if options.EntityTTL <= 0 {
-		options.EntityTTL = defaultEntityTTL
-	}
 	if options.DedupTTL <= 0 {
 		options.DedupTTL = defaultDedupTTL
-	}
-	if options.InboxKeep <= 0 {
-		options.InboxKeep = defaultInboxKeep
 	}
 	if options.StreamMaxLen <= 0 {
 		options.StreamMaxLen = defaultStreamMaxLen
@@ -88,9 +82,7 @@ func (a *GroupRedisAcceptor) Accept(
 		hashMessageBody(request.Body),
 		a.options.SeedFloor,
 		store.MaxSafeMessageID,
-		int64(a.options.EntityTTL / time.Second),
 		int64(a.options.DedupTTL / time.Second),
-		a.options.InboxKeep,
 		a.options.StreamMaxLen,
 		a.keyspace.prefixOrDefault() + "group-messages:",
 		request.SenderUsername,

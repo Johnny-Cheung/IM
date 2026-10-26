@@ -6,13 +6,11 @@ local created_at_ms = ARGV[5]
 local body_hash = ARGV[6]
 local seed_floor = tonumber(ARGV[7])
 local max_safe_id = tonumber(ARGV[8])
-local entity_ttl = tonumber(ARGV[9])
-local dedup_ttl = tonumber(ARGV[10])
-local inbox_keep = tonumber(ARGV[11])
-local stream_max_len = tonumber(ARGV[12])
-local message_prefix = ARGV[13]
-local sender_username = ARGV[14]
-local sender_nickname = ARGV[15]
+local dedup_ttl = tonumber(ARGV[9])
+local stream_max_len = tonumber(ARGV[10])
+local message_prefix = ARGV[11]
+local sender_username = ARGV[12]
+local sender_nickname = ARGV[13]
 
 if redis.call('EXISTS', KEYS[3]) == 1 then
   return {'projection_missing'}
@@ -62,7 +60,6 @@ redis.call('HSET', message_key,
   'sender_username', sender_username,
   'sender_nickname', sender_nickname,
   'body_hash', body_hash)
-redis.call('EXPIRE', message_key, entity_ttl)
 
 redis.call('HSET', KEYS[4],
   'id', tostring(message_id),
@@ -71,7 +68,6 @@ redis.call('HSET', KEYS[4],
 redis.call('EXPIRE', KEYS[4], dedup_ttl)
 
 redis.call('ZADD', KEYS[6], message_id, tostring(message_id))
-redis.call('ZREMRANGEBYRANK', KEYS[6], 0, -inbox_keep - 1)
 redis.call('SET', KEYS[7], tostring(message_id))
 
 redis.call('XADD', KEYS[8], 'MAXLEN', '~', stream_max_len, '*',

@@ -32,37 +32,27 @@ type RedisAcceptor struct {
 	options RedisAcceptorOptions
 }
 
-// RedisAcceptorOptions controls bounded Redis message storage.
+// RedisAcceptorOptions controls Redis message storage.
+//
+// Message entities and the inbox/outbox indexes are append-only: they carry no
+// TTL and are never trimmed, so every index entry always resolves to a stored
+// entity. Bounding the hot window is deferred until the read path owns an
+// explicit window marker.
 type RedisAcceptorOptions struct {
 	SeedFloor    uint64
 	Keyspace     Keyspace
-	EntityTTL    time.Duration
 	DedupTTL     time.Duration
-	InboxKeep    int64
-	OutboxKeep   int64
 	StreamMaxLen int64
 }
 
 const (
-	defaultEntityTTL    = 24 * time.Hour
 	defaultDedupTTL     = 7 * 24 * time.Hour
-	defaultInboxKeep    = int64(5000)
-	defaultOutboxKeep   = int64(5000)
 	defaultStreamMaxLen = int64(10000)
 )
 
 func NewRedisAcceptor(client redis.Scripter, options RedisAcceptorOptions) *RedisAcceptor {
-	if options.EntityTTL <= 0 {
-		options.EntityTTL = defaultEntityTTL
-	}
 	if options.DedupTTL <= 0 {
 		options.DedupTTL = defaultDedupTTL
-	}
-	if options.InboxKeep <= 0 {
-		options.InboxKeep = defaultInboxKeep
-	}
-	if options.OutboxKeep <= 0 {
-		options.OutboxKeep = defaultOutboxKeep
 	}
 	if options.StreamMaxLen <= 0 {
 		options.StreamMaxLen = defaultStreamMaxLen
@@ -97,10 +87,7 @@ func (a *RedisAcceptor) Accept(ctx context.Context, request DirectMessageRequest
 		bodyHash,
 		a.options.SeedFloor,
 		store.MaxSafeMessageID,
-		int64(a.options.EntityTTL / time.Second),
 		int64(a.options.DedupTTL / time.Second),
-		a.options.InboxKeep,
-		a.options.OutboxKeep,
 		a.options.StreamMaxLen,
 		keyspace.prefixOrDefault() + "messages:",
 	}
