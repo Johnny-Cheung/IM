@@ -61,6 +61,113 @@ func (r *RedisMessageReader) ReadConversationAfter(
 	return r.read(ctx, userID, otherID, 0, afterID, limit)
 }
 
+// FeedPage is one page of the user's direct-message feed.
+//
+// Complete reports whether the feed covers every message after the cursor.
+// When it is false the caller must resynchronise from conversation history.
+type FeedPage struct {
+	Page     store.MessagePage
+	Complete bool
+}
+
+// ReadFeed returns the messages the user exchanged after afterID, oldest
+// first, across all direct conversations.
+func (r *RedisMessageReader) ReadFeed(
+	ctx context.Context,
+	userID, afterID uint64,
+	limit int,
+) (FeedPage, error) {
+	if r == nil || r.client == nil {
+		return FeedPage{}, ErrMessageServiceUnavailable
+	}
+	if limit < 1 {
+		return FeedPage{}, fmt.Errorf("invalid feed limit")
+	}
+
+	lower := r.epoch
+	if afterID > lower {
+		lower = afterID
+	}
+	values, err := r.client.ZRangeByScore(ctx, r.keyspace.directFeedKey(userID), &redis.ZRangeBy{
+		Min:    exclusiveMin(lower),
+		Max:    "+inf",
+		Offset: 0,
+		Count:  int64(limit + 1),
+	}).Result()
+	if err != nil {
+		return FeedPage{}, err
+	}
+
+	ids := make([]uint64, 0, len(values))
+	for _, value := range values {
+		id, parseErr := strconv.ParseUint(value, 10, 64)
+		if parseErr != nil || id == 0 {
+			continue
+		}
+		ids = append(ids, id)
+	}
+
+	messages, missing, err := r.loadMessages(ctx, ids)
+	if err != nil {
+		return FeedPage{}, err
+	}
+	sort.Slice(messages, func(i, j int) bool { return messages[i].ID < messages[j].ID })
+
+	hasMore := len(messages) > limit
+	if hasMore {
+		messages = messages[:limit]
+	}
+	return FeedPage{
+		Page:     store.MessagePage{Messages: messages, HasMore: hasMore},
+		Complete: !missing && afterID >= r.epoch,
+	}, nil
+}
+
+// LastConversationMessages returns the newest message exchanged with each peer,
+// keyed by peer user ID.
+func (r *RedisMessageReader) LastConversationMessages(
+	ctx context.Context,
+	userID uint64,
+) (map[uint64]store.Message, error) {
+	if r == nil || r.client == nil {
+		return nil, ErrMessageServiceUnavailable
+	}
+	values, err := r.client.HGetAll(ctx, r.keyspace.directConversationLastKey(userID)).Result()
+	if err != nil {
+		return nil, err
+	}
+	if len(values) == 0 {
+		return map[uint64]store.Message{}, nil
+	}
+
+	peerByMessage := make(map[uint64]uint64, len(values))
+	ids := make([]uint64, 0, len(values))
+	for peerRaw, messageRaw := range values {
+		peerID, parseErr := strconv.ParseUint(peerRaw, 10, 64)
+		if parseErr != nil {
+			continue
+		}
+		messageID, parseErr := strconv.ParseUint(messageRaw, 10, 64)
+		if parseErr != nil {
+			continue
+		}
+		peerByMessage[messageID] = peerID
+		ids = append(ids, messageID)
+	}
+
+	messages, _, err := r.loadMessages(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[uint64]store.Message, len(messages))
+	for _, message := range messages {
+		if peerID, ok := peerByMessage[message.ID]; ok {
+			result[peerID] = message
+		}
+	}
+	return result, nil
+}
+
 func (r *RedisMessageReader) read(
 	ctx context.Context,
 	userID, otherID, beforeID, afterID uint64,

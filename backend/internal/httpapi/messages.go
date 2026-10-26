@@ -63,6 +63,12 @@ type messagePageResponse struct {
 	HasMore  bool              `json:"has_more"`
 }
 
+type syncMessagePageResponse struct {
+	Messages []messageResponse `json:"messages"`
+	HasMore  bool              `json:"has_more"`
+	Complete bool              `json:"complete"`
+}
+
 type sendMessageRequest struct {
 	Body            string `json:"body"`
 	ClientMessageID string `json:"client_message_id"`
@@ -88,6 +94,23 @@ func (a *API) listConversations(c *gin.Context) {
 		log.Printf("list conversations: %v", err)
 		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
 		return
+	}
+	if a.directReader != nil {
+		hotMessages, hotErr := a.directReader.LastConversationMessages(c.Request.Context(), current.ID)
+		if hotErr != nil {
+			log.Printf("read hot conversation messages: %v", hotErr)
+		} else {
+			for index := range conversations {
+				message, ok := hotMessages[conversations[index].UserID]
+				if !ok {
+					continue
+				}
+				if conversations[index].LastMessage == nil || message.ID > conversations[index].LastMessage.ID {
+					messageCopy := message
+					conversations[index].LastMessage = &messageCopy
+				}
+			}
+		}
 	}
 	groups, err := a.store.ListGroupConversations(c.Request.Context(), current.ID)
 	if err != nil {
@@ -345,6 +368,75 @@ func mergeMessagePages(primary, hot store.MessagePage, beforeDirection bool, lim
 		}
 	}
 	return store.MessagePage{Messages: messages, HasMore: hasMore}
+}
+
+// syncMessages returns every direct message after the cursor across all
+// conversations. It backs client-side incremental sync.
+func (a *API) syncMessages(c *gin.Context) {
+	current, ok := currentUser(c)
+	if !ok {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
+		return
+	}
+	afterID, err := parseAfterID(c.Query("after_id"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_request", "同步游标不正确")
+		return
+	}
+	limit, err := parseMessageLimit(c.Query("limit"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
+		return
+	}
+	if a.directReader == nil {
+		writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂不可用")
+		return
+	}
+
+	feed, err := a.directReader.ReadFeed(c.Request.Context(), current.ID, afterID, limit)
+	if err != nil {
+		log.Printf("read message feed: %v", err)
+		writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂不可用")
+		return
+	}
+
+	peerIDs := make(map[uint64]struct{}, len(feed.Page.Messages))
+	for _, message := range feed.Page.Messages {
+		if message.SenderID == current.ID {
+			peerIDs[message.RecipientID] = struct{}{}
+			continue
+		}
+		peerIDs[message.SenderID] = struct{}{}
+	}
+	ids := make([]uint64, 0, len(peerIDs))
+	for id := range peerIDs {
+		ids = append(ids, id)
+	}
+	peers, err := a.store.ListPublicUsersByIDs(c.Request.Context(), ids)
+	if err != nil {
+		log.Printf("list sync participants: %v", err)
+		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
+		return
+	}
+
+	response := syncMessagePageResponse{
+		Messages: make([]messageResponse, 0, len(feed.Page.Messages)),
+		HasMore:  feed.Page.HasMore,
+		Complete: feed.Complete,
+	}
+	for _, message := range feed.Page.Messages {
+		peerID := message.RecipientID
+		if message.SenderID != current.ID {
+			peerID = message.SenderID
+		}
+		peer := peers[peerID]
+		response.Messages = append(response.Messages, toMessageResponse(
+			message,
+			current,
+			publicUserResponse{Username: peer.Username, Nickname: peer.Nickname},
+		))
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func (a *API) sendMessage(c *gin.Context) {

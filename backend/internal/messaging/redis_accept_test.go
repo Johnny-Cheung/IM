@@ -59,6 +59,12 @@ func TestRedisAcceptorAcceptsAndDeduplicates(t *testing.T) {
 	if got := client.ZScore(context.Background(), directConversationKey(2, 1), "42").Val(); got != 42 {
 		t.Fatalf("conversation index score = %v, want 42", got)
 	}
+	if got := client.HGet(context.Background(), directConversationLastKey(1), "2").Val(); got != "42" {
+		t.Fatalf("sender last message = %q, want 42", got)
+	}
+	if got := client.HGet(context.Background(), directConversationLastKey(2), "1").Val(); got != "42" {
+		t.Fatalf("recipient last message = %q, want 42", got)
+	}
 	if got := client.XLen(context.Background(), messageStreamKey()).Val(); got != 1 {
 		t.Fatalf("stream length = %d, want 1", got)
 	}

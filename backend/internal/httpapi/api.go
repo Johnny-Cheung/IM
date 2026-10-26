@@ -67,6 +67,7 @@ type Store interface {
 	) error
 	DeleteFriend(ctx context.Context, userID, friendID uint64) error
 	ListConversations(ctx context.Context, userID uint64) ([]store.Conversation, error)
+	ListPublicUsersByIDs(ctx context.Context, ids []uint64) (map[uint64]store.PublicUser, error)
 	ListMessages(
 		ctx context.Context,
 		userID, otherID, beforeID uint64,
@@ -145,6 +146,8 @@ type FriendshipProjector interface {
 type DirectMessageReader interface {
 	ReadConversation(context.Context, uint64, uint64, uint64, int) (messaging.ConversationPage, error)
 	ReadConversationAfter(context.Context, uint64, uint64, uint64, int) (messaging.ConversationPage, error)
+	ReadFeed(context.Context, uint64, uint64, int) (messaging.FeedPage, error)
+	LastConversationMessages(context.Context, uint64) (map[uint64]store.Message, error)
 }
 
 // GroupMessageAcceptor is the optional Redis group acceptance path.
@@ -256,6 +259,7 @@ func (a *API) Register(router *gin.Engine) {
 	authed.POST("/friend-requests/:id/accept", a.acceptFriendRequest)
 	authed.POST("/friend-requests/:id/reject", a.rejectFriendRequest)
 	authed.GET("/conversations", a.listConversations)
+	authed.GET("/messages/sync", a.syncMessages)
 	authed.GET("/conversations/:username/messages", a.listMessages)
 	authed.POST("/conversations/:username/messages", a.sendMessage)
 	authed.POST("/conversations/:username/read", a.markConversationRead)

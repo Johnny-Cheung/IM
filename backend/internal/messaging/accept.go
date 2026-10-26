@@ -77,6 +77,8 @@ func (a *RedisAcceptor) Accept(ctx context.Context, request DirectMessageRequest
 		keyspace.directFeedKey(request.SenderID),
 		keyspace.directFeedKey(request.RecipientID),
 		keyspace.directConversationKey(request.RecipientID, request.SenderID),
+		keyspace.directConversationLastKey(request.SenderID),
+		keyspace.directConversationLastKey(request.RecipientID),
 		keyspace.messageStreamKey(),
 	}
 	args := []interface{}{

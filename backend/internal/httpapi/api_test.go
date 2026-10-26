@@ -392,6 +392,25 @@ func (f *fakeStore) ListGroupMemberIDs(context.Context, uint64) ([]uint64, error
 	return f.groupMemberIDs, f.groupMemberIDsErr
 }
 
+func (f *fakeStore) ListPublicUsersByIDs(
+	_ context.Context,
+	ids []uint64,
+) (map[uint64]store.PublicUser, error) {
+	result := make(map[uint64]store.PublicUser, len(ids))
+	for _, id := range ids {
+		for _, user := range f.usersByKey {
+			if user.ID == id {
+				result[id] = store.PublicUser{
+					Username: user.Username,
+					Nickname: user.Nickname,
+				}
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
 func (f *fakeStore) IsGroupMember(
 	context.Context,
 	uint64,

@@ -42,6 +42,10 @@ func directConversationKey(ownerID, peerID uint64) string {
 	return defaultKeyspace.directConversationKey(ownerID, peerID)
 }
 
+func directConversationLastKey(userID uint64) string {
+	return defaultKeyspace.directConversationLastKey(userID)
+}
+
 func (k Keyspace) counterKey() string {
 	return k.prefixOrDefault() + "messages:next_id"
 }
@@ -75,6 +79,12 @@ func (k Keyspace) directFeedKey(userID uint64) string {
 // directConversationKey indexes the messages peer sent to owner.
 func (k Keyspace) directConversationKey(ownerID, peerID uint64) string {
 	return fmt.Sprintf("%sdm:conv:%d:%d", k.prefixOrDefault(), ownerID, peerID)
+}
+
+// directConversationLastKey maps each peer to the newest message exchanged
+// with that peer, backing the conversation list.
+func (k Keyspace) directConversationLastKey(userID uint64) string {
+	return fmt.Sprintf("%sdm:conv-last:%d", k.prefixOrDefault(), userID)
 }
 
 // indexEpochKey records the highest message ID that is not guaranteed to be

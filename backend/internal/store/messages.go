@@ -38,11 +38,52 @@ type MessagePage struct {
 
 // Conversation is a chat list entry with the other user and latest message.
 type Conversation struct {
+	UserID                uint64
 	User                  PublicUser
 	IsFriend              bool
 	LastMessage           *Message
 	UnreadCount           int
 	PeerLastReadMessageID uint64
+}
+
+// ListPublicUsersByIDs returns public identities for the given user IDs.
+func (s *Store) ListPublicUsersByIDs(
+	ctx context.Context,
+	ids []uint64,
+) (map[uint64]PublicUser, error) {
+	result := make(map[uint64]PublicUser, len(ids))
+	if len(ids) == 0 {
+		return result, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, len(ids))
+	for index, id := range ids {
+		placeholders[index] = "?"
+		args[index] = id
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, username, nickname
+		 FROM users
+		 WHERE id IN (`+strings.Join(placeholders, ",")+`)`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list public users: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var id uint64
+		var user PublicUser
+		if err := rows.Scan(&id, &user.Username, &user.Nickname); err != nil {
+			return nil, fmt.Errorf("scan public user: %w", err)
+		}
+		result[id] = user
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate public users: %w", err)
+	}
+	return result, nil
 }
 
 // ListConversations returns all friends plus users with existing messages,
@@ -51,7 +92,7 @@ func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Convers
 	conversations := make([]Conversation, 0)
 
 	friendRows, err := s.db.QueryContext(ctx,
-		`SELECT u.username, u.nickname
+		`SELECT u.id, u.username, u.nickname
 		 FROM friendships f
 		 JOIN users u ON u.id = f.friend_user_id
 		 WHERE f.user_id = ?`,
@@ -62,16 +103,18 @@ func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Convers
 	}
 	friends := make(map[string]bool)
 	for friendRows.Next() {
-		var friend PublicUser
-		if err := friendRows.Scan(&friend.Username, &friend.Nickname); err != nil {
+		var conversation Conversation
+		if err := friendRows.Scan(
+			&conversation.UserID,
+			&conversation.User.Username,
+			&conversation.User.Nickname,
+		); err != nil {
 			_ = friendRows.Close()
 			return nil, fmt.Errorf("scan conversation friend: %w", err)
 		}
-		friends[friend.Username] = true
-		conversations = append(conversations, Conversation{
-			User:     friend,
-			IsFriend: true,
-		})
+		friends[conversation.User.Username] = true
+		conversation.IsFriend = true
+		conversations = append(conversations, conversation)
 	}
 	if err := friendRows.Err(); err != nil {
 		_ = friendRows.Close()
@@ -83,7 +126,7 @@ func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Convers
 
 	latestRows, err := s.db.QueryContext(ctx,
 		`SELECT m.server_message_id, m.sender_id, m.recipient_id, m.client_message_id,
-		        m.body, m.created_at, u.username, u.nickname
+		        m.body, m.created_at, u.username, u.nickname, u.id
 		 FROM messages m
 		 JOIN users u
 		   ON u.id = CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END
@@ -108,6 +151,7 @@ func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Convers
 	for latestRows.Next() {
 		var message Message
 		var other PublicUser
+		var otherID uint64
 		if err := latestRows.Scan(
 			&message.ID,
 			&message.SenderID,
@@ -117,15 +161,18 @@ func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Convers
 			&message.CreatedAt,
 			&other.Username,
 			&other.Nickname,
+			&otherID,
 		); err != nil {
 			return nil, fmt.Errorf("scan latest message: %w", err)
 		}
 		messageCopy := message
 		if index, ok := indexByUsername[other.Username]; ok {
+			conversations[index].UserID = otherID
 			conversations[index].LastMessage = &messageCopy
 			continue
 		}
 		conversations = append(conversations, Conversation{
+			UserID:      otherID,
 			User:        other,
 			IsFriend:    false,
 			LastMessage: &messageCopy,

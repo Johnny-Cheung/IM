@@ -152,6 +152,76 @@ func TestRedisMessageReaderFallsBackBelowEpoch(t *testing.T) {
 	}
 }
 
+func TestRedisMessageReaderReadsFeed(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	defer client.Close()
+	ctx := context.Background()
+
+	ids := seedDirectMessages(t, client, 1, 2, 2)
+
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	feed, err := reader.ReadFeed(ctx, 2, 0, 10)
+	if err != nil {
+		t.Fatalf("ReadFeed() error = %v", err)
+	}
+	if !feed.Complete || len(feed.Page.Messages) != 2 {
+		t.Fatalf("feed = %#v, want both messages and complete", feed)
+	}
+
+	tail, err := reader.ReadFeed(ctx, 2, ids[0], 10)
+	if err != nil {
+		t.Fatalf("ReadFeed(after) error = %v", err)
+	}
+	if !tail.Complete || len(tail.Page.Messages) != 1 || tail.Page.Messages[0].ID != ids[1] {
+		t.Fatalf("tail = %#v", tail)
+	}
+}
+
+func TestRedisMessageReaderFeedBelowEpochIsIncomplete(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	defer client.Close()
+	ctx := context.Background()
+
+	ids := seedDirectMessages(t, client, 1, 2, 2)
+
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, ids[0])
+	feed, err := reader.ReadFeed(ctx, 2, 1, 10)
+	if err != nil {
+		t.Fatalf("ReadFeed() error = %v", err)
+	}
+	if feed.Complete {
+		t.Fatal("complete = true, want false below the epoch")
+	}
+}
+
+func TestRedisMessageReaderReturnsLastConversationMessages(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	defer client.Close()
+	ctx := context.Background()
+
+	ids := seedDirectMessages(t, client, 1, 2, 3)
+
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	recipientView, err := reader.LastConversationMessages(ctx, 2)
+	if err != nil {
+		t.Fatalf("LastConversationMessages() error = %v", err)
+	}
+	if got := recipientView[1]; got.ID != ids[2] {
+		t.Fatalf("recipient last message = %#v, want %d", got, ids[2])
+	}
+
+	senderView, err := reader.LastConversationMessages(ctx, 1)
+	if err != nil {
+		t.Fatalf("LastConversationMessages(sender) error = %v", err)
+	}
+	if got := senderView[2]; got.ID != ids[2] {
+		t.Fatalf("sender last message = %#v, want %d", got, ids[2])
+	}
+}
+
 func TestRedisMessageReaderMissingEntityForcesFallback(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
