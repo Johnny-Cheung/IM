@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例已切换为 v1.2 私聊消息链路：MySQL、正式 `8198` 和验证 `8199`。v1.1 基础设施已就绪，v1.2 已完成正式切换；v1.3 及后续版本尚未开始。v1.2 的业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、完整读取优化、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例已切换为 v1.4 服务端消息读取链路：MySQL、正式 `8198` 和验证 `8199`。v1.1 基础设施已就绪，v1.2 私聊消息链路、v1.3 群聊消息链路和 v1.4 服务端读取链路均已完成正式切换。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -204,7 +204,7 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 ```
 
 - 单组件重启使用 `redis-restart`、`rabbitmq-restart`；日志使用 `logs redis|rabbitmq|runtime`。
-- 当前正式 `8198` 已接入 v1.2 私聊和 v1.3 群聊消息链路，群聊已读仍按路线留在 v1.7；不配置开机自启，开发机重启后手动执行 `infractl start` 和 `imctl restart`。
+- 当前正式 `8198` 已接入 v1.2 私聊、v1.3 群聊和 v1.4 服务端读取链路，群聊已读仍按路线留在 v1.7；不配置开机自启，开发机重启后手动执行 `infractl start` 和 `imctl restart`。
 
 ## v1.2 私聊消息链路（已切换正式）
 
@@ -224,6 +224,15 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 - 正式切换前需用 `imctl backup` 备份数据库和应用文件；群消息对外编号从内部自增 ID 切换为共享服务端消息号，属不可逆数据格式变更，应用回滚应使用上一个 v1.3 构建，不要直接回滚到 v1.2 二进制。
 - v1.3 隔离验证使用临时单元 `im-rebuild-verify`、`im_v07_verify` 数据库和验证命名空间；验证结束后停止临时单元，按 manifest 清理测试账号、群 ID 对应的 Redis 投影键，并只删除 `im:v13-verify:*` 键。
 - v1.3 不做群聊已读、高可用故障转移、pending 接管、死信、对账、压力测试或容量调优。
+
+## v1.4 服务端消息读取链路（已切换正式）
+
+- 读取改为按会话的方向索引 `dm:conv:{owner}:{peer}`，另加用户级增量日志 `dm:feed:{user}` 和会话最后消息 `dm:conv-last:{user}`；`inbox`/`outbox` 已停止写入，只保留作回滚兜底。
+- `index:epoch` 标记读取索引的完整边界：epoch 以下一律回落 MySQL。首次启动取 `max(落库最大消息号, Redis 计数器)`，重启保留原值，只有计数器落后于落库最大值时才上调。
+- 新增 `GET /api/messages/sync?after_id=N`，一次返回该用户全部私聊增量；`complete=false` 表示补收不完整，需要从会话历史重新同步。
+- 消息实体、`dm:feed`、`dm:conv`、`dm:conv-last` 均不设 TTL，也不再裁剪；Redis 内存不再有固定上限行为，发布后需要持续观察 `used_memory`。
+- 回滚：v1.4 只改变 Redis 索引格式，MySQL 仍是权威。回退到 v1.3 二进制时，切换后产生的消息在 MySQL 中完整可用；但新消息没有写入 `inbox`/`outbox`，热窗口会由 MySQL 兜底。
+- 验证实例继续使用 `imctl --verify`、Redis DB 1、vhost `im_v13_verify` 和命名空间 `im:v13-verify`。
 
 ## 回归检查
 
