@@ -230,7 +230,10 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 - 读取改为按会话的方向索引 `dm:conv:{owner}:{peer}`，另加用户级增量日志 `dm:feed:{user}` 和会话最后消息 `dm:conv-last:{user}`；`inbox`/`outbox` 已停止写入，只保留作回滚兜底。
 - `index:epoch` 标记读取索引的完整边界：epoch 以下一律回落 MySQL。首次启动取 `max(落库最大消息号, Redis 计数器)`，重启保留原值，只有计数器落后于落库最大值时才上调。
 - 新增 `GET /api/messages/sync?after_id=N`，一次返回该用户全部私聊增量；`complete=false` 表示补收不完整，需要从会话历史重新同步。
-- 消息实体、`dm:feed`、`dm:conv`、`dm:conv-last` 均不设 TTL，也不再裁剪；Redis 内存不再有固定上限行为，发布后需要持续观察 `used_memory`。
+- 消息实体、`dm:feed`、`dm:conv`、`dm:conv-last` 均不设 TTL，也不再裁剪；Redis 内存不再有固定上限行为，发布后需要持续观察 `used_memory`。观察方式是在私有 Redis 容器内读取 `INFO memory` 的 `used_memory_human`、`maxmemory_human` 和 `maxmemory_policy`，凭据仍由容器内受保护文件提供。
+- 切换后实测 `used_memory` 约 1.64 MB（上限 64 MB），键总数 232；`dm:feed`/`dm:conv`/`dm:conv-last` 在真实用户产生新消息前为空，属于 epoch 设计的预期现象。
+- `inbox`/`outbox` 已停止写入，仅保留作回滚兜底；确认稳定运行一个版本后再按前缀清理。
+- 本版未解决会话列表的 MySQL 查询量（仍为 4 条，含 `GROUP BY` 最新消息子查询），也未做服务端性能实测，统一留到 v1.6 和 v1.9。
 - 回滚：v1.4 只改变 Redis 索引格式，MySQL 仍是权威。回退到 v1.3 二进制时，切换后产生的消息在 MySQL 中完整可用；但新消息没有写入 `inbox`/`outbox`，热窗口会由 MySQL 兜底。
 - 验证实例继续使用 `imctl --verify`、Redis DB 1、vhost `im_v13_verify` 和命名空间 `im:v13-verify`。
 
