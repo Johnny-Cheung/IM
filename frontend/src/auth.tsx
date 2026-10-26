@@ -20,10 +20,9 @@ import {
   clearUser,
   readHints,
   setActiveUser,
-  writeConversations,
-  writeFriends,
 } from "./cache";
 import type { SyncState } from "./cache";
+import { applyBootstrapToCache } from "./workspace";
 
 type AuthStatus = "loading" | "authenticated" | "guest" | "offline";
 
@@ -82,12 +81,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setStatus("authenticated");
     setNotice(null);
     void setActiveUser(payload.user);
-    if (!payload.partial.includes("conversations")) {
-      void writeConversations(payload.user.username, payload.conversations);
-    }
-    if (!payload.partial.includes("friends")) {
-      void writeFriends(payload.user.username, payload.friends);
-    }
+    void applyBootstrapToCache(payload);
   }, []);
 
   useEffect(() => {

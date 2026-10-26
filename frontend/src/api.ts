@@ -135,6 +135,13 @@ export type MessagePageResponse = {
   has_more: boolean;
 };
 
+export type SyncMessagePageResponse = {
+  messages: ChatMessage[];
+  has_more: boolean;
+  complete: boolean;
+  cursor: number;
+};
+
 export type BootstrapGroupCursor = {
   group_id: number;
   after_id: number;
@@ -318,6 +325,13 @@ export const api = {
 
   listConversations: () =>
     request<ConversationListResponse>("/api/conversations"),
+
+  syncMessages: (afterID: number, limit = 200) => {
+    const params = new URLSearchParams();
+    params.set("after_id", String(afterID));
+    params.set("limit", String(limit));
+    return request<SyncMessagePageResponse>(`/api/messages/sync?${params.toString()}`);
+  },
 
   listMessages: (username: string, beforeID?: number, limit = 30) => {
     const params = new URLSearchParams();

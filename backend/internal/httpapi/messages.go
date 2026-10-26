@@ -21,6 +21,8 @@ import (
 const (
 	defaultMessagePageSize = 30
 	maxMessagePageSize     = 50
+	defaultSyncPageSize    = 200
+	maxSyncPageSize        = 200
 	maxMessageRunes        = 2000
 )
 
@@ -397,7 +399,7 @@ func (a *API) syncMessages(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid_request", "同步游标不正确")
 		return
 	}
-	limit, err := parseMessageLimit(c.Query("limit"))
+	limit, err := parseSyncLimit(c.Query("limit"))
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
 		return
@@ -659,6 +661,17 @@ func parseMessageLimit(raw string) (int, error) {
 	value, err := strconv.Atoi(raw)
 	if err != nil || value < 1 || value > maxMessagePageSize {
 		return 0, errors.New("invalid message limit")
+	}
+	return value, nil
+}
+
+func parseSyncLimit(raw string) (int, error) {
+	if raw == "" {
+		return defaultSyncPageSize, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 || value > maxSyncPageSize {
+		return 0, errors.New("invalid sync limit")
 	}
 	return value, nil
 }
