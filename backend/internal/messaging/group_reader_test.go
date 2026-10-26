@@ -35,15 +35,19 @@ func TestGroupMessageReaderReturnsNewestHotMessages(t *testing.T) {
 		}
 	}
 
-	reader := NewGroupMessageReader(client, keyspace)
-	page, err := reader.ListGroupMessages(ctx, 1, 9, 0, 2)
+	reader := NewGroupMessageReader(client, keyspace, 0)
+	page, err := reader.ReadGroup(ctx, 1, 9, 0, 2)
 	if err != nil {
-		t.Fatalf("ListGroupMessages() error = %v", err)
+		t.Fatalf("ReadGroup() error = %v", err)
 	}
-	if !page.HasMore || len(page.Messages) != 2 || page.Messages[0].ID != 3 || page.Messages[1].ID != 4 {
-		t.Fatalf("page = %#v", page)
+	if !page.Complete {
+		t.Fatal("complete = false, want true without an epoch boundary")
 	}
-	if page.Messages[0].CreatedAt.Before(time.UnixMilli(1700000000000)) {
+	if !page.Page.HasMore || len(page.Page.Messages) != 2 ||
+		page.Page.Messages[0].ID != 3 || page.Page.Messages[1].ID != 4 {
+		t.Fatalf("page = %#v", page.Page)
+	}
+	if page.Page.Messages[0].CreatedAt.Before(time.UnixMilli(1700000000000)) {
 		t.Fatal("created time was not decoded")
 	}
 }

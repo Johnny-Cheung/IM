@@ -50,11 +50,14 @@ func TestRedisAcceptorAcceptsAndDeduplicates(t *testing.T) {
 	if err != nil || body != "hello" {
 		t.Fatalf("stored body = %q, err = %v", body, err)
 	}
-	if got := client.ZScore(context.Background(), outboxKey(1), "42").Val(); got != 42 {
-		t.Fatalf("outbox score = %v, want 42", got)
+	if got := client.ZScore(context.Background(), directFeedKey(1), "42").Val(); got != 42 {
+		t.Fatalf("sender feed score = %v, want 42", got)
 	}
-	if got := client.ZScore(context.Background(), inboxKey(2), "42").Val(); got != 42 {
-		t.Fatalf("inbox score = %v, want 42", got)
+	if got := client.ZScore(context.Background(), directFeedKey(2), "42").Val(); got != 42 {
+		t.Fatalf("recipient feed score = %v, want 42", got)
+	}
+	if got := client.ZScore(context.Background(), directConversationKey(2, 1), "42").Val(); got != 42 {
+		t.Fatalf("conversation index score = %v, want 42", got)
 	}
 	if got := client.XLen(context.Background(), messageStreamKey()).Val(); got != 1 {
 		t.Fatalf("stream length = %d, want 1", got)
@@ -126,11 +129,14 @@ func TestRedisAcceptorKeepsIndexAndEntitiesAligned(t *testing.T) {
 		}
 	}
 
-	if got := client.ZCard(ctx, outboxKey(1)).Val(); got != total {
-		t.Fatalf("outbox size = %d, want %d (indexes must not be trimmed)", got, total)
+	if got := client.ZCard(ctx, directFeedKey(1)).Val(); got != total {
+		t.Fatalf("sender feed size = %d, want %d (indexes must not be trimmed)", got, total)
 	}
-	if got := client.ZCard(ctx, inboxKey(2)).Val(); got != total {
-		t.Fatalf("inbox size = %d, want %d (indexes must not be trimmed)", got, total)
+	if got := client.ZCard(ctx, directFeedKey(2)).Val(); got != total {
+		t.Fatalf("recipient feed size = %d, want %d (indexes must not be trimmed)", got, total)
+	}
+	if got := client.ZCard(ctx, directConversationKey(2, 1)).Val(); got != total {
+		t.Fatalf("conversation index size = %d, want %d (indexes must not be trimmed)", got, total)
 	}
 	for id := uint64(1); id <= total; id++ {
 		if got := client.Exists(ctx, messageKey(id)).Val(); got != 1 {

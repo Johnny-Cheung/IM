@@ -190,6 +190,108 @@ func TestListConversations(t *testing.T) {
 	}
 }
 
+type directReaderStub struct {
+	page  messaging.ConversationPage
+	err   error
+	calls int
+}
+
+func (s *directReaderStub) ReadConversation(
+	_ context.Context, _, _, _ uint64, _ int,
+) (messaging.ConversationPage, error) {
+	s.calls++
+	return s.page, s.err
+}
+
+func (s *directReaderStub) ReadConversationAfter(
+	_ context.Context, _, _, _ uint64, _ int,
+) (messaging.ConversationPage, error) {
+	s.calls++
+	return s.page, s.err
+}
+
+func TestListMessagesServesCompleteRedisPageWithoutStore(t *testing.T) {
+	now := time.Now().UTC()
+	dataStore := authenticatedChatStore()
+	reader := &directReaderStub{page: messaging.ConversationPage{
+		Page: store.MessagePage{Messages: []store.Message{{
+			ID:              42,
+			SenderID:        2,
+			RecipientID:     1,
+			ClientMessageID: "client-12345678",
+			Body:            "from redis",
+			CreatedAt:       now,
+		}}},
+		Complete: true,
+	}}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	New(dataStore, WithDirectMessageReader(reader)).Register(router)
+
+	recorder := doJSON(t, router, http.MethodGet, "/api/conversations/bob/messages", nil, authTestCookie())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if dataStore.listMessagesCall.userID != 0 {
+		t.Fatal("store was queried even though Redis covered the page")
+	}
+
+	var response messagePageResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Messages) != 1 || response.Messages[0].Body != "from redis" {
+		t.Fatalf("messages = %#v", response.Messages)
+	}
+}
+
+func TestListMessagesMergesHotPageWhenRedisIsIncomplete(t *testing.T) {
+	now := time.Now().UTC()
+	dataStore := authenticatedChatStore()
+	dataStore.messagePage = store.MessagePage{Messages: []store.Message{{
+		ID:              41,
+		SenderID:        2,
+		RecipientID:     1,
+		ClientMessageID: "client-12345678",
+		Body:            "from mysql",
+		CreatedAt:       now,
+	}}}
+	reader := &directReaderStub{page: messaging.ConversationPage{
+		Page: store.MessagePage{Messages: []store.Message{{
+			ID:              42,
+			SenderID:        1,
+			RecipientID:     2,
+			ClientMessageID: "client-87654321",
+			Body:            "from redis",
+			CreatedAt:       now,
+		}}},
+		Complete: false,
+	}}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	New(dataStore, WithDirectMessageReader(reader)).Register(router)
+
+	recorder := doJSON(t, router, http.MethodGet, "/api/conversations/bob/messages", nil, authTestCookie())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if dataStore.listMessagesCall.userID != 1 {
+		t.Fatal("store was not queried for an incomplete Redis page")
+	}
+
+	var response messagePageResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Messages) != 2 ||
+		response.Messages[0].Body != "from mysql" ||
+		response.Messages[1].Body != "from redis" {
+		t.Fatalf("messages = %#v", response.Messages)
+	}
+}
+
 func TestListMessages(t *testing.T) {
 	now := time.Now().UTC()
 	dataStore := authenticatedChatStore()

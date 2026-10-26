@@ -397,37 +397,60 @@ func (a *API) listGroupMessages(c *gin.Context) {
 	}
 
 	var page store.GroupMessagePage
-	if afterID > 0 {
-		page, err = a.store.ListGroupMessagesAfter(
-			c.Request.Context(),
-			current.ID,
-			groupID,
-			afterID,
-			limit,
-		)
-	} else {
-		page, err = a.store.ListGroupMessages(
-			c.Request.Context(),
-			current.ID,
-			groupID,
-			beforeID,
-			limit,
-		)
-	}
-	if err != nil {
-		a.writeGroupError(c, err)
-		return
-	}
+	servedFromRedis := false
+	var hotPage store.GroupMessagePage
+	hotAvailable := false
 	if a.groupReader != nil {
-		hotPage, hotErr := func() (store.GroupMessagePage, error) {
+		member, memberErr := a.store.IsGroupMember(c.Request.Context(), current.ID, groupID)
+		if memberErr != nil {
+			log.Printf("check group membership: %v", memberErr)
+		} else if member {
+			var hot messaging.GroupConversationPage
 			if afterID > 0 {
-				return a.groupReader.ListGroupMessagesAfter(c.Request.Context(), current.ID, groupID, afterID, limit)
+				hot, err = a.groupReader.ReadGroupAfter(
+					c.Request.Context(), current.ID, groupID, afterID, limit,
+				)
+			} else {
+				hot, err = a.groupReader.ReadGroup(
+					c.Request.Context(), current.ID, groupID, beforeID, limit,
+				)
 			}
-			return a.groupReader.ListGroupMessages(c.Request.Context(), current.ID, groupID, beforeID, limit)
-		}()
-		if hotErr != nil {
-			log.Printf("list group hot messages: %v", hotErr)
+			if err != nil {
+				log.Printf("list group hot messages: %v", err)
+			} else {
+				hotPage = hot.Page
+				hotAvailable = true
+				if hot.Complete {
+					page = hot.Page
+					servedFromRedis = true
+				}
+			}
+		}
+	}
+
+	if !servedFromRedis {
+		if afterID > 0 {
+			page, err = a.store.ListGroupMessagesAfter(
+				c.Request.Context(),
+				current.ID,
+				groupID,
+				afterID,
+				limit,
+			)
 		} else {
+			page, err = a.store.ListGroupMessages(
+				c.Request.Context(),
+				current.ID,
+				groupID,
+				beforeID,
+				limit,
+			)
+		}
+		if err != nil {
+			a.writeGroupError(c, err)
+			return
+		}
+		if hotAvailable {
 			page = mergeGroupMessagePages(page, hotPage, beforeID > 0 || afterID == 0, limit)
 		}
 	}

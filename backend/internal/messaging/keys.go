@@ -34,6 +34,14 @@ func messageStreamKey() string {
 	return defaultKeyspace.messageStreamKey()
 }
 
+func directFeedKey(userID uint64) string {
+	return defaultKeyspace.directFeedKey(userID)
+}
+
+func directConversationKey(ownerID, peerID uint64) string {
+	return defaultKeyspace.directConversationKey(ownerID, peerID)
+}
+
 func (k Keyspace) counterKey() string {
 	return k.prefixOrDefault() + "messages:next_id"
 }
@@ -56,6 +64,23 @@ func (k Keyspace) outboxKey(userID uint64) string {
 
 func (k Keyspace) inboxKey(userID uint64) string {
 	return fmt.Sprintf("%sinbox:%d", k.prefixOrDefault(), userID)
+}
+
+// directFeedKey indexes every direct message the user participates in,
+// regardless of direction. It backs whole-user incremental sync.
+func (k Keyspace) directFeedKey(userID uint64) string {
+	return fmt.Sprintf("%sdm:feed:%d", k.prefixOrDefault(), userID)
+}
+
+// directConversationKey indexes the messages peer sent to owner.
+func (k Keyspace) directConversationKey(ownerID, peerID uint64) string {
+	return fmt.Sprintf("%sdm:conv:%d:%d", k.prefixOrDefault(), ownerID, peerID)
+}
+
+// indexEpochKey records the highest message ID that is not guaranteed to be
+// present in the read indexes. Only higher IDs may be served from Redis.
+func (k Keyspace) indexEpochKey() string {
+	return k.prefixOrDefault() + "index:epoch"
 }
 
 func (k Keyspace) messageStreamKey() string {

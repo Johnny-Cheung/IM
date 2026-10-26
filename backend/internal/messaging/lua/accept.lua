@@ -60,8 +60,9 @@ redis.call('EXPIRE', KEYS[3], dedup_ttl)
 
 redis.call('ZADD', KEYS[4], message_id, tostring(message_id))
 redis.call('ZADD', KEYS[5], message_id, tostring(message_id))
+redis.call('ZADD', KEYS[6], message_id, tostring(message_id))
 
-redis.call('XADD', KEYS[6], 'MAXLEN', '~', stream_max_len, '*',
+redis.call('XADD', KEYS[7], 'MAXLEN', '~', stream_max_len, '*',
   'id', tostring(message_id),
   'sender_id', sender_id,
   'recipient_id', recipient_id,

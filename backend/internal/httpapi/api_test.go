@@ -392,6 +392,14 @@ func (f *fakeStore) ListGroupMemberIDs(context.Context, uint64) ([]uint64, error
 	return f.groupMemberIDs, f.groupMemberIDsErr
 }
 
+func (f *fakeStore) IsGroupMember(
+	context.Context,
+	uint64,
+	uint64,
+) (bool, error) {
+	return true, nil
+}
+
 func (f *fakeStore) ListGroupMessages(
 	context.Context,
 	uint64,

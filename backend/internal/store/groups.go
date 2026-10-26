@@ -363,6 +363,29 @@ func (s *Store) GetGroup(
 	return detail, nil
 }
 
+// IsGroupMember reports whether the user currently belongs to a live group.
+func (s *Store) IsGroupMember(
+	ctx context.Context,
+	userID, groupID uint64,
+) (bool, error) {
+	var found int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1
+		 FROM chat_groups g
+		 JOIN group_members member
+		   ON member.group_id = g.id AND member.user_id = ?
+		 WHERE g.id = ? AND g.dissolved_at IS NULL`,
+		userID, groupID,
+	).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check group membership: %w", err)
+	}
+	return true, nil
+}
+
 // RenameGroup changes the group name when the user is the owner.
 func (s *Store) RenameGroup(
 	ctx context.Context,

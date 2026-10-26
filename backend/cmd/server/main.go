@@ -105,6 +105,12 @@ func run(options serverOptions) error {
 		if err != nil {
 			return fmt.Errorf("seed message ID: %w", err)
 		}
+		indexEpoch, err := messaging.EnsureIndexEpoch(
+			startupCtx, infraManager.Redis(), keyspace, seedFloor,
+		)
+		if err != nil {
+			return fmt.Errorf("prepare index epoch: %w", err)
+		}
 		friendshipProjector = messaging.NewFriendshipProjectionWithKeyspace(infraManager.Redis(), keyspace)
 		pairs, err := dataStore.ListFriendshipPairs(startupCtx)
 		if err != nil {
@@ -117,7 +123,7 @@ func run(options serverOptions) error {
 			infraManager.Redis(),
 			messaging.RedisAcceptorOptions{SeedFloor: seedFloor, Keyspace: keyspace},
 		)
-		directReader = messaging.NewRedisMessageReaderWithKeyspace(infraManager.Redis(), keyspace)
+		directReader = messaging.NewRedisMessageReaderWithKeyspace(infraManager.Redis(), keyspace, indexEpoch)
 
 		if infraConfig.GroupMessagingEnabled {
 			groupProjector = messaging.NewGroupProjection(infraManager.Redis(), keyspace)
@@ -141,7 +147,7 @@ func run(options serverOptions) error {
 				keyspace,
 				messaging.RedisAcceptorOptions{SeedFloor: seedFloor, Keyspace: keyspace},
 			)
-			groupReader = messaging.NewGroupMessageReader(infraManager.Redis(), keyspace)
+			groupReader = messaging.NewGroupMessageReader(infraManager.Redis(), keyspace, indexEpoch)
 		}
 
 		workerContext, cancelWorkers = context.WithCancel(context.Background())

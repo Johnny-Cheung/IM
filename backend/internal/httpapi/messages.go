@@ -246,32 +246,13 @@ func (a *API) listMessages(c *gin.Context) {
 	}
 
 	var page store.MessagePage
-	if afterID > 0 {
-		page, err = a.store.ListMessagesAfter(
-			c.Request.Context(),
-			current.ID,
-			target.ID,
-			afterID,
-			limit,
-		)
-	} else {
-		page, err = a.store.ListMessages(
-			c.Request.Context(),
-			current.ID,
-			target.ID,
-			beforeID,
-			limit,
-		)
-	}
-	if err != nil {
-		log.Printf("list messages: %v", err)
-		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
-		return
-	}
+	servedFromRedis := false
+	var hotPage store.MessagePage
+	hotAvailable := false
 	if a.directReader != nil {
-		var hotPage store.MessagePage
+		var hot messaging.ConversationPage
 		if afterID > 0 {
-			hotPage, err = a.directReader.ListMessagesAfter(
+			hot, err = a.directReader.ReadConversationAfter(
 				c.Request.Context(),
 				current.ID,
 				target.ID,
@@ -279,7 +260,7 @@ func (a *API) listMessages(c *gin.Context) {
 				limit,
 			)
 		} else {
-			hotPage, err = a.directReader.ListMessages(
+			hot, err = a.directReader.ReadConversation(
 				c.Request.Context(),
 				current.ID,
 				target.ID,
@@ -290,6 +271,39 @@ func (a *API) listMessages(c *gin.Context) {
 		if err != nil {
 			log.Printf("read hot messages: %v", err)
 		} else {
+			hotPage = hot.Page
+			hotAvailable = true
+			if hot.Complete {
+				page = hot.Page
+				servedFromRedis = true
+			}
+		}
+	}
+
+	if !servedFromRedis {
+		if afterID > 0 {
+			page, err = a.store.ListMessagesAfter(
+				c.Request.Context(),
+				current.ID,
+				target.ID,
+				afterID,
+				limit,
+			)
+		} else {
+			page, err = a.store.ListMessages(
+				c.Request.Context(),
+				current.ID,
+				target.ID,
+				beforeID,
+				limit,
+			)
+		}
+		if err != nil {
+			log.Printf("list messages: %v", err)
+			writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
+			return
+		}
+		if hotAvailable {
 			page = mergeMessagePages(page, hotPage, beforeID > 0 || afterID == 0, limit)
 		}
 	}

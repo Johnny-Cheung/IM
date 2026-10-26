@@ -2,128 +2,193 @@ package messaging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"time"
 
-	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/Johnny-Cheung/IM/backend/internal/store"
 )
 
-// GroupMessageReader reads the bounded hot-message window for one group.
+// GroupConversationPage is one group-message page served from the Redis window.
+//
+// Complete reports whether the window fully covers the requested range. When
+// it is false the caller must consult MySQL before answering.
+type GroupConversationPage struct {
+	Page     store.GroupMessagePage
+	Complete bool
+}
+
+// GroupMessageReader reads one group from the Redis group inbox.
 type GroupMessageReader struct {
 	client   redis.UniversalClient
 	keyspace Keyspace
+	epoch    uint64
 }
 
-func NewGroupMessageReader(client redis.UniversalClient, keyspace Keyspace) *GroupMessageReader {
-	return &GroupMessageReader{client: client, keyspace: keyspace}
+func NewGroupMessageReader(
+	client redis.UniversalClient,
+	keyspace Keyspace,
+	epoch uint64,
+) *GroupMessageReader {
+	return &GroupMessageReader{client: client, keyspace: keyspace, epoch: epoch}
 }
 
-func (r *GroupMessageReader) ListGroupMessages(
+// ReadGroup returns the newest group messages before beforeID, or the newest
+// messages of the group when beforeID is zero.
+func (r *GroupMessageReader) ReadGroup(
 	ctx context.Context,
 	_ uint64,
 	groupID, beforeID uint64,
 	limit int,
-) (store.GroupMessagePage, error) {
-	return r.list(ctx, groupID, beforeID, 0, limit)
+) (GroupConversationPage, error) {
+	return r.read(ctx, groupID, beforeID, 0, limit)
 }
 
-func (r *GroupMessageReader) ListGroupMessagesAfter(
+// ReadGroupAfter returns group messages newer than afterID, oldest first.
+func (r *GroupMessageReader) ReadGroupAfter(
 	ctx context.Context,
 	_ uint64,
 	groupID, afterID uint64,
 	limit int,
-) (store.GroupMessagePage, error) {
-	return r.list(ctx, groupID, 0, afterID, limit)
+) (GroupConversationPage, error) {
+	return r.read(ctx, groupID, 0, afterID, limit)
 }
 
-func (r *GroupMessageReader) list(
+func (r *GroupMessageReader) read(
 	ctx context.Context,
 	groupID, beforeID, afterID uint64,
 	limit int,
-) (store.GroupMessagePage, error) {
+) (GroupConversationPage, error) {
 	if r == nil || r.client == nil {
-		return store.GroupMessagePage{}, ErrMessageServiceUnavailable
+		return GroupConversationPage{}, ErrMessageServiceUnavailable
 	}
 	if limit < 1 {
-		return store.GroupMessagePage{}, fmt.Errorf("invalid group hot message limit")
+		return GroupConversationPage{}, fmt.Errorf("invalid group hot message limit")
 	}
+
+	lower := r.epoch
+	if afterID > lower {
+		lower = afterID
+	}
+	key := r.keyspace.groupInboxKey(groupID)
 
 	var values []string
 	var err error
 	switch {
 	case beforeID > 0:
-		values, err = r.client.ZRevRangeByScore(ctx, r.keyspace.groupInboxKey(groupID), &redis.ZRangeBy{
+		values, err = r.client.ZRevRangeByScore(ctx, key, &redis.ZRangeBy{
 			Max:    exclusiveMax(beforeID),
-			Min:    "-inf",
+			Min:    exclusiveMin(lower),
 			Offset: 0,
 			Count:  int64(limit + 1),
 		}).Result()
 	case afterID > 0:
-		values, err = r.client.ZRangeByScore(ctx, r.keyspace.groupInboxKey(groupID), &redis.ZRangeBy{
-			Min:    exclusiveMin(afterID),
+		values, err = r.client.ZRangeByScore(ctx, key, &redis.ZRangeBy{
+			Min:    exclusiveMin(lower),
 			Max:    "+inf",
 			Offset: 0,
 			Count:  int64(limit + 1),
 		}).Result()
 	default:
-		values, err = r.client.ZRevRangeByScore(ctx, r.keyspace.groupInboxKey(groupID), &redis.ZRangeBy{
+		values, err = r.client.ZRevRangeByScore(ctx, key, &redis.ZRangeBy{
 			Max:    "+inf",
-			Min:    "-inf",
+			Min:    exclusiveMin(lower),
 			Offset: 0,
 			Count:  int64(limit + 1),
 		}).Result()
 	}
 	if err != nil {
-		return store.GroupMessagePage{}, err
+		return GroupConversationPage{}, err
 	}
 
-	messages := make([]store.GroupMessage, 0, len(values))
+	ids := make([]uint64, 0, len(values))
 	for _, value := range values {
-		messageID, err := strconv.ParseUint(value, 10, 64)
-		if err != nil || messageID == 0 {
+		messageID, parseErr := strconv.ParseUint(value, 10, 64)
+		if parseErr != nil || messageID == 0 {
 			continue
 		}
-		message, ok, err := r.loadMessage(ctx, messageID)
-		if err != nil {
-			return store.GroupMessagePage{}, err
-		}
-		if !ok || message.GroupID != groupID {
-			continue
-		}
-		if beforeID > 0 && message.ID >= beforeID {
-			continue
-		}
-		if afterID > 0 && message.ID <= afterID {
-			continue
-		}
-		messages = append(messages, message)
+		ids = append(ids, messageID)
+	}
+
+	messages, missing, err := r.loadMessages(ctx, ids, groupID)
+	if err != nil {
+		return GroupConversationPage{}, err
 	}
 	sort.Slice(messages, func(i, j int) bool { return messages[i].ID < messages[j].ID })
 
 	hasMore := len(messages) > limit
 	if hasMore {
-		if beforeID > 0 || afterID == 0 {
-			messages = messages[len(messages)-limit:]
-		} else {
+		if afterID > 0 {
 			messages = messages[:limit]
+		} else {
+			messages = messages[len(messages)-limit:]
 		}
 	}
-	return store.GroupMessagePage{Messages: messages, HasMore: hasMore}, nil
+
+	complete := false
+	switch {
+	case missing:
+		complete = false
+	case afterID > 0:
+		complete = afterID >= r.epoch
+	case r.epoch == 0:
+		complete = true
+	default:
+		complete = len(ids) >= limit+1
+	}
+
+	return GroupConversationPage{
+		Page:     store.GroupMessagePage{Messages: messages, HasMore: hasMore},
+		Complete: complete,
+	}, nil
 }
 
-func (r *GroupMessageReader) loadMessage(
+func (r *GroupMessageReader) loadMessages(
 	ctx context.Context,
-	messageID uint64,
-) (store.GroupMessage, bool, error) {
-	values, err := r.client.HMGet(ctx, r.keyspace.groupMessageKey(messageID),
-		"id", "group_id", "sender_id", "client_message_id", "body", "created_at_ms", "sender_username", "sender_nickname",
-	).Result()
-	if err != nil {
-		return store.GroupMessage{}, false, err
+	ids []uint64,
+	groupID uint64,
+) ([]store.GroupMessage, bool, error) {
+	if len(ids) == 0 {
+		return nil, false, nil
 	}
+
+	pipe := r.client.Pipeline()
+	commands := make([]*redis.SliceCmd, len(ids))
+	for index, id := range ids {
+		commands[index] = pipe.HMGet(ctx, r.keyspace.groupMessageKey(id),
+			"id", "group_id", "sender_id", "client_message_id", "body", "created_at_ms",
+			"sender_username", "sender_nickname",
+		)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, false, err
+	}
+
+	messages := make([]store.GroupMessage, 0, len(ids))
+	missing := false
+	for _, command := range commands {
+		values, err := command.Result()
+		if err != nil {
+			return nil, false, err
+		}
+		message, ok, err := parseGroupMessageValues(values)
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok || message.GroupID != groupID {
+			missing = true
+			continue
+		}
+		messages = append(messages, message)
+	}
+	return messages, missing, nil
+}
+
+func parseGroupMessageValues(values []interface{}) (store.GroupMessage, bool, error) {
 	if len(values) != 8 || values[0] == nil {
 		return store.GroupMessage{}, false, nil
 	}

@@ -110,6 +110,7 @@ type Store interface {
 	KickGroupMember(ctx context.Context, ownerID, groupID, targetID uint64) error
 	LeaveGroup(ctx context.Context, userID, groupID uint64, now time.Time) (bool, error)
 	ListGroupMemberIDs(ctx context.Context, groupID uint64) ([]uint64, error)
+	IsGroupMember(ctx context.Context, userID, groupID uint64) (bool, error)
 	ListGroupMessages(
 		ctx context.Context,
 		userID, groupID, beforeID uint64,
@@ -140,10 +141,10 @@ type FriendshipProjector interface {
 	RemovePair(context.Context, uint64, uint64) error
 }
 
-// DirectMessageReader reads the bounded Redis hot-message window.
+// DirectMessageReader reads one conversation from the Redis window.
 type DirectMessageReader interface {
-	ListMessages(context.Context, uint64, uint64, uint64, int) (store.MessagePage, error)
-	ListMessagesAfter(context.Context, uint64, uint64, uint64, int) (store.MessagePage, error)
+	ReadConversation(context.Context, uint64, uint64, uint64, int) (messaging.ConversationPage, error)
+	ReadConversationAfter(context.Context, uint64, uint64, uint64, int) (messaging.ConversationPage, error)
 }
 
 // GroupMessageAcceptor is the optional Redis group acceptance path.
@@ -151,10 +152,10 @@ type GroupMessageAcceptor interface {
 	Accept(context.Context, messaging.GroupMessageRequest) (messaging.GroupMessageResult, error)
 }
 
-// GroupMessageReader reads the bounded Redis hot-message window for one group.
+// GroupMessageReader reads one group from the Redis window.
 type GroupMessageReader interface {
-	ListGroupMessages(context.Context, uint64, uint64, uint64, int) (store.GroupMessagePage, error)
-	ListGroupMessagesAfter(context.Context, uint64, uint64, uint64, int) (store.GroupMessagePage, error)
+	ReadGroup(context.Context, uint64, uint64, uint64, int) (messaging.GroupConversationPage, error)
+	ReadGroupAfter(context.Context, uint64, uint64, uint64, int) (messaging.GroupConversationPage, error)
 }
 
 // GroupAcceptedWatermarkReader reads the highest group message accepted by Redis.
