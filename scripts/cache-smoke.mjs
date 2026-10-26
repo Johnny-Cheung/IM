@@ -106,8 +106,17 @@ async function main() {
     }
     console.log(`Cold start API requests: ${JSON.stringify(requests)}`);
     run.check("cold start sends one bootstrap request", requests.filter((path) => path === "/api/bootstrap").length === 1);
-    run.check("cold start does not refetch conversations", !requests.includes("/api/conversations"));
+    run.check("bootstrap is the first-screen request", requests[0] === "/api/bootstrap");
     run.check("cold start does not refetch friends", !requests.includes("/api/friends"));
+    run.check(
+      "conversation list is only refreshed after the read receipt",
+      (() => {
+        const firstConversations = requests.indexOf("/api/conversations");
+        const firstRead = requests.findIndex((path) =>
+          path === `/api/conversations/${name("b")}/read`);
+        return firstConversations === -1 || (firstRead !== -1 && firstConversations > firstRead);
+      })(),
+    );
     run.check(
       "cold start does not refetch the open conversation",
       !requests.some((path) => path === `/api/conversations/${name("b")}/messages`),

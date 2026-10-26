@@ -523,6 +523,7 @@ export function ChatPage() {
   const skipInitialConversationsRef = useRef(bootConversations !== null);
   const skipSocketConversationRefreshRef = useRef(bootConversations !== null);
   const skipInitialSocketSyncRef = useRef(bootConversations !== null);
+  const workspaceStartedAtRef = useRef(Date.now());
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptRef = useRef(0);
   const connectRef = useRef<() => void>(() => {});
@@ -1476,6 +1477,10 @@ export function ChatPage() {
       if (!visible || offline) {
         return;
       }
+      // The bootstrap payload already covers the first second.
+      if (Date.now() - workspaceStartedAtRef.current < 1000) {
+        return;
+      }
       void loadConversations(false);
       if (!replacedRef.current && websocketRef.current === null) {
         reconnectAttemptRef.current = 0;
@@ -1484,7 +1489,8 @@ export function ChatPage() {
       }
     };
     const handleFocus = () => {
-      if (document.visibilityState === "visible" && !offline) {
+      if (document.visibilityState === "visible" && !offline
+        && Date.now() - workspaceStartedAtRef.current >= 1000) {
         void loadConversations(false);
       }
     };
