@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例已切换为 v1.5 Web 端本地缓存与增量同步：MySQL、正式 `8198` 和验证 `8199`。v1.1 基础设施已就绪，v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路和 v1.5 本地缓存均已完成正式切换。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例已切换为 v1.6 私聊已读：MySQL、正式 `8198` 和验证 `8199`。v1.1 基础设施已就绪，v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存和 v1.6 私聊已读均已完成正式切换。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -163,7 +163,7 @@ BACKUP="$(/opt/IM-Rebuild/imctl backup)"
 - 使用独立 schema/用户 `im_v07_verify`，应用密码文件为 `/opt/IM-Rebuild/canary-v07/mysql-app`（属主 `nobody`，权限 0400）。不得复用生产库 `im`、账号 `im_app` 或生产凭据。自动化检查只使用本轮创建的账号和群，不登录、不修改 `demo_*` 演示数据。
 - v0.6 基线保留为 `/opt/IM-Rebuild/canary-v07/bin/im-server-v06`、`RELEASE.v06` 和初始 v0.6 `web/`。部署候选版本前先备份 canary 当前文件。
 
-canary 应用入口是 `/opt/IM-Rebuild/canary-v07/bin/im-server` 和 `web/`。当前 v0.6 基线已运行，其二进制另存为 `bin/im-server-v06`；准备候选时把候选二进制放到 `bin/im-server`，之后 `--verify start/restart` 使用该入口。启动、状态和检查：
+canary 应用入口是 `/opt/IM-Rebuild/canary-v07/bin/im-server` 和 `web/`。当前 canary 已部署 v1.6，其 v1.5 备份为 `bin/im-server-v15`、`RELEASE.v15` 和 `web-v15`；v0.6 基线仍保留为 `bin/im-server-v06`、`RELEASE.v06` 和初始 v0.6 `web/`。启动、状态和检查：
 
 ```bash
 /opt/IM-Rebuild/imctl --verify start
@@ -245,6 +245,21 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 - v1.5 没有数据库迁移和 Redis 数据格式变更，回滚只需恢复切换前的应用文件。正式切换备份为 `/opt/IM-Rebuild/backups/20261026T103036Z-17TJXE`。
 - 正式 smoke 产生的少量 Redis 测试索引未按 ID 清理，测试账号已从 MySQL 删除，不影响真实账号；容量治理时统一处理。
 - 回归新增 `node scripts/cache-smoke.mjs`，覆盖冷启动单次 bootstrap、离线只读、断网恢复、退出清理和账号隔离。
+
+## v1.6 私聊已读（已切换正式）
+
+- 私聊已读位置保存为 Redis `dm:read:{userID}` HASH；未读用 `dm:conv` 的 `ZCOUNT` 现算，对方回执直接读取对方的位置。已读和未读请求不再查询 `conversation_reads`。
+- 新增批量接口 `POST /api/read`（最多 50 项），保留单会话已读接口；已读位置通过 `dm:read:stream` 异步写回 MySQL，worker 使用 `GREATEST` 幂等落库。
+- 升级前必须执行一次历史回填：
+  ```bash
+  /opt/IM-Rebuild/imctl --verify backfill-read
+  /opt/IM-Rebuild/imctl backfill-read
+  ```
+  回填会索引历史私聊消息和已读位置，校验通过后写入 `dm:read:ready`。启用消息链路时，后端缺少该标记会拒绝启动；Redis 丢数据后也需要重新回填。
+- 正式切换前备份为 `/opt/IM-Rebuild/backups/20261027T150410Z-4Z7wA7`；回填统计为 50 条私聊、8 条已读、9 个方向，Redis 内存 1.94 MB → 1.96 MB。
+- 正式环境回归：API smoke 62 项、浏览器 smoke 39 项、缓存 smoke 18 项全部通过；本轮 10 个测试账号按 manifest 删除，生产队列 ready/unack 均为 0。
+- 回滚应用文件仍使用切换前备份。v1.5 不读取新的 Redis 键，MySQL 已读位置由异步 worker 持续写入，回退后继续可用。
+- 验证实例 `8199` 已停止；验证库测试账号和测试用 `dm:read` 键已清除。测试消息的 `dm:conv` 和实体索引留到 v1.9 容量治理。
 
 ## 回归检查
 
