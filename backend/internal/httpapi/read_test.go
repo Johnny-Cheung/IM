@@ -324,3 +324,130 @@ func TestLegacyMarkReadUsesReadTracker(t *testing.T) {
 		t.Fatalf("MySQL mark read was called: %#v", dataStore.markReadCall)
 	}
 }
+
+func TestListConversationsUsesReadTracker(t *testing.T) {
+	now := time.Now().UTC()
+	dataStore := authenticatedChatStore()
+	dataStore.conversations = []store.Conversation{
+		{
+			UserID:      2,
+			User:        store.PublicUser{Username: "bob", Nickname: "Bob"},
+			IsFriend:    true,
+			UnreadCount: 2,
+			LastMessage: &store.Message{
+				ID:              7,
+				SenderID:        1,
+				RecipientID:     2,
+				ClientMessageID: "client-12345678",
+				Body:            "hello",
+				CreatedAt:       now,
+			},
+		},
+		{
+			UserID:   3,
+			User:     store.PublicUser{Username: "carol", Nickname: "Carol"},
+			IsFriend: true,
+		},
+		{
+			UserID:   4,
+			User:     store.PublicUser{Username: "dave", Nickname: "Dave"},
+			IsFriend: false,
+			LastMessage: &store.Message{
+				ID:              6,
+				SenderID:        4,
+				RecipientID:     1,
+				ClientMessageID: "client-87654321",
+				Body:            "old message",
+				CreatedAt:       now.Add(-time.Minute),
+			},
+		},
+	}
+	tracker := newFakeDirectReadTracker()
+	tracker.positions = map[uint64]uint64{2: 10, 4: 3}
+	tracker.unread = map[uint64]int{2: 7, 3: 0, 4: 1}
+	tracker.peerPositions = map[uint64]uint64{2: 5, 4: 3}
+	router := testRouter(dataStore, WithDirectReadTracker(tracker))
+
+	recorder := doJSON(t, router, http.MethodGet, "/api/conversations", nil, authTestCookie())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	response := decodeBody[conversationListResponse](t, recorder)
+	if len(response.Conversations) != 3 {
+		t.Fatalf("conversations = %d, want 3", len(response.Conversations))
+	}
+	first := response.Conversations[0]
+	if first.User == nil || first.User.Username != "bob" ||
+		first.UnreadCount != 7 || first.PeerLastReadMessageID != 5 {
+		t.Fatalf("first conversation = %#v", first)
+	}
+	second := response.Conversations[1]
+	if second.User == nil || second.User.Username != "dave" ||
+		second.UnreadCount != 1 || second.PeerLastReadMessageID != 3 {
+		t.Fatalf("second conversation = %#v", second)
+	}
+	third := response.Conversations[2]
+	if third.User == nil || third.User.Username != "carol" || third.UnreadCount != 0 {
+		t.Fatalf("third conversation = %#v", third)
+	}
+}
+
+func TestListConversationsRequiresReadModel(t *testing.T) {
+	dataStore := authenticatedChatStore()
+	tracker := newFakeDirectReadTracker()
+	tracker.ready = false
+	router := testRouter(dataStore, WithDirectReadTracker(tracker))
+
+	recorder := doJSON(t, router, http.MethodGet, "/api/conversations", nil, authTestCookie())
+	if recorder.Code != http.StatusServiceUnavailable ||
+		errorCode(t, recorder) != "read_model_not_ready" {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestBootstrapUsesReadTracker(t *testing.T) {
+	now := time.Now().UTC()
+	dataStore := authenticatedChatStore()
+	dataStore.conversations = []store.Conversation{
+		{
+			UserID:   2,
+			User:     store.PublicUser{Username: "bob", Nickname: "Bob"},
+			IsFriend: true,
+			LastMessage: &store.Message{
+				ID:              7,
+				SenderID:        2,
+				RecipientID:     1,
+				ClientMessageID: "client-12345678",
+				Body:            "hello",
+				CreatedAt:       now,
+			},
+		},
+	}
+	dataStore.friends = []store.PublicUser{{Username: "bob", Nickname: "Bob"}}
+	tracker := newFakeDirectReadTracker()
+	tracker.positions = map[uint64]uint64{2: 5}
+	tracker.unread = map[uint64]int{2: 4}
+	tracker.peerPositions = map[uint64]uint64{2: 3}
+	router := testRouter(dataStore, WithDirectReadTracker(tracker))
+
+	recorder := doJSON(
+		t,
+		router,
+		http.MethodPost,
+		"/api/bootstrap",
+		map[string]any{},
+		authTestCookie(),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	response := decodeBody[bootstrapResponse](t, recorder)
+	if len(response.Conversations) != 1 {
+		t.Fatalf("conversations = %#v", response.Conversations)
+	}
+	item := response.Conversations[0]
+	if item.User == nil || item.User.Username != "bob" ||
+		item.UnreadCount != 4 || item.PeerLastReadMessageID != 3 {
+		t.Fatalf("conversation = %#v", item)
+	}
+}

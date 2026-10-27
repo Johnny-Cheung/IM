@@ -67,6 +67,7 @@ type Store interface {
 	) error
 	DeleteFriend(ctx context.Context, userID, friendID uint64) error
 	ListConversations(ctx context.Context, userID uint64) ([]store.Conversation, error)
+	ListConversationBasics(ctx context.Context, userID uint64) ([]store.Conversation, error)
 	ListPublicUsersByIDs(ctx context.Context, ids []uint64) (map[uint64]store.PublicUser, error)
 	ListMessages(
 		ctx context.Context,

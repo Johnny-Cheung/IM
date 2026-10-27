@@ -77,6 +77,7 @@ type syncMessagePageResponse struct {
 }
 
 var errMessageServiceUnavailable = errors.New("message service unavailable")
+var errReadModelNotReady = errors.New("direct read model not ready")
 
 type sendMessageRequest struct {
 	Body            string `json:"body"`
@@ -120,8 +121,15 @@ func (a *API) listConversations(c *gin.Context) {
 
 	conversations, err := a.buildConversations(c.Request.Context(), current)
 	if err != nil {
-		log.Printf("list conversations: %v", err)
-		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
+		switch {
+		case errors.Is(err, errReadModelNotReady):
+			writeError(c, http.StatusServiceUnavailable, "read_model_not_ready", "已读服务尚未就绪")
+		case errors.Is(err, messaging.ErrMessageServiceUnavailable):
+			writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂时不可用")
+		default:
+			log.Printf("list conversations: %v", err)
+			writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
+		}
 		return
 	}
 	c.JSON(http.StatusOK, conversationListResponse{Conversations: conversations})
@@ -131,9 +139,20 @@ func (a *API) buildConversations(
 	ctx context.Context,
 	current store.User,
 ) ([]conversationResponse, error) {
-	conversations, err := a.store.ListConversations(ctx, current.ID)
+	var conversations []store.Conversation
+	var err error
+	if a.directReads != nil {
+		conversations, err = a.store.ListConversationBasics(ctx, current.ID)
+	} else {
+		conversations, err = a.store.ListConversations(ctx, current.ID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("list direct conversations: %w", err)
+	}
+	if a.directReads != nil {
+		if err := a.applyDirectReadState(ctx, current.ID, conversations); err != nil {
+			return nil, fmt.Errorf("apply direct read state: %w", err)
+		}
 	}
 	if a.directReader != nil {
 		hotMessages, hotErr := a.directReader.LastConversationMessages(ctx, current.ID)
@@ -195,6 +214,58 @@ func (a *API) buildConversations(
 
 	sortConversations(response.Conversations)
 	return response.Conversations, nil
+}
+
+// applyDirectReadState fills unread counts and peer read positions from the
+// Redis read model. It never consults MySQL for read state.
+func (a *API) applyDirectReadState(
+	ctx context.Context,
+	userID uint64,
+	conversations []store.Conversation,
+) error {
+	ready, err := a.directReads.ReadModelReady(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: %v", messaging.ErrMessageServiceUnavailable, err)
+	}
+	if !ready {
+		return errReadModelNotReady
+	}
+
+	peerIDs := make([]uint64, 0, len(conversations))
+	seen := make(map[uint64]struct{}, len(conversations))
+	for _, conversation := range conversations {
+		if conversation.UserID == 0 {
+			continue
+		}
+		if _, ok := seen[conversation.UserID]; ok {
+			continue
+		}
+		seen[conversation.UserID] = struct{}{}
+		peerIDs = append(peerIDs, conversation.UserID)
+	}
+	if len(peerIDs) == 0 {
+		return nil
+	}
+
+	positions, err := a.directReads.ReadPositions(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("%w: %v", messaging.ErrMessageServiceUnavailable, err)
+	}
+	unread, err := a.directReads.UnreadCounts(ctx, userID, peerIDs, positions)
+	if err != nil {
+		return fmt.Errorf("%w: %v", messaging.ErrMessageServiceUnavailable, err)
+	}
+	peerPositions, err := a.directReads.PeerReadPositions(ctx, userID, peerIDs)
+	if err != nil {
+		return fmt.Errorf("%w: %v", messaging.ErrMessageServiceUnavailable, err)
+	}
+
+	for index := range conversations {
+		peerID := conversations[index].UserID
+		conversations[index].UnreadCount = unread[peerID]
+		conversations[index].PeerLastReadMessageID = peerPositions[peerID]
+	}
+	return nil
 }
 
 func sortConversations(conversations []conversationResponse) {

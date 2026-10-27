@@ -86,105 +86,22 @@ func (s *Store) ListPublicUsersByIDs(
 	return result, nil
 }
 
+// ListConversationBasics returns friends plus users with existing messages,
+// without per-conversation read state.
+func (s *Store) ListConversationBasics(
+	ctx context.Context,
+	userID uint64,
+) ([]Conversation, error) {
+	conversations, _, err := s.listConversationBasics(ctx, userID)
+	return conversations, err
+}
+
 // ListConversations returns all friends plus users with existing messages,
 // newest conversations first and friends without messages by nickname.
 func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Conversation, error) {
-	conversations := make([]Conversation, 0)
-
-	friendRows, err := s.db.QueryContext(ctx,
-		`SELECT u.id, u.username, u.nickname
-		 FROM friendships f
-		 JOIN users u ON u.id = f.friend_user_id
-		 WHERE f.user_id = ?`,
-		userID,
-	)
+	conversations, indexByUsername, err := s.listConversationBasics(ctx, userID)
 	if err != nil {
-		return nil, fmt.Errorf("list conversation friends: %w", err)
-	}
-	friends := make(map[string]bool)
-	for friendRows.Next() {
-		var conversation Conversation
-		if err := friendRows.Scan(
-			&conversation.UserID,
-			&conversation.User.Username,
-			&conversation.User.Nickname,
-		); err != nil {
-			_ = friendRows.Close()
-			return nil, fmt.Errorf("scan conversation friend: %w", err)
-		}
-		friends[conversation.User.Username] = true
-		conversation.IsFriend = true
-		conversations = append(conversations, conversation)
-	}
-	if err := friendRows.Err(); err != nil {
-		_ = friendRows.Close()
-		return nil, fmt.Errorf("iterate conversation friends: %w", err)
-	}
-	if err := friendRows.Close(); err != nil {
-		return nil, fmt.Errorf("close conversation friends: %w", err)
-	}
-
-	latestRows, err := s.db.QueryContext(ctx,
-		`SELECT m.server_message_id, m.sender_id, m.recipient_id, m.client_message_id,
-		        m.body, m.created_at, u.username, u.nickname, u.id
-		 FROM messages m
-		 JOIN users u
-		   ON u.id = CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END
-		 WHERE m.server_message_id IN (
-		     SELECT MAX(server_message_id)
-		     FROM messages
-		     WHERE sender_id = ? OR recipient_id = ?
-		     GROUP BY CASE WHEN sender_id = ? THEN recipient_id ELSE sender_id END
-		 )
-		 ORDER BY m.server_message_id DESC`,
-		userID, userID, userID, userID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("list latest messages: %w", err)
-	}
-
-	indexByUsername := make(map[string]int, len(conversations))
-	for index := range conversations {
-		indexByUsername[conversations[index].User.Username] = index
-	}
-
-	for latestRows.Next() {
-		var message Message
-		var other PublicUser
-		var otherID uint64
-		if err := latestRows.Scan(
-			&message.ID,
-			&message.SenderID,
-			&message.RecipientID,
-			&message.ClientMessageID,
-			&message.Body,
-			&message.CreatedAt,
-			&other.Username,
-			&other.Nickname,
-			&otherID,
-		); err != nil {
-			return nil, fmt.Errorf("scan latest message: %w", err)
-		}
-		messageCopy := message
-		if index, ok := indexByUsername[other.Username]; ok {
-			conversations[index].UserID = otherID
-			conversations[index].LastMessage = &messageCopy
-			continue
-		}
-		conversations = append(conversations, Conversation{
-			UserID:      otherID,
-			User:        other,
-			IsFriend:    false,
-			LastMessage: &messageCopy,
-		})
-		indexByUsername[other.Username] = len(conversations) - 1
-	}
-	if err := latestRows.Err(); err != nil {
-		_ = latestRows.Close()
-		return nil, fmt.Errorf("iterate latest messages: %w", err)
-	}
-	if err := latestRows.Close(); err != nil {
-		return nil, fmt.Errorf("close latest messages: %w", err)
+		return nil, err
 	}
 
 	unreadRows, err := s.db.QueryContext(ctx,
@@ -249,6 +166,109 @@ func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Convers
 		return nil, fmt.Errorf("close peer read positions: %w", err)
 	}
 
+	return conversations, nil
+}
+
+func (s *Store) listConversationBasics(
+	ctx context.Context,
+	userID uint64,
+) ([]Conversation, map[string]int, error) {
+	conversations := make([]Conversation, 0)
+
+	friendRows, err := s.db.QueryContext(ctx,
+		`SELECT u.id, u.username, u.nickname
+		 FROM friendships f
+		 JOIN users u ON u.id = f.friend_user_id
+		 WHERE f.user_id = ?`,
+		userID,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list conversation friends: %w", err)
+	}
+	for friendRows.Next() {
+		var conversation Conversation
+		if err := friendRows.Scan(
+			&conversation.UserID,
+			&conversation.User.Username,
+			&conversation.User.Nickname,
+		); err != nil {
+			_ = friendRows.Close()
+			return nil, nil, fmt.Errorf("scan conversation friend: %w", err)
+		}
+		conversation.IsFriend = true
+		conversations = append(conversations, conversation)
+	}
+	if err := friendRows.Err(); err != nil {
+		_ = friendRows.Close()
+		return nil, nil, fmt.Errorf("iterate conversation friends: %w", err)
+	}
+	if err := friendRows.Close(); err != nil {
+		return nil, nil, fmt.Errorf("close conversation friends: %w", err)
+	}
+
+	latestRows, err := s.db.QueryContext(ctx,
+		`SELECT m.server_message_id, m.sender_id, m.recipient_id, m.client_message_id,
+		        m.body, m.created_at, u.username, u.nickname, u.id
+		 FROM messages m
+		 JOIN users u
+		   ON u.id = CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END
+		 WHERE m.server_message_id IN (
+		     SELECT MAX(server_message_id)
+		     FROM messages
+		     WHERE sender_id = ? OR recipient_id = ?
+		     GROUP BY CASE WHEN sender_id = ? THEN recipient_id ELSE sender_id END
+		 )
+		 ORDER BY m.server_message_id DESC`,
+		userID, userID, userID, userID,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list latest messages: %w", err)
+	}
+
+	indexByUsername := make(map[string]int, len(conversations))
+	for index := range conversations {
+		indexByUsername[conversations[index].User.Username] = index
+	}
+
+	for latestRows.Next() {
+		var message Message
+		var other PublicUser
+		var otherID uint64
+		if err := latestRows.Scan(
+			&message.ID,
+			&message.SenderID,
+			&message.RecipientID,
+			&message.ClientMessageID,
+			&message.Body,
+			&message.CreatedAt,
+			&other.Username,
+			&other.Nickname,
+			&otherID,
+		); err != nil {
+			return nil, nil, fmt.Errorf("scan latest message: %w", err)
+		}
+		messageCopy := message
+		if index, ok := indexByUsername[other.Username]; ok {
+			conversations[index].UserID = otherID
+			conversations[index].LastMessage = &messageCopy
+			continue
+		}
+		conversations = append(conversations, Conversation{
+			UserID:      otherID,
+			User:        other,
+			IsFriend:    false,
+			LastMessage: &messageCopy,
+		})
+		indexByUsername[other.Username] = len(conversations) - 1
+	}
+	if err := latestRows.Err(); err != nil {
+		_ = latestRows.Close()
+		return nil, nil, fmt.Errorf("iterate latest messages: %w", err)
+	}
+	if err := latestRows.Close(); err != nil {
+		return nil, nil, fmt.Errorf("close latest messages: %w", err)
+	}
+
 	sort.SliceStable(conversations, func(i, j int) bool {
 		left, right := conversations[i], conversations[j]
 		switch {
@@ -267,7 +287,7 @@ func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Convers
 		return left.User.Username < right.User.Username
 	})
 
-	return conversations, nil
+	return conversations, indexByUsername, nil
 }
 
 // ListMessages returns a page of messages between two users. A beforeID of

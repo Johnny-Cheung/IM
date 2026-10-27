@@ -295,6 +295,13 @@ func (f *fakeStore) ListConversations(
 	return f.conversations, f.conversationsErr
 }
 
+func (f *fakeStore) ListConversationBasics(
+	context.Context,
+	uint64,
+) ([]store.Conversation, error) {
+	return f.conversations, f.conversationsErr
+}
+
 func (f *fakeStore) ListMessages(
 	_ context.Context,
 	userID, otherID, beforeID uint64,
