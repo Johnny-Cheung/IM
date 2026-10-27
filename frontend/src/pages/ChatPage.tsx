@@ -1508,7 +1508,7 @@ export function ChatPage() {
           ? {
             ...conversation,
             peer_last_read_message_id: Math.max(
-              conversation.peer_last_read_message_id,
+              conversation.peer_last_read_message_id ?? 0,
               event.lastReadMessageID,
             ),
           }

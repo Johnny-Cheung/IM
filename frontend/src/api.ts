@@ -75,7 +75,7 @@ export type DirectConversation = {
   is_friend: boolean;
   last_message: ConversationMessage | null;
   unread_count: number;
-  peer_last_read_message_id: number;
+  peer_last_read_message_id?: number;
 };
 
 export type GroupSummary = {

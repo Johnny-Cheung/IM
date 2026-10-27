@@ -243,6 +243,10 @@ async function main() {
     await tab.waitFor(`!document.querySelector('#conversation-list ${memberSelector(live)} .unread-badge')`);
     run.check("returning to foreground clears unread", true);
     for (let index = 0; index < 32; index += 1) await run.request("b", "POST", `/api/groups/${live}/messages`, { body: `历史 ${index}`, client_message_id: randomUUID() });
+    // Wait until every real-time message has reached the client before
+    // dropping the cache; a late WebSocket write would otherwise restore a
+    // single cached row and skip the network page.
+    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length === 35", 5000);
     // Drop this group's local cache so the refresh still exercises the
     // network pagination path instead of serving everything from IndexedDB.
     await tab.evaluate(`(async () => {
@@ -303,13 +307,19 @@ async function main() {
     await tab.waitFor(`!document.querySelector(${JSON.stringify(unread)})`);
     run.check("private foreground restoration clears unread", true);
 
-    const receiptMessage = await run.request("a", "POST", `/api/conversations/${name("b")}/messages`, {
-      body: "回执测试",
-      client_message_id: randomUUID(),
-    });
-    await tab.waitFor("document.querySelector('#message-list').innerText.includes('回执测试')");
-    await run.request("b", "POST", `/api/conversations/${name("a")}/read?through_id=${receiptMessage.message.id}`);
-    await tab.waitFor("document.querySelector('#message-list .read-state')?.textContent === '已读'", 5000);
+    await tab.setValue("#message-input", "回执测试");
+    await tab.click("#send-message");
+    await tab.waitFor(`(() => {
+      const row = [...document.querySelectorAll('#message-list .message-row')]
+        .find((el) => el.innerText.includes('回执测试'));
+      return !!row && row.dataset.status === 'sent' && Number(row.dataset.messageId) > 0;
+    })()`, 5000);
+    await run.request("b", "POST", `/api/conversations/${name("a")}/read`);
+    await tab.waitFor(`(() => {
+      const row = [...document.querySelectorAll('#message-list .message-row')]
+        .find((el) => el.innerText.includes('回执测试'));
+      return row?.querySelector('.read-state')?.textContent === '已读';
+    })()`, 5000);
     run.check("sender sees the peer read receipt", true);
 
     // Let the in-conversation read flush, then verify that switching away
