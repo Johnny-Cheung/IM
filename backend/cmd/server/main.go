@@ -28,16 +28,26 @@ const (
 )
 
 type serverOptions struct {
-	addr   string
-	webDir string
+	addr          string
+	webDir        string
+	backfillRead  bool
+	backfillBatch int
 }
 
 func main() {
 	options := serverOptions{}
 	flag.StringVar(&options.addr, "addr", defaultAddr, "HTTP server address")
 	flag.StringVar(&options.webDir, "web-dir", "", "directory containing the frontend build")
+	flag.BoolVar(&options.backfillRead, "backfill-read", false, "backfill the direct read model and exit")
+	flag.IntVar(&options.backfillBatch, "backfill-batch", 1000, "rows per backfill batch")
 	flag.Parse()
 
+	if options.backfillRead {
+		if err := runBackfill(options); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if err := run(options); err != nil {
 		log.Fatal(err)
 	}
@@ -135,6 +145,21 @@ func run(options serverOptions) error {
 			namespace,
 			dataStore,
 		)
+		if directReadTracker != nil {
+			ready, err := directReadTracker.ReadModelReady(startupCtx)
+			if err != nil {
+				return fmt.Errorf("check direct read model: %w", err)
+			}
+			if !ready {
+				if infraConfig.MessagingRequired {
+					return fmt.Errorf(
+						"direct read model is not ready; run with -backfill-read first",
+					)
+				}
+				log.Printf("direct read model is not ready; using MySQL read state")
+				directReadTracker = nil
+			}
+		}
 
 		if infraConfig.GroupMessagingEnabled {
 			groupProjector = messaging.NewGroupProjection(infraManager.Redis(), keyspace)
