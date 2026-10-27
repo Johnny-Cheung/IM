@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/go-sql-driver/mysql"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -183,6 +184,30 @@ func TestDirectReadPersisterDropsMalformedEvent(t *testing.T) {
 	}
 	if calls := store.snapshot(); len(calls) != 0 {
 		t.Fatalf("store calls = %d, want 0", len(calls))
+	}
+	if got := client.XLen(ctx, directReadStreamKey()).Val(); got != 0 {
+		t.Fatalf("stream length = %d, want 0", got)
+	}
+}
+
+func TestDirectReadPersisterDropsPermanentlyInvalidEvent(t *testing.T) {
+	store := &fakeReadPersistenceStore{
+		err: &mysql.MySQLError{Number: 1452, Message: "foreign key"},
+	}
+	persister, client := newReadPersisterTest(t, store)
+	ctx := context.Background()
+	if err := persister.ensureGroup(ctx); err != nil {
+		t.Fatalf("ensure group: %v", err)
+	}
+
+	addReadEvent(t, client, map[string]interface{}{
+		"user_id":              "2",
+		"peer_id":              "1",
+		"last_read_message_id": "42",
+		"updated_at_ms":        "1700000000123",
+	})
+	if err := persister.processStreams(ctx, readNewEvents(t, client, persister)); err != nil {
+		t.Fatalf("process permanent event: %v", err)
 	}
 	if got := client.XLen(ctx, directReadStreamKey()).Val(); got != 0 {
 		t.Fatalf("stream length = %d, want 0", got)

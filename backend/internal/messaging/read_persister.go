@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // DirectReadPersistenceStore persists read positions to durable storage.
@@ -171,9 +173,28 @@ func (p *DirectReadPersister) processEntry(ctx context.Context, entry redis.XMes
 		event.LastReadMessageID,
 		event.UpdatedAt,
 	); err != nil {
+		if isPermanentReadPersistError(err) {
+			log.Printf("drop permanent direct read event %s: %v", entry.ID, err)
+			return p.ackAndDelete(ctx, entry.ID)
+		}
 		return fmt.Errorf("persist direct read %s: %w", entry.ID, err)
 	}
 	return p.ackAndDelete(ctx, entry.ID)
+}
+
+// A read event can reference a user that no longer exists after test cleanup
+// or account removal. Retrying cannot succeed, so acknowledge and drop it.
+func isPermanentReadPersistError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	switch mysqlErr.Number {
+	case 1452, 3819:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *DirectReadPersister) ackAndDelete(ctx context.Context, entryID string) error {
