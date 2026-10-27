@@ -499,10 +499,10 @@ func (f *fakeStore) RevokeSession(
 	return f.revokeSessionErr
 }
 
-func testRouter(dataStore Store) *gin.Engine {
+func testRouter(dataStore Store, options ...Option) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	New(dataStore).Register(router)
+	New(dataStore, options...).Register(router)
 	return router
 }
 

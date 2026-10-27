@@ -93,6 +93,7 @@ func run(options serverOptions) error {
 
 	var directAcceptor *messaging.RedisAcceptor
 	var directReader *messaging.RedisMessageReader
+	var directReadTracker *messaging.DirectReadTracker
 	var friendshipProjector *messaging.FriendshipProjection
 	var groupAcceptor *messaging.GroupRedisAcceptor
 	var groupReader *messaging.GroupMessageReader
@@ -124,6 +125,10 @@ func run(options serverOptions) error {
 			messaging.RedisAcceptorOptions{SeedFloor: seedFloor, Keyspace: keyspace},
 		)
 		directReader = messaging.NewRedisMessageReaderWithKeyspace(infraManager.Redis(), keyspace, indexEpoch)
+		directReadTracker = messaging.NewDirectReadTracker(
+			infraManager.Redis(),
+			messaging.DirectReadTrackerOptions{Keyspace: keyspace},
+		)
 
 		if infraConfig.GroupMessagingEnabled {
 			groupProjector = messaging.NewGroupProjection(infraManager.Redis(), keyspace)
@@ -219,6 +224,9 @@ func run(options serverOptions) error {
 	}
 	if directReader != nil {
 		apiOptions = append(apiOptions, httpapi.WithDirectMessageReader(directReader))
+	}
+	if directReadTracker != nil {
+		apiOptions = append(apiOptions, httpapi.WithDirectReadTracker(directReadTracker))
 	}
 	if groupAcceptor != nil {
 		apiOptions = append(apiOptions, httpapi.WithGroupMessageAcceptor(groupAcceptor))

@@ -150,6 +150,15 @@ type DirectMessageReader interface {
 	LastConversationMessages(context.Context, uint64) (map[uint64]store.Message, error)
 }
 
+// DirectReadTracker owns direct-chat read positions in Redis.
+type DirectReadTracker interface {
+	AdvanceRead(context.Context, uint64, uint64, uint64, time.Time) (messaging.DirectReadAdvance, error)
+	ReadPositions(context.Context, uint64) (map[uint64]uint64, error)
+	PeerReadPositions(context.Context, uint64, []uint64) (map[uint64]uint64, error)
+	UnreadCounts(context.Context, uint64, []uint64, map[uint64]uint64) (map[uint64]int, error)
+	ReadModelReady(context.Context) (bool, error)
+}
+
 // GroupMessageAcceptor is the optional Redis group acceptance path.
 type GroupMessageAcceptor interface {
 	Accept(context.Context, messaging.GroupMessageRequest) (messaging.GroupMessageResult, error)
@@ -179,6 +188,7 @@ type API struct {
 	hub                  *Hub
 	directAcceptor       DirectMessageAcceptor
 	directReader         DirectMessageReader
+	directReads          DirectReadTracker
 	friendshipProject    FriendshipProjector
 	groupAcceptor        GroupMessageAcceptor
 	groupReader          GroupMessageReader
@@ -203,6 +213,12 @@ func WithFriendshipProjector(projector FriendshipProjector) Option {
 func WithDirectMessageReader(reader DirectMessageReader) Option {
 	return func(api *API) {
 		api.directReader = reader
+	}
+}
+
+func WithDirectReadTracker(tracker DirectReadTracker) Option {
+	return func(api *API) {
+		api.directReads = tracker
 	}
 }
 
@@ -261,6 +277,7 @@ func (a *API) Register(router *gin.Engine) {
 	authed.GET("/conversations", a.listConversations)
 	authed.GET("/messages/sync", a.syncMessages)
 	authed.POST("/bootstrap", a.bootstrap)
+	authed.POST("/read", a.markReadBatch)
 	authed.GET("/conversations/:username/messages", a.listMessages)
 	authed.POST("/conversations/:username/messages", a.sendMessage)
 	authed.POST("/conversations/:username/read", a.markConversationRead)

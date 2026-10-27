@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Johnny-Cheung/IM/backend/internal/auth"
 	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/gin-gonic/gin"
@@ -24,6 +25,7 @@ const (
 	defaultSyncPageSize    = 200
 	maxSyncPageSize        = 200
 	maxMessageRunes        = 2000
+	maxBatchReadItems      = 50
 )
 
 var clientMessageIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
@@ -87,6 +89,26 @@ type sendMessageResponse struct {
 
 type readStateResponse struct {
 	LastReadMessageID uint64 `json:"last_read_message_id"`
+}
+
+type batchReadItem struct {
+	Username  string `json:"username"`
+	ThroughID uint64 `json:"through_id"`
+}
+
+type batchReadRequest struct {
+	Reads []batchReadItem `json:"reads"`
+}
+
+type batchReadResult struct {
+	Username          string `json:"username"`
+	LastReadMessageID uint64 `json:"last_read_message_id"`
+	Advanced          bool   `json:"advanced"`
+	Error             string `json:"error,omitempty"`
+}
+
+type batchReadResponse struct {
+	Reads []batchReadResult `json:"reads"`
 }
 
 func (a *API) listConversations(c *gin.Context) {
@@ -586,12 +608,14 @@ func (a *API) markConversationRead(c *gin.Context) {
 	if !ok {
 		return
 	}
-	lastReadMessageID, advanced, err := a.store.MarkConversationRead(
+	if !a.ensureReadModelReady(c) {
+		return
+	}
+	lastReadMessageID, advanced, err := a.advanceDirectRead(
 		c.Request.Context(),
-		current.ID,
-		target.ID,
+		current,
+		target,
 		throughID,
-		time.Now().UTC(),
 	)
 	if err != nil {
 		a.writeMessageError(c, err)
@@ -608,6 +632,136 @@ func (a *API) markConversationRead(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, readStateResponse{LastReadMessageID: lastReadMessageID})
+}
+
+// markReadBatch advances several direct conversations in one request. Each
+// item is independent: a missing or invalid target does not stop the others.
+func (a *API) markReadBatch(c *gin.Context) {
+	current, ok := currentUser(c)
+	if !ok {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
+		return
+	}
+
+	var request batchReadRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_request", "同步参数不正确")
+		return
+	}
+	if len(request.Reads) > maxBatchReadItems {
+		writeError(c, http.StatusBadRequest, "invalid_request", "已读项过多")
+		return
+	}
+	if !a.ensureReadModelReady(c) {
+		return
+	}
+
+	ctx := c.Request.Context()
+	response := batchReadResponse{Reads: make([]batchReadResult, 0, len(request.Reads))}
+	for _, item := range request.Reads {
+		result := batchReadResult{Username: item.Username}
+		usernameKey := auth.UsernameKey(item.Username)
+		if usernameKey == "" {
+			result.Error = "invalid_username"
+			response.Reads = append(response.Reads, result)
+			continue
+		}
+
+		target, err := a.store.GetUserByUsernameKey(ctx, usernameKey)
+		if errors.Is(err, store.ErrUserNotFound) {
+			result.Error = "user_not_found"
+			response.Reads = append(response.Reads, result)
+			continue
+		}
+		if err != nil {
+			log.Printf("resolve batch read user: %v", err)
+			writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
+			return
+		}
+		if target.ID == current.ID {
+			result.Error = "cannot_message_self"
+			response.Reads = append(response.Reads, result)
+			continue
+		}
+
+		lastReadMessageID, advanced, err := a.advanceDirectRead(ctx, current, target, item.ThroughID)
+		if err != nil {
+			a.writeMessageError(c, err)
+			return
+		}
+		result.Username = target.Username
+		result.LastReadMessageID = lastReadMessageID
+		result.Advanced = advanced
+		response.Reads = append(response.Reads, result)
+		if advanced {
+			a.PublishRead(
+				current.ID,
+				target.ID,
+				current.Username,
+				target.Username,
+				lastReadMessageID,
+			)
+		}
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+func (a *API) ensureReadModelReady(c *gin.Context) bool {
+	if a.directReads == nil {
+		return true
+	}
+	ready, err := a.directReads.ReadModelReady(c.Request.Context())
+	if err != nil {
+		log.Printf("check direct read model: %v", err)
+		writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂时不可用")
+		return false
+	}
+	if !ready {
+		writeError(c, http.StatusServiceUnavailable, "read_model_not_ready", "已读服务尚未就绪")
+		return false
+	}
+	return true
+}
+
+func (a *API) advanceDirectRead(
+	ctx context.Context,
+	current, target store.User,
+	throughID uint64,
+) (uint64, bool, error) {
+	if throughID > store.MaxSafeMessageID {
+		throughID = store.MaxSafeMessageID
+	}
+	if a.directReads == nil {
+		return a.store.MarkConversationRead(
+			ctx,
+			current.ID,
+			target.ID,
+			throughID,
+			time.Now().UTC(),
+		)
+	}
+
+	result, err := a.directReads.AdvanceRead(
+		ctx,
+		current.ID,
+		target.ID,
+		throughID,
+		time.Now().UTC(),
+	)
+	if err != nil {
+		log.Printf("advance direct read: %v", err)
+		return 0, false, messaging.ErrMessageServiceUnavailable
+	}
+	if result.StreamError {
+		log.Printf(
+			"append direct read event: user=%d peer=%d position=%d",
+			current.ID,
+			target.ID,
+			result.LastReadMessageID,
+		)
+	}
+	return result.LastReadMessageID, result.Advanced, nil
 }
 
 func (a *API) writeMessageError(c *gin.Context, err error) {
