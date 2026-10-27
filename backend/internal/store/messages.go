@@ -730,3 +730,38 @@ func (s *Store) MarkConversationRead(
 	}
 	return existing, false, nil
 }
+
+// UpsertConversationRead advances a conversation read position monotonically.
+// It is used by the asynchronous read-position persister and is idempotent
+// under duplicate or out-of-order events.
+func (s *Store) UpsertConversationRead(
+	ctx context.Context,
+	userID, peerID, lastReadMessageID uint64,
+	updatedAt time.Time,
+) error {
+	if userID == peerID {
+		return ErrCannotMessageSelf
+	}
+	if lastReadMessageID == 0 {
+		return nil
+	}
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO conversation_reads
+		   (user_id, peer_user_id, last_read_message_id, updated_at)
+		 VALUES (?, ?, ?, ?) AS incoming
+		 ON DUPLICATE KEY UPDATE
+		   last_read_message_id = GREATEST(
+		     conversation_reads.last_read_message_id,
+		     incoming.last_read_message_id
+		   ),
+		   updated_at = GREATEST(conversation_reads.updated_at, incoming.updated_at)`,
+		userID, peerID, lastReadMessageID, updatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert conversation read: %w", err)
+	}
+	return nil
+}

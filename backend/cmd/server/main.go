@@ -129,6 +129,12 @@ func run(options serverOptions) error {
 			infraManager.Redis(),
 			messaging.DirectReadTrackerOptions{Keyspace: keyspace},
 		)
+		directReadPersister := messaging.NewDirectReadPersister(
+			infraManager.Redis(),
+			keyspace,
+			namespace,
+			dataStore,
+		)
 
 		if infraConfig.GroupMessagingEnabled {
 			groupProjector = messaging.NewGroupProjection(infraManager.Redis(), keyspace)
@@ -178,6 +184,13 @@ func run(options serverOptions) error {
 			defer workers.Done()
 			if err := consumer.Run(workerContext); err != nil && workerContext.Err() == nil {
 				log.Printf("direct message consumer stopped: %v", err)
+			}
+		}()
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			if err := directReadPersister.Run(workerContext); err != nil && workerContext.Err() == nil {
+				log.Printf("direct read persister stopped: %v", err)
 			}
 		}()
 		log.Printf("direct message pipeline enabled namespace=%s", namespace.Base())
