@@ -204,7 +204,7 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 ```
 
 - 单组件重启使用 `redis-restart`、`rabbitmq-restart`；日志使用 `logs redis|rabbitmq|runtime`。
-- 当前正式 `8198` 已接入 v1.2 私聊、v1.3 群聊、v1.4 服务端读取链路和 v1.5 本地缓存，群聊已读仍按路线留在 v1.7；不配置开机自启，开发机重启后手动执行 `infractl start` 和 `imctl restart`。
+- 当前正式 `8198` 已接入 v1.2 私聊、v1.3 群聊、v1.4 服务端读取链路、v1.5 本地缓存和 v1.6 私聊已读，群聊已读仍按路线留在 v1.7；不配置开机自启，开发机重启后手动执行 `infractl start` 和 `imctl restart`。
 
 ## v1.2 私聊消息链路（已切换正式）
 
@@ -233,7 +233,7 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 - 消息实体、`dm:feed`、`dm:conv`、`dm:conv-last` 均不设 TTL，也不再裁剪；Redis 内存不再有固定上限行为，发布后需要持续观察 `used_memory`。观察方式是在私有 Redis 容器内读取 `INFO memory` 的 `used_memory_human`、`maxmemory_human` 和 `maxmemory_policy`，凭据仍由容器内受保护文件提供。
 - 切换后实测 `used_memory` 约 1.64 MB（上限 64 MB），键总数 232；`dm:feed`/`dm:conv`/`dm:conv-last` 在真实用户产生新消息前为空，属于 epoch 设计的预期现象。
 - `inbox`/`outbox` 已停止写入，仅保留作回滚兜底；确认稳定运行一个版本后再按前缀清理。
-- 本版未解决会话列表的 MySQL 查询量（仍为 4 条，含 `GROUP BY` 最新消息子查询），也未做服务端性能实测，统一留到 v1.6 和 v1.9。
+- 本版未解决会话列表的 MySQL 查询量（当时为 4 条，含 `GROUP BY` 最新消息子查询），也未做服务端性能实测。v1.6 已移除其中的未读和对方已读查询，好友、最新消息和群聊查询仍在；性能实测仍留到 v1.9。
 - 回滚：v1.4 只改变 Redis 索引格式，MySQL 仍是权威。回退到 v1.3 二进制时，切换后产生的消息在 MySQL 中完整可用；但新消息没有写入 `inbox`/`outbox`，热窗口会由 MySQL 兜底。
 - 验证实例继续使用 `imctl --verify`、Redis DB 1、vhost `im_v13_verify` 和命名空间 `im:v13-verify`。
 
