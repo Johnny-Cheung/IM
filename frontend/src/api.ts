@@ -126,6 +126,22 @@ export type SendGroupMessageResponse = {
   message: GroupMessage;
 };
 
+export type ReadUpdate = {
+  username: string;
+  through_id: number;
+};
+
+export type ReadUpdateResult = {
+  username: string;
+  last_read_message_id: number;
+  advanced: boolean;
+  error?: string;
+};
+
+export type ReadBatchResponse = {
+  reads: ReadUpdateResult[];
+};
+
 export type ConversationListResponse = {
   conversations: Conversation[];
 };
@@ -358,6 +374,12 @@ export const api = {
       `/api/conversations/${encodeURIComponent(username)}/read?through_id=${throughID}`,
       { method: "POST" },
     ),
+
+  markReadBatch: (reads: ReadUpdate[]) =>
+    request<ReadBatchResponse>("/api/read", {
+      method: "POST",
+      body: JSON.stringify({ reads }),
+    }),
 
   sendMessage: (username: string, body: string, clientMessageID: string) =>
     request<SendMessageResponse>(

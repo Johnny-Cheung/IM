@@ -9,6 +9,7 @@ import type {
   PublicUser,
 } from "../api";
 import { conversationKey } from "./keys";
+import type { SerializedPendingReads } from "../readQueue";
 import {
   cacheSupported,
   clearUser,
@@ -18,6 +19,7 @@ import {
   readFriends,
   readHints,
   readMessages,
+  readPendingReads,
   readSyncState,
   removeConversation,
   removeGroupCursor,
@@ -27,6 +29,7 @@ import {
   writeConversations,
   writeFriends,
   writeMessages,
+  writePendingReads,
   writeSyncState,
 } from "./store";
 import { emptySyncState } from "./types";
@@ -350,6 +353,28 @@ describe("sync state", () => {
   });
 });
 
+describe("pending reads", () => {
+  it("round-trips pending read positions per user", async () => {
+    const reads: SerializedPendingReads = {
+      "direct:bob": {
+        kind: "direct",
+        key: "direct:bob",
+        username: "bob",
+        throughID: 12,
+      },
+      "group:7": {
+        kind: "group",
+        key: "group:7",
+        groupID: 7,
+        throughID: 20,
+      },
+    };
+    await writePendingReads("alice", reads);
+    expect(await readPendingReads("alice")).toEqual(reads);
+    expect(await readPendingReads("bob")).toEqual({});
+  });
+});
+
 describe("clearUser", () => {
   it("removes only the given user's cache", async () => {
     await setActiveUser(alice);
@@ -361,6 +386,14 @@ describe("clearUser", () => {
       directComplete: true,
       groups: { 1: 10 },
       savedAt: "2026-10-26T00:00:00.000Z",
+    });
+    await writePendingReads("alice", {
+      "direct:bob": {
+        kind: "direct",
+        key: "direct:bob",
+        username: "bob",
+        throughID: 10,
+      },
     });
 
     await writeConversations("bob", [directConversation("carol", 20)]);
@@ -375,6 +408,7 @@ describe("clearUser", () => {
     expect(await readMessages("alice", "direct:bob")).toEqual([]);
     expect(await readFriends("alice")).toEqual([]);
     expect(await readSyncState("alice")).toEqual(emptySyncState());
+    expect(await readPendingReads("alice")).toEqual({});
     expect(await readHints()).toEqual({ user: null, sync: null });
 
     expect(keysOf(await readConversations("bob"))).toEqual(["direct:carol"]);

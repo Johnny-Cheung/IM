@@ -23,18 +23,28 @@ import {
   type GroupDetail,
   type GroupMessage,
   type PublicUser,
+  type ReadUpdateResult,
 } from "../api";
 import {
   readConversations,
   readFriends,
   readMessages,
+  readPendingReads,
   readSyncState,
   removeMessages,
   writeConversations,
   writeFriends,
   writeMessages,
+  writePendingReads,
 } from "../cache";
 import type { CachedMessage } from "../cache";
+import {
+  deserializePendingReads,
+  enqueueRead,
+  serializePendingReads,
+  splitPendingReads,
+  type PendingRead,
+} from "../readQueue";
 import { Brand } from "../components/Brand";
 import { useAuth } from "../auth";
 
@@ -44,7 +54,10 @@ const MAX_GROUP_NAME_LENGTH = 30;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY = 1000;
 const RECONNECT_MAX_DELAY = 10000;
-const READ_DEBOUNCE_MS = 300;
+const READ_FLUSH_MS = 1000;
+const READ_SWITCH_FLUSH_MS = 300;
+const READ_RETRY_MS = 5000;
+const READ_BATCH_LIMIT = 50;
 const WS_CLOSE_REPLACED = 4001;
 const WS_CLOSE_SESSION = 4002;
 
@@ -73,6 +86,27 @@ type ScrollPosition = {
   height: number;
   top: number;
 };
+
+function sameUsername(left: string, right: string): boolean {
+  return left.toLocaleLowerCase() === right.toLocaleLowerCase();
+}
+
+function usernameKey(value: string): string {
+  return value.toLocaleLowerCase();
+}
+
+function maxMessageID(items: DisplayMessage[]): number {
+  return items.reduce((latest, message) => Math.max(latest, message.id), 0);
+}
+
+function isPermanentReadError(error: unknown): boolean {
+  return error instanceof ApiError
+    && error.status >= 400
+    && error.status < 500
+    && error.status !== 401
+    && error.status !== 408
+    && error.status !== 429;
+}
 
 const messageTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
   hour: "2-digit",
@@ -228,7 +262,7 @@ function previewOf(conversation: Conversation, currentUsername: string): string 
   if (!message) {
     return conversation.type === "group" ? "群聊已创建" : "还没有消息";
   }
-  const prefix = message.sender.username === currentUsername
+  const prefix = sameUsername(message.sender.username, currentUsername)
     ? "我："
     : conversation.type === "group"
       ? `${message.sender.nickname}：`
@@ -528,7 +562,16 @@ export function ChatPage() {
   const reconnectAttemptRef = useRef(0);
   const connectRef = useRef<() => void>(() => {});
   const syncingRef = useRef(false);
-  const readTimerRef = useRef<number | null>(null);
+  const pendingReadsRef = useRef<Map<string, PendingRead>>(new Map());
+  const readFlushTimerRef = useRef<number | null>(null);
+  const readFlushRef = useRef<() => void>(() => {});
+  const readFlushingRef = useRef(false);
+  const readPersistTimerRef = useRef<number | null>(null);
+  const previousReadTargetRef = useRef<ActiveTarget | null>(null);
+  const pendingReadsLoadedForRef = useRef("");
+  const pendingReadsLoadingForRef = useRef("");
+  const pendingReadsMergedRef = useRef(false);
+  const conversationMaxRef = useRef<Map<string, number>>(new Map());
   const nearBottomRef = useRef(true);
   const scrollToBottomNextRef = useRef(false);
   const pendingOlderScrollRef = useRef<ScrollPosition | null>(null);
@@ -615,6 +658,280 @@ export function ChatPage() {
     setChatNotice(notice);
     navigate("/", { replace: true });
   }, [navigate]);
+
+  const persistPendingReads = useCallback((immediate = false) => {
+    const currentUser = userRef.current;
+    if (!currentUser || loggingOutRef.current || !pendingReadsMergedRef.current) {
+      return;
+    }
+    if (readPersistTimerRef.current !== null) {
+      window.clearTimeout(readPersistTimerRef.current);
+      readPersistTimerRef.current = null;
+    }
+    const write = () => {
+      void writePendingReads(
+        currentUser.username,
+        serializePendingReads(pendingReadsRef.current),
+      );
+    };
+    if (immediate) {
+      write();
+      return;
+    }
+    readPersistTimerRef.current = window.setTimeout(() => {
+      readPersistTimerRef.current = null;
+      write();
+    }, 300);
+  }, []);
+
+  const enqueuePendingRead = useCallback((target: ActiveTarget, throughID: number) => {
+    if (!enqueueRead(pendingReadsRef.current, target, throughID)) {
+      return false;
+    }
+    persistPendingReads();
+    return true;
+  }, [persistPendingReads]);
+
+  const clearLocalUnread = useCallback((target: ActiveTarget, throughID: number) => {
+    setConversations((previous) => previous.map((conversation) => {
+      if (target.kind === "direct") {
+        return conversation.type === "direct"
+          && sameUsername(conversation.user.username, target.username)
+          && (conversation.last_message?.id ?? 0) <= throughID
+          ? { ...conversation, unread_count: 0 }
+          : conversation;
+      }
+      return conversation.type === "group"
+        && conversation.group.id === target.groupID
+        && (conversation.last_message?.id ?? 0) <= throughID
+        ? { ...conversation, unread_count: 0 }
+        : conversation;
+    }));
+  }, []);
+
+  const scheduleReadFlush = useCallback((delay: number, replace = false) => {
+    if (readFlushTimerRef.current !== null) {
+      if (!replace) {
+        return;
+      }
+      window.clearTimeout(readFlushTimerRef.current);
+      readFlushTimerRef.current = null;
+    }
+    readFlushTimerRef.current = window.setTimeout(() => {
+      readFlushTimerRef.current = null;
+      readFlushRef.current();
+    }, delay);
+  }, []);
+
+  const flushPendingReads = useCallback(async (updateLocal = true) => {
+    if (offlineRef.current || readFlushingRef.current) {
+      return;
+    }
+    const queue = pendingReadsRef.current;
+    if (queue.size === 0) {
+      return;
+    }
+    if (readFlushTimerRef.current !== null) {
+      window.clearTimeout(readFlushTimerRef.current);
+      readFlushTimerRef.current = null;
+    }
+
+    readFlushingRef.current = true;
+    const items = [...queue.values()];
+    queue.clear();
+    const retry: PendingRead[] = [];
+    let sessionEnded = false;
+
+    try {
+      const { direct, groups } = splitPendingReads(items);
+      for (let start = 0; start < direct.length; start += READ_BATCH_LIMIT) {
+        const chunk = direct.slice(start, start + READ_BATCH_LIMIT);
+        try {
+          const response = await api.markReadBatch(chunk.map((item) => ({
+            username: item.username,
+            through_id: item.throughID,
+          })));
+          const results = new Map<string, ReadUpdateResult>(
+            response.reads.map((result) => [usernameKey(result.username), result]),
+          );
+          for (const item of chunk) {
+            const result = results.get(usernameKey(item.username));
+            if (result === undefined) {
+              retry.push(item);
+              continue;
+            }
+            if (result.error !== undefined && result.error !== "") {
+              if (result.error === "message_service_unavailable") {
+                retry.push(item);
+              }
+              continue;
+            }
+            if (updateLocal) {
+              clearLocalUnread(item, result.last_read_message_id);
+            }
+          }
+        } catch (error) {
+          if (handleSessionError(error)) {
+            sessionEnded = true;
+            break;
+          }
+          if (isPermanentReadError(error)) {
+            continue;
+          }
+          retry.push(...chunk);
+        }
+      }
+
+      if (!sessionEnded) {
+        for (const item of groups) {
+          try {
+            const result = await api.markGroupRead(item.groupID, item.throughID);
+            if (updateLocal) {
+              clearLocalUnread(item, result.last_read_message_id);
+            }
+          } catch (error) {
+            if (handleSessionError(error)) {
+              sessionEnded = true;
+              break;
+            }
+            if (isPermanentReadError(error)) {
+              continue;
+            }
+            retry.push(item);
+          }
+        }
+      }
+    } finally {
+      readFlushingRef.current = false;
+      if (sessionEnded) {
+        pendingReadsRef.current.clear();
+        persistPendingReads(true);
+        return;
+      }
+      for (const item of retry) {
+        const existing = pendingReadsRef.current.get(item.key);
+        if (existing === undefined || existing.throughID < item.throughID) {
+          pendingReadsRef.current.set(item.key, item);
+        }
+      }
+      persistPendingReads();
+      if (pendingReadsRef.current.size > 0 && !offlineRef.current) {
+        scheduleReadFlush(retry.length > 0 ? READ_RETRY_MS : READ_FLUSH_MS);
+      }
+    }
+  }, [
+    clearLocalUnread,
+    handleSessionError,
+    persistPendingReads,
+    scheduleReadFlush,
+  ]);
+
+  useEffect(() => {
+    readFlushRef.current = () => {
+      void flushPendingReads();
+    };
+  }, [flushPendingReads]);
+
+  useEffect(() => {
+    if (!user) {
+      return;
+    }
+    const username = user.username;
+    if (
+      pendingReadsLoadedForRef.current === username
+      || pendingReadsLoadingForRef.current === username
+    ) {
+      return;
+    }
+    if (pendingReadsLoadedForRef.current !== "") {
+      pendingReadsRef.current.clear();
+      conversationMaxRef.current.clear();
+      pendingReadsMergedRef.current = false;
+      pendingReadsLoadedForRef.current = "";
+      if (readFlushTimerRef.current !== null) {
+        window.clearTimeout(readFlushTimerRef.current);
+        readFlushTimerRef.current = null;
+      }
+    }
+    pendingReadsLoadingForRef.current = username;
+    let cancelled = false;
+    void (async () => {
+      const stored = await readPendingReads(username);
+      if (cancelled) {
+        return;
+      }
+      for (const [key, item] of deserializePendingReads(stored)) {
+        const existing = pendingReadsRef.current.get(key);
+        if (existing === undefined || existing.throughID < item.throughID) {
+          pendingReadsRef.current.set(key, item);
+        }
+      }
+      pendingReadsLoadingForRef.current = "";
+      pendingReadsLoadedForRef.current = username;
+      pendingReadsMergedRef.current = true;
+      persistPendingReads(true);
+      if (!offlineRef.current && pendingReadsRef.current.size > 0) {
+        scheduleReadFlush(0, true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (pendingReadsLoadingForRef.current === username) {
+        pendingReadsLoadingForRef.current = "";
+      }
+    };
+  }, [persistPendingReads, scheduleReadFlush, user]);
+
+  useEffect(() => {
+    if (offline) {
+      return;
+    }
+    if (pendingReadsRef.current.size > 0) {
+      scheduleReadFlush(0, true);
+    }
+  }, [offline, scheduleReadFlush]);
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "hidden") {
+        return;
+      }
+      persistPendingReads(true);
+      void flushPendingReads();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [flushPendingReads, persistPendingReads]);
+
+  useEffect(() => () => {
+    if (readFlushTimerRef.current !== null) {
+      window.clearTimeout(readFlushTimerRef.current);
+      readFlushTimerRef.current = null;
+    }
+    if (readPersistTimerRef.current !== null) {
+      window.clearTimeout(readPersistTimerRef.current);
+      readPersistTimerRef.current = null;
+    }
+    if (loggingOutRef.current) {
+      return;
+    }
+    persistPendingReads(true);
+    void flushPendingReads(false);
+  }, [flushPendingReads, persistPendingReads]);
+
+  useEffect(() => {
+    const previous = previousReadTargetRef.current;
+    if (previous !== null && previous.key !== activeKey) {
+      const throughID = conversationMaxRef.current.get(previous.key) ?? 0;
+      if (throughID > 0) {
+        enqueuePendingRead(previous, throughID);
+        scheduleReadFlush(READ_SWITCH_FLUSH_MS, true);
+      }
+    }
+    previousReadTargetRef.current = activeTargetRef.current;
+  }, [activeKey, enqueuePendingRead, scheduleReadFlush]);
 
   const loadConversations = useCallback(async (initial = false) => {
     const requestID = ++conversationRequestRef.current;
@@ -962,29 +1279,12 @@ export function ChatPage() {
       if (isGroupMessage(message)) {
         continue;
       }
-      if (message.sender.username === user.username && message.status === "sent") {
+      if (sameUsername(message.sender.username, user.username) && message.status === "sent") {
         return message.id;
       }
     }
     return 0;
   }, [activeKey, messages, messagesBelongToActive, user]);
-
-  const markRead = useCallback(async (target: ActiveTarget, throughID: number) => {
-    if (offline) {
-      return;
-    }
-    try {
-      if (target.kind === "direct") {
-        await api.markConversationRead(target.username, throughID);
-      } else {
-        await api.markGroupRead(target.groupID, throughID);
-      }
-      // New messages may have arrived while this read request was in flight.
-      await loadConversations(false);
-    } catch (error) {
-      handleSessionError(error);
-    }
-  }, [handleSessionError, loadConversations, offline]);
 
   useEffect(() => {
     const target = activeTargetRef.current;
@@ -997,31 +1297,25 @@ export function ChatPage() {
     if (!pageVisible || connectionStatus === "replaced") {
       return;
     }
-    const throughID = messages.reduce((latest, message) => Math.max(latest, message.id), 0);
+    const throughID = maxMessageID(messages);
     if (throughID === 0) {
       return;
     }
-    if (readTimerRef.current !== null) {
-      window.clearTimeout(readTimerRef.current);
+    conversationMaxRef.current.set(target.key, throughID);
+    clearLocalUnread(target, throughID);
+    if (enqueuePendingRead(target, throughID) && !offlineRef.current) {
+      scheduleReadFlush(READ_FLUSH_MS);
     }
-    readTimerRef.current = window.setTimeout(() => {
-      readTimerRef.current = null;
-      void markRead(target, throughID);
-    }, READ_DEBOUNCE_MS);
-    return () => {
-      if (readTimerRef.current !== null) {
-        window.clearTimeout(readTimerRef.current);
-        readTimerRef.current = null;
-      }
-    };
   }, [
     activeKey,
+    clearLocalUnread,
     connectionStatus,
-    markRead,
+    enqueuePendingRead,
     messages,
     messagesBelongToActive,
     messagesLoading,
     pageVisible,
+    scheduleReadFlush,
   ]);
 
   const loadOlderMessages = useCallback(async () => {
@@ -1106,8 +1400,8 @@ export function ChatPage() {
     if (!currentUser) {
       return;
     }
-    const sentByCurrent = message.sender.username === currentUser.username;
-    const receivedByCurrent = message.recipient.username === currentUser.username;
+    const sentByCurrent = sameUsername(message.sender.username, currentUser.username);
+    const receivedByCurrent = sameUsername(message.recipient.username, currentUser.username);
     if (!sentByCurrent && !receivedByCurrent) {
       return;
     }
@@ -1120,7 +1414,7 @@ export function ChatPage() {
     );
     const target = activeTargetRef.current;
     const targetMatches = target?.kind === "direct"
-      && target.username.toLocaleLowerCase() === otherUser.username.toLocaleLowerCase();
+      && sameUsername(target.username, otherUser.username);
     const readingNow = targetMatches
       && pageVisibleRef.current
       && !replacedRef.current;
@@ -1128,7 +1422,7 @@ export function ChatPage() {
     if (conversationKeysRef.current.has(directKey(otherUser.username))) {
       setConversations((previous) => sortConversations(previous.map((conversation) =>
         conversation.type === "direct"
-          && conversation.user.username === otherUser.username
+          && sameUsername(conversation.user.username, otherUser.username)
           ? {
             ...conversation,
             last_message: message,
@@ -1155,7 +1449,7 @@ export function ChatPage() {
     if (!currentUser) {
       return;
     }
-    const sentByCurrent = message.sender.username === currentUser.username;
+    const sentByCurrent = sameUsername(message.sender.username, currentUser.username);
     const target = activeTargetRef.current;
     const readingNow = target?.kind === "group"
       && target.groupID === message.group_id
@@ -1196,13 +1490,21 @@ export function ChatPage() {
     if (!currentUser) {
       return;
     }
-    if (event.reader === currentUser.username) {
-      void loadConversations(false);
+    if (sameUsername(event.reader, currentUser.username)) {
+      // The batch response already cleared local unread; do not refetch the
+      // whole conversation list for our own read echo.
+      setConversations((previous) => previous.map((conversation) =>
+        conversation.type === "direct"
+          && sameUsername(conversation.user.username, event.peer)
+          && (conversation.last_message?.id ?? 0) <= event.lastReadMessageID
+          ? { ...conversation, unread_count: 0 }
+          : conversation));
       return;
     }
-    if (event.peer === currentUser.username) {
+    if (sameUsername(event.peer, currentUser.username)) {
       setConversations((previous) => previous.map((conversation) =>
-        conversation.type === "direct" && conversation.user.username === event.reader
+        conversation.type === "direct"
+          && sameUsername(conversation.user.username, event.reader)
           ? {
             ...conversation,
             peer_last_read_message_id: Math.max(
@@ -1212,7 +1514,7 @@ export function ChatPage() {
           }
           : conversation));
     }
-  }, [loadConversations]);
+  }, []);
 
   const handleGroupChanged = useCallback((event: GroupChangedEvent) => {
     if (event.action === "removed" || event.action === "dissolved") {
@@ -2167,7 +2469,7 @@ export function ChatPage() {
                         const previous = messages[index - 1];
                         const showDay = !previous
                           || !isSameDay(previous.created_at, message.created_at);
-                        const mine = message.sender.username === user.username;
+                        const mine = sameUsername(message.sender.username, user.username);
                         const groupMessage = isGroupMessage(message);
                         return (
                           <Fragment key={message.client_message_id || message.id}>
