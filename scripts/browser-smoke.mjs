@@ -44,6 +44,23 @@ async function online() {
   await tab.evaluate("window.dispatchEvent(new Event('online'))");
 }
 
+function readPositionOf(request) {
+  const query = Number(new URL(request.url).searchParams.get("through_id"));
+  if (Number.isFinite(query) && query > 0) {
+    return query;
+  }
+  try {
+    const body = JSON.parse(request.postData ?? "");
+    const reads = Array.isArray(body?.reads) ? body.reads : [];
+    return reads.reduce(
+      (latest, item) => Math.max(latest, Number(item?.through_id) || 0),
+      0,
+    );
+  } catch {
+    return 0;
+  }
+}
+
 async function readWhileHiding(pattern, send, unreadSelector) {
   await delay(400);
   let resolveRead;
@@ -51,8 +68,9 @@ async function readWhileHiding(pattern, send, unreadSelector) {
   const offRead = tab.on("Fetch.requestPaused", resolveRead);
   await tab.send("Fetch.enable", { patterns: [{ urlPattern: pattern, requestStage: "Request" }] });
   try {
-    await send("前台已看到");
+    const sent = await send("前台已看到");
     const read = await Promise.race([paused, delay(5000).then(() => { throw new Error("read request was not intercepted"); })]);
+    const readPosition = readPositionOf(read.request);
     await tab.evaluate("Object.defineProperty(document, 'visibilityState', {configurable:true, get:()=>window.__imHidden ? 'hidden' : 'visible'}); window.__imHidden=true; document.dispatchEvent(new Event('visibilitychange'))");
     await send("后台未读");
     await tab.waitFor(`document.querySelector(${JSON.stringify(unreadSelector)})?.textContent === '1'`);
@@ -64,7 +82,7 @@ async function readWhileHiding(pattern, send, unreadSelector) {
       await Promise.race([completed, delay(5000).then(() => { throw new Error("read request did not finish"); })]);
       await delay(250);
       run.check(`in-flight read preserves background unread (${unreadSelector})`, await tab.evaluate(`document.querySelector(${JSON.stringify(unreadSelector)})?.textContent === '1'`));
-      run.check("read request captures viewed message position", Number(new URL(read.request.url).searchParams.get("through_id")) > 0);
+      run.check("read request captures viewed message position", readPosition >= sent.message.id);
     } finally { offCompleted(); }
   } finally {
     offRead();
@@ -278,12 +296,57 @@ async function main() {
     await tab.select(directSelector("b"), `/chat/${name("b")}`);
     const unread = `#conversation-list ${directSelector("b")} .unread-badge`;
     await readWhileHiding(
-      `*/api/conversations/${name("b")}/read*`,
+      "*/api/read*",
       (body) => run.request("b", "POST", `/api/conversations/${name("a")}/messages`, { body, client_message_id: randomUUID() }),
       unread,
     );
     await tab.waitFor(`!document.querySelector(${JSON.stringify(unread)})`);
     run.check("private foreground restoration clears unread", true);
+
+    const receiptMessage = await run.request("a", "POST", `/api/conversations/${name("b")}/messages`, {
+      body: "回执测试",
+      client_message_id: randomUUID(),
+    });
+    await tab.waitFor("document.querySelector('#message-list').innerText.includes('回执测试')");
+    await run.request("b", "POST", `/api/conversations/${name("a")}/read?through_id=${receiptMessage.message.id}`);
+    await tab.waitFor("document.querySelector('#message-list .read-state')?.textContent === '已读'", 5000);
+    run.check("sender sees the peer read receipt", true);
+
+    // Let the in-conversation read flush, then verify that switching away
+    // sends the previous conversation's position.
+    await delay(1500);
+    const switchReads = [];
+    const offSwitchRead = tab.on("Network.requestWillBeSent", ({ request }) => {
+      if (new URL(request.url).pathname !== "/api/read") return;
+      try {
+        const body = JSON.parse(request.postData ?? "{}");
+        if (Array.isArray(body.reads)) switchReads.push(...body.reads);
+      } catch {
+        // Ignore malformed requests.
+      }
+    });
+    try {
+      await tab.select(directSelector("c"), `/chat/${name("c")}`);
+      const expected = name("b").toLocaleLowerCase();
+      const deadline = Date.now() + 3000;
+      while (
+        Date.now() < deadline
+        && !switchReads.some(
+          (item) => String(item.username).toLocaleLowerCase() === expected,
+        )
+      ) {
+        await delay(100);
+      }
+      run.check(
+        "switching conversations flushes the previous read",
+        switchReads.some(
+          (item) => String(item.username).toLocaleLowerCase() === expected,
+        ),
+      );
+    } finally {
+      offSwitchRead();
+    }
+
     await tab.select(memberSelector(live), `/chat/group/${live}`);
     await tab.waitFor("document.querySelectorAll('#message-list .message-row').length > 0");
   });

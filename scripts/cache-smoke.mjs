@@ -112,8 +112,7 @@ async function main() {
       "conversation list is only refreshed after the read receipt",
       (() => {
         const firstConversations = requests.indexOf("/api/conversations");
-        const firstRead = requests.findIndex((path) =>
-          path === `/api/conversations/${name("b")}/read`);
+        const firstRead = requests.indexOf("/api/read");
         return firstConversations === -1 || (firstRead !== -1 && firstConversations > firstRead);
       })(),
     );
@@ -141,11 +140,47 @@ async function main() {
   });
 
   await scenario("reconnecting restores the live connection", async () => {
-    await setOffline(false);
-    await tab.evaluate("window.dispatchEvent(new Event('online'))");
-    await tab.waitFor("!document.querySelector('#offline-banner')", 5000);
-    await tab.waitFor("!!document.querySelector('.connection-state--open')", 10000);
-    run.check("composer becomes editable again", !await tab.evaluate("document.querySelector('#message-input').disabled"));
+    const flushedReads = [];
+    const offReads = tab.on("Network.requestWillBeSent", ({ request }) => {
+      try {
+        const url = new URL(request.url);
+        if (url.origin !== run.base || url.pathname !== "/api/read") {
+          return;
+        }
+        const body = JSON.parse(request.postData ?? "{}");
+        if (Array.isArray(body.reads)) {
+          flushedReads.push(...body.reads);
+        }
+      } catch {
+        // Ignore malformed or unrelated requests.
+      }
+    });
+    try {
+      await setOffline(false);
+      await tab.evaluate("window.dispatchEvent(new Event('online'))");
+      await tab.waitFor("!document.querySelector('#offline-banner')", 5000);
+      await tab.waitFor("!!document.querySelector('.connection-state--open')", 10000);
+      run.check("composer becomes editable again", !await tab.evaluate("document.querySelector('#message-input').disabled"));
+
+      const expected = name("c").toLocaleLowerCase();
+      const deadline = Date.now() + 5000;
+      while (
+        Date.now() < deadline
+        && !flushedReads.some(
+          (item) => String(item.username).toLocaleLowerCase() === expected,
+        )
+      ) {
+        await delay(100);
+      }
+      run.check(
+        "offline read is queued and flushed on reconnect",
+        flushedReads.some(
+          (item) => String(item.username).toLocaleLowerCase() === expected,
+        ),
+      );
+    } finally {
+      offReads();
+    }
   });
 
   await scenario("logout clears this account's cache", async () => {

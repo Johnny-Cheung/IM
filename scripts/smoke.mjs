@@ -65,6 +65,38 @@ async function main() {
   run.check("private read position cannot rewind", directOldRead.last_read_message_id === directLatest && directOf(await list("b"), run.users.get("a").username).unread_count === 0);
   await run.expectError("invalid private read bound rejected", "b", "POST", `${directPath("a")}/read?through_id=-1`, undefined, 400, "invalid_request");
 
+  const batchMessage = await run.request("a", "POST", `${directPath("b")}/messages`, {
+    body: "批量已读",
+    client_message_id: randomUUID(),
+  });
+  const batch = await run.request("b", "POST", "/api/read", {
+    reads: [
+      { username: run.users.get("a").username, through_id: batchMessage.message.id },
+      { username: `${run.prefix}_missing`, through_id: batchMessage.message.id },
+      { username: run.users.get("b").username, through_id: batchMessage.message.id },
+    ],
+  });
+  run.check(
+    "batch read advances valid item",
+    batch.reads[0].advanced === true
+      && batch.reads[0].last_read_message_id === batchMessage.message.id,
+  );
+  run.check("batch read reports missing peer", batch.reads[1].error === "user_not_found");
+  run.check("batch read reports self", batch.reads[2].error === "cannot_message_self");
+  run.check("batch read clears unread", directOf(await list("b"), run.users.get("a").username).unread_count === 0);
+  run.check(
+    "batch read persists receipt",
+    directOf(await list("a"), run.users.get("b").username).peer_last_read_message_id >= batchMessage.message.id,
+  );
+  const batchRewind = await run.request("b", "POST", "/api/read", {
+    reads: [{ username: run.users.get("a").username, through_id: first.message.id }],
+  });
+  run.check(
+    "batch read cannot rewind",
+    batchRewind.reads[0].advanced === false
+      && batchRewind.reads[0].last_read_message_id === batchMessage.message.id,
+  );
+
   await run.expectError("group needs members", "a", "POST", "/api/groups", { name: "empty", member_usernames: [] }, 400, "invalid_members");
   await run.expectError("group needs valid name", "a", "POST", "/api/groups", { name: "群".repeat(31), member_usernames: [run.users.get("b").username] }, 400, "invalid_group_name");
   await run.expectError("group invite requires own friendship", "a", "POST", "/api/groups", { name: "nonfriend", member_usernames: [run.users.get("d").username] }, 403, "not_friends");

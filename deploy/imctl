@@ -214,6 +214,49 @@ backend_stop() {
   fi
 }
 
+infra_ready() {
+  [ -s "${INFRA_REDIS_URL_FILE}" ] \
+    && [ -s "${INFRA_REDIS_PASSWORD_FILE}" ] \
+    && [ -s "${INFRA_RABBITMQ_URL_FILE}" ] \
+    && [ -s "${INFRA_RABBITMQ_PASSWORD_FILE}" ]
+}
+
+backend_env_args() {
+  printf '%s\n' \
+    "IM_MYSQL_HOST=127.0.0.1" \
+    "IM_MYSQL_PORT=${MYSQL_PORT}" \
+    "IM_MYSQL_DB=${MYSQL_DB}" \
+    "IM_MYSQL_USER=${MYSQL_USER}" \
+    "IM_MYSQL_PASSWORD_FILE=${BACKEND_APP_SECRET}"
+  if infra_ready; then
+    printf '%s\n' \
+      "IM_REDIS_URL_FILE=${INFRA_REDIS_URL_FILE}" \
+      "IM_REDIS_PASSWORD_FILE=${INFRA_REDIS_PASSWORD_FILE}" \
+      "IM_RABBITMQ_URL_FILE=${INFRA_RABBITMQ_URL_FILE}" \
+      "IM_RABBITMQ_PASSWORD_FILE=${INFRA_RABBITMQ_PASSWORD_FILE}" \
+      "IM_REDIS_DB=$([ "${VERIFY_MODE}" = "1" ] && printf '1' || printf '0')" \
+      "IM_MESSAGING_NAMESPACE=$([ "${VERIFY_MODE}" = "1" ] && printf 'im:v13-verify' || printf 'im:v12')" \
+      "IM_GROUP_MESSAGING_ENABLED=true" \
+      "IM_MESSAGING_REQUIRED=$([ "${VERIFY_MODE}" = "1" ] && printf 'true' || printf 'false')"
+  fi
+}
+
+backfill_read() {
+  prepare_backend_config
+  if ! infra_ready; then
+    echo "direct read backfill requires Redis configuration" >&2
+    return 1
+  fi
+  local -a env_args=()
+  local line
+  while IFS= read -r line; do
+    env_args+=("${line}")
+  done < <(backend_env_args)
+  /usr/bin/env "${env_args[@]}" \
+    "${APP_ROOT}/bin/im-server" -backfill-read \
+    -backfill-batch "${BACKFILL_BATCH:-1000}"
+}
+
 backend_start() {
   if systemctl is-active --quiet "${UNIT}"; then
     echo "backend is already running on port ${PORT}"
@@ -235,31 +278,12 @@ backend_start() {
     snapshot > "${BASELINE}"
   fi
   prepare_backend_config
-  local -a env_args=(
-    "IM_MYSQL_HOST=127.0.0.1"
-    "IM_MYSQL_PORT=${MYSQL_PORT}"
-    "IM_MYSQL_DB=${MYSQL_DB}"
-    "IM_MYSQL_USER=${MYSQL_USER}"
-    "IM_MYSQL_PASSWORD_FILE=${BACKEND_APP_SECRET}"
-  )
-  local infra_ready=0
-  if [ -s "${INFRA_REDIS_URL_FILE}" ] \
-    && [ -s "${INFRA_REDIS_PASSWORD_FILE}" ] \
-    && [ -s "${INFRA_RABBITMQ_URL_FILE}" ] \
-    && [ -s "${INFRA_RABBITMQ_PASSWORD_FILE}" ]; then
-    infra_ready=1
-    env_args+=(
-      "IM_REDIS_URL_FILE=${INFRA_REDIS_URL_FILE}"
-      "IM_REDIS_PASSWORD_FILE=${INFRA_REDIS_PASSWORD_FILE}"
-      "IM_RABBITMQ_URL_FILE=${INFRA_RABBITMQ_URL_FILE}"
-      "IM_RABBITMQ_PASSWORD_FILE=${INFRA_RABBITMQ_PASSWORD_FILE}"
-      "IM_REDIS_DB=$([ "${VERIFY_MODE}" = "1" ] && printf '1' || printf '0')"
-      "IM_MESSAGING_NAMESPACE=$([ "${VERIFY_MODE}" = "1" ] && printf 'im:v13-verify' || printf 'im:v12')"
-      "IM_GROUP_MESSAGING_ENABLED=true"
-      "IM_MESSAGING_REQUIRED=$([ "${VERIFY_MODE}" = "1" ] && printf 'true' || printf 'false')"
-    )
-  fi
-  if [ "${VERIFY_MODE}" = "1" ] && [ "${infra_ready}" = "0" ]; then
+  local -a env_args=()
+  local line
+  while IFS= read -r line; do
+    env_args+=("${line}")
+  done < <(backend_env_args)
+  if [ "${VERIFY_MODE}" = "1" ] && ! infra_ready; then
     echo "verification backend requires isolated Redis and RabbitMQ configuration" >&2
     return 1
   fi
@@ -476,6 +500,7 @@ main() {
     restart) restart ;;
     backend-start) backend_start ;;
     backend-stop) backend_stop ;;
+    backfill-read) backfill_read ;;
     health) health ;;
     status) status ;;
     backup) backup ;;
@@ -487,7 +512,7 @@ main() {
     runtime-stop) runtime_stop ;;
     verify-host) verify_host ;;
     logs) logs "${2:-backend}" "${3:-80}" ;;
-    *) echo "Usage: $0 [--verify] {start|stop|restart|backend-start|backend-stop|health|status|backup|restore-check <backup>|mysql-start|mysql-stop|mysql-status|runtime-start|runtime-stop|verify-host|logs [backend|mysql|runtime] [lines]}" >&2; return 2 ;;
+    *) echo "Usage: $0 [--verify] {start|stop|restart|backend-start|backend-stop|backfill-read|health|status|backup|restore-check <backup>|mysql-start|mysql-stop|mysql-status|runtime-start|runtime-stop|verify-host|logs [backend|mysql|runtime] [lines]}" >&2; return 2 ;;
   esac
 }
 

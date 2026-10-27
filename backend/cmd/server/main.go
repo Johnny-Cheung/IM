@@ -151,13 +151,9 @@ func run(options serverOptions) error {
 				return fmt.Errorf("check direct read model: %w", err)
 			}
 			if !ready {
-				if infraConfig.MessagingRequired {
-					return fmt.Errorf(
-						"direct read model is not ready; run with -backfill-read first",
-					)
-				}
-				log.Printf("direct read model is not ready; using MySQL read state")
-				directReadTracker = nil
+				return fmt.Errorf(
+					"direct read model is not ready; run with -backfill-read first",
+				)
 			}
 		}
 
