@@ -46,6 +46,18 @@ func directConversationLastKey(userID uint64) string {
 	return defaultKeyspace.directConversationLastKey(userID)
 }
 
+func directReadKey(userID uint64) string {
+	return defaultKeyspace.directReadKey(userID)
+}
+
+func directReadStreamKey() string {
+	return defaultKeyspace.directReadStreamKey()
+}
+
+func directReadReadyKey() string {
+	return defaultKeyspace.directReadReadyKey()
+}
+
 func (k Keyspace) counterKey() string {
 	return k.prefixOrDefault() + "messages:next_id"
 }
@@ -85,6 +97,23 @@ func (k Keyspace) directConversationKey(ownerID, peerID uint64) string {
 // with that peer, backing the conversation list.
 func (k Keyspace) directConversationLastKey(userID uint64) string {
 	return fmt.Sprintf("%sdm:conv-last:%d", k.prefixOrDefault(), userID)
+}
+
+// directReadKey stores the last read message ID per peer for one user.
+func (k Keyspace) directReadKey(userID uint64) string {
+	return fmt.Sprintf("%sdm:read:%d", k.prefixOrDefault(), userID)
+}
+
+// directReadStreamKey carries read-position events for asynchronous
+// persistence.
+func (k Keyspace) directReadStreamKey() string {
+	return k.prefixOrDefault() + "dm:read:stream"
+}
+
+// directReadReadyKey marks that historical messages and read positions have
+// been backfilled into Redis.
+func (k Keyspace) directReadReadyKey() string {
+	return k.prefixOrDefault() + "dm:read:ready"
 }
 
 // indexEpochKey records the highest message ID that is not guaranteed to be
