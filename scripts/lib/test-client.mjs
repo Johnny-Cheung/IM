@@ -93,6 +93,34 @@ export class TestRun {
     return detail.group.id;
   }
 
+  async openSocket(user) {
+    const socket = new WebSocket(`${this.base.replace(/^http/, "ws")}/api/ws`, {
+      headers: { Cookie: this.cookies.get(user) },
+    });
+    const events = [];
+    socket.addEventListener("message", (event) => {
+      try { events.push(JSON.parse(event.data)); } catch { /* ignore non-JSON frames */ }
+    });
+    await new Promise((resolve, reject) => {
+      socket.addEventListener("open", resolve, { once: true });
+      socket.addEventListener("error", () => reject(new Error(`websocket for ${user} failed to open`)), { once: true });
+    });
+    return {
+      events,
+      send: (frame) => socket.send(JSON.stringify(frame)),
+      async waitFor(predicate, message, from = 0, timeout = 5000) {
+        const deadline = Date.now() + timeout;
+        while (Date.now() < deadline) {
+          const found = events.slice(from).find(predicate);
+          if (found) return found;
+          await delay(25);
+        }
+        throw new Error(message);
+      },
+      close: () => socket.close(),
+    };
+  }
+
   async save() {
     await mkdir(this.reportDir, { recursive: true });
     await writeFile(join(this.reportDir, "manifest.json"), JSON.stringify({

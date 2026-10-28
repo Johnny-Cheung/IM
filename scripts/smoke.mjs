@@ -232,6 +232,83 @@ async function main() {
     "alone in the group has no denominator",
     alone.read_count === 0 && alone.member_count === 0 && alone.all_read === false,
   );
+
+  await implicitReadOverWebSocket();
+}
+
+async function implicitReadOverWebSocket() {
+  for (const key of ["h", "i", "j"]) await run.register(key);
+  await run.befriend("h", "i");
+  await run.befriend("h", "j");
+  const sockets = [];
+  const open = async (key) => {
+    const socket = await run.openSocket(key);
+    sockets.push(socket);
+    return socket;
+  };
+  const focusGroup = async (socket, id) => {
+    const from = socket.events.length;
+    socket.send({ type: "focus", kind: "group", group_id: id });
+    return socket.waitFor((event) => event.type === "focus.ack" && event.group_id === id, "group focus was not acknowledged", from);
+  };
+  try {
+    const live = await run.group("h", "隐式已读群", ["i", "j"]);
+    const owner = await open("h");
+    const readerI = await open("i");
+    const readerJ = await open("j");
+    run.check("viewers focus the group", !(await focusGroup(readerI, live)).error && !(await focusGroup(readerJ, live)).error);
+
+    const ownerFrom = owner.events.length;
+    const first = await sendGroup("h", live, "隐式已读群消息");
+    await owner.waitFor((event) => event.type === "group.read" && event.group_id === live, "the sender never received group.read", ownerFrom);
+    run.check("sender receives group.read when focused viewers read", true);
+    await until(async () => (await readStats("h", live, first.message.id)).all_read, "focused viewers did not complete the receipt");
+    const stats = await readStats("h", live, first.message.id);
+    run.check("focused viewers implicitly read the message", stats.read_count === 2 && stats.member_count === 2);
+    run.check(
+      "no member has unread after implicit read",
+      (await Promise.all(["h", "i", "j"].map((key) => list(key)))).every((conversations) => groupOf(conversations, live).unread_count === 0),
+    );
+
+    readerJ.send({ type: "blur" });
+    await delay(150);
+    const second = await sendGroup("h", live, "j 已离开");
+    await until(async () => (await readStats("h", live, second.message.id)).read_count === 1, "the focused viewer did not read");
+    await delay(400);
+    run.check(
+      "a blurred viewer is not auto-read",
+      (await readStats("h", live, second.message.id)).read_count === 1 && groupOf(await list("j"), live).unread_count === 1,
+    );
+    const ack = await focusGroup(readerJ, live);
+    await until(async () => (await readStats("h", live, second.message.id)).all_read, "refocus did not catch up");
+    run.check("refocus catches up the missed message", !ack.error && groupOf(await list("j"), live).unread_count === 0);
+
+    const outsider = await open("a");
+    run.check("a non-member cannot focus the group", (await focusGroup(outsider, live)).error === "not_group_member");
+
+    const owner2 = owner.events.length;
+    const readerI2 = readerI.events.length;
+    readerI.send({ type: "focus", kind: "direct", username: run.users.get("h").username });
+    const directAck = await readerI.waitFor((event) => event.type === "focus.ack" && event.kind === "direct", "direct focus was not acknowledged", readerI2);
+    const direct = await run.request("h", "POST", `${directPath("i")}/messages`, { body: "私聊隐式已读", client_message_id: randomUUID() });
+    const readEvent = await owner.waitFor(
+      (event) => event.type === "messages.read" && event.last_read_message_id >= direct.message.id,
+      "the sender never received messages.read",
+      owner2,
+    );
+    run.check("private focus reads without any read request", !directAck.error && readEvent.reader === run.users.get("i").username);
+    run.check(
+      "private receipt and unread settle",
+      directOf(await list("h"), run.users.get("i").username).peer_last_read_message_id >= direct.message.id
+        && directOf(await list("i"), run.users.get("h").username).unread_count === 0,
+    );
+    const refused = readerI.events.length;
+    readerI.send({ type: "focus", kind: "direct", username: run.users.get("a").username });
+    const denied = await readerI.waitFor((event) => event.type === "focus.ack" && event.kind === "direct" && event.username === run.users.get("a").username, "non-friend focus got no answer", refused);
+    run.check("a non-friend cannot be focused", denied.error === "not_friend");
+  } finally {
+    for (const socket of sockets) socket.close();
+  }
 }
 
 try { await main(); } catch (error) { console.error(`FAIL ${error.message}`); process.exitCode = 1; } finally { await run.finish(); }
