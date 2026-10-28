@@ -15,9 +15,11 @@ import (
 
 // ConversationPage is one direct-message page served from the Redis window.
 //
-// Complete reports whether every seq of the requested range was resolved from
-// a Redis entity. When it is false the caller must consult MySQL before
-// answering.
+// Complete reports whether Redis can prove the whole requested range: every
+// seq of the window resolved from a Redis entity, the window is non-empty, and
+// the counter covers the durable tail (a counter behind MySQL's MAX(seq) makes
+// the window unprovable). When it is false the caller must consult MySQL
+// before answering.
 type ConversationPage struct {
 	Page     store.MessagePage
 	Complete bool
@@ -287,22 +289,48 @@ func (r *RedisMessageReader) read(
 	}
 
 	var low, high uint64
-	var hasMore bool
+	var hasMore, counterBounded bool
 	switch {
 	case afterMode:
 		low = afterSeq
 		high = counter
 		if afterSeq+uint64(limit) < high {
 			high = afterSeq + uint64(limit)
+		} else {
+			counterBounded = true
 		}
 		hasMore = high < counter
 	default:
 		high = counter
-		if beforeSeq > 0 {
+		counterBounded = beforeSeq == 0
+		if beforeSeq > 0 && beforeSeq-1 < high {
 			// before_seq is exclusive: the page ends just below it.
-			if upper := beforeSeq - 1; upper < high {
-				high = upper
-			}
+			high = beforeSeq - 1
+		} else if beforeSeq > 0 {
+			counterBounded = true
+		}
+	}
+	staleCounter := false
+	if counterBounded {
+		// A lowered counter with an intact index means the tail extends past
+		// the counter. Keep the window bounded and hand the page to MySQL
+		// instead of loading an unbounded index range.
+		top, err := r.client.ZRangeWithScores(
+			ctx,
+			r.keyspace.directPairKey(userID, otherID),
+			-1,
+			-1,
+		).Result()
+		if err != nil {
+			return ConversationPage{}, err
+		}
+		if len(top) > 0 && uint64(top[0].Score) > high {
+			staleCounter = true
+		}
+	}
+	if !afterMode {
+		if beforeSeq > 0 && beforeSeq-1 < high {
+			high = beforeSeq - 1
 		}
 		if high > uint64(limit) {
 			low = high - uint64(limit)
@@ -310,9 +338,12 @@ func (r *RedisMessageReader) read(
 		hasMore = low > 0
 	}
 	if low >= high {
+		// A counter that is behind MySQL's MAX(seq) (lost AOF tail, lowered
+		// counter, in-flight calibration) makes an empty window unprovable.
+		// Never claim completeness; let the caller fill from MySQL.
 		return ConversationPage{
 			Page:     store.MessagePage{},
-			Complete: true,
+			Complete: false,
 		}, nil
 	}
 
@@ -361,6 +392,9 @@ func (r *RedisMessageReader) read(
 	if len(messages) > limit {
 		if afterMode {
 			messages = messages[:limit]
+			// The window was extended past a stale counter, so the cut-off
+			// tail still has more messages.
+			hasMore = true
 		} else {
 			messages = messages[len(messages)-limit:]
 		}
@@ -368,7 +402,7 @@ func (r *RedisMessageReader) read(
 
 	return ConversationPage{
 		Page:     store.MessagePage{Messages: messages, HasMore: hasMore},
-		Complete: completeSeqRange(resolved, low, high),
+		Complete: !staleCounter && completeSeqRange(resolved, low, high),
 	}, nil
 }
 

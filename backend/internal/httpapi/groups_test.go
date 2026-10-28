@@ -126,6 +126,56 @@ func TestListConversationsIncludesGroups(t *testing.T) {
 	}
 }
 
+func TestListConversationsKeepsGroupMySQLSeqFloor(t *testing.T) {
+	now := time.Now().UTC()
+	dataStore := authenticatedChatStore()
+	dataStore.groupConversationsWithoutUnread = []store.GroupConversation{{
+		Group: store.Group{
+			ID:        9,
+			Name:      "Team",
+			OwnerID:   2,
+			Owner:     store.PublicUser{Username: "bob", Nickname: "Bob"},
+			CreatedAt: now,
+		},
+		MemberCount: 3,
+		LastSeq:     10,
+		LastMessage: &store.GroupMessage{
+			ID:              10,
+			Seq:             10,
+			GroupID:         9,
+			SenderID:        2,
+			Sender:          store.PublicUser{Username: "bob", Nickname: "Bob"},
+			ClientMessageID: "group-00000010",
+			Body:            "persisted before the lost counter tail",
+			CreatedAt:       now,
+		},
+	}}
+	tracker := newFakeGroupReadTracker()
+	tracker.states = map[uint64]messaging.GroupConversationState{
+		9: {LastSeq: 9, ReadSeq: 2, Unread: 7},
+	}
+
+	router := testRouter(dataStore, WithGroupReadTracker(tracker))
+	recorder := doJSON(t, router, http.MethodGet, "/api/conversations", nil, authTestCookie())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	response := decodeBody[conversationListResponse](t, recorder)
+	if len(response.Conversations) != 1 {
+		t.Fatalf("conversations = %#v", response.Conversations)
+	}
+	conversation := response.Conversations[0]
+	if conversation.LastSeq != 10 {
+		t.Fatalf("last_seq = %d, want the MySQL floor 10", conversation.LastSeq)
+	}
+	if conversation.LastMessage == nil || conversation.LastMessage.Seq != 10 {
+		t.Fatalf("last message = %#v", conversation.LastMessage)
+	}
+	if conversation.UnreadCount != 7 {
+		t.Fatalf("unread = %d, want 7", conversation.UnreadCount)
+	}
+}
+
 func TestCreateGroup(t *testing.T) {
 	now := time.Now().UTC()
 	dataStore := authenticatedChatStore()
@@ -356,6 +406,46 @@ func TestListGroupMessagesAfterZeroStartsAtBeginning(t *testing.T) {
 	}
 	if dataStore.groupMessageCall.limit != 0 {
 		t.Fatalf("before-seq path was used: %#v", dataStore.groupMessageCall)
+	}
+}
+
+func TestListGroupMessagesCursorPresenceDecidesDirection(t *testing.T) {
+	dataStore := authenticatedChatStore()
+	dataStore.groupMessageAfterPage = store.GroupMessagePage{}
+	router := testRouter(dataStore)
+
+	recorder := doJSON(
+		t, router, http.MethodGet, "/api/groups/7/messages?after_seq=", nil, authTestCookie(),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s",
+			recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if dataStore.groupMessageAfterCall.afterSeq != 0 ||
+		dataStore.groupMessageAfterCall.limit != defaultMessagePageSize {
+		t.Fatalf("after-seq call = %#v", dataStore.groupMessageAfterCall)
+	}
+	if dataStore.groupMessageCall.limit != 0 {
+		t.Fatalf("an empty after_seq took the before-seq path: %#v", dataStore.groupMessageCall)
+	}
+}
+
+func TestListGroupMessagesRejectsTwoCursorsWhenOneIsEmpty(t *testing.T) {
+	router := testRouter(authenticatedChatStore())
+
+	for _, path := range []string{
+		"/api/groups/7/messages?before_seq=5&after_seq=",
+		"/api/groups/7/messages?before_seq=&after_seq=10",
+	} {
+		t.Run(path, func(t *testing.T) {
+			recorder := doJSON(t, router, http.MethodGet, path, nil, authTestCookie())
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			if got := errorCode(t, recorder); got != "invalid_request" {
+				t.Fatalf("error code = %q, want invalid_request", got)
+			}
+		})
 	}
 }
 

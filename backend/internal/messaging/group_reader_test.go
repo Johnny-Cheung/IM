@@ -134,8 +134,75 @@ func TestGroupMessageReaderBeforeSeqIsExclusive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadGroup(before first) error = %v", err)
 	}
-	if !empty.Complete || empty.Page.HasMore || len(empty.Page.Messages) != 0 {
-		t.Fatalf("empty page = %#v, want empty complete", empty)
+	if empty.Complete || empty.Page.HasMore || len(empty.Page.Messages) != 0 {
+		t.Fatalf("empty page = %#v, want empty incomplete", empty)
+	}
+}
+
+func TestGroupMessageReaderStaleCounterFallsBackToMySQL(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	defer client.Close()
+	ctx := context.Background()
+
+	seedGroupMessages(t, client, 9, map[uint64]uint64{1: 1, 2: 2, 3: 3, 4: 4})
+	setGroupSequence(t, client, 9, 2)
+
+	reader := NewGroupMessageReader(client, defaultKeyspace)
+	newest, err := reader.ReadGroup(ctx, 1, 9, 0, 2)
+	if err != nil {
+		t.Fatalf("ReadGroup() error = %v", err)
+	}
+	// The inbox reaches past the counter, so the HTTP layer must merge MySQL
+	// to recover seq 3 and 4.
+	if newest.Complete || len(newest.Page.Messages) != 2 ||
+		newest.Page.Messages[1].Seq != 2 {
+		t.Fatalf("newest page = %#v, want seq 1..2 without completeness", newest.Page)
+	}
+
+	forward, err := reader.ReadGroupAfter(ctx, 1, 9, 0, 10)
+	if err != nil {
+		t.Fatalf("ReadGroupAfter() error = %v", err)
+	}
+	if forward.Complete || len(forward.Page.Messages) != 2 ||
+		forward.Page.Messages[1].Seq != 2 {
+		t.Fatalf("forward page = %#v, want seq 1..2 without completeness", forward)
+	}
+
+	before, err := reader.ReadGroup(ctx, 1, 9, 4, 10)
+	if err != nil {
+		t.Fatalf("ReadGroup(before) error = %v", err)
+	}
+	if before.Complete || len(before.Page.Messages) != 2 ||
+		before.Page.Messages[1].Seq != 2 {
+		t.Fatalf("before page = %#v, want seq 1..2 without completeness", before)
+	}
+}
+
+func TestGroupMessageReaderEmptyWindowIsNotComplete(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	defer client.Close()
+	ctx := context.Background()
+
+	seedGroupMessages(t, client, 9, map[uint64]uint64{1: 1, 2: 2})
+	setGroupSequence(t, client, 9, 2)
+
+	reader := NewGroupMessageReader(client, defaultKeyspace)
+	empty, err := reader.ReadGroupAfter(ctx, 1, 9, 2, 10)
+	if err != nil {
+		t.Fatalf("ReadGroupAfter() error = %v", err)
+	}
+	if empty.Complete || len(empty.Page.Messages) != 0 || empty.Page.HasMore {
+		t.Fatalf("empty page = %#v, want an empty incomplete page", empty)
+	}
+
+	page, err := reader.ReadGroup(ctx, 1, 9, 0, 10)
+	if err != nil {
+		t.Fatalf("ReadGroup() error = %v", err)
+	}
+	if !page.Complete || len(page.Page.Messages) != 2 {
+		t.Fatalf("non-empty page = %#v, want completeness", page)
 	}
 }
 

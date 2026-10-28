@@ -212,6 +212,83 @@ func TestImplicitReadRequeuesAfterSlowBatch(t *testing.T) {
 	})
 }
 
+func TestImplicitReadRequeueOnlyChargesAttemptedBatch(t *testing.T) {
+	tracker := newFakeDirectReadTracker()
+	tracker.advanceErr = errors.New("redis: connection reset")
+	api := New(&fakeStore{}, WithDirectReadTracker(tracker))
+	reader := api.implicitReads
+
+	const batchCount = 6
+	batches := make([]*implicitReadBatch, 0, batchCount)
+	for peerID := uint64(1); peerID <= batchCount; peerID++ {
+		key := implicitReadKey{direct: true, first: 1, second: peerID}
+		batch := &implicitReadBatch{
+			key:         key,
+			direct:      true,
+			senderID:    1,
+			recipientID: peerID,
+			throughSeq:  5,
+			queuedAt:    time.Now().Add(-2 * implicitReadWindow),
+		}
+		reader.pending[key] = batch
+		batches = append(batches, batch)
+	}
+
+	reader.flushDue()
+
+	attempted := 0
+	for _, batch := range batches {
+		if batch.attempts == 0 {
+			if _, ok := reader.pending[batch.key]; !ok {
+				t.Fatalf("untouched batch %#v was dropped", batch.key)
+			}
+			continue
+		}
+		attempted++
+		if batch.attempts != 1 {
+			t.Fatalf("attempts = %d, want 1 for one flush pass", batch.attempts)
+		}
+	}
+	if attempted != 1 {
+		t.Fatalf("attempted batches = %d, want exactly one", attempted)
+	}
+	if len(reader.pending) != batchCount {
+		t.Fatalf("pending = %d, want %d", len(reader.pending), batchCount)
+	}
+
+	for pass := 0; pass < batchCount*(implicitReadMaxRetries+1)+batchCount; pass++ {
+		if len(reader.pending) == 0 {
+			break
+		}
+		reader.mu.Lock()
+		for _, batch := range reader.pending {
+			batch.queuedAt = time.Now().Add(-2 * implicitReadWindow)
+		}
+		reader.mu.Unlock()
+		reader.flushDue()
+	}
+	if len(reader.pending) != 0 {
+		t.Fatalf("pending = %d, want every batch retired", len(reader.pending))
+	}
+
+	attemptsByPeer := make(map[uint64]int)
+	for _, call := range tracker.calls {
+		if call.userID == 1 {
+			attemptsByPeer[call.peerID]++
+		}
+	}
+	for _, batch := range batches {
+		if batch.attempts != implicitReadMaxRetries+1 {
+			t.Fatalf("batch %#v attempts = %d, want %d",
+				batch.key, batch.attempts, implicitReadMaxRetries+1)
+		}
+		if attemptsByPeer[batch.recipientID] != batch.attempts {
+			t.Fatalf("peer %d was attempted %d times but charged %d",
+				batch.recipientID, attemptsByPeer[batch.recipientID], batch.attempts)
+		}
+	}
+}
+
 func TestGroupFocusLogsStreamFailure(t *testing.T) {
 	alice := store.User{ID: 1, Username: "alice", Nickname: "Alice"}
 	dataStore := &fakeStore{

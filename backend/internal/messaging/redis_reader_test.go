@@ -160,8 +160,8 @@ func TestRedisMessageReaderHasMoreUsesRangeBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadConversationAfter(caught up) error = %v", err)
 	}
-	if len(caughtUp.Page.Messages) != 0 || !caughtUp.Complete || caughtUp.Page.HasMore {
-		t.Fatalf("caught up page = %#v", caughtUp)
+	if len(caughtUp.Page.Messages) != 0 || caughtUp.Complete || caughtUp.Page.HasMore {
+		t.Fatalf("caught up page = %#v, want an empty incomplete page", caughtUp)
 	}
 }
 
@@ -180,6 +180,74 @@ func TestRedisMessageReaderAfterZeroStartsAtFirstSeq(t *testing.T) {
 	if !page.Complete || !page.Page.HasMore || len(page.Page.Messages) != 2 ||
 		page.Page.Messages[0].Seq != 1 || page.Page.Messages[1].Seq != 2 {
 		t.Fatalf("page = %#v, want seqs 1 and 2 with more", page)
+	}
+}
+
+func TestRedisMessageReaderStaleCounterFallsBackToMySQL(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	defer client.Close()
+	ctx := context.Background()
+
+	seedDirectMessages(t, client, 1, 2, 5)
+	if err := client.Set(ctx, directSequenceKey(1, 2), "3", 0).Err(); err != nil {
+		t.Fatalf("lower counter: %v", err)
+	}
+
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	newest, err := reader.ReadConversation(ctx, 2, 1, 0, 2)
+	if err != nil {
+		t.Fatalf("ReadConversation() error = %v", err)
+	}
+	// The index reaches past the counter, so the window is not authoritative:
+	// the HTTP layer must merge the MySQL page to recover seq 4 and 5.
+	if newest.Complete || !newest.Page.HasMore || len(newest.Page.Messages) != 2 ||
+		newest.Page.Messages[1].Seq != 3 {
+		t.Fatalf("newest page = %#v, want seq 2..3, more and no completeness", newest.Page)
+	}
+
+	forward, err := reader.ReadConversationAfter(ctx, 2, 1, 0, 10)
+	if err != nil {
+		t.Fatalf("ReadConversationAfter() error = %v", err)
+	}
+	if forward.Complete || len(forward.Page.Messages) != 3 ||
+		forward.Page.Messages[2].Seq != 3 {
+		t.Fatalf("forward page = %#v, want seq 1..3 without completeness", forward)
+	}
+
+	before, err := reader.ReadConversation(ctx, 2, 1, 5, 10)
+	if err != nil {
+		t.Fatalf("ReadConversation(before) error = %v", err)
+	}
+	if before.Complete || len(before.Page.Messages) != 3 ||
+		before.Page.Messages[2].Seq != 3 {
+		t.Fatalf("before page = %#v, want seq 1..3 without completeness", before)
+	}
+}
+
+func TestRedisMessageReaderEmptyWindowIsNotComplete(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	defer client.Close()
+	ctx := context.Background()
+
+	seedDirectMessages(t, client, 1, 2, 2)
+
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	empty, err := reader.ReadConversationAfter(ctx, 2, 1, 2, 10)
+	if err != nil {
+		t.Fatalf("ReadConversationAfter() error = %v", err)
+	}
+	if empty.Complete || len(empty.Page.Messages) != 0 || empty.Page.HasMore {
+		t.Fatalf("empty page = %#v, want an empty incomplete page", empty)
+	}
+
+	page, err := reader.ReadConversation(ctx, 2, 1, 0, 10)
+	if err != nil {
+		t.Fatalf("ReadConversation() error = %v", err)
+	}
+	if !page.Complete || len(page.Page.Messages) != 2 {
+		t.Fatalf("non-empty page = %#v, want completeness", page)
 	}
 }
 

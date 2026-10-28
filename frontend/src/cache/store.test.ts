@@ -653,6 +653,39 @@ describe("seq storage", () => {
     expect(await readConversationSeq("alice", conversation)).toBe(2);
   });
 
+  it("archives own messages when a resync deletes before writing the push", async () => {
+    const conversation = "direct:bob";
+    await writeMessages("alice", conversation, [
+      directMessage(10, { seq: 1 }),
+      directMessage(20, { seq: 2, body: "stale" }),
+      directMessage(30, {
+        seq: 3,
+        body: "lost",
+        client_message_id: "client-lost",
+      }),
+    ]);
+
+    // Handler order for a reused seq: delete and archive first, then cache the
+    // authoritative push. Writing first would let the merge purge seq 3 with
+    // nothing left for deleteMessagesFrom to archive.
+    const archived = await deleteMessagesFrom("alice", conversation, 3);
+    await writeMessages("alice", conversation, [
+      directMessage(99, { seq: 2, body: "server" }),
+    ]);
+
+    expect(archived).toHaveLength(1);
+    expect(archived[0]).toMatchObject({
+      client_message_id: "client-lost",
+      body: "lost",
+      status: "failed",
+    });
+    const cached = await readMessages("alice", conversation);
+    expect(cached.map((message) => message.seq)).toEqual([1, 2]);
+    expect(cached[1]).toMatchObject({ id: 99, body: "server" });
+    expect(await readOutbox("alice", conversation)).toEqual(archived);
+    expect(await readConversationSeq("alice", conversation)).toBe(2);
+  });
+
   it("archives own messages dropped by a rollback as failed outbox entries", async () => {
     const conversation = "direct:bob";
     await writeMessages("alice", conversation, [

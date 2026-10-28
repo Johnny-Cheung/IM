@@ -218,6 +218,17 @@ export function planGapPull(
   return { afterSeq: Math.max(unfilled[0] - 1, 0), targetSeq };
 }
 
+// A forward pull is capped and the server's cursor 0 means "from seq 1", so a
+// cold list or an oversized hole cannot be stitched from the oldest pages: it
+// must load the newest page and page backwards from there.
+export function shouldLoadNewestPage(
+  afterSeq: number,
+  targetSeq: number,
+  maxSpan: number,
+): boolean {
+  return !isAcceptedMessageSeq(afterSeq) || targetSeq - afterSeq > maxSpan;
+}
+
 export function nextUnread(
   plan: IncomingPlan,
   currentUnread: number,

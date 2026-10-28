@@ -14,6 +14,7 @@ import {
   planIncoming,
   planListRollback,
   planRollback,
+  shouldLoadNewestPage,
   shouldReplacePreview,
   sortConversationMessages,
 } from "./seqSync";
@@ -230,6 +231,20 @@ describe("gap filling", () => {
     tracker.clear("group:1");
     expect(tracker.has("group:1", 2)).toBe(false);
     expect(tracker.pending("group:1").size).toBe(0);
+  });
+});
+
+describe("shouldLoadNewestPage", () => {
+  it("loads the newest page for a cold list or an oversized hole", () => {
+    // Cursor 0 is the server's "start at seq 1" sentinel.
+    expect(shouldLoadNewestPage(0, 3500, 1500)).toBe(true);
+    expect(shouldLoadNewestPage(100, 1700, 1500)).toBe(true);
+    expect(shouldLoadNewestPage(5, 1706, 1500)).toBe(true);
+  });
+
+  it("keeps the forward pull for a hole within the cap", () => {
+    expect(shouldLoadNewestPage(5, 9, 1500)).toBe(false);
+    expect(shouldLoadNewestPage(100, 1600, 1500)).toBe(false);
   });
 });
 

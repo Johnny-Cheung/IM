@@ -65,8 +65,8 @@ import {
   planActiveSync,
   planGapPull,
   planIncoming,
-  planListRollback,
   planRollback,
+  shouldLoadNewestPage,
   shouldReplacePreview,
   sortConversationMessages,
 } from "../seqSync";
@@ -75,6 +75,10 @@ import { useAuth } from "../auth";
 
 const PAGE_SIZE = 30;
 const MAX_GAP_SCAN = 2000;
+// pullGaps is capped at 3 rounds x 10 pages x 50 messages. A wider push gap
+// (or a cold list, whose cursor 0 starts at seq 1) must load the newest page
+// instead of a partial oldest window that leaves history unreachable.
+const MAX_GAP_SPAN = 1500;
 const MAX_MESSAGE_LENGTH = 2000;
 const MAX_GROUP_NAME_LENGTH = 30;
 const MAX_RECONNECT_ATTEMPTS = 5;
@@ -1283,28 +1287,9 @@ export function ChatPage() {
 
     try {
       let localMax = maxAcceptedSeq(cached);
+      // The list snapshot can trail a tail this tab already pulled, so it is
+      // never rollback evidence here; a fresh list response decides that.
       const knownLast = conversationLastSeqsRef.current.get(target.key);
-      const rollback = localMax > 0
-        ? planListRollback(knownLast, localMax)
-        : null;
-      if (rollback !== null) {
-        // Server counter went backwards: drop the reusable tail and reload.
-        let archived: CachedOutbox[] = [];
-        if (username !== "") {
-          archived = await deleteMessagesFrom(
-            username,
-            target.key,
-            rollback.fromSeq,
-          );
-        }
-        cached = cached.filter((message) => message.seq < rollback.fromSeq);
-        localMax = rollback.fromSeq - 1;
-        missingSeqTrackerRef.current.clear(target.key);
-        outbox = mergeOutboxEntries(outbox, archived);
-        setMessages((previous) => previous.filter((message) =>
-          !isAcceptedSeq(message.seq) || message.seq <= localMax));
-        showArchivedFailures(target, archived);
-      }
 
       const serverLast = conversationLastMessagesRef.current.get(target.key);
       const cachedNewest = cached.length > 0 ? cached[cached.length - 1] : null;
@@ -1710,7 +1695,6 @@ export function ChatPage() {
     const otherUser = sentByCurrent ? message.recipient : message.sender;
     const incoming = receivedByCurrent;
     const key = directKey(otherUser.username);
-    void writeMessages(currentUser.username, key, [message]);
     const target = activeTargetRef.current;
     const targetMatches = target?.kind === "direct"
       && sameUsername(target.username, otherUser.username);
@@ -1726,6 +1710,18 @@ export function ChatPage() {
           || sameUsername(item.recipient.username, otherUser.username)))
       : [];
     const seqIDs = targetMatches ? acceptedSeqMap(openMessages) : undefined;
+    const openPlan = targetMatches
+      ? planIncoming(message.seq, message.id, {
+        maxSeq: maxAcceptedSeq(openMessages),
+        seqIDs,
+      })
+      : null;
+    // A reused seq must be deleted (and archived) before the new copy is
+    // cached: writeMessages' conflict merge purges the tail itself, so a
+    // preceding write would leave deleteMessagesFrom nothing to archive.
+    if (openPlan?.kind !== "resync") {
+      void writeMessages(currentUser.username, key, [message]);
+    }
     const listPlan = planIncoming(message.seq, message.id, {
       maxSeq: knownLast,
       seqIDs,
@@ -1758,13 +1754,9 @@ export function ChatPage() {
           : conversation)));
     }
 
-    if (!target || !targetMatches) {
+    if (!target || openPlan === null) {
       return;
     }
-    const openPlan = planIncoming(message.seq, message.id, {
-      maxSeq: maxAcceptedSeq(openMessages),
-      seqIDs: acceptedSeqMap(openMessages),
-    });
     if (openPlan.kind === "duplicate") {
       return;
     }
@@ -1773,31 +1765,52 @@ export function ChatPage() {
       setMessages((previous) => mergeMessages(previous, [toDirectDisplay(message)]));
     } else if (openPlan.kind === "pull") {
       setMessages((previous) => mergeMessages(previous, [toDirectDisplay(message)]));
-      const present = new Set(
-        openMessages
-          .filter((item) => isAcceptedSeq(item.seq))
-          .map((item) => item.seq),
-      );
-      void (async () => {
-        try {
-          const gapMessages = await pullGaps(
-            target,
-            openPlan.afterSeq,
-            openPlan.targetSeq - 1,
-            present,
-            missingSeqTrackerRef.current,
-          );
-          if (gapMessages.length === 0) {
-            return;
+      if (shouldLoadNewestPage(openPlan.afterSeq, openPlan.targetSeq, MAX_GAP_SPAN)) {
+        // A cold list (cursor 0 starts at seq 1) or an oversized hole cannot be
+        // stitched by the capped forward pull; reload the newest page so older
+        // history stays reachable by paging backwards.
+        void (async () => {
+          try {
+            const page = await fetchInitialPage(target);
+            if (activeTargetRef.current?.key !== target.key) {
+              return;
+            }
+            setMessages((previous) => mergeMessages(previous, page.messages));
+            setHasMore(page.hasMore);
+            if (userRef.current) {
+              void writeMessages(userRef.current.username, key, page.messages);
+            }
+          } catch {
+            // The conversation refresh above already scheduled a retry path.
           }
-          setMessages((previous) => mergeMessages(previous, gapMessages));
-          if (userRef.current) {
-            void writeMessages(userRef.current.username, key, gapMessages);
+        })();
+      } else {
+        const present = new Set(
+          openMessages
+            .filter((item) => isAcceptedSeq(item.seq))
+            .map((item) => item.seq),
+        );
+        void (async () => {
+          try {
+            const gapMessages = await pullGaps(
+              target,
+              openPlan.afterSeq,
+              openPlan.targetSeq - 1,
+              present,
+              missingSeqTrackerRef.current,
+            );
+            if (gapMessages.length === 0) {
+              return;
+            }
+            setMessages((previous) => mergeMessages(previous, gapMessages));
+            if (userRef.current) {
+              void writeMessages(userRef.current.username, key, gapMessages);
+            }
+          } catch {
+            // The conversation refresh above already scheduled a retry path.
           }
-        } catch {
-          // The conversation refresh above already scheduled a retry path.
-        }
-      })();
+        })();
+      }
     } else {
       missingSeqTrackerRef.current.clear(key);
       // Seqs above the reused one are stale; the pushed message itself is
@@ -1831,7 +1844,6 @@ export function ChatPage() {
       && pageVisibleRef.current
       && !replacedRef.current;
     const key = groupKey(message.group_id);
-    void writeMessages(currentUser.username, key, [message]);
 
     const knownLast = conversationLastSeqsRef.current.get(key) ?? 0;
     const openMessages = targetMatches
@@ -1839,6 +1851,18 @@ export function ChatPage() {
         isGroupMessage(item) && item.group_id === message.group_id)
       : [];
     const seqIDs = targetMatches ? acceptedSeqMap(openMessages) : undefined;
+    const openPlan = targetMatches
+      ? planIncoming(message.seq, message.id, {
+        maxSeq: maxAcceptedSeq(openMessages),
+        seqIDs,
+      })
+      : null;
+    // A reused seq must be deleted (and archived) before the new copy is
+    // cached: writeMessages' conflict merge purges the tail itself, so a
+    // preceding write would leave deleteMessagesFrom nothing to archive.
+    if (openPlan?.kind !== "resync") {
+      void writeMessages(currentUser.username, key, [message]);
+    }
     const listPlan = planIncoming(message.seq, message.id, {
       maxSeq: knownLast,
       seqIDs,
@@ -1868,13 +1892,9 @@ export function ChatPage() {
           : conversation)));
     }
 
-    if (!target || !targetMatches) {
+    if (!target || openPlan === null) {
       return;
     }
-    const openPlan = planIncoming(message.seq, message.id, {
-      maxSeq: maxAcceptedSeq(openMessages),
-      seqIDs: acceptedSeqMap(openMessages),
-    });
     if (openPlan.kind === "duplicate") {
       return;
     }
@@ -1883,31 +1903,52 @@ export function ChatPage() {
       setMessages((previous) => mergeMessages(previous, [toGroupDisplay(message)]));
     } else if (openPlan.kind === "pull") {
       setMessages((previous) => mergeMessages(previous, [toGroupDisplay(message)]));
-      const present = new Set(
-        openMessages
-          .filter((item) => isAcceptedSeq(item.seq))
-          .map((item) => item.seq),
-      );
-      void (async () => {
-        try {
-          const gapMessages = await pullGaps(
-            target,
-            openPlan.afterSeq,
-            openPlan.targetSeq - 1,
-            present,
-            missingSeqTrackerRef.current,
-          );
-          if (gapMessages.length === 0) {
-            return;
+      if (shouldLoadNewestPage(openPlan.afterSeq, openPlan.targetSeq, MAX_GAP_SPAN)) {
+        // A cold list (cursor 0 starts at seq 1) or an oversized hole cannot be
+        // stitched by the capped forward pull; reload the newest page so older
+        // history stays reachable by paging backwards.
+        void (async () => {
+          try {
+            const page = await fetchInitialPage(target);
+            if (activeTargetRef.current?.key !== target.key) {
+              return;
+            }
+            setMessages((previous) => mergeMessages(previous, page.messages));
+            setHasMore(page.hasMore);
+            if (userRef.current) {
+              void writeMessages(userRef.current.username, key, page.messages);
+            }
+          } catch {
+            // The conversation refresh above already scheduled a retry path.
           }
-          setMessages((previous) => mergeMessages(previous, gapMessages));
-          if (userRef.current) {
-            void writeMessages(userRef.current.username, key, gapMessages);
+        })();
+      } else {
+        const present = new Set(
+          openMessages
+            .filter((item) => isAcceptedSeq(item.seq))
+            .map((item) => item.seq),
+        );
+        void (async () => {
+          try {
+            const gapMessages = await pullGaps(
+              target,
+              openPlan.afterSeq,
+              openPlan.targetSeq - 1,
+              present,
+              missingSeqTrackerRef.current,
+            );
+            if (gapMessages.length === 0) {
+              return;
+            }
+            setMessages((previous) => mergeMessages(previous, gapMessages));
+            if (userRef.current) {
+              void writeMessages(userRef.current.username, key, gapMessages);
+            }
+          } catch {
+            // The conversation refresh above already scheduled a retry path.
           }
-        } catch {
-          // The conversation refresh above already scheduled a retry path.
-        }
-      })();
+        })();
+      }
     } else {
       missingSeqTrackerRef.current.clear(key);
       // Seqs above the reused one are stale; the pushed message itself is

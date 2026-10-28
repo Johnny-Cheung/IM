@@ -538,6 +538,53 @@ func TestListConversationsRaisesLastSeqToHotMessage(t *testing.T) {
 	}
 }
 
+func TestListConversationsKeepsMySQLSeqFloor(t *testing.T) {
+	now := time.Now().UTC()
+	dataStore := authenticatedFriendStore()
+	dataStore.conversations = []store.Conversation{{
+		UserID:   2,
+		User:     store.PublicUser{Username: "bob", Nickname: "Bob"},
+		IsFriend: true,
+		LastSeq:  10,
+		LastMessage: &store.Message{
+			ID:              10,
+			Seq:             10,
+			SenderID:        2,
+			RecipientID:     1,
+			ClientMessageID: "client-00000010",
+			Body:            "persisted before the lost counter tail",
+			CreatedAt:       now,
+		},
+	}}
+	tracker := newFakeDirectReadTracker()
+	tracker.states = map[uint64]messaging.DirectConversationState{
+		2: {LastSeq: 9, ReadSeq: 3, Unread: 6},
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	New(dataStore, WithDirectReadTracker(tracker)).Register(router)
+
+	recorder := doJSON(t, router, http.MethodGet, "/api/conversations", nil, authTestCookie())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	response := decodeBody[conversationListResponse](t, recorder)
+	if len(response.Conversations) != 1 {
+		t.Fatalf("conversations = %#v", response.Conversations)
+	}
+	conversation := response.Conversations[0]
+	if conversation.LastSeq != 10 {
+		t.Fatalf("last_seq = %d, want the MySQL floor 10", conversation.LastSeq)
+	}
+	if conversation.LastMessage == nil || conversation.LastMessage.Seq != 10 {
+		t.Fatalf("last message = %#v", conversation.LastMessage)
+	}
+	if conversation.UnreadCount != 6 {
+		t.Fatalf("unread = %d, want 6", conversation.UnreadCount)
+	}
+}
+
 func TestListMessages(t *testing.T) {
 	now := time.Now().UTC()
 	dataStore := authenticatedChatStore()
@@ -688,6 +735,48 @@ func TestListMessagesRejectsTwoCursors(t *testing.T) {
 	}
 	if got := errorCode(t, recorder); got != "invalid_request" {
 		t.Fatalf("error code = %q, want invalid_request", got)
+	}
+}
+
+func TestListMessagesCursorPresenceDecidesDirection(t *testing.T) {
+	dataStore := authenticatedChatStore()
+	dataStore.messageAfterPage = store.MessagePage{}
+	router := testRouter(dataStore)
+
+	recorder := doJSON(
+		t, router, http.MethodGet,
+		"/api/conversations/bob/messages?after_seq=",
+		nil, authTestCookie(),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s",
+			recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if dataStore.listMessagesAfterCall.afterSeq != 0 ||
+		dataStore.listMessagesAfterCall.limit != defaultMessagePageSize {
+		t.Fatalf("after-seq call = %#v", dataStore.listMessagesAfterCall)
+	}
+	if dataStore.listMessagesCall.limit != 0 {
+		t.Fatalf("an empty after_seq took the before-seq path: %#v", dataStore.listMessagesCall)
+	}
+}
+
+func TestListMessagesRejectsTwoCursorsWhenOneIsEmpty(t *testing.T) {
+	router := testRouter(authenticatedChatStore())
+
+	for _, path := range []string{
+		"/api/conversations/bob/messages?before_seq=5&after_seq=",
+		"/api/conversations/bob/messages?before_seq=&after_seq=10",
+	} {
+		t.Run(path, func(t *testing.T) {
+			recorder := doJSON(t, router, http.MethodGet, path, nil, authTestCookie())
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			if got := errorCode(t, recorder); got != "invalid_request" {
+				t.Fatalf("error code = %q, want invalid_request", got)
+			}
+		})
 	}
 }
 

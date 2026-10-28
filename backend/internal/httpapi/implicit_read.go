@@ -187,12 +187,13 @@ func (r *implicitRead) flushDue() {
 		default:
 		}
 		if ctx.Err() != nil {
-			r.requeue(due[index:])
+			// Nothing at or after index was attempted.
+			r.requeue(due[index:], nil)
 			return
 		}
 		if !r.flushBatch(ctx, batch) {
 			// One stalled Redis call must not discard the batches behind it.
-			r.requeue(due[index:])
+			r.requeue(due[index:], batch)
 			return
 		}
 	}
@@ -206,19 +207,23 @@ func (r *implicitRead) flushBatch(ctx context.Context, batch *implicitReadBatch)
 }
 
 // requeue puts unflushed batches back so a slow or failing Redis call retries
-// instead of silently losing the readers' positions.
-func (r *implicitRead) requeue(batches []*implicitReadBatch) {
+// instead of silently losing the readers' positions. Only the batch that was
+// actually attempted consumes a retry attempt; batches that were never
+// reached keep their full budget.
+func (r *implicitRead) requeue(batches []*implicitReadBatch, attempted *implicitReadBatch) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.stopped {
 		return
 	}
 	for _, batch := range batches {
-		batch.attempts++
-		if batch.attempts > implicitReadMaxRetries {
-			log.Printf("implicit read dropped after %d attempts: direct=%t group=%d seq=%d",
-				batch.attempts, batch.direct, batch.groupID, batch.throughSeq)
-			continue
+		if batch == attempted {
+			batch.attempts++
+			if batch.attempts > implicitReadMaxRetries {
+				log.Printf("implicit read dropped after %d attempts: direct=%t group=%d seq=%d",
+					batch.attempts, batch.direct, batch.groupID, batch.throughSeq)
+				continue
+			}
 		}
 		batch.queuedAt = time.Now()
 		existing, ok := r.pending[batch.key]

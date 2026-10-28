@@ -495,15 +495,15 @@ func (a *API) listGroupMessages(c *gin.Context) {
 		return
 	}
 
-	beforeSeq, err := parseBeforeSeq(c.Query("before_seq"))
+	beforeRaw, hasBefore := c.GetQuery("before_seq")
+	beforeSeq, err := parseBeforeSeq(beforeRaw)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
 		return
 	}
-	afterRaw := c.Query("after_seq")
+	afterRaw, hasAfter := c.GetQuery("after_seq")
 	afterSeq, err := parseAfterSeq(afterRaw)
-	hasAfter := afterRaw != ""
-	if err != nil || (beforeSeq > 0 && hasAfter) {
+	if err != nil || (hasBefore && hasAfter) {
 		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
 		return
 	}
