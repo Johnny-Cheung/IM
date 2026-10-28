@@ -24,11 +24,13 @@ describe("group read events", () => {
 describe("group read stats", () => {
   it("parses a valid response", () => {
     expect(parseGroupReadStats({
+      seq: 12,
       message_id: 345,
       read_count: 3,
       member_count: 5,
       all_read: false,
     })).toEqual({
+      seq: 12,
       message_id: 345,
       read_count: 3,
       member_count: 5,
@@ -44,6 +46,20 @@ describe("group read stats", () => {
       read_count: 0,
       member_count: 2,
       all_read: "no",
+    })).toBeNull();
+    expect(parseGroupReadStats({
+      seq: 0,
+      message_id: 1,
+      read_count: 0,
+      member_count: 2,
+      all_read: false,
+    })).toBeNull();
+    expect(parseGroupReadStats({
+      seq: 1.5,
+      message_id: 1,
+      read_count: 0,
+      member_count: 2,
+      all_read: false,
     })).toBeNull();
   });
 });

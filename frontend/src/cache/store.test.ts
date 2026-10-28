@@ -9,16 +9,23 @@ import type {
   PublicUser,
 } from "../api";
 import { conversationKey } from "./keys";
-import { META_STORE, openCacheDB } from "./db";
+import { CONVERSATIONS_STORE, MESSAGES_STORE, META_STORE, openCacheDB } from "./db";
 import {
   cacheSupported,
   clearUser,
+  deleteMessagesFrom,
+  deleteOutbox,
   enforceUserLimits,
+  markOutboxFailed,
   patchSyncState,
+  readConversationSeq,
   readConversations,
   readFriends,
   readHints,
+  readMaxMessageSeq,
   readMessages,
+  readOutbox,
+  readOutboxEntry,
   readSyncState,
   removeConversation,
   removeGroupCursor,
@@ -28,10 +35,11 @@ import {
   writeConversations,
   writeFriends,
   writeMessages,
+  writeOutbox,
   writeSyncState,
 } from "./store";
 import { emptySyncState } from "./types";
-import type { SyncState } from "./types";
+import type { CachedOutbox, SyncState } from "./types";
 
 const alice: PublicUser = { username: "alice", nickname: "Alice" };
 const bob: PublicUser = { username: "bob", nickname: "Bob" };
@@ -64,6 +72,7 @@ function directMessage(
 ): ChatMessage {
   return {
     id,
+    seq: id,
     sender: alice,
     recipient: bob,
     body: `direct-${id}`,
@@ -80,6 +89,7 @@ function groupMessage(
 ): GroupMessage {
   return {
     id,
+    seq: id,
     group_id: groupID,
     sender: alice,
     body: `group-${groupID}-${id}`,
@@ -103,14 +113,16 @@ function directConversation(
         ? null
         : {
             id: lastMessageID,
+            seq: lastMessageID,
             sender: alice,
             recipient: peer,
             body: `direct-${lastMessageID}`,
             client_message_id: `direct-client-${lastMessageID}`,
             created_at: "2026-10-26T00:00:00Z",
           },
+    last_seq: lastMessageID ?? 0,
     unread_count: 0,
-    peer_last_read_message_id: 0,
+    peer_last_read_seq: 0,
   };
 }
 
@@ -133,12 +145,14 @@ function groupConversation(
         ? null
         : {
             id: lastMessageID,
+            seq: lastMessageID,
             group_id: groupID,
             sender: alice,
             body: `group-${lastMessageID}`,
             client_message_id: `group-client-${lastMessageID}`,
             created_at: "2026-10-26T00:00:00Z",
           },
+    last_seq: lastMessageID ?? 0,
     unread_count: 0,
   };
 }
@@ -171,6 +185,7 @@ describe("hints", () => {
       afterID: 42,
       directComplete: false,
       groups: { 7: 99 },
+      localSeq: {},
       savedAt: "2026-10-26T00:00:00.000Z",
     };
     await setActiveUser(alice);
@@ -322,6 +337,7 @@ describe("sync state", () => {
       afterID: 10,
       directComplete: true,
       groups: { 3: 30 },
+      localSeq: {},
       savedAt: "2026-10-26T00:00:00.000Z",
     };
     await writeSyncState("alice", state);
@@ -334,6 +350,7 @@ describe("sync state", () => {
       afterID: 10,
       directComplete: true,
       groups: { 3: 30 },
+      localSeq: {},
       savedAt: "2026-10-26T00:00:00.000Z",
     });
 
@@ -383,6 +400,7 @@ describe("clearUser", () => {
       afterID: 10,
       directComplete: true,
       groups: { 1: 10 },
+      localSeq: {},
       savedAt: "2026-10-26T00:00:00.000Z",
     });
     await writeMeta("alice:pending-read", {
@@ -497,6 +515,216 @@ describe("enforceUserLimits", () => {
   });
 });
 
+function outboxEntry(overrides: Partial<CachedOutbox> = {}): CachedOutbox {
+  return {
+    user: "alice",
+    conversation: "direct:bob",
+    client_message_id: "client-outbox",
+    body: "pending",
+    kind: "direct",
+    recipient: bob,
+    created_at: "2026-10-26T00:00:00Z",
+    status: "sending",
+    ...overrides,
+  };
+}
+
+async function writeRawMessageRecord(record: unknown): Promise<void> {
+  const db = await openCacheDB();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(MESSAGES_STORE, "readwrite");
+    transaction.objectStore(MESSAGES_STORE).put(record);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+}
+
+async function writeRawConversationRecord(record: unknown): Promise<void> {
+  const db = await openCacheDB();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(CONVERSATIONS_STORE, "readwrite");
+    transaction.objectStore(CONVERSATIONS_STORE).put(record);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+}
+
+describe("seq storage", () => {
+  it("orders and trims cached messages by seq, not by global id", async () => {
+    const conversation = "direct:bob";
+    const messages = Array.from({ length: 250 }, (_, index) =>
+      directMessage(1000 - index, { seq: index + 1 }));
+
+    await writeMessages("alice", conversation, messages);
+
+    const cached = await readMessages("alice", conversation, 10_000);
+    expect(cached.map((message) => message.seq)).toEqual(
+      Array.from({ length: 200 }, (_, index) => index + 51),
+    );
+    expect(
+      (await readMessages("alice", conversation, 2)).map((message) => message.seq),
+    ).toEqual([249, 250]);
+    expect(await readConversationSeq("alice", conversation)).toBe(250);
+    expect(await readMaxMessageSeq("alice", conversation)).toBe(250);
+  });
+
+  it("drops cached records that have no seq", async () => {
+    await writeMessages("alice", "direct:bob", [directMessage(1)]);
+    await writeRawMessageRecord({
+      user: "alice",
+      conversation: "direct:bob",
+      id: 2,
+      message: { ...directMessage(2), seq: undefined },
+    });
+
+    expect(idsOf(await readMessages("alice", "direct:bob"))).toEqual([1]);
+  });
+
+  it("drops cached conversations without a seq watermark", async () => {
+    await writeRawConversationRecord({
+      user: "alice",
+      key: "direct:bob",
+      updatedAt: 1,
+      conversation: {
+        type: "direct",
+        user: bob,
+        is_friend: true,
+        last_message: null,
+        unread_count: 0,
+        peer_last_read_message_id: 0,
+      },
+    });
+
+    expect(await readConversations("alice")).toEqual([]);
+  });
+
+  it("replaces a row and lowers the watermark when a seq is reused", async () => {
+    const conversation = "direct:bob";
+    await writeMessages("alice", conversation, [
+      directMessage(10, { seq: 1 }),
+      directMessage(20, { seq: 2, body: "stale" }),
+      directMessage(30, { seq: 3 }),
+    ]);
+
+    await writeMessages("alice", conversation, [
+      directMessage(99, { seq: 2, body: "server" }),
+    ]);
+
+    const cached = await readMessages("alice", conversation);
+    expect(cached.map((message) => message.seq)).toEqual([1, 2]);
+    expect(cached[1]).toMatchObject({ id: 99, body: "server" });
+    expect(await readConversationSeq("alice", conversation)).toBe(2);
+  });
+
+  it("deletes the tail from a seq and lowers the watermark", async () => {
+    const conversation = "direct:bob";
+    await writeMessages("alice", conversation, [
+      directMessage(10, { seq: 1 }),
+      directMessage(20, { seq: 2 }),
+      directMessage(30, { seq: 3 }),
+      directMessage(40, { seq: 4 }),
+    ]);
+
+    await deleteMessagesFrom("alice", conversation, 3);
+
+    expect((await readMessages("alice", conversation)).map((message) => message.seq))
+      .toEqual([1, 2]);
+    expect(await readConversationSeq("alice", conversation)).toBe(2);
+  });
+
+  it("keeps a reused seq when the resync delete only drops the tail above it", async () => {
+    const conversation = "direct:bob";
+    await writeMessages("alice", conversation, [
+      directMessage(10, { seq: 1 }),
+      directMessage(20, { seq: 2, body: "stale" }),
+      directMessage(30, { seq: 3 }),
+    ]);
+
+    // A push reused seq 2: delete from 3 on, then re-write the confirmed push
+    // so an aborted tail resync cannot leave seq 2 out of the cache.
+    await deleteMessagesFrom("alice", conversation, 3);
+    await writeMessages("alice", conversation, [
+      directMessage(99, { seq: 2, body: "server" }),
+    ]);
+
+    const cached = await readMessages("alice", conversation);
+    expect(cached.map((message) => message.seq)).toEqual([1, 2]);
+    expect(cached[1]).toMatchObject({ id: 99, body: "server" });
+    expect(await readConversationSeq("alice", conversation)).toBe(2);
+  });
+
+  it("keeps the newest 200 messages per conversation by seq", async () => {
+    const conversation = "direct:bob";
+    const messages = Array.from({ length: 250 }, (_, index) =>
+      directMessage(index + 1, { seq: index + 1 }));
+
+    await writeMessages("alice", conversation, messages.slice(0, 120));
+    await writeMessages("alice", conversation, messages.slice(120));
+
+    const cached = await readMessages("alice", conversation);
+    expect(cached.map((message) => message.seq)).toEqual(
+      Array.from({ length: 200 }, (_, index) => index + 51),
+    );
+  });
+});
+
+describe("outbox", () => {
+  it("persists pending messages and marks them failed", async () => {
+    await writeOutbox(outboxEntry());
+    expect(await readOutboxEntry("alice", "direct:bob", "client-outbox"))
+      .toMatchObject({ body: "pending", status: "sending" });
+
+    await markOutboxFailed("alice", "direct:bob", "client-outbox");
+    expect(await readOutboxEntry("alice", "direct:bob", "client-outbox"))
+      .toMatchObject({ status: "failed" });
+    expect(await readOutbox("alice", "direct:bob")).toHaveLength(1);
+    expect(await readOutbox("alice", "direct:carol")).toEqual([]);
+  });
+
+  it("removes the entry once the server confirms its client id", async () => {
+    await writeOutbox(outboxEntry());
+    await writeMessages("alice", "direct:bob", [
+      directMessage(10, { seq: 1, client_message_id: "client-outbox" }),
+    ]);
+
+    expect(await readOutbox("alice", "direct:bob")).toEqual([]);
+  });
+
+  it("can delete an entry explicitly", async () => {
+    await writeOutbox(outboxEntry());
+    await deleteOutbox("alice", "direct:bob", "client-outbox");
+    expect(await readOutboxEntry("alice", "direct:bob", "client-outbox"))
+      .toBeNull();
+  });
+
+  it("is cleared with the user and with a removed conversation", async () => {
+    await writeOutbox(outboxEntry());
+    await writeOutbox(outboxEntry({
+      conversation: "group:9",
+      kind: "group",
+      recipient: undefined,
+      group_id: 9,
+      client_message_id: "group-outbox",
+    }));
+
+    await removeConversation("alice", "direct:bob");
+    expect(await readOutbox("alice", "direct:bob")).toEqual([]);
+    expect(await readOutbox("alice", "group:9")).toHaveLength(1);
+
+    await clearUser("alice");
+    expect(await readOutbox("alice", "group:9")).toEqual([]);
+  });
+
+  it("drops a conversation watermark together with the conversation", async () => {
+    await writeMessages("alice", "direct:bob", [directMessage(10, { seq: 3 })]);
+    expect(await readConversationSeq("alice", "direct:bob")).toBe(3);
+
+    await removeConversation("alice", "direct:bob");
+
+    expect(await readConversationSeq("alice", "direct:bob")).toBe(0);
+  });
+});
+
 describe("degraded mode", () => {
   it("returns empty values and silently ignores writes without IndexedDB", async () => {
     Object.defineProperty(globalThis, "indexedDB", {
@@ -511,6 +739,10 @@ describe("degraded mode", () => {
     await expect(readConversations("alice")).resolves.toEqual([]);
     await expect(readFriends("alice")).resolves.toEqual([]);
     await expect(readMessages("alice", "direct:bob")).resolves.toEqual([]);
+    await expect(readConversationSeq("alice", "direct:bob")).resolves.toBe(0);
+    await expect(readOutbox("alice", "direct:bob")).resolves.toEqual([]);
+    await expect(readOutboxEntry("alice", "direct:bob", "client-outbox"))
+      .resolves.toBeNull();
     await expect(readSyncState("alice")).resolves.toEqual(emptySyncState());
 
     await expect(setActiveUser(alice)).resolves.toBeUndefined();
@@ -518,6 +750,13 @@ describe("degraded mode", () => {
     await expect(
       writeMessages("alice", "direct:bob", [directMessage(1)]),
     ).resolves.toBeUndefined();
+    await expect(deleteMessagesFrom("alice", "direct:bob", 2))
+      .resolves.toBeUndefined();
+    await expect(writeOutbox(outboxEntry())).resolves.toBeUndefined();
+    await expect(deleteOutbox("alice", "direct:bob", "client-outbox"))
+      .resolves.toBeUndefined();
+    await expect(markOutboxFailed("alice", "direct:bob", "client-outbox"))
+      .resolves.toBeUndefined();
     await expect(writeFriends("alice", [bob])).resolves.toBeUndefined();
     await expect(
       patchSyncState("alice", { afterID: 1 }),
@@ -579,24 +818,30 @@ describe("storage guarantees", () => {
     );
   });
 
-  it("evicts the conversation with the oldest message id", async () => {
+  it("evicts the conversation with the oldest global message id", async () => {
     await writeConversations("alice", [
-      groupConversation(9, 10),
-      groupConversation(1, 100),
+      groupConversation(9, 100),
+      groupConversation(1, 10),
     ]);
-    await writeMessages("alice", "group:9", [groupMessage(9, 10)]);
-    await writeMessages("alice", "group:1", [groupMessage(1, 100)]);
-    await setGroupCursor("alice", 9, 10);
-    await setGroupCursor("alice", 1, 100);
+    await writeMessages("alice", "group:9", [
+      groupMessage(9, 10, { seq: 100 }),
+    ]);
+    await writeMessages("alice", "group:1", [
+      groupMessage(1, 100, { seq: 10 }),
+    ]);
+    await setGroupCursor("alice", 9, 100);
+    await setGroupCursor("alice", 1, 10);
 
     await enforceUserLimits("alice", {
       maxConversations: 1,
       maxMessages: 10_000,
     });
 
+    // seq is conversation-local, so eviction must use the global id: group 1
+    // holds the newest message even though its seq is lower.
     expect(await readMessages("alice", "group:9")).toEqual([]);
     expect(idsOf(await readMessages("alice", "group:1"))).toEqual([100]);
-    expect((await readSyncState("alice")).groups).toEqual({ 1: 100 });
+    expect((await readSyncState("alice")).groups).toEqual({ 1: 10 });
   });
 
   it("drops group cursors when their messages are evicted", async () => {

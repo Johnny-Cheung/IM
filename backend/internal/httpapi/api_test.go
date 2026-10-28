@@ -81,9 +81,6 @@ type fakeStore struct {
 	messagePageErr    error
 	messageAfterPage  store.MessagePage
 	messageAfterErr   error
-	markReadResult    uint64
-	markReadAdvanced  bool
-	markReadErr       error
 	createdMessage    store.Message
 	createdMessageNew bool
 	createMessageErr  error
@@ -95,22 +92,16 @@ type fakeStore struct {
 		now             time.Time
 	}
 	listMessagesCall struct {
-		userID   uint64
-		otherID  uint64
-		beforeID uint64
-		limit    int
+		userID    uint64
+		otherID   uint64
+		beforeSeq uint64
+		limit     int
 	}
 	listMessagesAfterCall struct {
-		userID  uint64
-		otherID uint64
-		afterID uint64
-		limit   int
-	}
-	markReadCall struct {
-		userID    uint64
-		peerID    uint64
-		throughID uint64
-		now       time.Time
+		userID   uint64
+		otherID  uint64
+		afterSeq uint64
+		limit    int
 	}
 
 	groupConversations                 []store.GroupConversation
@@ -119,9 +110,15 @@ type fakeStore struct {
 	groupConversationsWithoutUnreadErr error
 	groupMember                        bool
 	groupMessageCall                   struct {
+		userID    uint64
+		groupID   uint64
+		beforeSeq uint64
+		limit     int
+	}
+	groupMessageAfterCall struct {
 		userID   uint64
 		groupID  uint64
-		beforeID uint64
+		afterSeq uint64
 		limit    int
 	}
 	usersByKey          map[string]store.User
@@ -169,10 +166,6 @@ type fakeStore struct {
 		body            string
 		now             time.Time
 	}
-	markGroupReadThrough    uint64
-	markGroupReadResult     uint64
-	markGroupReadAdvanced   bool
-	markGroupReadErr        error
 	groupMessageSender      uint64
 	groupMessageSenderFound bool
 	groupMessageSenderErr   error
@@ -328,38 +321,26 @@ func (f *fakeStore) ListConversationBasics(
 
 func (f *fakeStore) ListMessages(
 	_ context.Context,
-	userID, otherID, beforeID uint64,
+	userID, otherID, beforeSeq uint64,
 	limit int,
 ) (store.MessagePage, error) {
 	f.listMessagesCall.userID = userID
 	f.listMessagesCall.otherID = otherID
-	f.listMessagesCall.beforeID = beforeID
+	f.listMessagesCall.beforeSeq = beforeSeq
 	f.listMessagesCall.limit = limit
 	return f.messagePage, f.messagePageErr
 }
 
 func (f *fakeStore) ListMessagesAfter(
 	_ context.Context,
-	userID, otherID, afterID uint64,
+	userID, otherID, afterSeq uint64,
 	limit int,
 ) (store.MessagePage, error) {
 	f.listMessagesAfterCall.userID = userID
 	f.listMessagesAfterCall.otherID = otherID
-	f.listMessagesAfterCall.afterID = afterID
+	f.listMessagesAfterCall.afterSeq = afterSeq
 	f.listMessagesAfterCall.limit = limit
 	return f.messageAfterPage, f.messageAfterErr
-}
-
-func (f *fakeStore) MarkConversationRead(
-	_ context.Context,
-	userID, peerID, throughID uint64,
-	now time.Time,
-) (uint64, bool, error) {
-	f.markReadCall.userID = userID
-	f.markReadCall.peerID = peerID
-	f.markReadCall.throughID = throughID
-	f.markReadCall.now = now
-	return f.markReadResult, f.markReadAdvanced, f.markReadErr
 }
 
 func (f *fakeStore) CreateMessage(
@@ -495,23 +476,25 @@ func (f *fakeStore) IsGroupMember(
 
 func (f *fakeStore) ListGroupMessages(
 	_ context.Context,
-	userID, groupID, beforeID uint64,
+	userID, groupID, beforeSeq uint64,
 	limit int,
 ) (store.GroupMessagePage, error) {
 	f.groupMessageCall.userID = userID
 	f.groupMessageCall.groupID = groupID
-	f.groupMessageCall.beforeID = beforeID
+	f.groupMessageCall.beforeSeq = beforeSeq
 	f.groupMessageCall.limit = limit
 	return f.groupMessagePage, f.groupMessagePageErr
 }
 
 func (f *fakeStore) ListGroupMessagesAfter(
-	context.Context,
-	uint64,
-	uint64,
-	uint64,
-	int,
+	_ context.Context,
+	userID, groupID, afterSeq uint64,
+	limit int,
 ) (store.GroupMessagePage, error) {
+	f.groupMessageAfterCall.userID = userID
+	f.groupMessageAfterCall.groupID = groupID
+	f.groupMessageAfterCall.afterSeq = afterSeq
+	f.groupMessageAfterCall.limit = limit
 	return f.groupMessageAfterPage, f.groupMessageAfterErr
 }
 
@@ -527,11 +510,6 @@ func (f *fakeStore) CreateGroupMessage(
 	f.createGroupMessageCall.body = body
 	f.createGroupMessageCall.now = now
 	return f.createdGroupMessage, f.createdGroupMessageNew, f.createGroupMessageErr
-}
-
-func (f *fakeStore) MarkGroupRead(_ context.Context, _, _, throughID uint64) (uint64, bool, error) {
-	f.markGroupReadThrough = throughID
-	return f.markGroupReadResult, f.markGroupReadAdvanced, f.markGroupReadErr
 }
 
 func (f *fakeStore) GroupMessageSender(

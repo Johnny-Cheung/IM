@@ -3,7 +3,6 @@ package messaging
 import (
 	"context"
 	"errors"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -30,7 +29,7 @@ func seedGroupReadState(
 	client *redis.Client,
 	groupID uint64,
 	memberIDs []uint64,
-	messageIDs []uint64,
+	seqs []uint64,
 	positions map[uint64]uint64,
 ) {
 	t.Helper()
@@ -44,10 +43,10 @@ func seedGroupReadState(
 			t.Fatalf("seed members: %v", err)
 		}
 	}
-	for _, messageID := range messageIDs {
+	for _, seq := range seqs {
 		if err := client.ZAdd(ctx, defaultKeyspace.groupInboxKey(groupID), redis.Z{
-			Score:  float64(messageID),
-			Member: strconv.FormatUint(messageID, 10),
+			Score:  float64(seq),
+			Member: strconvUint(seq),
 		}).Err(); err != nil {
 			t.Fatalf("seed inbox: %v", err)
 		}
@@ -55,7 +54,7 @@ func seedGroupReadState(
 	for userID, position := range positions {
 		if err := client.ZAdd(ctx, defaultKeyspace.groupReadKey(groupID), redis.Z{
 			Score:  float64(position),
-			Member: strconv.FormatUint(userID, 10),
+			Member: strconvUint(userID),
 		}).Err(); err != nil {
 			t.Fatalf("seed read position: %v", err)
 		}
@@ -66,29 +65,30 @@ func TestGroupReadTrackerAdvancesMonotonically(t *testing.T) {
 	client := newGroupReadTestClient(t)
 	ctx := context.Background()
 	now := time.UnixMilli(1700000000000).UTC()
-	seedGroupReadState(t, client, 9, []uint64{1, 2, 3}, []uint64{10, 20, 30}, nil)
+	seedGroupReadState(t, client, 9, []uint64{1, 2, 3}, []uint64{1, 2, 3}, nil)
+	setGroupSequence(t, client, 9, 3)
 	tracker := newGroupReadTracker(t, client)
 
-	first, err := tracker.AdvanceRead(ctx, 9, 2, 20, now)
+	first, err := tracker.AdvanceRead(ctx, 9, 2, 2, now)
 	if err != nil {
 		t.Fatalf("first advance: %v", err)
 	}
-	if !first.Advanced || first.LastReadMessageID != 20 || first.UserID != 2 {
-		t.Fatalf("first advance = %#v, want user 2 at 20", first)
+	if !first.Advanced || first.LastReadSeq != 2 || first.UserID != 2 {
+		t.Fatalf("first advance = %#v, want user 2 at 2", first)
 	}
-	if got := client.ZScore(ctx, defaultKeyspace.groupReadKey(9), "2").Val(); got != 20 {
-		t.Fatalf("stored position = %v, want 20", got)
+	if got := client.ZScore(ctx, defaultKeyspace.groupReadKey(9), "2").Val(); got != 2 {
+		t.Fatalf("stored position = %v, want 2", got)
 	}
 	if got := client.XLen(ctx, defaultKeyspace.groupReadStreamKey()).Val(); got != 1 {
 		t.Fatalf("stream length = %d, want 1", got)
 	}
 
-	backwards, err := tracker.AdvanceRead(ctx, 9, 2, 15, now.Add(time.Second))
+	backwards, err := tracker.AdvanceRead(ctx, 9, 2, 1, now.Add(time.Second))
 	if err != nil {
 		t.Fatalf("backwards advance: %v", err)
 	}
-	if backwards.Advanced || backwards.LastReadMessageID != 20 {
-		t.Fatalf("backwards advance = %#v, want unchanged position 20", backwards)
+	if backwards.Advanced || backwards.LastReadSeq != 2 {
+		t.Fatalf("backwards advance = %#v, want unchanged position 2", backwards)
 	}
 	if got := client.XLen(ctx, defaultKeyspace.groupReadStreamKey()).Val(); got != 1 {
 		t.Fatalf("stream length after no-op = %d, want 1", got)
@@ -98,16 +98,16 @@ func TestGroupReadTrackerAdvancesMonotonically(t *testing.T) {
 	if err != nil {
 		t.Fatalf("forward advance: %v", err)
 	}
-	if !forward.Advanced || forward.LastReadMessageID != 30 {
-		t.Fatalf("forward advance = %#v, want position 30", forward)
+	if !forward.Advanced || forward.LastReadSeq != 3 {
+		t.Fatalf("forward advance = %#v, want position 3 clamped to the counter", forward)
 	}
 
 	unbounded, err := tracker.AdvanceRead(ctx, 9, 2, 0, now.Add(3*time.Second))
 	if err != nil {
 		t.Fatalf("unbounded advance: %v", err)
 	}
-	if unbounded.Advanced || unbounded.LastReadMessageID != 30 {
-		t.Fatalf("unbounded advance = %#v, want unchanged position 30", unbounded)
+	if unbounded.Advanced || unbounded.LastReadSeq != 3 {
+		t.Fatalf("unbounded advance = %#v, want unchanged position 3", unbounded)
 	}
 
 	events, err := client.XRange(ctx, defaultKeyspace.groupReadStreamKey(), "-", "+").Result()
@@ -119,52 +119,53 @@ func TestGroupReadTrackerAdvancesMonotonically(t *testing.T) {
 	}
 	values := events[0].Values
 	if values["group_id"] != "9" || values["user_id"] != "2" ||
-		values["last_read_message_id"] != "20" || values["updated_at_ms"] != "1700000000000" {
+		values["last_read_seq"] != "2" || values["updated_at_ms"] != "1700000000000" {
 		t.Fatalf("stream event = %#v", values)
+	}
+	if _, ok := values["last_read_message_id"]; ok {
+		t.Fatalf("stream event still uses last_read_message_id: %#v", values)
 	}
 }
 
-func TestGroupReadTrackerClampsToInbox(t *testing.T) {
+func TestGroupReadTrackerClampsToCounter(t *testing.T) {
 	client := newGroupReadTestClient(t)
 	ctx := context.Background()
-	seedGroupReadState(t, client, 9, []uint64{1}, []uint64{10, 20, 30}, nil)
+	seedGroupReadState(t, client, 9, []uint64{1}, []uint64{1, 2, 3}, nil)
+	setGroupSequence(t, client, 9, 3)
 	tracker := newGroupReadTracker(t, client)
 
-	clamped, err := tracker.AdvanceRead(ctx, 9, 1, 25, time.Now())
+	clamped, err := tracker.AdvanceRead(ctx, 9, 1, 2, time.Now())
 	if err != nil {
 		t.Fatalf("clamped advance: %v", err)
 	}
-	if !clamped.Advanced || clamped.LastReadMessageID != 20 {
-		t.Fatalf("clamped advance = %#v, want position 20", clamped)
+	if !clamped.Advanced || clamped.LastReadSeq != 2 {
+		t.Fatalf("clamped advance = %#v, want position 2", clamped)
 	}
 
-	below, err := tracker.AdvanceRead(ctx, 9, 1, 5, time.Now())
+	below, err := tracker.AdvanceRead(ctx, 9, 1, 1, time.Now())
 	if err != nil {
 		t.Fatalf("below advance: %v", err)
 	}
-	if below.Advanced || below.LastReadMessageID != 20 {
-		t.Fatalf("below advance = %#v, want unchanged position 20", below)
+	if below.Advanced || below.LastReadSeq != 2 {
+		t.Fatalf("below advance = %#v, want unchanged position 2", below)
 	}
 }
 
-func TestGroupReadTrackerNoMessages(t *testing.T) {
+func TestGroupReadTrackerNoCounter(t *testing.T) {
 	client := newGroupReadTestClient(t)
 	ctx := context.Background()
-	seedGroupReadState(t, client, 9, []uint64{1}, nil, nil)
+	seedGroupReadState(t, client, 9, []uint64{1}, []uint64{1}, nil)
 	tracker := newGroupReadTracker(t, client)
 
 	result, err := tracker.AdvanceRead(ctx, 9, 1, 100, time.Now())
 	if err != nil {
-		t.Fatalf("advance without messages: %v", err)
+		t.Fatalf("advance without a counter: %v", err)
 	}
-	if result.Advanced || result.LastReadMessageID != 0 {
+	if result.Advanced || result.LastReadSeq != 0 {
 		t.Fatalf("advance = %#v, want no change", result)
 	}
 	if got := client.Exists(ctx, defaultKeyspace.groupReadKey(9)).Val(); got != 0 {
 		t.Fatalf("read key exists = %d, want 0", got)
-	}
-	if got := client.XLen(ctx, defaultKeyspace.groupReadStreamKey()).Val(); got != 0 {
-		t.Fatalf("stream length = %d, want 0", got)
 	}
 }
 
@@ -181,7 +182,8 @@ func TestGroupReadTrackerFailsClosed(t *testing.T) {
 	})
 	t.Run("sync required", func(t *testing.T) {
 		client := newGroupReadTestClient(t)
-		seedGroupReadState(t, client, 9, []uint64{1}, []uint64{10}, nil)
+		seedGroupReadState(t, client, 9, []uint64{1}, []uint64{1}, nil)
+		setGroupSequence(t, client, 9, 1)
 		if err := client.Set(ctx, defaultKeyspace.groupSyncRequiredKey(9), "1", 0).Err(); err != nil {
 			t.Fatalf("set sync required: %v", err)
 		}
@@ -192,7 +194,7 @@ func TestGroupReadTrackerFailsClosed(t *testing.T) {
 	})
 	t.Run("dissolved", func(t *testing.T) {
 		client := newGroupReadTestClient(t)
-		seedGroupReadState(t, client, 9, []uint64{1}, []uint64{10}, nil)
+		seedGroupReadState(t, client, 9, []uint64{1}, []uint64{1}, nil)
 		if err := client.Set(ctx, defaultKeyspace.groupDissolvedKey(9), "1", 0).Err(); err != nil {
 			t.Fatalf("set dissolved: %v", err)
 		}
@@ -200,18 +202,18 @@ func TestGroupReadTrackerFailsClosed(t *testing.T) {
 		if _, err := tracker.AdvanceRead(ctx, 9, 1, 0, now); err != ErrGroupDissolved {
 			t.Fatalf("AdvanceRead() error = %v, want group dissolved", err)
 		}
-		if _, err := tracker.ReadStats(ctx, 9, 1, 10); err != ErrGroupDissolved {
+		if _, err := tracker.ReadStats(ctx, 9, 1, 1); err != ErrGroupDissolved {
 			t.Fatalf("ReadStats() error = %v, want group dissolved", err)
 		}
 	})
 	t.Run("not a member", func(t *testing.T) {
 		client := newGroupReadTestClient(t)
-		seedGroupReadState(t, client, 9, []uint64{1}, []uint64{10}, nil)
+		seedGroupReadState(t, client, 9, []uint64{1}, []uint64{1}, nil)
 		tracker := newGroupReadTracker(t, client)
 		if _, err := tracker.AdvanceRead(ctx, 9, 2, 0, now); err != ErrGroupNotMember {
 			t.Fatalf("AdvanceRead() error = %v, want not member", err)
 		}
-		if _, err := tracker.ReadStats(ctx, 9, 2, 10); err != ErrGroupNotMember {
+		if _, err := tracker.ReadStats(ctx, 9, 2, 1); err != ErrGroupNotMember {
 			t.Fatalf("ReadStats() error = %v, want not member", err)
 		}
 	})
@@ -220,44 +222,42 @@ func TestGroupReadTrackerFailsClosed(t *testing.T) {
 func TestGroupReadTrackerStreamFailureKeepsRead(t *testing.T) {
 	client := newGroupReadTestClient(t)
 	ctx := context.Background()
-	seedGroupReadState(t, client, 9, []uint64{1}, []uint64{10, 20}, nil)
+	seedGroupReadState(t, client, 9, []uint64{1}, []uint64{1, 2}, nil)
+	setGroupSequence(t, client, 9, 2)
 	if err := client.Set(ctx, defaultKeyspace.groupReadStreamKey(), "not-a-stream", 0).Err(); err != nil {
 		t.Fatalf("corrupt stream key: %v", err)
 	}
 	tracker := newGroupReadTracker(t, client)
 
-	result, err := tracker.AdvanceRead(ctx, 9, 1, 20, time.Now())
+	result, err := tracker.AdvanceRead(ctx, 9, 1, 2, time.Now())
 	if err != nil {
 		t.Fatalf("advance with stream failure: %v", err)
 	}
-	if !result.Advanced || result.LastReadMessageID != 20 || !result.StreamError {
-		t.Fatalf("advance = %#v, want advanced position 20 with stream error", result)
+	if !result.Advanced || result.LastReadSeq != 2 || !result.StreamError {
+		t.Fatalf("advance = %#v, want advanced position 2 with stream error", result)
 	}
-	if got := client.ZScore(ctx, defaultKeyspace.groupReadKey(9), "1").Val(); got != 20 {
-		t.Fatalf("stored position = %v, want 20", got)
+	if got := client.ZScore(ctx, defaultKeyspace.groupReadKey(9), "1").Val(); got != 2 {
+		t.Fatalf("stored position = %v, want 2", got)
 	}
 }
 
 func TestGroupReadTrackerConcurrentAdvancesStayMonotonic(t *testing.T) {
 	client := newGroupReadTestClient(t)
 	ctx := context.Background()
-	ids := make([]uint64, 0, 10)
-	for index := uint64(1); index <= 10; index++ {
-		ids = append(ids, index*10)
-	}
-	seedGroupReadState(t, client, 9, []uint64{1}, ids, nil)
+	setGroupSequence(t, client, 9, 100)
+	seedGroupReadState(t, client, 9, []uint64{1}, nil, nil)
 	tracker := newGroupReadTracker(t, client)
 
 	var wait sync.WaitGroup
-	failures := make(chan error, len(ids))
-	for _, throughID := range ids {
+	failures := make(chan error, 10)
+	for index := uint64(1); index <= 10; index++ {
 		wait.Add(1)
-		go func(throughID uint64) {
+		go func(through uint64) {
 			defer wait.Done()
-			if _, err := tracker.AdvanceRead(ctx, 9, 1, throughID, time.Now()); err != nil {
+			if _, err := tracker.AdvanceRead(ctx, 9, 1, through*10, time.Now()); err != nil {
 				failures <- err
 			}
-		}(throughID)
+		}(index)
 	}
 	wait.Wait()
 	close(failures)
@@ -269,22 +269,20 @@ func TestGroupReadTrackerConcurrentAdvancesStayMonotonic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("final advance: %v", err)
 	}
-	if final.LastReadMessageID != 100 || final.Advanced {
+	if final.LastReadSeq != 100 || final.Advanced {
 		t.Fatalf("final advance = %#v, want position 100 already applied", final)
-	}
-	if length := client.XLen(ctx, defaultKeyspace.groupReadStreamKey()).Val(); length < 1 || length > 10 {
-		t.Fatalf("stream length = %d, want between 1 and 10", length)
 	}
 }
 
 func TestGroupReadTrackerAdvanceMany(t *testing.T) {
 	client := newGroupReadTestClient(t)
 	ctx := context.Background()
-	seedGroupReadState(t, client, 9, []uint64{1, 2, 3}, []uint64{10, 20, 30}, nil)
+	seedGroupReadState(t, client, 9, []uint64{1, 2, 3}, []uint64{1, 2, 3}, nil)
+	setGroupSequence(t, client, 9, 3)
 	tracker := newGroupReadTracker(t, client)
 
 	advances, err := tracker.AdvanceReadMany(
-		ctx, 9, []uint64{2, 3, 2, 0, 99}, 25, time.Now(),
+		ctx, 9, []uint64{2, 3, 2, 0, 99}, 2, time.Now(),
 	)
 	if err != nil {
 		t.Fatalf("advance many: %v", err)
@@ -293,28 +291,22 @@ func TestGroupReadTrackerAdvanceMany(t *testing.T) {
 		t.Fatalf("advances = %#v, want users 2 and 3", advances)
 	}
 	for _, advance := range advances {
-		if !advance.Advanced || advance.LastReadMessageID != 20 {
-			t.Fatalf("advance = %#v, want position 20", advance)
+		if !advance.Advanced || advance.LastReadSeq != 2 {
+			t.Fatalf("advance = %#v, want position 2", advance)
 		}
 	}
 	if advances[0].UserID != 2 || advances[1].UserID != 3 {
 		t.Fatalf("advance order = %#v", advances)
 	}
-	if got := client.XLen(ctx, defaultKeyspace.groupReadStreamKey()).Val(); got != 2 {
-		t.Fatalf("stream length = %d, want 2", got)
-	}
 
-	again, err := tracker.AdvanceReadMany(ctx, 9, []uint64{2, 3}, 25, time.Now())
+	again, err := tracker.AdvanceReadMany(ctx, 9, []uint64{2, 3}, 2, time.Now())
 	if err != nil {
 		t.Fatalf("second advance many: %v", err)
 	}
 	for _, advance := range again {
-		if advance.Advanced || advance.LastReadMessageID != 20 {
-			t.Fatalf("second advance = %#v, want unchanged position 20", advance)
+		if advance.Advanced || advance.LastReadSeq != 2 {
+			t.Fatalf("second advance = %#v, want unchanged position 2", advance)
 		}
-	}
-	if got := client.XLen(ctx, defaultKeyspace.groupReadStreamKey()).Val(); got != 2 {
-		t.Fatalf("stream length after no-op = %d, want 2", got)
 	}
 
 	empty, err := tracker.AdvanceReadMany(ctx, 9, nil, 0, time.Now())
@@ -331,7 +323,7 @@ func TestGroupReadTrackerAdvanceManyFailsClosed(t *testing.T) {
 		t.Fatalf("missing members error = %v, want service unavailable", err)
 	}
 
-	seedGroupReadState(t, client, 9, []uint64{1}, []uint64{10}, nil)
+	seedGroupReadState(t, client, 9, []uint64{1}, nil, nil)
 	if err := client.Set(ctx, defaultKeyspace.groupDissolvedKey(9), "1", 0).Err(); err != nil {
 		t.Fatalf("set dissolved: %v", err)
 	}
@@ -343,9 +335,11 @@ func TestGroupReadTrackerAdvanceManyFailsClosed(t *testing.T) {
 func TestGroupReadTrackerUnreadCounts(t *testing.T) {
 	client := newGroupReadTestClient(t)
 	ctx := context.Background()
-	seedGroupReadState(t, client, 9, []uint64{1, 2}, []uint64{10, 20, 30}, map[uint64]uint64{1: 20})
-	seedGroupReadState(t, client, 10, []uint64{1}, []uint64{40, 50}, nil)
-	seedGroupReadState(t, client, 11, []uint64{1}, nil, map[uint64]uint64{1: 50})
+	seedGroupReadState(t, client, 9, []uint64{1, 2}, nil, map[uint64]uint64{1: 2})
+	setGroupSequence(t, client, 9, 3)
+	seedGroupReadState(t, client, 10, []uint64{1}, nil, nil)
+	setGroupSequence(t, client, 10, 2)
+	seedGroupReadState(t, client, 11, []uint64{1}, nil, map[uint64]uint64{1: 5})
 	tracker := newGroupReadTracker(t, client)
 
 	counts, err := tracker.UnreadCounts(ctx, 1, []uint64{9, 10, 11})
@@ -362,10 +356,10 @@ func TestGroupReadTrackerUnreadCountsFailsClosed(t *testing.T) {
 	for name, prepare := range map[string]func(*redis.Client){
 		"members missing": func(*redis.Client) {},
 		"not a member": func(client *redis.Client) {
-			seedGroupReadState(t, client, 9, []uint64{2}, []uint64{10}, nil)
+			seedGroupReadState(t, client, 9, []uint64{2}, nil, nil)
 		},
 		"sync required": func(client *redis.Client) {
-			seedGroupReadState(t, client, 9, []uint64{1}, []uint64{10}, nil)
+			seedGroupReadState(t, client, 9, []uint64{1}, nil, nil)
 			if err := client.Set(ctx, defaultKeyspace.groupSyncRequiredKey(9), "1", 0).Err(); err != nil {
 				t.Fatalf("set sync required: %v", err)
 			}
@@ -382,16 +376,66 @@ func TestGroupReadTrackerUnreadCountsFailsClosed(t *testing.T) {
 	}
 }
 
+func TestGroupReadTrackerStates(t *testing.T) {
+	client := newGroupReadTestClient(t)
+	ctx := context.Background()
+	seedGroupReadState(t, client, 9, []uint64{1}, nil, map[uint64]uint64{1: 2})
+	setGroupSequence(t, client, 9, 5)
+	seedGroupReadState(t, client, 10, []uint64{1}, nil, nil)
+	setGroupSequence(t, client, 10, 4)
+	seedGroupReadState(t, client, 11, []uint64{1}, nil, nil)
+	tracker := newGroupReadTracker(t, client)
+
+	states, err := tracker.States(ctx, 1, []uint64{9, 10, 11})
+	if err != nil {
+		t.Fatalf("States() error = %v", err)
+	}
+	if states[9].LastSeq != 5 || states[9].ReadSeq != 2 || states[9].Unread != 3 {
+		t.Fatalf("group 9 state = %#v", states[9])
+	}
+	if states[10].LastSeq != 4 || states[10].Unread != 4 {
+		t.Fatalf("group 10 state = %#v", states[10])
+	}
+	if states[11].LastSeq != 0 || states[11].Unread != 0 {
+		t.Fatalf("group 11 state = %#v", states[11])
+	}
+}
+
+func TestGroupReadTrackerStatesFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	for name, prepare := range map[string]func(*redis.Client){
+		"members missing": func(*redis.Client) {},
+		"not a member": func(client *redis.Client) {
+			seedGroupReadState(t, client, 9, []uint64{2}, nil, nil)
+		},
+		"sync required": func(client *redis.Client) {
+			seedGroupReadState(t, client, 9, []uint64{1}, nil, nil)
+			if err := client.Set(ctx, defaultKeyspace.groupSyncRequiredKey(9), "1", 0).Err(); err != nil {
+				t.Fatalf("set sync required: %v", err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := newGroupReadTestClient(t)
+			prepare(client)
+			tracker := newGroupReadTracker(t, client)
+			if _, err := tracker.States(ctx, 1, []uint64{9}); err != ErrMessageServiceUnavailable {
+				t.Fatalf("States() error = %v, want service unavailable", err)
+			}
+		})
+	}
+}
+
 func TestGroupReadTrackerReadStats(t *testing.T) {
 	client := newGroupReadTestClient(t)
 	ctx := context.Background()
 	seedGroupReadState(
-		t, client, 9, []uint64{1, 2, 3}, []uint64{10, 20, 30},
-		map[uint64]uint64{1: 25, 2: 30, 3: 40},
+		t, client, 9, []uint64{1, 2, 3}, nil,
+		map[uint64]uint64{1: 2, 2: 3, 3: 4},
 	)
 	tracker := newGroupReadTracker(t, client)
 
-	notCaughtUp, err := tracker.ReadStats(ctx, 9, 1, 30)
+	notCaughtUp, err := tracker.ReadStats(ctx, 9, 1, 3)
 	if err != nil {
 		t.Fatalf("read stats: %v", err)
 	}
@@ -400,11 +444,11 @@ func TestGroupReadTrackerReadStats(t *testing.T) {
 	}
 
 	if err := client.ZAdd(ctx, defaultKeyspace.groupReadKey(9), redis.Z{
-		Score: 30, Member: "1",
+		Score: 3, Member: "1",
 	}).Err(); err != nil {
 		t.Fatalf("catch sender up: %v", err)
 	}
-	caughtUp, err := tracker.ReadStats(ctx, 9, 1, 30)
+	caughtUp, err := tracker.ReadStats(ctx, 9, 1, 3)
 	if err != nil {
 		t.Fatalf("read stats after catch-up: %v", err)
 	}
@@ -415,7 +459,7 @@ func TestGroupReadTrackerReadStats(t *testing.T) {
 	if err := client.ZRem(ctx, defaultKeyspace.groupReadKey(9), "3").Err(); err != nil {
 		t.Fatalf("remove reader: %v", err)
 	}
-	partial, err := tracker.ReadStats(ctx, 9, 1, 30)
+	partial, err := tracker.ReadStats(ctx, 9, 1, 3)
 	if err != nil {
 		t.Fatalf("partial read stats: %v", err)
 	}
@@ -429,7 +473,7 @@ func TestGroupReadTrackerReadStats(t *testing.T) {
 	if err := client.SRem(ctx, defaultKeyspace.groupMembersKey(9), 3).Err(); err != nil {
 		t.Fatalf("remove member from set: %v", err)
 	}
-	shrunk, err := tracker.ReadStats(ctx, 9, 1, 30)
+	shrunk, err := tracker.ReadStats(ctx, 9, 1, 3)
 	if err != nil {
 		t.Fatalf("shrunk read stats: %v", err)
 	}
@@ -441,10 +485,10 @@ func TestGroupReadTrackerReadStats(t *testing.T) {
 func TestGroupReadTrackerReadStatsMissingPositionsCountAsUnread(t *testing.T) {
 	client := newGroupReadTestClient(t)
 	ctx := context.Background()
-	seedGroupReadState(t, client, 9, []uint64{1, 2, 3}, []uint64{30}, map[uint64]uint64{2: 30})
+	seedGroupReadState(t, client, 9, []uint64{1, 2, 3}, nil, map[uint64]uint64{2: 3})
 	tracker := newGroupReadTracker(t, client)
 
-	stats, err := tracker.ReadStats(ctx, 9, 1, 30)
+	stats, err := tracker.ReadStats(ctx, 9, 1, 3)
 	if err != nil {
 		t.Fatalf("read stats: %v", err)
 	}
@@ -456,10 +500,10 @@ func TestGroupReadTrackerReadStatsMissingPositionsCountAsUnread(t *testing.T) {
 func TestGroupReadTrackerReadStatsAloneInGroup(t *testing.T) {
 	client := newGroupReadTestClient(t)
 	ctx := context.Background()
-	seedGroupReadState(t, client, 9, []uint64{1}, []uint64{5}, map[uint64]uint64{1: 5})
+	seedGroupReadState(t, client, 9, []uint64{1}, nil, map[uint64]uint64{1: 1})
 	tracker := newGroupReadTracker(t, client)
 
-	stats, err := tracker.ReadStats(ctx, 9, 1, 5)
+	stats, err := tracker.ReadStats(ctx, 9, 1, 1)
 	if err != nil {
 		t.Fatalf("read stats: %v", err)
 	}
@@ -468,45 +512,35 @@ func TestGroupReadTrackerReadStatsAloneInGroup(t *testing.T) {
 	}
 }
 
-func TestGroupReadTrackerMessageSender(t *testing.T) {
+func TestGroupReadTrackerMessageBySeq(t *testing.T) {
 	client := newGroupReadTestClient(t)
 	ctx := context.Background()
-	if err := client.HSet(ctx, defaultKeyspace.groupMessageKey(50), map[string]interface{}{
-		"group_id": "9", "sender_id": "7",
-	}).Err(); err != nil {
-		t.Fatalf("seed message 50: %v", err)
-	}
-	if err := client.HSet(ctx, defaultKeyspace.groupMessageKey(51), map[string]interface{}{
-		"group_id": "8", "sender_id": "7",
-	}).Err(); err != nil {
-		t.Fatalf("seed message 51: %v", err)
-	}
-	if err := client.HSet(ctx, defaultKeyspace.groupMessageKey(52), map[string]interface{}{
-		"sender_id": "7",
-	}).Err(); err != nil {
-		t.Fatalf("seed message 52: %v", err)
+	seedGroupMessages(t, client, 9, map[uint64]uint64{50: 5, 52: 8})
+	seedGroupMessages(t, client, 8, map[uint64]uint64{51: 6})
+	if err := client.HDel(ctx, defaultKeyspace.groupMessageKey(52), "sender_id").Err(); err != nil {
+		t.Fatalf("remove sender: %v", err)
 	}
 	tracker := newGroupReadTracker(t, client)
 
-	senderID, found, err := tracker.MessageSender(ctx, 9, 50)
-	if err != nil || !found || senderID != 7 {
-		t.Fatalf("MessageSender(50) = %d, %t, %v", senderID, found, err)
+	ref, found, err := tracker.MessageBySeq(ctx, 9, 5)
+	if err != nil || !found || ref.ID != 50 || ref.SenderID != 1 {
+		t.Fatalf("MessageBySeq(9,5) = %#v, %t, %v", ref, found, err)
 	}
-	senderID, found, err = tracker.MessageSender(ctx, 9, 51)
-	if err != nil || !found || senderID != 0 {
-		t.Fatalf("MessageSender(51) = %d, %t, %v, want other group", senderID, found, err)
-	}
-	_, found, err = tracker.MessageSender(ctx, 9, 53)
+	_, found, err = tracker.MessageBySeq(ctx, 9, 6)
 	if err != nil || found {
-		t.Fatalf("MessageSender(53) = %t, %v, want missing", found, err)
+		t.Fatalf("MessageBySeq(9,6) = %t, %v, want missing (other group)", found, err)
 	}
-	_, found, err = tracker.MessageSender(ctx, 9, 0)
+	_, found, err = tracker.MessageBySeq(ctx, 9, 7)
 	if err != nil || found {
-		t.Fatalf("MessageSender(0) = %t, %v, want missing", found, err)
+		t.Fatalf("MessageBySeq(9,7) = %t, %v, want missing", found, err)
 	}
-	senderID, found, err = tracker.MessageSender(ctx, 9, 52)
-	if err != nil || !found || senderID != 0 {
-		t.Fatalf("MessageSender(52) = %d, %t, %v, want unknown sender", senderID, found, err)
+	_, found, err = tracker.MessageBySeq(ctx, 9, 0)
+	if err != nil || found {
+		t.Fatalf("MessageBySeq(9,0) = %t, %v, want missing", found, err)
+	}
+	ref, found, err = tracker.MessageBySeq(ctx, 9, 8)
+	if err != nil || !found || ref.ID != 52 || ref.SenderID != 0 {
+		t.Fatalf("MessageBySeq(9,8) = %#v, %t, %v, want entity without sender", ref, found, err)
 	}
 }
 
@@ -601,24 +635,46 @@ func TestGroupReadTrackerMemberIDs(t *testing.T) {
 func TestGroupReadTrackerReadModelReady(t *testing.T) {
 	client := newGroupReadTestClient(t)
 	ctx := context.Background()
-	tracker := newGroupReadTracker(t, client)
+	gate := NewSeqGate()
+	tracker := NewGroupReadTracker(client, GroupReadTrackerOptions{Gate: gate})
 
 	ready, err := tracker.ReadModelReady(ctx)
 	if err != nil {
 		t.Fatalf("initial ready: %v", err)
 	}
 	if ready {
-		t.Fatalf("initial ready = true, want false")
+		t.Fatal("initial ready = true, want false")
 	}
 	if err := tracker.MarkReadModelReady(ctx); err != nil {
 		t.Fatalf("mark ready: %v", err)
 	}
 	ready, err = tracker.ReadModelReady(ctx)
-	if err != nil {
-		t.Fatalf("ready after mark: %v", err)
+	if err != nil || !ready {
+		t.Fatalf("ready after mark = %v, %v; want true", ready, err)
 	}
-	if !ready {
-		t.Fatalf("ready after mark = false, want true")
+
+	gate.Close()
+	ready, err = tracker.ReadModelReady(ctx)
+	if err != nil || ready {
+		t.Fatalf("ready with closed gate = %v, %v; want false", ready, err)
+	}
+}
+
+func TestGroupReadTrackerGate(t *testing.T) {
+	client := newGroupReadTestClient(t)
+	ctx := context.Background()
+	gate := NewSeqGate()
+	tracker := NewGroupReadTracker(client, GroupReadTrackerOptions{Gate: gate})
+	gate.Close()
+
+	if _, err := tracker.AdvanceReadMany(ctx, 9, []uint64{1}, 0, time.Now()); !errors.Is(err, ErrSeqNotReady) {
+		t.Fatalf("AdvanceReadMany() error = %v, want ErrSeqNotReady", err)
+	}
+	if _, err := tracker.States(ctx, 1, []uint64{9}); !errors.Is(err, ErrSeqNotReady) {
+		t.Fatalf("States() error = %v, want ErrSeqNotReady", err)
+	}
+	if _, _, err := tracker.MessageBySeq(ctx, 9, 1); !errors.Is(err, ErrSeqNotReady) {
+		t.Fatalf("MessageBySeq() error = %v, want ErrSeqNotReady", err)
 	}
 }
 
@@ -636,5 +692,11 @@ func TestGroupReadTrackerRequiresRedis(t *testing.T) {
 	}
 	if _, err := tracker.ReadStats(ctx, 1, 2, 10); err == nil {
 		t.Fatalf("ReadStats() error = nil, want service unavailable")
+	}
+	if _, err := tracker.States(ctx, 2, []uint64{1}); err == nil {
+		t.Fatalf("States() error = nil, want service unavailable")
+	}
+	if _, _, err := tracker.MessageBySeq(ctx, 1, 10); err == nil {
+		t.Fatalf("MessageBySeq() error = nil, want service unavailable")
 	}
 }

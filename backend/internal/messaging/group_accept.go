@@ -59,6 +59,9 @@ func (a *GroupRedisAcceptor) Accept(
 	if a == nil || a.client == nil {
 		return GroupMessageResult{}, ErrMessageServiceUnavailable
 	}
+	if err := a.options.Gate.Ready(); err != nil {
+		return GroupMessageResult{}, err
+	}
 	if request.CreatedAt.IsZero() {
 		request.CreatedAt = time.Now().UTC()
 	}
@@ -70,8 +73,9 @@ func (a *GroupRedisAcceptor) Accept(
 		a.keyspace.groupDedupKey(request.GroupID, request.SenderID, request.ClientMessageID),
 		a.keyspace.counterKey(),
 		a.keyspace.groupInboxKey(request.GroupID),
-		a.keyspace.groupLastAcceptedKey(request.GroupID),
+		a.keyspace.groupSequenceKey(request.GroupID),
 		a.keyspace.groupMessageStreamKey(),
+		a.keyspace.sequenceReadyKey(),
 	}
 	args := []interface{}{
 		request.SenderID,
@@ -82,6 +86,7 @@ func (a *GroupRedisAcceptor) Accept(
 		hashMessageBody(request.Body),
 		a.options.SeedFloor,
 		store.MaxSafeMessageID,
+		store.MaxSafeSeq,
 		int64(a.options.DedupTTL / time.Second),
 		a.options.StreamMaxLen,
 		a.keyspace.prefixOrDefault() + "group-messages:",
@@ -101,7 +106,7 @@ func (a *GroupRedisAcceptor) Accept(
 	}
 	switch status {
 	case "accepted", "duplicate":
-		if len(values) < 3 {
+		if len(values) < 4 {
 			return GroupMessageResult{}, ErrMessageServiceUnavailable
 		}
 		messageID, err := parseRedisUint(values[1])
@@ -112,9 +117,14 @@ func (a *GroupRedisAcceptor) Accept(
 		if err != nil {
 			return GroupMessageResult{}, err
 		}
+		seq, err := parseRedisUint(values[3])
+		if err != nil || seq == 0 {
+			return GroupMessageResult{}, ErrSeqNotReady
+		}
 		return GroupMessageResult{
 			Message: store.GroupMessage{
 				ID:              messageID,
+				Seq:             seq,
 				GroupID:         request.GroupID,
 				SenderID:        request.SenderID,
 				Sender:          store.PublicUser{Username: request.SenderUsername, Nickname: request.SenderNickname},
@@ -132,6 +142,10 @@ func (a *GroupRedisAcceptor) Accept(
 		return GroupMessageResult{}, store.ErrMessageConflict
 	case "id_overflow":
 		return GroupMessageResult{}, store.ErrMessageIDExhausted
+	case "seq_not_ready", "seq_unavailable":
+		return GroupMessageResult{}, ErrSeqNotReady
+	case "seq_overflow":
+		return GroupMessageResult{}, ErrSeqOverflow
 	default:
 		return GroupMessageResult{}, ErrMessageServiceUnavailable
 	}

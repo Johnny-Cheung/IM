@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -101,6 +102,7 @@ func (r *GroupStreamRelay) relayEntry(
 ) error {
 	message, err := groupStreamMessage(entry.Values)
 	if err != nil {
+		log.Printf("drop malformed group stream entry %s: %v", entry.ID, err)
 		if ackErr := r.redis.XAck(ctx, r.keyspace.groupMessageStreamKey(), groupRelayName(r.namespace), entry.ID).Err(); ackErr != nil {
 			return fmt.Errorf("ack malformed group stream entry %s: %w", entry.ID, ackErr)
 		}

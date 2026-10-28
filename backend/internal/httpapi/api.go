@@ -72,19 +72,14 @@ type Store interface {
 	ListPublicUsersByIDs(ctx context.Context, ids []uint64) (map[uint64]store.PublicUser, error)
 	ListMessages(
 		ctx context.Context,
-		userID, otherID, beforeID uint64,
+		userID, otherID, beforeSeq uint64,
 		limit int,
 	) (store.MessagePage, error)
 	ListMessagesAfter(
 		ctx context.Context,
-		userID, otherID, afterID uint64,
+		userID, otherID, afterSeq uint64,
 		limit int,
 	) (store.MessagePage, error)
-	MarkConversationRead(
-		ctx context.Context,
-		userID, peerID, throughID uint64,
-		now time.Time,
-	) (uint64, bool, error)
 	CreateMessage(
 		ctx context.Context,
 		senderID, recipientID uint64,
@@ -122,12 +117,12 @@ type Store interface {
 	IsGroupMember(ctx context.Context, userID, groupID uint64) (bool, error)
 	ListGroupMessages(
 		ctx context.Context,
-		userID, groupID, beforeID uint64,
+		userID, groupID, beforeSeq uint64,
 		limit int,
 	) (store.GroupMessagePage, error)
 	ListGroupMessagesAfter(
 		ctx context.Context,
-		userID, groupID, afterID uint64,
+		userID, groupID, afterSeq uint64,
 		limit int,
 	) (store.GroupMessagePage, error)
 	CreateGroupMessage(
@@ -138,9 +133,8 @@ type Store interface {
 	) (store.GroupMessage, bool, error)
 	GroupMessageSender(
 		ctx context.Context,
-		groupID, messageID uint64,
+		groupID, seq uint64,
 	) (uint64, bool, error)
-	MarkGroupRead(ctx context.Context, userID, groupID, throughID uint64) (uint64, bool, error)
 }
 
 // DirectMessageAcceptor is the optional v1.2 message acceptance path.
@@ -162,16 +156,16 @@ type DirectMessageReader interface {
 	LastConversationMessages(context.Context, uint64) (map[uint64]store.Message, error)
 }
 
-// DirectReadTracker owns direct-chat read positions in Redis.
+// DirectReadTracker owns direct-chat read positions in Redis. Every position
+// and counter is a per-conversation seq.
 type DirectReadTracker interface {
 	AdvanceRead(context.Context, uint64, uint64, uint64, time.Time) (messaging.DirectReadAdvance, error)
-	ReadPositions(context.Context, uint64) (map[uint64]uint64, error)
-	PeerReadPositions(context.Context, uint64, []uint64) (map[uint64]uint64, error)
-	UnreadCounts(context.Context, uint64, []uint64, map[uint64]uint64) (map[uint64]int, error)
+	States(context.Context, uint64, []uint64) (map[uint64]messaging.DirectConversationState, error)
 	ReadModelReady(context.Context) (bool, error)
 }
 
-// GroupReadTracker owns group read positions in Redis.
+// GroupReadTracker owns group read positions in Redis. Every position,
+// threshold and counter is a per-group seq.
 type GroupReadTracker interface {
 	AdvanceRead(
 		context.Context, uint64, uint64, uint64, time.Time,
@@ -179,9 +173,9 @@ type GroupReadTracker interface {
 	AdvanceReadMany(
 		context.Context, uint64, []uint64, uint64, time.Time,
 	) ([]messaging.GroupReadAdvance, error)
-	UnreadCounts(context.Context, uint64, []uint64) (map[uint64]int, error)
+	States(context.Context, uint64, []uint64) (map[uint64]messaging.GroupConversationState, error)
 	ReadStats(context.Context, uint64, uint64, uint64) (messaging.GroupReadStats, error)
-	MessageSender(context.Context, uint64, uint64) (uint64, bool, error)
+	MessageBySeq(context.Context, uint64, uint64) (messaging.MessageRef, bool, error)
 	SeedMember(context.Context, uint64, uint64, uint64) error
 	SetMemberBaseline(context.Context, uint64, uint64, uint64) error
 	RemoveMember(context.Context, uint64, uint64) error
@@ -200,9 +194,9 @@ type GroupMessageReader interface {
 	ReadGroupAfter(context.Context, uint64, uint64, uint64, int) (messaging.GroupConversationPage, error)
 }
 
-// GroupAcceptedWatermarkReader reads the highest group message accepted by Redis.
-type GroupAcceptedWatermarkReader interface {
-	LastAcceptedID(context.Context, uint64) (uint64, error)
+// GroupSequenceReader reads a group's conversation seq counter.
+type GroupSequenceReader interface {
+	LastSeq(context.Context, uint64) (uint64, error)
 }
 
 // GroupProjector mirrors committed group membership changes in Redis.
@@ -213,20 +207,20 @@ type GroupProjector interface {
 
 // API registers the versioned JSON endpoints.
 type API struct {
-	store                Store
-	hub                  *Hub
-	directAcceptor       DirectMessageAcceptor
-	directReader         DirectMessageReader
-	directReads          DirectReadTracker
-	friendshipProject    FriendshipProjector
-	groupAcceptor        GroupMessageAcceptor
-	groupReader          GroupMessageReader
-	groupWatermarkReader GroupAcceptedWatermarkReader
-	groupProjector       GroupProjector
-	groupReads           GroupReadTracker
-	implicitReads        *implicitRead
-	groupRepairs         *groupRepair
-	groupWrites          groupWrites
+	store               Store
+	hub                 *Hub
+	directAcceptor      DirectMessageAcceptor
+	directReader        DirectMessageReader
+	directReads         DirectReadTracker
+	friendshipProject   FriendshipProjector
+	groupAcceptor       GroupMessageAcceptor
+	groupReader         GroupMessageReader
+	groupSequenceReader GroupSequenceReader
+	groupProjector      GroupProjector
+	groupReads          GroupReadTracker
+	implicitReads       *implicitRead
+	groupRepairs        *groupRepair
+	groupWrites         groupWrites
 }
 
 type Option func(*API)
@@ -267,9 +261,9 @@ func WithGroupMessageReader(reader GroupMessageReader) Option {
 	}
 }
 
-func WithGroupAcceptedWatermarkReader(reader GroupAcceptedWatermarkReader) Option {
+func WithGroupSequenceReader(reader GroupSequenceReader) Option {
 	return func(api *API) {
-		api.groupWatermarkReader = reader
+		api.groupSequenceReader = reader
 	}
 }
 
@@ -335,10 +329,8 @@ func (a *API) Register(router *gin.Engine) {
 	authed.GET("/conversations", a.listConversations)
 	authed.GET("/messages/sync", a.syncMessages)
 	authed.POST("/bootstrap", a.bootstrap)
-	authed.POST("/read", a.markReadBatch)
 	authed.GET("/conversations/:username/messages", a.listMessages)
 	authed.POST("/conversations/:username/messages", a.sendMessage)
-	authed.POST("/conversations/:username/read", a.markConversationRead)
 	authed.POST("/groups", a.createGroup)
 	authed.GET("/groups/:id", a.getGroup)
 	authed.PATCH("/groups/:id", a.renameGroup)
@@ -347,7 +339,6 @@ func (a *API) Register(router *gin.Engine) {
 	authed.POST("/groups/:id/leave", a.leaveGroup)
 	authed.GET("/groups/:id/messages", a.listGroupMessages)
 	authed.POST("/groups/:id/messages", a.sendGroupMessage)
-	authed.POST("/groups/:id/read", a.markGroupRead)
 	authed.GET("/groups/:id/read-stats", a.groupReadStats)
 	authed.GET("/ws", a.websocket)
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -28,30 +29,22 @@ const (
 )
 
 type serverOptions struct {
-	addr              string
-	webDir            string
-	backfillRead      bool
-	backfillGroupRead bool
-	backfillBatch     int
+	addr          string
+	webDir        string
+	backfillSeq   bool
+	backfillBatch int
 }
 
 func main() {
 	options := serverOptions{}
 	flag.StringVar(&options.addr, "addr", defaultAddr, "HTTP server address")
 	flag.StringVar(&options.webDir, "web-dir", "", "directory containing the frontend build")
-	flag.BoolVar(&options.backfillRead, "backfill-read", false, "backfill the direct read model and exit")
-	flag.BoolVar(&options.backfillGroupRead, "backfill-group-read", false, "backfill the group read model and exit")
+	flag.BoolVar(&options.backfillSeq, "backfill-seq", false, "number conversation history and write seq:ready, then exit")
 	flag.IntVar(&options.backfillBatch, "backfill-batch", 1000, "rows per backfill batch")
 	flag.Parse()
 
-	if options.backfillRead {
-		if err := runBackfill(options); err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
-	if options.backfillGroupRead {
-		if err := runGroupBackfill(options); err != nil {
+	if options.backfillSeq {
+		if err := runSeqBackfill(options); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -117,6 +110,7 @@ func run(options serverOptions) error {
 	var groupReader *messaging.GroupMessageReader
 	var groupProjector *messaging.GroupProjection
 	var groupReadTracker *messaging.GroupReadTracker
+	var seqWatcher *messaging.SeqWatcher
 	var workerContext context.Context
 	var cancelWorkers context.CancelFunc
 	var workers sync.WaitGroup
@@ -125,12 +119,28 @@ func run(options serverOptions) error {
 		if err != nil {
 			return fmt.Errorf("seed message ID: %w", err)
 		}
+		readyChecker := messaging.NewDirectReadTracker(
+			infraManager.Redis(),
+			messaging.DirectReadTrackerOptions{Keyspace: keyspace},
+		)
+		ready, err := readyChecker.ReadModelReady(startupCtx)
+		if err != nil {
+			return fmt.Errorf("check conversation sequence readiness: %w", err)
+		}
+		if !ready {
+			return fmt.Errorf(
+				"conversation sequence is not ready; stop the backend and run `imctl backfill-seq` first",
+			)
+		}
+
 		indexEpoch, err := messaging.EnsureIndexEpoch(
 			startupCtx, infraManager.Redis(), keyspace, seedFloor,
 		)
 		if err != nil {
 			return fmt.Errorf("prepare index epoch: %w", err)
 		}
+		gate := messaging.NewSeqGate()
+		gate.Close()
 		friendshipProjector = messaging.NewFriendshipProjectionWithKeyspace(infraManager.Redis(), keyspace)
 		pairs, err := dataStore.ListFriendshipPairs(startupCtx)
 		if err != nil {
@@ -141,12 +151,12 @@ func run(options serverOptions) error {
 		}
 		directAcceptor = messaging.NewRedisAcceptor(
 			infraManager.Redis(),
-			messaging.RedisAcceptorOptions{SeedFloor: seedFloor, Keyspace: keyspace},
+			messaging.RedisAcceptorOptions{SeedFloor: seedFloor, Keyspace: keyspace, Gate: gate},
 		)
 		directReader = messaging.NewRedisMessageReaderWithKeyspace(infraManager.Redis(), keyspace, indexEpoch)
 		directReadTracker = messaging.NewDirectReadTracker(
 			infraManager.Redis(),
-			messaging.DirectReadTrackerOptions{Keyspace: keyspace},
+			messaging.DirectReadTrackerOptions{Keyspace: keyspace, Gate: gate},
 		)
 		directReadPersister := messaging.NewDirectReadPersister(
 			infraManager.Redis(),
@@ -154,32 +164,12 @@ func run(options serverOptions) error {
 			namespace,
 			dataStore,
 		)
-		if directReadTracker != nil {
-			ready, err := directReadTracker.ReadModelReady(startupCtx)
-			if err != nil {
-				return fmt.Errorf("check direct read model: %w", err)
-			}
-			if !ready {
-				return fmt.Errorf(
-					"direct read model is not ready; run with -backfill-read first",
-				)
-			}
-		}
 
 		if infraConfig.GroupMessagingEnabled {
 			groupReadTracker = messaging.NewGroupReadTracker(
 				infraManager.Redis(),
-				messaging.GroupReadTrackerOptions{Keyspace: keyspace},
+				messaging.GroupReadTrackerOptions{Keyspace: keyspace, Gate: gate},
 			)
-			ready, err := groupReadTracker.ReadModelReady(startupCtx)
-			if err != nil {
-				return fmt.Errorf("check group read model: %w", err)
-			}
-			if !ready {
-				return fmt.Errorf(
-					"group read model is not ready; stop the backend and run `imctl backfill-group-read`",
-				)
-			}
 
 			groupProjector = messaging.NewGroupProjection(infraManager.Redis(), keyspace)
 			storedGroups, err := dataStore.ListGroupMembershipProjections(startupCtx)
@@ -209,15 +199,46 @@ func run(options serverOptions) error {
 			groupAcceptor = messaging.NewGroupRedisAcceptor(
 				infraManager.Redis(),
 				keyspace,
-				messaging.RedisAcceptorOptions{SeedFloor: seedFloor, Keyspace: keyspace},
+				messaging.RedisAcceptorOptions{SeedFloor: seedFloor, Keyspace: keyspace, Gate: gate},
 			)
-			groupReader = messaging.NewGroupMessageReader(infraManager.Redis(), keyspace, indexEpoch)
+			groupReader = messaging.NewGroupMessageReader(infraManager.Redis(), keyspace)
 		}
+
+		// Capture the run_id before calibration so a Redis restart during or
+		// just after startup calibration is still detected by the first check.
+		runIDBeforeCalibration, err := messaging.ReadRunID(
+			startupCtx, infraManager.Redis(),
+		)
+		if err != nil {
+			return fmt.Errorf("read redis run id: %w", err)
+		}
+		calibrator := messaging.NewSeqCalibrator(
+			infraManager.Redis(), keyspace, dataStore, options.backfillBatch,
+		)
+		calibrationCtx, cancelCalibration := context.WithTimeout(context.Background(), 5*time.Minute)
+		calibrated, err := calibrator.Calibrate(calibrationCtx)
+		cancelCalibration()
+		if err != nil {
+			return fmt.Errorf("calibrate conversation counters: %w", err)
+		}
+		gate.Open()
+		log.Printf("conversation counters calibrated conversations=%d", calibrated)
+		seqWatcher = messaging.NewSeqWatcher(infraManager.Redis(), messaging.SeqWatcherOptions{
+			Keyspace:     keyspace,
+			Gate:         gate,
+			Calibrator:   calibrator,
+			InitialRunID: runIDBeforeCalibration,
+		})
 
 		workerContext, cancelWorkers = context.WithCancel(context.Background())
 		defer func() {
 			cancelWorkers()
 			workers.Wait()
+		}()
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			seqWatcher.Run(workerContext)
 		}()
 
 		relay := messaging.NewStreamRelayWithNamespace(
@@ -288,11 +309,21 @@ func run(options serverOptions) error {
 		return err
 	}
 	if infraManager != nil {
-		registerInfraStatus(router, infraManager)
+		registerInfraStatus(router, infraManager, func() *messaging.SeqWatcherStatus {
+			if seqWatcher == nil {
+				return nil
+			}
+			status := seqWatcher.Status()
+			return &status
+		})
 	}
 	apiOptions := make([]httpapi.Option, 0, 8)
 	if directAcceptor != nil {
-		apiOptions = append(apiOptions, httpapi.WithDirectMessageAcceptor(directAcceptor))
+		var acceptor httpapi.DirectMessageAcceptor = directAcceptor
+		if seqWatcher != nil {
+			acceptor = notifyingDirectAcceptor{inner: acceptor, watcher: seqWatcher}
+		}
+		apiOptions = append(apiOptions, httpapi.WithDirectMessageAcceptor(acceptor))
 	}
 	if friendshipProjector != nil {
 		apiOptions = append(apiOptions, httpapi.WithFriendshipProjector(friendshipProjector))
@@ -304,7 +335,11 @@ func run(options serverOptions) error {
 		apiOptions = append(apiOptions, httpapi.WithDirectReadTracker(directReadTracker))
 	}
 	if groupAcceptor != nil {
-		apiOptions = append(apiOptions, httpapi.WithGroupMessageAcceptor(groupAcceptor))
+		var acceptor httpapi.GroupMessageAcceptor = groupAcceptor
+		if seqWatcher != nil {
+			acceptor = notifyingGroupAcceptor{inner: acceptor, watcher: seqWatcher}
+		}
+		apiOptions = append(apiOptions, httpapi.WithGroupMessageAcceptor(acceptor))
 	}
 	if groupReader != nil {
 		apiOptions = append(apiOptions, httpapi.WithGroupMessageReader(groupReader))
@@ -312,7 +347,7 @@ func run(options serverOptions) error {
 	if groupProjector != nil {
 		apiOptions = append(apiOptions,
 			httpapi.WithGroupProjector(groupProjector),
-			httpapi.WithGroupAcceptedWatermarkReader(groupProjector),
+			httpapi.WithGroupSequenceReader(groupProjector),
 		)
 	}
 	if groupReadTracker != nil {
@@ -352,10 +387,71 @@ type infraStatusProvider interface {
 	Snapshot() infra.Snapshot
 }
 
-func registerInfraStatus(router *gin.Engine, provider infraStatusProvider) {
+type infraStatusResponse struct {
+	infra.Snapshot
+	Seq *messaging.SeqWatcherStatus `json:"seq,omitempty"`
+}
+
+func registerInfraStatus(
+	router *gin.Engine,
+	provider infraStatusProvider,
+	seqStatus func() *messaging.SeqWatcherStatus,
+) {
 	router.GET("/ops/infra", func(c *gin.Context) {
-		c.JSON(http.StatusOK, provider.Snapshot())
+		response := infraStatusResponse{Snapshot: provider.Snapshot()}
+		if seqStatus != nil {
+			response.Seq = seqStatus()
+		}
+		c.JSON(http.StatusOK, response)
 	})
+}
+
+// notifySeqWatcher asks the watcher to recheck Redis after a failure that is
+// not a business rejection. ErrSeqNotReady is expected while the gate is
+// closed, so it must not feed the check loop.
+func notifySeqWatcher(watcher *messaging.SeqWatcher, err error) {
+	if watcher == nil || err == nil {
+		return
+	}
+	switch {
+	case errors.Is(err, messaging.ErrSeqNotReady),
+		errors.Is(err, messaging.ErrSeqOverflow),
+		errors.Is(err, store.ErrCannotMessageSelf),
+		errors.Is(err, store.ErrNotFriends),
+		errors.Is(err, store.ErrMessageConflict),
+		errors.Is(err, store.ErrMessageIDExhausted),
+		errors.Is(err, store.ErrGroupNotFound):
+		return
+	}
+	watcher.Notify()
+}
+
+type notifyingDirectAcceptor struct {
+	inner   httpapi.DirectMessageAcceptor
+	watcher *messaging.SeqWatcher
+}
+
+func (a notifyingDirectAcceptor) Accept(
+	ctx context.Context,
+	request messaging.DirectMessageRequest,
+) (messaging.DirectMessageResult, error) {
+	result, err := a.inner.Accept(ctx, request)
+	notifySeqWatcher(a.watcher, err)
+	return result, err
+}
+
+type notifyingGroupAcceptor struct {
+	inner   httpapi.GroupMessageAcceptor
+	watcher *messaging.SeqWatcher
+}
+
+func (a notifyingGroupAcceptor) Accept(
+	ctx context.Context,
+	request messaging.GroupMessageRequest,
+) (messaging.GroupMessageResult, error) {
+	result, err := a.inner.Accept(ctx, request)
+	notifySeqWatcher(a.watcher, err)
+	return result, err
 }
 
 func newRouter(webDir string, ready func(context.Context) error) (*gin.Engine, error) {

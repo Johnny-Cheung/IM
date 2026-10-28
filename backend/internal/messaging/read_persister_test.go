@@ -26,10 +26,10 @@ func (f *fakeReadPersistenceStore) UpsertConversationRead(
 ) error {
 	f.mu.Lock()
 	f.calls = append(f.calls, readStreamEvent{
-		UserID:            userID,
-		PeerID:            peerID,
-		LastReadMessageID: lastReadMessageID,
-		UpdatedAt:         updatedAt,
+		UserID:      userID,
+		PeerID:      peerID,
+		LastReadSeq: lastReadMessageID,
+		UpdatedAt:   updatedAt,
 	})
 	fail := f.failures > 0
 	if fail {
@@ -111,10 +111,10 @@ func TestDirectReadPersisterProcessesAndAcknowledges(t *testing.T) {
 	}
 
 	addReadEvent(t, client, map[string]interface{}{
-		"user_id":              "2",
-		"peer_id":              "1",
-		"last_read_message_id": "42",
-		"updated_at_ms":        "1700000000123",
+		"user_id":       "2",
+		"peer_id":       "1",
+		"last_read_seq": "42",
+		"updated_at_ms": "1700000000123",
 	})
 	if err := persister.processStreams(ctx, readNewEvents(t, client, persister)); err != nil {
 		t.Fatalf("process streams: %v", err)
@@ -124,7 +124,7 @@ func TestDirectReadPersisterProcessesAndAcknowledges(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("store calls = %d, want 1", len(calls))
 	}
-	if calls[0].UserID != 2 || calls[0].PeerID != 1 || calls[0].LastReadMessageID != 42 {
+	if calls[0].UserID != 2 || calls[0].PeerID != 1 || calls[0].LastReadSeq != 42 {
 		t.Fatalf("store call = %#v", calls[0])
 	}
 	if got := calls[0].UpdatedAt; !got.Equal(time.UnixMilli(1700000000123).UTC()) {
@@ -144,10 +144,10 @@ func TestDirectReadPersisterRetriesPendingEvent(t *testing.T) {
 	}
 
 	addReadEvent(t, client, map[string]interface{}{
-		"user_id":              "2",
-		"peer_id":              "1",
-		"last_read_message_id": "42",
-		"updated_at_ms":        "1700000000123",
+		"user_id":       "2",
+		"peer_id":       "1",
+		"last_read_seq": "42",
+		"updated_at_ms": "1700000000123",
 	})
 	if err := persister.processStreams(ctx, readNewEvents(t, client, persister)); err == nil {
 		t.Fatalf("first process error = nil, want failure")
@@ -201,10 +201,10 @@ func TestDirectReadPersisterDropsPermanentlyInvalidEvent(t *testing.T) {
 	}
 
 	addReadEvent(t, client, map[string]interface{}{
-		"user_id":              "2",
-		"peer_id":              "1",
-		"last_read_message_id": "42",
-		"updated_at_ms":        "1700000000123",
+		"user_id":       "2",
+		"peer_id":       "1",
+		"last_read_seq": "42",
+		"updated_at_ms": "1700000000123",
 	})
 	if err := persister.processStreams(ctx, readNewEvents(t, client, persister)); err != nil {
 		t.Fatalf("process permanent event: %v", err)
@@ -216,37 +216,37 @@ func TestDirectReadPersisterDropsPermanentlyInvalidEvent(t *testing.T) {
 
 func TestParseReadStreamEvent(t *testing.T) {
 	event, err := parseReadStreamEvent(map[string]interface{}{
-		"user_id":              int64(2),
-		"peer_id":              "1",
-		"last_read_message_id": "42",
-		"updated_at_ms":        "1700000000123",
+		"user_id":       int64(2),
+		"peer_id":       "1",
+		"last_read_seq": "42",
+		"updated_at_ms": "1700000000123",
 	})
 	if err != nil {
 		t.Fatalf("parse event: %v", err)
 	}
 	if event.UserID != 2 || event.PeerID != 1 ||
-		event.LastReadMessageID != 42 ||
+		event.LastReadSeq != 42 ||
 		!event.UpdatedAt.Equal(time.UnixMilli(1700000000123).UTC()) {
 		t.Fatalf("event = %#v", event)
 	}
 
 	for name, values := range map[string]map[string]interface{}{
 		"missing user": {
-			"peer_id":              "1",
-			"last_read_message_id": "42",
-			"updated_at_ms":        "1700000000123",
+			"peer_id":       "1",
+			"last_read_seq": "42",
+			"updated_at_ms": "1700000000123",
 		},
 		"self": {
-			"user_id":              "1",
-			"peer_id":              "1",
-			"last_read_message_id": "42",
-			"updated_at_ms":        "1700000000123",
+			"user_id":       "1",
+			"peer_id":       "1",
+			"last_read_seq": "42",
+			"updated_at_ms": "1700000000123",
 		},
 		"zero position": {
-			"user_id":              "2",
-			"peer_id":              "1",
-			"last_read_message_id": "0",
-			"updated_at_ms":        "1700000000123",
+			"user_id":       "2",
+			"peer_id":       "1",
+			"last_read_seq": "0",
+			"updated_at_ms": "1700000000123",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

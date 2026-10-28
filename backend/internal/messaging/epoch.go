@@ -9,9 +9,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// EnsureIndexEpoch returns the highest message ID that the Redis read indexes
-// are not guaranteed to contain. Only IDs above the returned value may be
-// served from Redis without consulting MySQL.
+// EnsureIndexEpoch returns the highest message ID that the private feed index
+// (dm:feed) is not guaranteed to contain. Only IDs above the returned value
+// may be served from the feed without consulting MySQL. Conversation and group
+// history are read by seq range and never use this value.
 //
 // The value is seeded from the durable maximum the first time an index is
 // built, and kept across restarts so already indexed history stays readable.

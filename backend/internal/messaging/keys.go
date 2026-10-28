@@ -38,8 +38,12 @@ func directFeedKey(userID uint64) string {
 	return defaultKeyspace.directFeedKey(userID)
 }
 
-func directConversationKey(ownerID, peerID uint64) string {
-	return defaultKeyspace.directConversationKey(ownerID, peerID)
+func directSequenceKey(userID, peerID uint64) string {
+	return defaultKeyspace.directSequenceKey(userID, peerID)
+}
+
+func directPairKey(userID, peerID uint64) string {
+	return defaultKeyspace.directPairKey(userID, peerID)
 }
 
 func directConversationLastKey(userID uint64) string {
@@ -54,8 +58,8 @@ func directReadStreamKey() string {
 	return defaultKeyspace.directReadStreamKey()
 }
 
-func directReadReadyKey() string {
-	return defaultKeyspace.directReadReadyKey()
+func sequenceReadyKey() string {
+	return defaultKeyspace.sequenceReadyKey()
 }
 
 func (k Keyspace) counterKey() string {
@@ -88,9 +92,25 @@ func (k Keyspace) directFeedKey(userID uint64) string {
 	return fmt.Sprintf("%sdm:feed:%d", k.prefixOrDefault(), userID)
 }
 
-// directConversationKey indexes the messages peer sent to owner.
-func (k Keyspace) directConversationKey(ownerID, peerID uint64) string {
-	return fmt.Sprintf("%sdm:conv:%d:%d", k.prefixOrDefault(), ownerID, peerID)
+// directPairKey indexes every message of one private conversation, in both
+// directions, scored by the conversation seq.
+func (k Keyspace) directPairKey(userID, peerID uint64) string {
+	low, high := sortedPair(userID, peerID)
+	return fmt.Sprintf("%sdm:pair:%d:%d", k.prefixOrDefault(), low, high)
+}
+
+// directSequenceKey is the private conversation's seq counter.
+func (k Keyspace) directSequenceKey(userID, peerID uint64) string {
+	low, high := sortedPair(userID, peerID)
+	return fmt.Sprintf("%sdm:seq:%d:%d", k.prefixOrDefault(), low, high)
+}
+
+// sortedPair normalises the two members of a private conversation.
+func sortedPair(userID, peerID uint64) (uint64, uint64) {
+	if userID < peerID {
+		return userID, peerID
+	}
+	return peerID, userID
 }
 
 // directConversationLastKey maps each peer to the newest message exchanged
@@ -99,7 +119,7 @@ func (k Keyspace) directConversationLastKey(userID uint64) string {
 	return fmt.Sprintf("%sdm:conv-last:%d", k.prefixOrDefault(), userID)
 }
 
-// directReadKey stores the last read message ID per peer for one user.
+// directReadKey stores the last read seq per peer for one user.
 func (k Keyspace) directReadKey(userID uint64) string {
 	return fmt.Sprintf("%sdm:read:%d", k.prefixOrDefault(), userID)
 }
@@ -110,14 +130,20 @@ func (k Keyspace) directReadStreamKey() string {
 	return k.prefixOrDefault() + "dm:read:stream"
 }
 
-// directReadReadyKey marks that historical messages and read positions have
-// been backfilled into Redis.
-func (k Keyspace) directReadReadyKey() string {
-	return k.prefixOrDefault() + "dm:read:ready"
+// sequenceReadyKey marks that history and counters are complete.
+func (k Keyspace) sequenceReadyKey() string {
+	return k.prefixOrDefault() + "seq:ready"
+}
+
+// sequenceConvertingKey marks that a seq backfill has started converting read
+// watermarks. Watermarks seen while it exists may already be in seq units.
+func (k Keyspace) sequenceConvertingKey() string {
+	return k.prefixOrDefault() + "seq:converting"
 }
 
 // indexEpochKey records the highest message ID that is not guaranteed to be
-// present in the read indexes. Only higher IDs may be served from Redis.
+// present in the private feed index. It is a global-ID score floor for
+// dm:feed only and must never be used for conversation seq ranges.
 func (k Keyspace) indexEpochKey() string {
 	return k.prefixOrDefault() + "index:epoch"
 }
@@ -138,12 +164,14 @@ func (k Keyspace) groupSyncRequiredKey(groupID uint64) string {
 	return fmt.Sprintf("%sgroup:%d:sync_required", k.prefixOrDefault(), groupID)
 }
 
+// groupInboxKey indexes every group message, scored by the group seq.
 func (k Keyspace) groupInboxKey(groupID uint64) string {
 	return fmt.Sprintf("%sgroup:%d:inbox", k.prefixOrDefault(), groupID)
 }
 
-func (k Keyspace) groupLastAcceptedKey(groupID uint64) string {
-	return fmt.Sprintf("%sgroup:%d:last_accepted_id", k.prefixOrDefault(), groupID)
+// groupSequenceKey is the group's seq counter.
+func (k Keyspace) groupSequenceKey(groupID uint64) string {
+	return fmt.Sprintf("%sgroup:%d:seq", k.prefixOrDefault(), groupID)
 }
 
 func (k Keyspace) groupDedupKey(groupID, senderID uint64, clientMessageID string) string {
@@ -164,8 +192,4 @@ func (k Keyspace) groupReadKey(groupID uint64) string {
 
 func (k Keyspace) groupReadStreamKey() string {
 	return k.prefixOrDefault() + "group-read:stream"
-}
-
-func (k Keyspace) groupReadReadyKey() string {
-	return k.prefixOrDefault() + "group-read:ready"
 }

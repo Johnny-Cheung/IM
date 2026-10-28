@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -118,6 +119,7 @@ func (r *StreamRelay) relayEntry(
 	if err != nil {
 		// Entries are produced by our own Lua script. A malformed entry cannot
 		// be retried successfully, so acknowledge and remove it after logging.
+		log.Printf("drop malformed direct stream entry %s: %v", entry.ID, err)
 		if ackErr := r.redis.XAck(ctx, r.keyspace.messageStreamKey(), directRelayGroup(r.namespace), entry.ID).Err(); ackErr != nil {
 			return fmt.Errorf("ack malformed stream entry %s: %w", entry.ID, ackErr)
 		}

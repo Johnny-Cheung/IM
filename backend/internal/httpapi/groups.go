@@ -41,6 +41,7 @@ type groupDetailResponse struct {
 
 type groupMessageResponse struct {
 	ID              uint64             `json:"id"`
+	Seq             uint64             `json:"seq"`
 	GroupID         uint64             `json:"group_id"`
 	Sender          publicUserResponse `json:"sender"`
 	Body            string             `json:"body"`
@@ -254,16 +255,16 @@ func (a *API) inviteGroupMembers(c *gin.Context) {
 	defer mutation.finish()
 
 	baselineFloor := uint64(0)
-	if a.groupWatermarkReader != nil {
+	if a.groupSequenceReader != nil {
 		// Read after BeginMutation: a send racing with the invite is already
 		// rejected, so it cannot slip below the new members' baseline.
-		accepted, err := a.groupWatermarkReader.LastAcceptedID(ctx, groupID)
+		lastSeq, err := a.groupSequenceReader.LastSeq(ctx, groupID)
 		if err != nil {
-			log.Printf("read group accepted watermark for invite: %v", err)
+			log.Printf("read group sequence for invite: %v", err)
 			a.writeGroupError(c, messaging.ErrMessageServiceUnavailable)
 			return
 		}
-		baselineFloor = accepted
+		baselineFloor = lastSeq
 	}
 
 	baseline, err := a.store.InviteGroupMembersWithBaseline(
@@ -491,13 +492,13 @@ func (a *API) listGroupMessages(c *gin.Context) {
 		return
 	}
 
-	beforeID, err := parseBeforeID(c.Query("before_id"))
+	beforeSeq, err := parseBeforeSeq(c.Query("before_seq"))
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
 		return
 	}
-	afterID, err := parseAfterID(c.Query("after_id"))
-	if err != nil || (beforeID > 0 && afterID > 0) {
+	afterSeq, err := parseAfterSeq(c.Query("after_seq"))
+	if err != nil || (beforeSeq > 0 && afterSeq > 0) {
 		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
 		return
 	}
@@ -517,13 +518,13 @@ func (a *API) listGroupMessages(c *gin.Context) {
 			log.Printf("check group membership: %v", memberErr)
 		} else if member {
 			var hot messaging.GroupConversationPage
-			if afterID > 0 {
+			if afterSeq > 0 {
 				hot, err = a.groupReader.ReadGroupAfter(
-					c.Request.Context(), current.ID, groupID, afterID, limit,
+					c.Request.Context(), current.ID, groupID, afterSeq, limit,
 				)
 			} else {
 				hot, err = a.groupReader.ReadGroup(
-					c.Request.Context(), current.ID, groupID, beforeID, limit,
+					c.Request.Context(), current.ID, groupID, beforeSeq, limit,
 				)
 			}
 			if err != nil {
@@ -540,12 +541,12 @@ func (a *API) listGroupMessages(c *gin.Context) {
 	}
 
 	if !servedFromRedis {
-		if afterID > 0 {
+		if afterSeq > 0 {
 			page, err = a.store.ListGroupMessagesAfter(
 				c.Request.Context(),
 				current.ID,
 				groupID,
-				afterID,
+				afterSeq,
 				limit,
 			)
 		} else {
@@ -553,7 +554,7 @@ func (a *API) listGroupMessages(c *gin.Context) {
 				c.Request.Context(),
 				current.ID,
 				groupID,
-				beforeID,
+				beforeSeq,
 				limit,
 			)
 		}
@@ -562,7 +563,7 @@ func (a *API) listGroupMessages(c *gin.Context) {
 			return
 		}
 		if hotAvailable {
-			page = mergeGroupMessagePages(page, hotPage, beforeID > 0 || afterID == 0, limit)
+			page = mergeGroupMessagePages(page, hotPage, beforeSeq > 0 || afterSeq == 0, limit)
 		}
 	}
 
@@ -632,62 +633,10 @@ func (a *API) sendGroupMessage(c *gin.Context) {
 			log.Printf("list group message recipients: %v", err)
 		} else {
 			a.PublishGroupMessage(memberIDs, response)
-			a.scheduleGroupImplicitRead(groupID, current.ID, message.ID, memberIDs)
+			a.scheduleGroupImplicitRead(groupID, current.ID, message.Seq, memberIDs)
 		}
 	}
 	c.JSON(status, sendGroupMessageResponse{Message: response})
-}
-
-func (a *API) markGroupRead(c *gin.Context) {
-	current, ok := currentUser(c)
-	if !ok {
-		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
-		return
-	}
-	groupID, ok := parseGroupID(c)
-	if !ok {
-		return
-	}
-
-	throughID, ok := parseReadThroughID(c)
-	if !ok {
-		return
-	}
-	if a.groupReads != nil {
-		if !a.ensureGroupReadModelReady(c) {
-			return
-		}
-		result, err := a.groupReads.AdvanceRead(
-			c.Request.Context(),
-			groupID,
-			current.ID,
-			throughID,
-			time.Now().UTC(),
-		)
-		if err != nil {
-			a.writeGroupError(c, err)
-			return
-		}
-		if result.Advanced {
-			logGroupReadStreamError(result, groupID)
-			a.publishGroupReadFromRedis(c.Request.Context(), groupID, map[uint64]struct{}{
-				current.ID: {},
-			})
-		}
-		c.JSON(http.StatusOK, readStateResponse{
-			LastReadMessageID: result.LastReadMessageID,
-		})
-		return
-	}
-
-	lastReadMessageID, _, err := a.markGroupReadThrough(
-		c.Request.Context(), current.ID, groupID, throughID,
-	)
-	if err != nil {
-		a.writeGroupError(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, readStateResponse{LastReadMessageID: lastReadMessageID})
 }
 
 // publishGroupReadFromRedis broadcasts a group read signal from the Redis
@@ -727,6 +676,7 @@ func (a *API) ensureGroupReadModelReady(c *gin.Context) bool {
 }
 
 type groupReadStatsResponse struct {
+	Seq         uint64 `json:"seq"`
 	MessageID   uint64 `json:"message_id"`
 	ReadCount   int    `json:"read_count"`
 	MemberCount int    `json:"member_count"`
@@ -743,7 +693,7 @@ func (a *API) groupReadStats(c *gin.Context) {
 	if !ok {
 		return
 	}
-	messageID, err := parseReadStatsMessageID(c.Query("message_id"))
+	seq, err := parseReadStatsSeq(c.Query("seq"))
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "invalid_request", "已读消息参数不正确")
 		return
@@ -755,24 +705,26 @@ func (a *API) groupReadStats(c *gin.Context) {
 	ctx := c.Request.Context()
 	// Check membership before the message lookup: a non-member must get the
 	// same answer whether or not the message exists.
-	stats, err := a.groupReads.ReadStats(ctx, groupID, current.ID, messageID)
+	stats, err := a.groupReads.ReadStats(ctx, groupID, current.ID, seq)
 	if err != nil {
 		a.writeGroupError(c, err)
 		return
 	}
 
-	senderID, found, err := a.groupReads.MessageSender(ctx, groupID, messageID)
+	messageID := uint64(0)
+	ref, found, err := a.groupReads.MessageBySeq(ctx, groupID, seq)
 	if err != nil {
-		log.Printf("load group message sender group=%d message=%d: %v",
-			groupID, messageID, err)
+		log.Printf("load group message by seq group=%d seq=%d: %v", groupID, seq, err)
 		writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂时不可用")
 		return
 	}
-	if !found {
-		senderID, found, err = a.store.GroupMessageSender(ctx, groupID, messageID)
+	if found {
+		messageID = ref.ID
+	} else {
+		ref.SenderID, found, err = a.store.GroupMessageSender(ctx, groupID, seq)
 		if err != nil {
-			log.Printf("load persisted group message sender group=%d message=%d: %v",
-				groupID, messageID, err)
+			log.Printf("load persisted group message sender group=%d seq=%d: %v",
+				groupID, seq, err)
 			writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
 			return
 		}
@@ -780,13 +732,22 @@ func (a *API) groupReadStats(c *gin.Context) {
 			writeError(c, http.StatusNotFound, "message_not_found", "消息不存在")
 			return
 		}
+		resolved, resolveErr := a.persistedGroupMessageID(ctx, current.ID, groupID, seq)
+		if resolveErr != nil {
+			log.Printf("resolve persisted group message group=%d seq=%d: %v",
+				groupID, seq, resolveErr)
+			writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
+			return
+		}
+		messageID = resolved
 	}
-	if senderID != current.ID {
+	if ref.SenderID != current.ID {
 		writeError(c, http.StatusForbidden, "not_your_message", "只能查看自己消息的已读情况")
 		return
 	}
 
 	c.JSON(http.StatusOK, groupReadStatsResponse{
+		Seq:         seq,
 		MessageID:   messageID,
 		ReadCount:   stats.ReadCount,
 		MemberCount: stats.MemberCount,
@@ -794,13 +755,29 @@ func (a *API) groupReadStats(c *gin.Context) {
 	})
 }
 
-func parseReadStatsMessageID(raw string) (uint64, error) {
+// persistedGroupMessageID resolves the global message ID of a seq that is not
+// in the hot window, so the client can validate the read-stats response.
+func (a *API) persistedGroupMessageID(
+	ctx context.Context,
+	userID, groupID, seq uint64,
+) (uint64, error) {
+	page, err := a.store.ListGroupMessagesAfter(ctx, userID, groupID, seq-1, 1)
+	if err != nil {
+		return 0, err
+	}
+	if len(page.Messages) != 1 || page.Messages[0].Seq != seq {
+		return 0, nil
+	}
+	return page.Messages[0].ID, nil
+}
+
+func parseReadStatsSeq(raw string) (uint64, error) {
 	if raw == "" {
-		return 0, errors.New("missing message id")
+		return 0, errors.New("missing seq")
 	}
 	value, err := strconv.ParseUint(raw, 10, 64)
 	if err != nil || value == 0 {
-		return 0, errors.New("invalid message id")
+		return 0, errors.New("invalid seq")
 	}
 	return value, nil
 }
@@ -812,30 +789,7 @@ func logGroupReadStreamError(advance messaging.GroupReadAdvance, groupID uint64)
 		return
 	}
 	log.Printf("group read stream append failed group=%d user=%d position=%d; MySQL persistence is delayed",
-		groupID, advance.UserID, advance.LastReadMessageID)
-}
-
-func (a *API) markGroupReadThrough(
-	ctx context.Context,
-	userID, groupID, throughID uint64,
-) (uint64, bool, error) {
-	target := throughID
-	if a.groupWatermarkReader != nil {
-		accepted, err := a.groupWatermarkReader.LastAcceptedID(ctx, groupID)
-		if err != nil {
-			log.Printf("read group accepted watermark: %v", err)
-		} else if accepted > 0 {
-			if target == 0 || target > accepted {
-				target = accepted
-			}
-			if advancer, ok := a.store.(interface {
-				AdvanceGroupReadThrough(context.Context, uint64, uint64, uint64) (uint64, bool, error)
-			}); ok {
-				return advancer.AdvanceGroupReadThrough(ctx, userID, groupID, target)
-			}
-		}
-	}
-	return a.store.MarkGroupRead(ctx, userID, groupID, target)
+		groupID, advance.UserID, advance.LastReadSeq)
 }
 
 func (a *API) resolveGroupMemberIDs(
@@ -931,14 +885,22 @@ func mergeGroupMessagePages(
 	limit int,
 ) store.GroupMessagePage {
 	byID := make(map[uint64]store.GroupMessage)
-	for _, message := range append(append([]store.GroupMessage{}, base.Messages...), hot.Messages...) {
+	for _, message := range base.Messages {
+		byID[message.ID] = message
+	}
+	for _, message := range hot.Messages {
 		byID[message.ID] = message
 	}
 	messages := make([]store.GroupMessage, 0, len(byID))
 	for _, message := range byID {
 		messages = append(messages, message)
 	}
-	sort.Slice(messages, func(i, j int) bool { return messages[i].ID < messages[j].ID })
+	sort.Slice(messages, func(i, j int) bool {
+		if messages[i].Seq != messages[j].Seq {
+			return messages[i].Seq < messages[j].Seq
+		}
+		return messages[i].ID < messages[j].ID
+	})
 	hasMore := base.HasMore || hot.HasMore || len(messages) > limit
 	if len(messages) > limit {
 		if keepNewest {
@@ -985,6 +947,7 @@ func toGroupDetailResponse(detail store.GroupDetail) groupDetailResponse {
 func toGroupMessageResponse(message store.GroupMessage) groupMessageResponse {
 	return groupMessageResponse{
 		ID:      message.ID,
+		Seq:     message.Seq,
 		GroupID: message.GroupID,
 		Sender: publicUserResponse{
 			Username: message.Sender.Username,

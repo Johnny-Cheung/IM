@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/config"
@@ -98,10 +99,18 @@ func (c *GroupMessageConsumer) runConnection(ctx context.Context) error {
 func (c *GroupMessageConsumer) handleDelivery(ctx context.Context, delivery amqp091.Delivery) error {
 	message, err := decodeGroupMessage(delivery.Body)
 	if err != nil {
+		log.Printf("drop malformed group message delivery: %v", err)
 		return delivery.Ack(false)
 	}
 	if _, err := c.persister.PersistGroupMessage(ctx, message); err != nil {
 		if errors.Is(err, store.ErrMessageConflict) {
+			return delivery.Ack(false)
+		}
+		if errors.Is(err, store.ErrSeqConflict) || errors.Is(err, store.ErrSeqInvalid) {
+			log.Printf(
+				"drop group message id=%d group=%d sender=%d seq=%d: %v",
+				message.ID, message.GroupID, message.SenderID, message.Seq, err,
+			)
 			return delivery.Ack(false)
 		}
 		if nackErr := delivery.Nack(false, true); nackErr != nil {

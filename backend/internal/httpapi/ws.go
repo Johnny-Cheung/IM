@@ -51,10 +51,10 @@ type wsEvent struct {
 }
 
 type wsReadEvent struct {
-	Type              string `json:"type"`
-	Reader            string `json:"reader"`
-	Peer              string `json:"peer"`
-	LastReadMessageID uint64 `json:"last_read_message_id"`
+	Type        string `json:"type"`
+	Reader      string `json:"reader"`
+	Peer        string `json:"peer"`
+	LastReadSeq uint64 `json:"last_read_seq"`
 }
 
 type wsGroupMessageEvent struct {
@@ -69,12 +69,12 @@ type wsGroupChangedEvent struct {
 }
 
 type wsFocusAckEvent struct {
-	Type              string `json:"type"`
-	Kind              string `json:"kind,omitempty"`
-	Username          string `json:"username,omitempty"`
-	GroupID           uint64 `json:"group_id,omitempty"`
-	LastReadMessageID uint64 `json:"last_read_message_id"`
-	Error             string `json:"error,omitempty"`
+	Type        string `json:"type"`
+	Kind        string `json:"kind,omitempty"`
+	Username    string `json:"username,omitempty"`
+	GroupID     uint64 `json:"group_id,omitempty"`
+	LastReadSeq uint64 `json:"last_read_seq"`
+	Error       string `json:"error,omitempty"`
 }
 
 type wsGroupReadEvent struct {
@@ -452,13 +452,13 @@ func (a *API) handleDirectFocus(client *wsClient, rawUsername string) {
 			target.ID,
 			client.username,
 			target.Username,
-			result.LastReadMessageID,
+			result.LastReadSeq,
 		)
 	}
 	a.sendFocusAck(client, wsFocusAckEvent{
-		Kind:              wsFocusKindDirect,
-		Username:          target.Username,
-		LastReadMessageID: result.LastReadMessageID,
+		Kind:        wsFocusKindDirect,
+		Username:    target.Username,
+		LastReadSeq: result.LastReadSeq,
 	})
 }
 
@@ -477,8 +477,17 @@ func (a *API) handleGroupFocus(client *wsClient, groupID uint64) {
 		ctx, groupID, client.userID, 0, time.Now().UTC(),
 	)
 	if err != nil {
-		// One answer for not-a-member, dissolved and nonexistent groups: the
-		// distinction would let anyone probe group IDs.
+		// Backend unavailability must stay distinguishable from a refused
+		// membership; everything else gets one answer so group IDs cannot be
+		// probed.
+		if errors.Is(err, messaging.ErrMessageServiceUnavailable) {
+			log.Printf("websocket focus group=%d user=%d: %v",
+				groupID, client.userID, err)
+			a.sendFocusError(
+				client, wsFocusKindGroup, "", groupID, "message_service_unavailable",
+			)
+			return
+		}
 		if !errors.Is(err, messaging.ErrGroupNotMember) &&
 			!errors.Is(err, messaging.ErrGroupDissolved) {
 			log.Printf("websocket focus group=%d user=%d: %v",
@@ -496,9 +505,9 @@ func (a *API) handleGroupFocus(client *wsClient, groupID uint64) {
 		})
 	}
 	a.sendFocusAck(client, wsFocusAckEvent{
-		Kind:              wsFocusKindGroup,
-		GroupID:           groupID,
-		LastReadMessageID: result.LastReadMessageID,
+		Kind:        wsFocusKindGroup,
+		GroupID:     groupID,
+		LastReadSeq: result.LastReadSeq,
 	})
 }
 
@@ -625,13 +634,13 @@ func (a *API) PublishGroupChanged(memberIDs []uint64, groupID uint64, action str
 func (a *API) PublishRead(
 	readerID, peerID uint64,
 	reader, peer string,
-	lastReadMessageID uint64,
+	lastReadSeq uint64,
 ) {
 	payload, err := json.Marshal(wsReadEvent{
-		Type:              "messages.read",
-		Reader:            reader,
-		Peer:              peer,
-		LastReadMessageID: lastReadMessageID,
+		Type:        "messages.read",
+		Reader:      reader,
+		Peer:        peer,
+		LastReadSeq: lastReadSeq,
 	})
 	if err != nil {
 		log.Printf("marshal websocket read event: %v", err)

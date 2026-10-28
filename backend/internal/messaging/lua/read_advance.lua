@@ -1,10 +1,10 @@
--- Advance one user's read position for a peer.
+-- Advance one user's read watermark for a peer.
 --
--- KEYS[1] = dm:conv:{user}:{peer} (messages peer sent to user)
--- KEYS[2] = dm:read:{user} (HASH peer -> last read message ID)
+-- KEYS[1] = dm:seq:{low}:{high} (conversation seq counter)
+-- KEYS[2] = dm:read:{user} (HASH peer -> last read seq)
 -- KEYS[3] = dm:read:stream
 -- ARGV[1] = peer user ID
--- ARGV[2] = through message ID (0 means newest accepted incoming message)
+-- ARGV[2] = through seq (0 means the conversation counter)
 -- ARGV[3] = updated at (unix milliseconds)
 -- ARGV[4] = stream max length
 -- ARGV[5] = user ID, stored on the stream event
@@ -12,26 +12,21 @@
 -- Returns {final position, candidate position, advanced, stream error?}.
 
 local peer_id = ARGV[1]
-local through_id = tonumber(ARGV[2])
+local through_seq = tonumber(ARGV[2])
 local updated_at_ms = ARGV[3]
 local stream_max_len = tonumber(ARGV[4])
 local user_id = ARGV[5]
 
-local candidate = 0
-if through_id > 0 then
-  local values = redis.call('ZREVRANGEBYSCORE', KEYS[1], through_id, '-inf', 'LIMIT', 0, 1)
-  if #values > 0 then
-    candidate = tonumber(values[1])
-  end
-else
-  local values = redis.call('ZREVRANGE', KEYS[1], 0, 0)
-  if #values > 0 then
-    candidate = tonumber(values[1])
-  end
+local last_seq = tonumber(redis.call('GET', KEYS[1]) or '0')
+local old = tonumber(redis.call('HGET', KEYS[2], peer_id) or '0')
+if last_seq <= 0 then
+  return {tostring(old), '0', '0'}
 end
 
-local old_raw = redis.call('HGET', KEYS[2], peer_id)
-local old = tonumber(old_raw or '0')
+local candidate = last_seq
+if through_seq > 0 and through_seq < last_seq then
+  candidate = through_seq
+end
 
 if candidate <= old then
   return {tostring(old), tostring(candidate), '0'}
@@ -45,7 +40,7 @@ local appended = redis.pcall(
   'XADD', KEYS[3], 'MAXLEN', '~', stream_max_len, '*',
   'user_id', user_id,
   'peer_id', peer_id,
-  'last_read_message_id', tostring(candidate),
+  'last_read_seq', tostring(candidate),
   'updated_at_ms', updated_at_ms
 )
 if type(appended) == 'table' and appended.err then

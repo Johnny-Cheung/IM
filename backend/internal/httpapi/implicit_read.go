@@ -36,7 +36,7 @@ type implicitReadBatch struct {
 	senderUsername    string
 	recipientUsername string
 	groupID           uint64
-	throughID         uint64
+	throughSeq        uint64
 	memberIDs         []uint64
 	queuedAt          time.Time
 	attempts          int
@@ -218,15 +218,15 @@ func (r *implicitRead) requeue(batches []*implicitReadBatch) {
 	for _, batch := range batches {
 		batch.attempts++
 		if batch.attempts > implicitReadMaxRetries {
-			log.Printf("implicit read dropped after %d attempts: direct=%t group=%d through=%d",
-				batch.attempts, batch.direct, batch.groupID, batch.throughID)
+			log.Printf("implicit read dropped after %d attempts: direct=%t group=%d seq=%d",
+				batch.attempts, batch.direct, batch.groupID, batch.throughSeq)
 			continue
 		}
 		batch.queuedAt = time.Now()
 		existing, ok := r.pending[batch.key]
 		if ok {
-			if batch.throughID > existing.throughID {
-				existing.throughID = batch.throughID
+			if batch.throughSeq > existing.throughSeq {
+				existing.throughSeq = batch.throughSeq
 			}
 			if batch.senderUsername != "" {
 				existing.senderUsername = batch.senderUsername
@@ -241,8 +241,8 @@ func (r *implicitRead) requeue(batches []*implicitReadBatch) {
 			continue
 		}
 		if len(r.pending) >= implicitReadMaxPending {
-			log.Printf("implicit read queue full, dropping: direct=%t group=%d through=%d",
-				batch.direct, batch.groupID, batch.throughID)
+			log.Printf("implicit read queue full, dropping: direct=%t group=%d seq=%d",
+				batch.direct, batch.groupID, batch.throughSeq)
 			continue
 		}
 		r.pending[batch.key] = batch
@@ -260,8 +260,8 @@ func (r *implicitRead) enqueue(batch implicitReadBatch) {
 	}
 	existing, ok := r.pending[batch.key]
 	if ok {
-		if batch.throughID > existing.throughID {
-			existing.throughID = batch.throughID
+		if batch.throughSeq > existing.throughSeq {
+			existing.throughSeq = batch.throughSeq
 		}
 		if batch.senderUsername != "" {
 			existing.senderUsername = batch.senderUsername
@@ -275,8 +275,8 @@ func (r *implicitRead) enqueue(batch implicitReadBatch) {
 	}
 	if len(r.pending) >= implicitReadMaxPending {
 		r.mu.Unlock()
-		log.Printf("implicit read queue full, dropping: direct=%t group=%d through=%d",
-			batch.direct, batch.groupID, batch.throughID)
+		log.Printf("implicit read queue full, dropping: direct=%t group=%d seq=%d",
+			batch.direct, batch.groupID, batch.throughSeq)
 		return
 	}
 	batch.queuedAt = time.Now()
@@ -293,9 +293,9 @@ func (r *implicitRead) enqueue(batch implicitReadBatch) {
 func (a *API) scheduleDirectImplicitRead(
 	senderID, recipientID uint64,
 	senderUsername, recipientUsername string,
-	messageID uint64,
+	seq uint64,
 ) {
-	if a.directReads == nil || messageID == 0 {
+	if a.directReads == nil || seq == 0 {
 		return
 	}
 	a.implicitReads.enqueue(implicitReadBatch{
@@ -305,26 +305,26 @@ func (a *API) scheduleDirectImplicitRead(
 		recipientID:       recipientID,
 		senderUsername:    senderUsername,
 		recipientUsername: recipientUsername,
-		throughID:         messageID,
+		throughSeq:        seq,
 	})
 }
 
 func (a *API) scheduleGroupImplicitRead(
 	groupID, senderID uint64,
-	messageID uint64,
+	seq uint64,
 	memberIDs []uint64,
 ) {
-	if a.groupReads == nil || messageID == 0 {
+	if a.groupReads == nil || seq == 0 {
 		return
 	}
 	a.implicitReads.enqueue(implicitReadBatch{
 		// Keyed by sender: merging two senders would advance the first one to
 		// the other's message and drop the second sender's own-message bump.
-		key:       implicitReadKey{first: groupID, second: senderID},
-		senderID:  senderID,
-		groupID:   groupID,
-		throughID: messageID,
-		memberIDs: memberIDs,
+		key:        implicitReadKey{first: groupID, second: senderID},
+		senderID:   senderID,
+		groupID:    groupID,
+		throughSeq: seq,
+		memberIDs:  memberIDs,
 	})
 }
 
@@ -338,7 +338,7 @@ func (a *API) flushDirectImplicitRead(ctx context.Context, batch *implicitReadBa
 	advanced := make([]advancedRead, 0, 2)
 	if a.hub.isDirectFocus(batch.recipientID, batch.senderID) {
 		result, err := a.directReads.AdvanceRead(
-			ctx, batch.recipientID, batch.senderID, batch.throughID, now,
+			ctx, batch.recipientID, batch.senderID, batch.throughSeq, now,
 		)
 		if err != nil {
 			log.Printf("implicit direct read recipient=%d peer=%d: %v",
@@ -347,13 +347,13 @@ func (a *API) flushDirectImplicitRead(ctx context.Context, batch *implicitReadBa
 			advanced = append(advanced, advancedRead{
 				readerID: batch.recipientID,
 				peerID:   batch.senderID,
-				position: result.LastReadMessageID,
+				position: result.LastReadSeq,
 			})
 		}
 	}
 
 	result, err := a.directReads.AdvanceRead(
-		ctx, batch.senderID, batch.recipientID, batch.throughID, now,
+		ctx, batch.senderID, batch.recipientID, batch.throughSeq, now,
 	)
 	if err != nil {
 		log.Printf("implicit direct read sender=%d peer=%d: %v",
@@ -362,7 +362,7 @@ func (a *API) flushDirectImplicitRead(ctx context.Context, batch *implicitReadBa
 		advanced = append(advanced, advancedRead{
 			readerID: batch.senderID,
 			peerID:   batch.recipientID,
-			position: result.LastReadMessageID,
+			position: result.LastReadSeq,
 		})
 	}
 
@@ -385,7 +385,7 @@ func (a *API) flushGroupImplicitRead(ctx context.Context, batch *implicitReadBat
 	viewers := a.hub.focusedGroupUsers(batch.groupID)
 	if len(viewers) > 0 {
 		advances, err := a.groupReads.AdvanceReadMany(
-			ctx, batch.groupID, viewers, batch.throughID, now,
+			ctx, batch.groupID, viewers, batch.throughSeq, now,
 		)
 		if err != nil {
 			if !groupGoneError(err) {
@@ -404,7 +404,7 @@ func (a *API) flushGroupImplicitRead(ctx context.Context, batch *implicitReadBat
 
 	if batch.senderID != 0 {
 		advance, err := a.groupReads.AdvanceRead(
-			ctx, batch.groupID, batch.senderID, batch.throughID, now,
+			ctx, batch.groupID, batch.senderID, batch.throughSeq, now,
 		)
 		if err != nil {
 			if !groupGoneError(err) {

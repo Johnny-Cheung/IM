@@ -53,11 +53,11 @@ function groupCursors(sync: SyncState | null): BootstrapGroupCursor[] {
     return [];
   }
   return Object.entries(sync.groups)
-    .map(([groupID, afterID]) => ({
+    .map(([groupID, afterSeq]) => ({
       group_id: Number(groupID),
-      after_id: afterID,
+      after_seq: afterSeq,
     }))
-    .filter((cursor) => cursor.group_id > 0 && cursor.after_id > 0)
+    .filter((cursor) => cursor.group_id > 0 && cursor.after_seq > 0)
     .slice(0, 200);
 }
 

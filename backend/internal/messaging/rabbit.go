@@ -29,6 +29,7 @@ func directRelayGroup(namespace Namespace) string {
 
 type directMessageEnvelope struct {
 	ServerMessageID uint64 `json:"server_message_id"`
+	Seq             uint64 `json:"seq"`
 	SenderID        uint64 `json:"sender_id"`
 	RecipientID     uint64 `json:"recipient_id"`
 	ClientMessageID string `json:"client_message_id"`
@@ -39,6 +40,7 @@ type directMessageEnvelope struct {
 func encodeDirectMessage(message store.Message) ([]byte, error) {
 	return json.Marshal(directMessageEnvelope{
 		ServerMessageID: message.ID,
+		Seq:             message.Seq,
 		SenderID:        message.SenderID,
 		RecipientID:     message.RecipientID,
 		ClientMessageID: message.ClientMessageID,
@@ -53,6 +55,7 @@ func decodeDirectMessage(payload []byte) (store.Message, error) {
 		return store.Message{}, fmt.Errorf("decode direct message payload: %w", err)
 	}
 	if envelope.ServerMessageID == 0 ||
+		envelope.Seq == 0 ||
 		envelope.SenderID == 0 ||
 		envelope.RecipientID == 0 ||
 		envelope.ClientMessageID == "" {
@@ -64,6 +67,7 @@ func decodeDirectMessage(payload []byte) (store.Message, error) {
 	}
 	return store.Message{
 		ID:              envelope.ServerMessageID,
+		Seq:             envelope.Seq,
 		SenderID:        envelope.SenderID,
 		RecipientID:     envelope.RecipientID,
 		ClientMessageID: envelope.ClientMessageID,
@@ -74,6 +78,10 @@ func decodeDirectMessage(payload []byte) (store.Message, error) {
 
 func streamMessage(values map[string]interface{}) (store.Message, error) {
 	messageID, err := streamUint(values, "id")
+	if err != nil {
+		return store.Message{}, err
+	}
+	seq, err := streamUint(values, "seq")
 	if err != nil {
 		return store.Message{}, err
 	}
@@ -99,6 +107,7 @@ func streamMessage(values map[string]interface{}) (store.Message, error) {
 	}
 	return store.Message{
 		ID:              messageID,
+		Seq:             seq,
 		SenderID:        senderID,
 		RecipientID:     recipientID,
 		ClientMessageID: clientMessageID,

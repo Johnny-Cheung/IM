@@ -9,7 +9,7 @@ import type {
 import {
   mergeMessages,
   planGroupSync,
-  sortMessagesByID,
+  sortMessagesBySeq,
   trimMessageIDs,
 } from "./merge";
 
@@ -18,10 +18,12 @@ const bob: PublicUser = { username: "bob", nickname: "Bob" };
 
 function directMessage(
   id: number,
+  seq: number = id,
   overrides: Partial<ChatMessage> = {},
 ): ChatMessage {
   return {
     id,
+    seq,
     sender: alice,
     recipient: bob,
     body: `direct-${id}`,
@@ -33,7 +35,7 @@ function directMessage(
 
 function groupConversation(
   id: number,
-  lastMessageID: number | null,
+  lastSeq: number | null,
 ): GroupConversation {
   return {
     type: "group",
@@ -46,23 +48,25 @@ function groupConversation(
     },
     is_owner: false,
     last_message:
-      lastMessageID === null
+      lastSeq === null
         ? null
         : {
-            id: lastMessageID,
+            id: lastSeq * 10,
+            seq: lastSeq,
             group_id: id,
             sender: alice,
-            body: `group-${lastMessageID}`,
-            client_message_id: `group-client-${lastMessageID}`,
+            body: `group-${lastSeq}`,
+            client_message_id: `group-client-${lastSeq}`,
             created_at: "2026-10-26T00:00:00Z",
           },
+    last_seq: lastSeq ?? 0,
     unread_count: 0,
   };
 }
 
 function directConversation(
   username: string,
-  lastMessageID: number | null,
+  lastSeq: number | null,
 ): DirectConversation {
   const peer: PublicUser = { username, nickname: username };
   return {
@@ -70,135 +74,171 @@ function directConversation(
     user: peer,
     is_friend: true,
     last_message:
-      lastMessageID === null
+      lastSeq === null
         ? null
         : {
-            id: lastMessageID,
+            id: lastSeq * 10,
+            seq: lastSeq,
             sender: alice,
             recipient: peer,
-            body: `direct-${lastMessageID}`,
-            client_message_id: `direct-client-${lastMessageID}`,
+            body: `direct-${lastSeq}`,
+            client_message_id: `direct-client-${lastSeq}`,
             created_at: "2026-10-26T00:00:00Z",
           },
+    last_seq: lastSeq ?? 0,
     unread_count: 0,
-    peer_last_read_message_id: 0,
+    peer_last_read_seq: 0,
   };
 }
 
 describe("mergeMessages", () => {
-  it("deduplicates by id and keeps the incoming version", () => {
+  it("deduplicates by seq and keeps the incoming version", () => {
     const existing = [
       directMessage(1),
-      directMessage(2, { body: "old" }),
+      directMessage(2, 2, { body: "old" }),
     ];
     const incoming = [
-      directMessage(2, { body: "new", client_message_id: "different" }),
+      directMessage(2, 2, { body: "new", client_message_id: "different" }),
     ];
 
-    const merged = mergeMessages(existing, incoming);
+    const { messages, conflictSeq } = mergeMessages(existing, incoming);
 
-    expect(merged.map((message) => message.id)).toEqual([1, 2]);
-    expect(merged[1].body).toBe("new");
+    expect(messages.map((message) => message.seq)).toEqual([1, 2]);
+    expect(messages[1].body).toBe("new");
+    expect(conflictSeq).toBeNull();
   });
 
   it("keeps two confirmed messages even when client ids collide", () => {
     const existing = [
-      directMessage(1, { client_message_id: "shared-client" }),
+      directMessage(1, 1, { client_message_id: "shared-client" }),
     ];
     const incoming = [
-      directMessage(2, { client_message_id: "shared-client", body: "new" }),
+      directMessage(2, 2, { client_message_id: "shared-client", body: "new" }),
     ];
 
-    const merged = mergeMessages(existing, incoming);
+    const { messages } = mergeMessages(existing, incoming);
 
     // Client message ids are only unique per sender, so two server-confirmed
     // messages must never collapse into one.
-    expect(merged.map((message) => message.id)).toEqual([1, 2]);
+    expect(messages.map((message) => message.seq)).toEqual([1, 2]);
   });
 
   it("does not let an unconfirmed copy replace a confirmed message", () => {
     const existing = [
-      directMessage(1, { client_message_id: "shared-client", body: "confirmed" }),
+      directMessage(1, 1, { client_message_id: "shared-client", body: "confirmed" }),
     ];
     const incoming = [
-      directMessage(0, { client_message_id: "shared-client", body: "optimistic" }),
+      directMessage(0, 0, { client_message_id: "shared-client", body: "optimistic" }),
     ];
 
-    const merged = mergeMessages(existing, incoming);
+    const { messages } = mergeMessages(existing, incoming);
 
-    expect(merged).toHaveLength(1);
-    expect(merged[0]).toMatchObject({ id: 1, body: "confirmed" });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ id: 1, body: "confirmed" });
+  });
+
+  it("replaces a pending copy with its confirmed message", () => {
+    const pending = directMessage(0, 0, {
+      client_message_id: "pending",
+      body: "pending",
+    });
+    const confirmed = directMessage(9, 4, {
+      client_message_id: "pending",
+      body: "confirmed",
+    });
+
+    const { messages } = mergeMessages([pending], [confirmed]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ id: 9, seq: 4, body: "confirmed" });
   });
 
   it("collapses exact duplicates inside incoming", () => {
     const incoming = [
-      directMessage(5, { body: "first" }),
-      directMessage(5, { body: "second" }),
+      directMessage(5, 5, { body: "first" }),
+      directMessage(5, 5, { body: "second" }),
     ];
 
-    const merged = mergeMessages([], incoming);
+    const { messages } = mergeMessages([], incoming);
 
-    expect(merged).toHaveLength(1);
-    expect(merged[0]).toMatchObject({ id: 5, body: "second" });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ id: 5, body: "second" });
   });
 
   it("does not collapse distinct messages with empty client ids", () => {
-    const merged = mergeMessages(
-      [directMessage(1, { client_message_id: "" })],
-      [directMessage(2, { client_message_id: "" })],
+    const { messages } = mergeMessages(
+      [directMessage(1, 1, { client_message_id: "" })],
+      [directMessage(2, 2, { client_message_id: "" })],
     );
 
-    expect(merged.map((message) => message.id)).toEqual([1, 2]);
+    expect(messages.map((message) => message.seq)).toEqual([1, 2]);
   });
 
-  it("returns a stable ascending order", () => {
+  it("orders confirmed messages by seq and pending messages last", () => {
     const existing = [
-      directMessage(0, { client_message_id: "b" }),
-      directMessage(0, { client_message_id: "a" }),
-      directMessage(3),
+      directMessage(0, 0, { client_message_id: "b" }),
+      directMessage(0, 0, { client_message_id: "a" }),
+      directMessage(30, 3),
     ];
-    const incoming = [directMessage(1)];
+    const incoming = [directMessage(10, 1)];
 
-    const merged = mergeMessages(existing, incoming);
+    const { messages } = mergeMessages(existing, incoming);
 
-    expect(merged.map((message) => message.id)).toEqual([0, 0, 1, 3]);
-    expect(merged[0].client_message_id).toBe("b");
-    expect(merged[1].client_message_id).toBe("a");
+    expect(messages.map((message) => message.seq)).toEqual([1, 3, 0, 0]);
+    expect(messages[2].client_message_id).toBe("a");
+    expect(messages[3].client_message_id).toBe("b");
+  });
+
+  it("reports a reused seq and drops the stale tail above it", () => {
+    const existing = [
+      directMessage(10, 1),
+      directMessage(20, 2, { body: "stale-2" }),
+      directMessage(30, 3, { body: "stale-3" }),
+    ];
+    const incoming = [
+      directMessage(99, 2, { body: "server-2" }),
+    ];
+
+    const { messages, conflictSeq } = mergeMessages(existing, incoming);
+
+    expect(conflictSeq).toBe(2);
+    expect(messages.map((message) => message.seq)).toEqual([1, 2]);
+    expect(messages[1].body).toBe("server-2");
   });
 
   it("does not mutate its inputs", () => {
     const existing = [
       directMessage(1),
-      directMessage(0, { client_message_id: "" }),
+      directMessage(0, 0, { client_message_id: "" }),
     ];
     const incoming = [
-      directMessage(1, { body: "replacement" }),
+      directMessage(1, 1, { body: "replacement" }),
       directMessage(2),
     ];
     const existingSnapshot = structuredClone(existing);
     const incomingSnapshot = structuredClone(incoming);
 
-    const merged = mergeMessages(existing, incoming);
+    const { messages } = mergeMessages(existing, incoming);
 
     expect(existing).toEqual(existingSnapshot);
     expect(incoming).toEqual(incomingSnapshot);
-    expect(merged).not.toBe(existing);
-    expect(merged).not.toBe(incoming);
+    expect(messages).not.toBe(existing);
+    expect(messages).not.toBe(incoming);
   });
 });
 
-describe("sortMessagesByID", () => {
-  it("sorts ascending without mutating and is stable for equal ids", () => {
-    const first = directMessage(0, { client_message_id: "first" });
-    const second = directMessage(0, { client_message_id: "second" });
-    const messages = [directMessage(4), second, first, directMessage(2)];
+describe("sortMessagesBySeq", () => {
+  it("sorts ascending by seq without mutating and keeps pending messages last", () => {
+    const first = directMessage(0, 0, { client_message_id: "first" });
+    const second = directMessage(0, 0, { client_message_id: "second" });
+    const messages = [directMessage(40, 4), second, first, directMessage(20, 2)];
     const snapshot = structuredClone(messages);
 
-    const sorted = sortMessagesByID(messages);
+    const sorted = sortMessagesBySeq(messages);
 
-    expect(sorted.map((message) => message.id)).toEqual([0, 0, 2, 4]);
-    expect(sorted[0]).toBe(second);
-    expect(sorted[1]).toBe(first);
+    expect(sorted.map((message) => message.seq)).toEqual([2, 4, 0, 0]);
+    expect(sorted[2]).toBe(first);
+    expect(sorted[3]).toBe(second);
     expect(messages).toEqual(snapshot);
     expect(sorted).not.toBe(messages);
   });
@@ -262,7 +302,7 @@ describe("planGroupSync", () => {
 
     const plan = planGroupSync(conversations, cursors);
 
-    expect(plan).toEqual([{ groupID: 1, afterID: 15 }]);
+    expect(plan).toEqual([{ groupID: 1, afterSeq: 15 }]);
   });
 
   it("deduplicates by group id, keeping the first eligible entry", () => {
@@ -275,8 +315,8 @@ describe("planGroupSync", () => {
     const plan = planGroupSync(conversations, { 9: 1, 8: 1 });
 
     expect(plan).toEqual([
-      { groupID: 9, afterID: 1 },
-      { groupID: 8, afterID: 1 },
+      { groupID: 9, afterSeq: 1 },
+      { groupID: 8, afterSeq: 1 },
     ]);
   });
 
@@ -291,7 +331,7 @@ describe("planGroupSync", () => {
     expect(plan).toEqual([]);
   });
 
-  it("orders groups by last message id descending", () => {
+  it("orders groups by last seq descending", () => {
     const conversations: Conversation[] = [
       groupConversation(1, 5),
       groupConversation(2, 20),
@@ -301,9 +341,9 @@ describe("planGroupSync", () => {
     const plan = planGroupSync(conversations, { 1: 1, 2: 1, 3: 1 });
 
     expect(plan).toEqual([
-      { groupID: 2, afterID: 1 },
-      { groupID: 3, afterID: 1 },
-      { groupID: 1, afterID: 1 },
+      { groupID: 2, afterSeq: 1 },
+      { groupID: 3, afterSeq: 1 },
+      { groupID: 1, afterSeq: 1 },
     ]);
   });
 
@@ -316,8 +356,8 @@ describe("planGroupSync", () => {
     const cursors: Record<number, number> = { 1: 1, 2: 1, 3: 1 };
 
     expect(planGroupSync(conversations, cursors, 2)).toEqual([
-      { groupID: 2, afterID: 1 },
-      { groupID: 3, afterID: 1 },
+      { groupID: 2, afterSeq: 1 },
+      { groupID: 3, afterSeq: 1 },
     ]);
     expect(planGroupSync(conversations, cursors, 0)).toEqual([]);
   });
@@ -333,7 +373,7 @@ describe("planGroupSync", () => {
     const plan = planGroupSync(conversations, cursors);
 
     expect(plan).toHaveLength(200);
-    expect(plan[0]).toEqual({ groupID: 205, afterID: 1 });
-    expect(plan[199]).toEqual({ groupID: 6, afterID: 1 });
+    expect(plan[0]).toEqual({ groupID: 205, afterSeq: 1 });
+    expect(plan[199]).toEqual({ groupID: 6, afterSeq: 1 });
   });
 });

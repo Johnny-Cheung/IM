@@ -40,6 +40,7 @@ func TestListGroupMessagesServesCompleteRedisPageWithoutStore(t *testing.T) {
 	reader := &groupReaderStub{page: messaging.GroupConversationPage{
 		Page: store.GroupMessagePage{Messages: []store.GroupMessage{{
 			ID:              7,
+			Seq:             7,
 			GroupID:         9,
 			SenderID:        2,
 			Sender:          store.PublicUser{Username: "bob", Nickname: "Bob"},
@@ -66,7 +67,8 @@ func TestListGroupMessagesServesCompleteRedisPageWithoutStore(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if len(response.Messages) != 1 || response.Messages[0].ID != 7 {
+	if len(response.Messages) != 1 || response.Messages[0].ID != 7 ||
+		response.Messages[0].Seq != 7 {
 		t.Fatalf("messages = %#v", response.Messages)
 	}
 }
@@ -104,12 +106,50 @@ func TestListGroupMessagesChecksMembershipBeforeRedis(t *testing.T) {
 	}
 }
 
+func TestListGroupMessagesFallsBackWhenCounterIsMissing(t *testing.T) {
+	now := time.Now().UTC()
+	dataStore := authenticatedFriendStore()
+	dataStore.groupMember = true
+	dataStore.groupMessagePage = store.GroupMessagePage{Messages: []store.GroupMessage{{
+		ID:              6,
+		Seq:             6,
+		GroupID:         9,
+		SenderID:        1,
+		ClientMessageID: "client-00000006",
+		Body:            "from mysql",
+		CreatedAt:       now,
+	}}}
+	// The reader reports the empty, incomplete page produced by a lost counter.
+	reader := &groupReaderStub{page: messaging.GroupConversationPage{Complete: false}}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	New(dataStore, WithGroupMessageReader(reader)).Register(router)
+
+	recorder := doJSON(t, router, http.MethodGet, "/api/groups/9/messages", nil, authTestCookie())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if dataStore.groupMessageCall.groupID != 9 {
+		t.Fatal("store was not queried when the group seq counter was missing")
+	}
+
+	var response groupMessagePageResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Messages) != 1 || response.Messages[0].Body != "from mysql" {
+		t.Fatalf("messages = %#v, want the MySQL history", response.Messages)
+	}
+}
+
 func TestListGroupMessagesMergesHotPageWhenRedisIsIncomplete(t *testing.T) {
 	now := time.Now().UTC()
 	dataStore := authenticatedFriendStore()
 	dataStore.groupMember = true
 	dataStore.groupMessagePage = store.GroupMessagePage{Messages: []store.GroupMessage{{
 		ID:              6,
+		Seq:             6,
 		GroupID:         9,
 		SenderID:        1,
 		ClientMessageID: "client-00000006",
@@ -119,6 +159,7 @@ func TestListGroupMessagesMergesHotPageWhenRedisIsIncomplete(t *testing.T) {
 	reader := &groupReaderStub{page: messaging.GroupConversationPage{
 		Page: store.GroupMessagePage{Messages: []store.GroupMessage{{
 			ID:              7,
+			Seq:             7,
 			GroupID:         9,
 			SenderID:        2,
 			ClientMessageID: "client-00000007",

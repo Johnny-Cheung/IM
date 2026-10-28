@@ -12,7 +12,12 @@ UNIT=im-test
 PORT=8199
 VERIFY_MODE=0
 mkdir -p "${APP_ROOT}/bin" "${APP_ROOT}/web"
-printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexit 0\n' "${TEST_DIR}/server-args" > "${APP_ROOT}/bin/im-server"
+cat > "${APP_ROOT}/bin/im-server" <<SH
+#!/bin/sh
+printf '%s\n' "\$*" >> "${TEST_DIR}/server-args"
+printf '%s %s %s\n' "\${IM_MESSAGING_NAMESPACE:-}" "\${IM_REDIS_DB:-}" "\${IM_MESSAGING_REQUIRED:-}" >> "${TEST_DIR}/server-env"
+exit 0
+SH
 chmod +x "${APP_ROOT}/bin/im-server"
 printf 'test page' > "${APP_ROOT}/web/index.html"
 printf 'version: test\n' > "${APP_ROOT}/RELEASE"
@@ -91,16 +96,50 @@ if health >/dev/null 2>&1; then exit 1; fi
 pass 'health rejects transport failures'
 TEST_NETWORK=0
 TEST_READY=200
+rm -f "${TEST_DIR}/active"
 : > "${TEST_DIR}/server-args"
-backfill_group_read >/dev/null
-test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-backfill-group-read -backfill-batch 1000 '
-pass 'group read backfill runs the backend with the group read flag'
+: > "${TEST_DIR}/server-env"
+backfill_seq >/dev/null
+test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-backfill-seq -backfill-batch 1000 '
+test "$(cat "${TEST_DIR}/server-env")" = 'im:v13-verify 1 true'
+pass 'seq backfill runs the backend with the seq flag in the verify namespace'
+touch "${TEST_DIR}/active"
+if backfill_seq >/dev/null 2>&1; then exit 1; fi
+rm -f "${TEST_DIR}/active"
+pass 'seq backfill refuses to run while the backend is active'
 INFRA_REDIS_URL_FILE="${TEST_DIR}/missing-redis-url"
 VERIFY_MODE=0
-if backfill_group_read >/dev/null 2>&1; then exit 1; fi
+if backfill_seq >/dev/null 2>&1; then exit 1; fi
 VERIFY_MODE=1
 INFRA_REDIS_URL_FILE="${INFRA_CONFIG_DIR}/redis-url"
-pass 'group read backfill requires Redis configuration'
+pass 'seq backfill requires Redis configuration'
+if main backfill-read >/dev/null 2>&1; then exit 1; fi
+if main backfill-group-read >/dev/null 2>&1; then exit 1; fi
+pass 'removed read backfill subcommands are rejected'
+usage="$(main unknown-command 2>&1 || true)"
+if ! grep -q 'backfill-seq' <<<"${usage}" || ! grep -q 'queue-status' <<<"${usage}"; then
+  echo 'FAIL usage does not list backfill-seq and queue-status'
+  exit 1
+fi
+pass 'usage lists the seq backfill and the queue drain check'
+DI() {
+  case "$*" in
+    *list_queues*)
+      printf 'im.v13-verify.messages.persist\t%s\t0\n' "${TEST_QUEUE_READY:-0}"
+      printf 'im.v13-verify.group.messages.persist\t0\t0\n'
+      ;;
+    *) return 1 ;;
+  esac
+}
+queue_status >/dev/null
+pass 'queue status reports drained verify queues'
+TEST_QUEUE_READY=3
+if queue_status >/dev/null 2>&1; then exit 1; fi
+pass 'queue status fails while persist messages are pending'
+TEST_QUEUE_READY=0
+DI() { return 1; }
+if queue_status >/dev/null 2>&1; then exit 1; fi
+pass 'queue status fails when RabbitMQ is unreachable'
 if grep -q 'IM_REDIS_URL_FILE' "${SCRIPT_DIR}/imctl" \
   && grep -q 'IM_REDIS_PASSWORD_FILE' "${SCRIPT_DIR}/imctl" \
   && grep -q 'IM_RABBITMQ_URL_FILE' "${SCRIPT_DIR}/imctl" \

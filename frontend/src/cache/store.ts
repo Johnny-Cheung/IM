@@ -1,9 +1,12 @@
+import { isAcceptedSeq } from "../api";
 import type { Conversation, PublicUser, User } from "../api";
 import {
   CONVERSATIONS_STORE,
   FRIENDS_STORE,
+  MESSAGES_SEQ_INDEX,
   MESSAGES_STORE,
   META_STORE,
+  OUTBOX_STORE,
   closeCacheDB,
   openCacheDB,
   requestToPromise,
@@ -11,7 +14,7 @@ import {
 } from "./db";
 import type { CacheStoreName } from "./db";
 import { conversationKey, groupIDFromKey } from "./keys";
-import { mergeMessages, sortMessagesByID, trimMessageIDs } from "./merge";
+import { mergeMessages, sortMessagesBySeq } from "./merge";
 import {
   CONVERSATION_CACHE_LIMIT,
   MESSAGE_LIMIT_PER_CONVERSATION,
@@ -23,6 +26,7 @@ import type {
   CachedConversation,
   CachedFriends,
   CachedMessage,
+  CachedOutbox,
   SyncState,
 } from "./types";
 
@@ -32,6 +36,7 @@ type CachedMessageRecord = {
   user: string;
   conversation: string;
   id: number;
+  seq: number;
   message: CachedMessage;
 };
 
@@ -50,18 +55,21 @@ function readSyncStateValue(value: unknown): SyncState | null {
   if (!isRecord(value)) {
     return null;
   }
-  const { afterID, directComplete, groups, savedAt } = value;
+  const { afterID, directComplete, groups, localSeq, savedAt } = value;
   if (
     typeof afterID !== "number" ||
     !Number.isInteger(afterID) ||
     afterID < 0 ||
     typeof directComplete !== "boolean" ||
     !isRecord(groups) ||
+    !isRecord(localSeq) ||
     typeof savedAt !== "string"
   ) {
     return null;
   }
 
+  // Group cursor values are seq units; afterID above is the private feed's
+  // global message id. Never compare the two.
   const cursors: Record<number, number> = {};
   for (const [key, cursor] of Object.entries(groups)) {
     const groupID = Number(key);
@@ -76,7 +84,17 @@ function readSyncStateValue(value: unknown): SyncState | null {
     }
   }
 
-  return { afterID, directComplete, groups: cursors, savedAt };
+  const seqs: Record<string, number> = {};
+  for (const [key, seq] of Object.entries(localSeq)) {
+    if (key === "") {
+      continue;
+    }
+    if (typeof seq === "number" && Number.isInteger(seq) && seq >= 0) {
+      seqs[key] = seq;
+    }
+  }
+
+  return { afterID, directComplete, groups: cursors, localSeq: seqs, savedAt };
 }
 
 function readUserValue(value: unknown): User | null {
@@ -125,8 +143,30 @@ function isValidConversationRecord(
   if (!isRecord(conversation)) {
     return false;
   }
+  if (
+    typeof conversation.last_seq !== "number"
+    || !Number.isInteger(conversation.last_seq)
+    || conversation.last_seq < 0
+  ) {
+    return false;
+  }
+  const lastMessage = conversation.last_message;
+  if (
+    lastMessage !== null
+    && (!isRecord(lastMessage)
+      || typeof lastMessage.id !== "number"
+      || lastMessage.id <= 0
+      || !isAcceptedSeq(lastMessage.seq))
+  ) {
+    return false;
+  }
   if (conversation.type === "direct") {
-    return isRecord(conversation.user);
+    const peerSeq = conversation.peer_last_read_seq;
+    return isRecord(conversation.user)
+      && (peerSeq === undefined
+        || (typeof peerSeq === "number"
+          && Number.isInteger(peerSeq)
+          && peerSeq >= 0));
   }
   if (conversation.type === "group") {
     return isRecord(conversation.group);
@@ -144,10 +184,44 @@ function isValidMessageRecord(value: unknown): value is CachedMessageRecord {
   if (typeof value.id !== "number" || value.id <= 0) {
     return false;
   }
+  if (!isAcceptedSeq(value.seq)) {
+    return false;
+  }
   if (!isRecord(value.message)) {
     return false;
   }
-  return value.message.id === value.id;
+  return value.message.id === value.id && value.message.seq === value.seq;
+}
+
+function isValidOutboxRecord(value: unknown): value is CachedOutbox {
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (
+    typeof value.user !== "string"
+    || value.user === ""
+    || typeof value.conversation !== "string"
+    || value.conversation === ""
+    || typeof value.client_message_id !== "string"
+    || value.client_message_id === ""
+    || typeof value.body !== "string"
+    || typeof value.created_at !== "string"
+    || (value.status !== "sending" && value.status !== "failed")
+  ) {
+    return false;
+  }
+  if (value.kind === "direct") {
+    const recipient = value.recipient;
+    return isRecord(recipient)
+      && typeof recipient.username === "string"
+      && typeof recipient.nickname === "string";
+  }
+  if (value.kind === "group") {
+    return typeof value.group_id === "number"
+      && Number.isInteger(value.group_id)
+      && value.group_id > 0;
+  }
+  return false;
 }
 
 function readValue(
@@ -208,6 +282,37 @@ function mergeGroupCursors(
     }
   }
   return merged;
+}
+
+function mergeLocalSeqs(
+  current: Record<string, number>,
+  incoming: Record<string, number>,
+): Record<string, number> {
+  const merged = { ...current };
+  for (const [key, seq] of Object.entries(incoming)) {
+    if (key !== "" && Number.isInteger(seq) && seq > 0) {
+      merged[key] = Math.max(merged[key] ?? 0, seq);
+    }
+  }
+  return merged;
+}
+
+function conversationSeqRange(
+  user: string,
+  conversation: string,
+  fromSeq: number,
+): IDBKeyRange {
+  return IDBKeyRange.bound(
+    [user, conversation, fromSeq],
+    [user, conversation, Number.MAX_SAFE_INTEGER],
+  );
+}
+
+function conversationOutboxRange(
+  user: string,
+  conversation: string,
+): IDBKeyRange {
+  return IDBKeyRange.bound([user, conversation], [user, conversation, []]);
 }
 
 function disableCache(context: string, error: unknown): void {
@@ -371,12 +476,13 @@ export async function writeConversations(
   await runWrite(async (db) => {
     await runTransaction(
       db,
-      [CONVERSATIONS_STORE, MESSAGES_STORE, META_STORE],
+      [CONVERSATIONS_STORE, MESSAGES_STORE, META_STORE, OUTBOX_STORE],
       "readwrite",
       async (transaction) => {
         const conversationStore = transaction.objectStore(CONVERSATIONS_STORE);
         const messageStore = transaction.objectStore(MESSAGES_STORE);
         const metaStore = transaction.objectStore(META_STORE);
+        const outboxStore = transaction.objectStore(OUTBOX_STORE);
 
         const records = await readAll<CachedConversation>(conversationStore);
         const existing = new Map<string, CachedConversation>();
@@ -390,6 +496,7 @@ export async function writeConversations(
           conversations.map((conversation) => conversationKey(conversation)),
         );
         const removedGroups: number[] = [];
+        const removedKeys: string[] = [];
 
         for (const key of existing.keys()) {
           if (keptKeys.has(key)) {
@@ -399,6 +506,10 @@ export async function writeConversations(
           await requestToPromise(
             messageStore.delete(conversationMessagesRange(user, key)),
           );
+          await requestToPromise(
+            outboxStore.delete(conversationOutboxRange(user, key)),
+          );
+          removedKeys.push(key);
           const groupID = groupIDFromKey(key);
           if (groupID !== null) {
             removedGroups.push(groupID);
@@ -417,7 +528,7 @@ export async function writeConversations(
           await requestToPromise(conversationStore.put(record));
         }
 
-        if (removedGroups.length > 0) {
+        if (removedKeys.length > 0) {
           const state = readSyncStateValue(
             await readValue(metaStore, syncKey(user)),
           );
@@ -426,6 +537,12 @@ export async function writeConversations(
             for (const groupID of removedGroups) {
               if (groupID in state.groups) {
                 delete state.groups[groupID];
+                changed = true;
+              }
+            }
+            for (const key of removedKeys) {
+              if (key in state.localSeq) {
+                delete state.localSeq[key];
                 changed = true;
               }
             }
@@ -487,13 +604,66 @@ export async function readMessages(
           transaction.objectStore(MESSAGES_STORE),
           conversationMessagesRange(user, conversation),
         );
-        const sorted = sortMessagesByID(
+        const sorted = sortMessagesBySeq(
           records.filter(isValidMessageRecord).map((record) => record.message),
         );
-        if (sorted.length <= effectiveLimit) {
-          return sorted;
+        const deduped: CachedMessage[] = [];
+        for (const message of sorted) {
+          if (
+            deduped.length > 0
+            && deduped[deduped.length - 1].seq === message.seq
+          ) {
+            deduped[deduped.length - 1] = message;
+            continue;
+          }
+          deduped.push(message);
         }
-        return sorted.slice(sorted.length - effectiveLimit);
+        if (deduped.length <= effectiveLimit) {
+          return deduped;
+        }
+        return deduped.slice(deduped.length - effectiveLimit);
+      }),
+  );
+}
+
+export async function readConversationSeq(
+  user: string,
+  conversation: string,
+): Promise<number> {
+  return runRead<number>(
+    0,
+    async (db) =>
+      runTransaction(db, [META_STORE], "readonly", async (transaction) => {
+        const state = readSyncStateValue(
+          await readValue(transaction.objectStore(META_STORE), syncKey(user)),
+        );
+        return state?.localSeq[conversation] ?? 0;
+      }),
+  );
+}
+
+// Reads the highest seq actually stored through the (conversation, seq) index.
+export async function readMaxMessageSeq(
+  user: string,
+  conversation: string,
+): Promise<number> {
+  return runRead<number>(
+    0,
+    async (db) =>
+      runTransaction(db, [MESSAGES_STORE], "readonly", async (transaction) => {
+        const index = transaction
+          .objectStore(MESSAGES_STORE)
+          .index(MESSAGES_SEQ_INDEX);
+        const records = await requestToPromise(
+          index.getAll(conversationSeqRange(user, conversation, 1)),
+        );
+        let max = 0;
+        for (const record of records) {
+          if (isValidMessageRecord(record) && record.seq > max) {
+            max = record.seq;
+          }
+        }
+        return max;
       }),
   );
 }
@@ -504,60 +674,238 @@ export async function writeMessages(
   messages: CachedMessage[],
 ): Promise<void> {
   const confirmed = messages.filter(
-    (message) => Number.isInteger(message.id) && message.id > 0,
+    (message) =>
+      Number.isInteger(message.id)
+      && message.id > 0
+      && isAcceptedSeq(message.seq),
   );
   if (confirmed.length === 0) {
     return;
   }
   await runWrite(async (db) => {
-    await runTransaction(db, [MESSAGES_STORE], "readwrite", async (transaction) => {
-      const store = transaction.objectStore(MESSAGES_STORE);
-      const records = await readAll<CachedMessageRecord>(
-        store,
-        conversationMessagesRange(user, conversation),
-      );
-      const merged = mergeMessages(
-        records.map((record) => record.message),
-        confirmed,
-      );
-      const trimmedIDs = new Set(
-        trimMessageIDs(
-          merged.map((message) => message.id),
-          MESSAGE_LIMIT_PER_CONVERSATION,
-        ),
-      );
-      const keptIDs = new Set(
-        merged
-          .filter((message) => !trimmedIDs.has(message.id))
-          .map((message) => message.id),
-      );
-      const incomingIDs = new Set(confirmed.map((message) => message.id));
-      const deletedIDs = new Set<number>(trimmedIDs);
-
-      for (const record of records) {
-        if (!keptIDs.has(record.id)) {
-          deletedIDs.add(record.id);
+    await runTransaction(
+      db,
+      [MESSAGES_STORE, META_STORE, OUTBOX_STORE],
+      "readwrite",
+      async (transaction) => {
+        const store = transaction.objectStore(MESSAGES_STORE);
+        const metaStore = transaction.objectStore(META_STORE);
+        const outboxStore = transaction.objectStore(OUTBOX_STORE);
+        const records = await readAll<CachedMessageRecord>(
+          store,
+          conversationMessagesRange(user, conversation),
+        );
+        const merged = mergeMessages(
+          records.filter(isValidMessageRecord).map((record) => record.message),
+          confirmed,
+        );
+        // Ordering and trimming are by seq; the global id stays the key.
+        const kept = merged.messages.slice(
+          Math.max(0, merged.messages.length - MESSAGE_LIMIT_PER_CONVERSATION),
+        );
+        const keptIDs = new Set(kept.map((message) => message.id));
+        for (const record of records) {
+          if (!keptIDs.has(record.id)) {
+            await requestToPromise(store.delete([user, conversation, record.id]));
+          }
         }
-      }
-      for (const id of deletedIDs) {
-        await requestToPromise(store.delete([user, conversation, id]));
-      }
 
-      for (const message of merged) {
-        if (!keptIDs.has(message.id) || !incomingIDs.has(message.id)) {
-          continue;
+        const incomingIDs = new Set(confirmed.map((message) => message.id));
+        let newestSeq = 0;
+        for (const message of kept) {
+          if (message.seq > newestSeq) {
+            newestSeq = message.seq;
+          }
+          if (!incomingIDs.has(message.id)) {
+            continue;
+          }
+          const record: CachedMessageRecord = {
+            user,
+            conversation,
+            id: message.id,
+            seq: message.seq,
+            message,
+          };
+          await requestToPromise(store.put(record));
         }
-        const record: CachedMessageRecord = {
-          user,
-          conversation,
-          id: message.id,
-          message,
-        };
-        await requestToPromise(store.put(record));
-      }
+
+        if (newestSeq > 0) {
+          const value = await readValue(metaStore, syncKey(user));
+          const state = readSyncStateValue(value) ?? emptySyncState();
+          const current = state.localSeq[conversation] ?? 0;
+          // A reused seq rolled the timeline back, so the watermark has to
+          // follow it down instead of staying monotonic.
+          const nextSeq = merged.conflictSeq !== null
+            ? newestSeq
+            : Math.max(current, newestSeq);
+          if (nextSeq !== current) {
+            await requestToPromise(
+              metaStore.put(
+                {
+                  ...state,
+                  localSeq: { ...state.localSeq, [conversation]: nextSeq },
+                  savedAt: new Date().toISOString(),
+                },
+                syncKey(user),
+              ),
+            );
+          }
+        }
+
+        for (const message of confirmed) {
+          if (message.client_message_id === "") {
+            continue;
+          }
+          await requestToPromise(
+            outboxStore.delete([user, conversation, message.client_message_id]),
+          );
+        }
+      },
+    );
+  });
+}
+
+// Drops the local tail from fromSeq on (rollback resync) and lowers the local
+// watermark so the next pull starts at the server's position.
+export async function deleteMessagesFrom(
+  user: string,
+  conversation: string,
+  fromSeq: number,
+): Promise<void> {
+  if (!Number.isInteger(fromSeq) || fromSeq < 1) {
+    return;
+  }
+  await runWrite(async (db) => {
+    await runTransaction(
+      db,
+      [MESSAGES_STORE, META_STORE],
+      "readwrite",
+      async (transaction) => {
+        const store = transaction.objectStore(MESSAGES_STORE);
+        const index = store.index(MESSAGES_SEQ_INDEX);
+        const keys = await requestToPromise(
+          index.getAllKeys(conversationSeqRange(user, conversation, fromSeq)),
+        );
+        for (const key of keys) {
+          await requestToPromise(store.delete(key));
+        }
+
+        const metaStore = transaction.objectStore(META_STORE);
+        const state = readSyncStateValue(
+          await readValue(metaStore, syncKey(user)),
+        );
+        if (state === null) {
+          return;
+        }
+        const keepSeq = fromSeq - 1;
+        const current = state.localSeq[conversation] ?? 0;
+        if (current <= keepSeq) {
+          return;
+        }
+        const localSeq = { ...state.localSeq };
+        if (keepSeq > 0) {
+          localSeq[conversation] = keepSeq;
+        } else {
+          delete localSeq[conversation];
+        }
+        await requestToPromise(
+          metaStore.put(
+            { ...state, localSeq, savedAt: new Date().toISOString() },
+            syncKey(user),
+          ),
+        );
+      },
+    );
+  });
+}
+
+// The outbox keeps locally pending or failed messages across reloads so a
+// message lost with the server's dropped tail can be retried with its original
+// client id.
+export async function writeOutbox(entry: CachedOutbox): Promise<void> {
+  if (!isValidOutboxRecord(entry)) {
+    return;
+  }
+  await runWrite(async (db) => {
+    await runTransaction(db, [OUTBOX_STORE], "readwrite", async (transaction) => {
+      await requestToPromise(transaction.objectStore(OUTBOX_STORE).put(entry));
     });
   });
 }
+
+export async function readOutbox(
+  user: string,
+  conversation: string,
+): Promise<CachedOutbox[]> {
+  return runRead<CachedOutbox[]>(
+    [],
+    async (db) =>
+      runTransaction(db, [OUTBOX_STORE], "readonly", async (transaction) => {
+        const records = await readAll<CachedOutbox>(
+          transaction.objectStore(OUTBOX_STORE),
+          conversationOutboxRange(user, conversation),
+        );
+        return records
+          .filter(isValidOutboxRecord)
+          .filter((record) =>
+            record.user === user && record.conversation === conversation)
+          .sort((left, right) =>
+            left.created_at.localeCompare(right.created_at));
+      }),
+  );
+}
+
+export async function readOutboxEntry(
+  user: string,
+  conversation: string,
+  clientMessageID: string,
+): Promise<CachedOutbox | null> {
+  return runRead<CachedOutbox | null>(
+    null,
+    async (db) =>
+      runTransaction(db, [OUTBOX_STORE], "readonly", async (transaction) => {
+        const value = await readValue(
+          transaction.objectStore(OUTBOX_STORE),
+          [user, conversation, clientMessageID],
+        );
+        return isValidOutboxRecord(value) ? value : null;
+      }),
+  );
+}
+
+export async function deleteOutbox(
+  user: string,
+  conversation: string,
+  clientMessageID: string,
+): Promise<void> {
+  await runWrite(async (db) => {
+    await runTransaction(db, [OUTBOX_STORE], "readwrite", async (transaction) => {
+      await requestToPromise(
+        transaction
+          .objectStore(OUTBOX_STORE)
+          .delete([user, conversation, clientMessageID]),
+      );
+    });
+  });
+}
+
+export async function markOutboxFailed(
+  user: string,
+  conversation: string,
+  clientMessageID: string,
+): Promise<void> {
+  await runWrite(async (db) => {
+    await runTransaction(db, [OUTBOX_STORE], "readwrite", async (transaction) => {
+      const store = transaction.objectStore(OUTBOX_STORE);
+      const value = await readValue(store, [user, conversation, clientMessageID]);
+      if (!isValidOutboxRecord(value)) {
+        return;
+      }
+      await requestToPromise(store.put({ ...value, status: "failed" }));
+    });
+  });
+}
+
 
 export async function readSyncState(user: string): Promise<SyncState> {
   return runRead<SyncState>(
@@ -596,6 +944,7 @@ export async function writeSyncState(
         ),
         directComplete: state.directComplete,
         groups: mergeGroupCursors(current.groups, state.groups),
+        localSeq: mergeLocalSeqs(current.localSeq, state.localSeq),
         savedAt: state.savedAt === "" ? new Date().toISOString() : state.savedAt,
       };
       await requestToPromise(store.put(next, syncKey(user)));
@@ -617,6 +966,9 @@ export async function patchSyncState(
       groups: patch.groups !== undefined
         ? mergeGroupCursors(current.groups, patch.groups)
         : current.groups,
+      localSeq: patch.localSeq !== undefined
+        ? mergeLocalSeqs(current.localSeq, patch.localSeq)
+        : current.localSeq,
       savedAt: new Date().toISOString(),
     }));
   });
@@ -666,13 +1018,34 @@ export async function removeMessages(
   conversation: string,
 ): Promise<void> {
   await runWrite(async (db) => {
-    await runTransaction(db, [MESSAGES_STORE], "readwrite", async (transaction) => {
-      await requestToPromise(
-        transaction
-          .objectStore(MESSAGES_STORE)
-          .delete(conversationMessagesRange(user, conversation)),
-      );
-    });
+    await runTransaction(
+      db,
+      [MESSAGES_STORE, META_STORE],
+      "readwrite",
+      async (transaction) => {
+        await requestToPromise(
+          transaction
+            .objectStore(MESSAGES_STORE)
+            .delete(conversationMessagesRange(user, conversation)),
+        );
+
+        const metaStore = transaction.objectStore(META_STORE);
+        const state = readSyncStateValue(
+          await readValue(metaStore, syncKey(user)),
+        );
+        if (state === null || !(conversation in state.localSeq)) {
+          return;
+        }
+        const localSeq = { ...state.localSeq };
+        delete localSeq[conversation];
+        await requestToPromise(
+          metaStore.put(
+            { ...state, localSeq, savedAt: new Date().toISOString() },
+            syncKey(user),
+          ),
+        );
+      },
+    );
   });
 }
 
@@ -682,7 +1055,7 @@ export async function removeConversation(
 ): Promise<void> {  await runWrite(async (db) => {
     await runTransaction(
       db,
-      [CONVERSATIONS_STORE, MESSAGES_STORE, META_STORE],
+      [CONVERSATIONS_STORE, MESSAGES_STORE, META_STORE, OUTBOX_STORE],
       "readwrite",
       async (transaction) => {
         await requestToPromise(
@@ -693,23 +1066,33 @@ export async function removeConversation(
             .objectStore(MESSAGES_STORE)
             .delete(conversationMessagesRange(user, key)),
         );
+        await requestToPromise(
+          transaction
+            .objectStore(OUTBOX_STORE)
+            .delete(conversationOutboxRange(user, key)),
+        );
 
-        const groupID = groupIDFromKey(key);
-        if (groupID === null) {
-          return;
-        }
         const metaStore = transaction.objectStore(META_STORE);
         const state = readSyncStateValue(
           await readValue(metaStore, syncKey(user)),
         );
-        if (state === null || !(groupID in state.groups)) {
+        if (state === null) {
+          return;
+        }
+        const groupID = groupIDFromKey(key);
+        const hasCursor = groupID !== null && groupID in state.groups;
+        if (!hasCursor && !(key in state.localSeq)) {
           return;
         }
         const groups = { ...state.groups };
-        delete groups[groupID];
+        if (groupID !== null) {
+          delete groups[groupID];
+        }
+        const localSeq = { ...state.localSeq };
+        delete localSeq[key];
         await requestToPromise(
           metaStore.put(
-            { ...state, groups, savedAt: new Date().toISOString() },
+            { ...state, groups, localSeq, savedAt: new Date().toISOString() },
             syncKey(user),
           ),
         );
@@ -736,13 +1119,14 @@ export async function clearUser(user: string): Promise<void> {
   await runWrite(async (db) => {
     await runTransaction(
       db,
-      [CONVERSATIONS_STORE, MESSAGES_STORE, FRIENDS_STORE, META_STORE],
+      [CONVERSATIONS_STORE, MESSAGES_STORE, FRIENDS_STORE, META_STORE, OUTBOX_STORE],
       "readwrite",
       async (transaction) => {
         const conversationStore = transaction.objectStore(CONVERSATIONS_STORE);
         const messageStore = transaction.objectStore(MESSAGES_STORE);
         const friendsStore = transaction.objectStore(FRIENDS_STORE);
         const metaStore = transaction.objectStore(META_STORE);
+        const outboxStore = transaction.objectStore(OUTBOX_STORE);
 
         const conversationKeys = await requestToPromise(
           conversationStore.getAllKeys(),
@@ -757,6 +1141,13 @@ export async function clearUser(user: string): Promise<void> {
         for (const key of messageKeys) {
           if (Array.isArray(key) && key[0] === user) {
             await requestToPromise(messageStore.delete(key));
+          }
+        }
+
+        const outboxKeys = await requestToPromise(outboxStore.getAllKeys());
+        for (const key of outboxKeys) {
+          if (Array.isArray(key) && key[0] === user) {
+            await requestToPromise(outboxStore.delete(key));
           }
         }
 
@@ -785,6 +1176,30 @@ async function dropGroupCursors(
   for (const groupID of groupIDs) {
     if (groupID in state.groups) {
       delete state.groups[groupID];
+      changed = true;
+    }
+  }
+  if (changed) {
+    await requestToPromise(metaStore.put(state, syncKey(user)));
+  }
+}
+
+async function dropLocalSeqs(
+  metaStore: IDBObjectStore,
+  user: string,
+  keys: string[],
+): Promise<void> {
+  if (keys.length === 0) {
+    return;
+  }
+  const state = readSyncStateValue(await readValue(metaStore, syncKey(user)));
+  if (state === null) {
+    return;
+  }
+  let changed = false;
+  for (const key of keys) {
+    if (key in state.localSeq) {
+      delete state.localSeq[key];
       changed = true;
     }
   }
@@ -841,8 +1256,9 @@ export async function enforceUserLimits(
           return;
         }
 
-        // Evict by the newest message id, which is the cache's notion of
-        // conversation activity. Missing conversation records sort first.
+        // Evict by the newest global message id: it is the only ordering that
+        // is comparable across conversations. seq is conversation-local and
+        // must never be used here.
         const candidates = Array.from(stats.keys());
         candidates.sort((left, right) => {
           const leftID = stats.get(left)?.maxID ?? 0;
@@ -854,6 +1270,7 @@ export async function enforceUserLimits(
         });
 
         const removedGroups: number[] = [];
+        const removedKeys: string[] = [];
         for (const key of candidates) {
           if (
             conversationCount <= maxConversations &&
@@ -867,6 +1284,7 @@ export async function enforceUserLimits(
           );
           conversationCount -= 1;
           messageCount -= entry.count;
+          removedKeys.push(key);
           const groupID = groupIDFromKey(key);
           if (groupID !== null) {
             removedGroups.push(groupID);
@@ -874,6 +1292,7 @@ export async function enforceUserLimits(
         }
 
         await dropGroupCursors(metaStore, user, removedGroups);
+        await dropLocalSeqs(metaStore, user, removedKeys);
       },
     );
   });

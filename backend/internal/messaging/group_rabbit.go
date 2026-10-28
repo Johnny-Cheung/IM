@@ -11,6 +11,7 @@ import (
 
 type groupMessageEnvelope struct {
 	ServerMessageID uint64 `json:"server_message_id"`
+	Seq             uint64 `json:"seq"`
 	GroupID         uint64 `json:"group_id"`
 	SenderID        uint64 `json:"sender_id"`
 	ClientMessageID string `json:"client_message_id"`
@@ -41,6 +42,7 @@ func groupRelayName(namespace Namespace) string {
 func encodeGroupMessage(message store.GroupMessage) ([]byte, error) {
 	return json.Marshal(groupMessageEnvelope{
 		ServerMessageID: message.ID,
+		Seq:             message.Seq,
 		GroupID:         message.GroupID,
 		SenderID:        message.SenderID,
 		ClientMessageID: message.ClientMessageID,
@@ -56,7 +58,8 @@ func decodeGroupMessage(payload []byte) (store.GroupMessage, error) {
 	if err := json.Unmarshal(payload, &envelope); err != nil {
 		return store.GroupMessage{}, fmt.Errorf("decode group message payload: %w", err)
 	}
-	if envelope.ServerMessageID == 0 || envelope.GroupID == 0 || envelope.SenderID == 0 || envelope.ClientMessageID == "" {
+	if envelope.ServerMessageID == 0 || envelope.Seq == 0 || envelope.GroupID == 0 ||
+		envelope.SenderID == 0 || envelope.ClientMessageID == "" {
 		return store.GroupMessage{}, fmt.Errorf("decode group message payload: missing identity")
 	}
 	createdAt, err := time.Parse(time.RFC3339Nano, envelope.CreatedAt)
@@ -65,6 +68,7 @@ func decodeGroupMessage(payload []byte) (store.GroupMessage, error) {
 	}
 	return store.GroupMessage{
 		ID:              envelope.ServerMessageID,
+		Seq:             envelope.Seq,
 		GroupID:         envelope.GroupID,
 		SenderID:        envelope.SenderID,
 		Sender:          store.PublicUser{Username: envelope.SenderUsername, Nickname: envelope.SenderNickname},
@@ -76,6 +80,10 @@ func decodeGroupMessage(payload []byte) (store.GroupMessage, error) {
 
 func groupStreamMessage(values map[string]interface{}) (store.GroupMessage, error) {
 	messageID, err := streamUint(values, "id")
+	if err != nil {
+		return store.GroupMessage{}, err
+	}
+	seq, err := streamUint(values, "seq")
 	if err != nil {
 		return store.GroupMessage{}, err
 	}
@@ -109,6 +117,7 @@ func groupStreamMessage(values map[string]interface{}) (store.GroupMessage, erro
 	}
 	return store.GroupMessage{
 		ID:              messageID,
+		Seq:             seq,
 		GroupID:         groupID,
 		SenderID:        senderID,
 		Sender:          store.PublicUser{Username: username, Nickname: nickname},

@@ -15,7 +15,7 @@ import (
 type GroupReadStore interface {
 	UpsertGroupRead(
 		ctx context.Context,
-		groupID, userID, lastReadMessageID uint64,
+		groupID, userID, lastReadSeq uint64,
 	) (bool, error)
 }
 
@@ -30,9 +30,9 @@ type GroupReadPersister struct {
 }
 
 type groupReadStreamEvent struct {
-	GroupID           uint64
-	UserID            uint64
-	LastReadMessageID uint64
+	GroupID     uint64
+	UserID      uint64
+	LastReadSeq uint64
 }
 
 type groupReadEventKey struct {
@@ -178,8 +178,8 @@ func (p *GroupReadPersister) processStreams(
 				batches[key] = batch
 				order = append(order, key)
 			}
-			if event.LastReadMessageID > batch.position {
-				batch.position = event.LastReadMessageID
+			if event.LastReadSeq > batch.position {
+				batch.position = event.LastReadSeq
 			}
 			batch.entries = append(batch.entries, entry.ID)
 		}
@@ -258,19 +258,19 @@ func parseGroupReadStreamEvent(values map[string]interface{}) (groupReadStreamEv
 	if err != nil {
 		return groupReadStreamEvent{}, fmt.Errorf("user_id: %w", err)
 	}
-	lastReadMessageID, err := parseRedisUint(values["last_read_message_id"])
+	lastReadSeq, err := parseRedisUint(values["last_read_seq"])
 	if err != nil {
-		return groupReadStreamEvent{}, fmt.Errorf("last_read_message_id: %w", err)
+		return groupReadStreamEvent{}, fmt.Errorf("last_read_seq: %w", err)
 	}
 	if _, err := parseRedisInt64(values["updated_at_ms"]); err != nil {
 		return groupReadStreamEvent{}, fmt.Errorf("updated_at_ms: %w", err)
 	}
-	if groupID == 0 || userID == 0 || lastReadMessageID == 0 {
+	if groupID == 0 || userID == 0 || lastReadSeq == 0 {
 		return groupReadStreamEvent{}, fmt.Errorf("invalid group read event identity")
 	}
 	return groupReadStreamEvent{
-		GroupID:           groupID,
-		UserID:            userID,
-		LastReadMessageID: lastReadMessageID,
+		GroupID:     groupID,
+		UserID:      userID,
+		LastReadSeq: lastReadSeq,
 	}, nil
 }

@@ -9,8 +9,10 @@ const list = (who) => run.request(who, "GET", "/api/conversations");
 const bootstrapOf = (who) => run.request(who, "POST", "/api/bootstrap", {});
 const sendGroup = (who, id, body, key = randomUUID()) => run.request(who, "POST", `/api/groups/${id}/messages`, { body, client_message_id: key });
 const directPath = (who) => `/api/conversations/${run.users.get(who).username}`;
-const readStats = (who, id, messageID) => run.request(who, "GET", `/api/groups/${id}/read-stats?message_id=${messageID}`);
-const groupReadThrough = (who, id, throughID) => run.request(who, "POST", `/api/groups/${id}/read?through_id=${throughID}`);
+const readStats = (who, id, seq) => run.request(who, "GET", `/api/groups/${id}/read-stats?seq=${seq}`);
+const seqsOf = (messages) => messages.map((message) => message.seq);
+const contiguous = (seqs, first) => seqs.length > 0
+  && seqs.every((seq, index) => seq === first + index);
 
 async function until(condition, message, timeout = 5000) {
   const deadline = Date.now() + timeout;
@@ -52,13 +54,55 @@ async function main() {
   run.check("rejected outgoing request retained", rejected.history.some((item) => item.status === "rejected"));
 
   const directID = randomUUID();
-  const first = await run.request("a", "POST", `${directPath("b")}/messages`, { body: "私聊第一条\n🙂", client_message_id: directID });
-  const duplicate = await run.request("a", "POST", `${directPath("b")}/messages`, { body: "私聊第一条\n🙂", client_message_id: directID });
-  run.check("private send retry is idempotent", first.message.id === duplicate.message.id);
-  run.check("private unread increments", directOf(await list("b"), run.users.get("a").username).unread_count === 1);
-  await run.request("b", "POST", `${directPath("a")}/read`);
-  run.check("private unread clears", directOf(await list("b"), run.users.get("a").username).unread_count === 0);
-  run.check("peer read receipt persisted", directOf(await list("a"), run.users.get("b").username).peer_last_read_message_id >= first.message.id);
+  const aSocket = await run.openSocket("a");
+  try {
+    const first = await run.request("a", "POST", `${directPath("b")}/messages`, { body: "私聊第一条\n🙂", client_message_id: directID });
+    const duplicate = await run.request("a", "POST", `${directPath("b")}/messages`, { body: "私聊第一条\n🙂", client_message_id: directID });
+    run.check("private conversation starts at seq 1", first.message.seq === 1);
+    run.check(
+      "private send retry is idempotent and keeps the seq",
+      first.message.id === duplicate.message.id && duplicate.message.seq === first.message.seq,
+    );
+    const readerB = await run.openSocket("b");
+    try {
+      const readerItem = directOf(await list("b"), run.users.get("a").username);
+      run.check(
+        "private conversation exposes seq fields",
+        Number.isInteger(readerItem.last_seq) && !("peer_last_read_message_id" in readerItem),
+      );
+      run.check("private unread is last_seq minus the read seq", readerItem.last_seq === 1 && readerItem.unread_count === 1);
+      const ack = await readerB.focusDirect(run.users.get("a").username);
+      run.check("direct focus acknowledges last_read_seq", !ack.error && ack.last_read_seq === 1);
+      run.check("private unread clears after focus", directOf(await list("b"), run.users.get("a").username).unread_count === 0);
+      const peerItem = directOf(await list("a"), run.users.get("b").username);
+      run.check(
+        "peer read receipt uses the message seq",
+        peerItem.peer_last_read_seq === 1 && !("peer_last_read_message_id" in peerItem),
+      );
+
+      const pushedFrom = aSocket.events.length;
+      const replyKey = randomUUID();
+      const second = await run.request("b", "POST", `${directPath("a")}/messages`, { body: "私聊第二条", client_message_id: replyKey });
+      const pushed = await aSocket.waitFor(
+        (event) => event.type === "message.created" && event.message?.client_message_id === replyKey,
+        "the private push never arrived",
+        pushedFrom,
+      );
+      run.check("both directions share one conversation seq", second.message.seq === 2);
+      run.check("websocket private pushes carry seq", pushed.message.seq === 2 && pushed.message.id === second.message.id);
+      await until(
+        async () => directOf(await list("a"), run.users.get("b").username)?.unread_count === 1
+          && directOf(await list("a"), run.users.get("b").username)?.last_seq === 2,
+        "private unread did not settle on the sender",
+      );
+      run.check("private unread counts by seq across both directions", true);
+    } finally {
+      readerB.close();
+    }
+  } finally {
+    aSocket.close();
+  }
+
   await run.expectError("non-friend send denied", "d", "POST", `${directPath("a")}/messages`, { body: "no", client_message_id: randomUUID() }, 403, "not_friends");
   const outsider = await run.request("d", "GET", `${directPath("a")}/messages`);
   run.check("outsider sees only their own empty pair", outsider.messages.length === 0);
@@ -67,49 +111,44 @@ async function main() {
     await run.request("a", "POST", `${directPath("b")}/messages`, { body: `private page ${index}`, client_message_id: randomUUID() });
   }
   const newest = await run.request("b", "GET", `${directPath("a")}/messages?limit=30`);
-  const older = await run.request("b", "GET", `${directPath("a")}/messages?before_id=${newest.messages[0].id}&limit=30`);
-  run.check("private history pages without overlap", newest.has_more && newest.messages.length === 30 && older.messages.length === 3 && older.messages.at(-1).id < newest.messages[0].id);
-  const directAfter = await run.request("b", "GET", `${directPath("a")}/messages?after_id=${first.message.id}&limit=50`);
-  run.check("private reconnect cursor catches up", directAfter.messages.length === 32);
-  await run.request("b", "POST", `${directPath("a")}/read?through_id=${first.message.id}`);
-  run.check("bounded private read preserves newer unread", directOf(await list("b"), run.users.get("a").username).unread_count === 32);
-  const directLatest = newest.messages.at(-1).id;
-  await run.request("b", "POST", `${directPath("a")}/read?through_id=${directLatest}`);
-  const directOldRead = await run.request("b", "POST", `${directPath("a")}/read?through_id=${first.message.id}`);
-  run.check("private read position cannot rewind", directOldRead.last_read_message_id === directLatest && directOf(await list("b"), run.users.get("a").username).unread_count === 0);
-  await run.expectError("invalid private read bound rejected", "b", "POST", `${directPath("a")}/read?through_id=-1`, undefined, 400, "invalid_request");
+  const older = await run.request("b", "GET", `${directPath("a")}/messages?before_seq=${newest.messages[0].seq}&limit=30`);
+  run.check(
+    "private history pages by seq without overlap",
+    newest.has_more && newest.messages.length === 30 && older.messages.length === 4
+      && older.messages.at(-1).seq < newest.messages[0].seq,
+  );
+  run.check("private history seqs are contiguous", contiguous(seqsOf(newest.messages), 5) && contiguous(seqsOf(older.messages), 1));
+  const directAfter = await run.request("b", "GET", `${directPath("a")}/messages?after_seq=1&limit=50`);
+  run.check("private reconnect cursor catches up by seq", contiguous(seqsOf(directAfter.messages), 2) && directAfter.messages.length === 33);
+  const directGap = await run.request("b", "GET", `${directPath("a")}/messages?after_seq=30&limit=50`);
+  run.check("private after_seq backfills a gap", contiguous(seqsOf(directGap.messages), 31) && directGap.messages.length === 4);
+  const sync = await run.request("b", "GET", `/api/messages/sync?after_id=${newest.messages[0].id}&limit=200`);
+  run.check(
+    "private feed sync still uses after_id and carries seq",
+    sync.messages.length === 29 && sync.messages.every((message) => Number.isInteger(message.seq) && message.seq >= 1)
+      && sync.messages.every((message, index) => index === 0 || message.id > sync.messages[index - 1].id),
+  );
+  await until(
+    async () => directOf(await list("b"), run.users.get("a").username)?.unread_count === 32,
+    "private unread did not settle",
+  );
+  run.check("private unread follows the seq counter", true);
 
-  const batchMessage = await run.request("a", "POST", `${directPath("b")}/messages`, {
-    body: "批量已读",
-    client_message_id: randomUUID(),
-  });
-  const batch = await run.request("b", "POST", "/api/read", {
-    reads: [
-      { username: run.users.get("a").username, through_id: batchMessage.message.id },
-      { username: `${run.prefix}_missing`, through_id: batchMessage.message.id },
-      { username: run.users.get("b").username, through_id: batchMessage.message.id },
-    ],
-  });
-  run.check(
-    "batch read advances valid item",
-    batch.reads[0].advanced === true
-      && batch.reads[0].last_read_message_id === batchMessage.message.id,
+  const concurrent = await Promise.all(Array.from({ length: 10 }, (_, index) =>
+    run.request("a", "POST", `${directPath("b")}/messages`, { body: `private concurrent ${index}`, client_message_id: randomUUID() })));
+  const concurrentSeqs = concurrent.map((response) => response.message.seq).sort((left, right) => left - right);
+  run.check("concurrent private sends reuse no seq and leave no gap", contiguous(concurrentSeqs, 35));
+  await until(
+    async () => directOf(await list("b"), run.users.get("a").username)?.last_seq === 44
+      && directOf(await list("b"), run.users.get("a").username)?.unread_count === 42,
+    "private unread did not follow the concurrent seqs",
   );
-  run.check("batch read reports missing peer", batch.reads[1].error === "user_not_found");
-  run.check("batch read reports self", batch.reads[2].error === "cannot_message_self");
-  run.check("batch read clears unread", directOf(await list("b"), run.users.get("a").username).unread_count === 0);
-  run.check(
-    "batch read persists receipt",
-    directOf(await list("a"), run.users.get("b").username).peer_last_read_message_id >= batchMessage.message.id,
-  );
-  const batchRewind = await run.request("b", "POST", "/api/read", {
-    reads: [{ username: run.users.get("a").username, through_id: first.message.id }],
-  });
-  run.check(
-    "batch read cannot rewind",
-    batchRewind.reads[0].advanced === false
-      && batchRewind.reads[0].last_read_message_id === batchMessage.message.id,
-  );
+  run.check("private seq ends at the sent count", true);
+
+  // Bounded and rewinding HTTP reads are gone: focus always advances to the
+  // conversation counter, so only the latest position can be recorded.
+  await run.expectStatus("legacy conversation read endpoint is gone", "b", "POST", `${directPath("a")}/read`, 404);
+  await run.expectStatus("legacy batch read endpoint is gone", "b", "POST", "/api/read", 404, { reads: [] });
 
   await run.expectError("group needs members", "a", "POST", "/api/groups", { name: "empty", member_usernames: [] }, 400, "invalid_members");
   await run.expectError("group needs valid name", "a", "POST", "/api/groups", { name: "群".repeat(31), member_usernames: [run.users.get("b").username] }, 400, "invalid_group_name");
@@ -119,18 +158,35 @@ async function main() {
   const messageKey = randomUUID();
   const groupFirst = await sendGroup("a", id, "入群前的历史", messageKey);
   const repeated = await sendGroup("a", id, "入群前的历史", messageKey);
-  run.check("group retry is idempotent", groupFirst.message.id === repeated.message.id);
+  run.check("group conversation starts at seq 1", groupFirst.message.seq === 1);
+  run.check(
+    "group retry is idempotent and keeps the seq",
+    groupFirst.message.id === repeated.message.id && repeated.message.seq === groupFirst.message.seq,
+  );
   // v1.7 advances the sender's own position asynchronously after accept.
   await until(async () => groupOf(await list("a"), id)?.unread_count === 0, "group sender unread did not settle");
   run.check("group sender has no own unread", true);
-  run.check("group receiver unread increments", groupOf(await list("b"), id).unread_count === 1);
-  await run.request("b", "POST", `/api/groups/${id}/read`);
-  run.check("group read persists", groupOf(await list("b"), id).unread_count === 0);
+  const groupPeer = groupOf(await list("b"), id);
+  run.check(
+    "group unread is last_seq minus the read seq",
+    groupPeer.last_seq === 1 && groupPeer.unread_count === 1 && !("peer_last_read_seq" in groupPeer),
+  );
+  const groupReader = await run.openSocket("b");
+  try {
+    const ack = await groupReader.focusGroup(id);
+    run.check("group focus acknowledges last_read_seq", !ack.error && ack.last_read_seq === 1);
+    run.check("group focus clears unread", groupOf(await list("b"), id).unread_count === 0);
+  } finally {
+    groupReader.close();
+  }
   await run.request("b", "POST", `/api/groups/${id}/members`, { usernames: [run.users.get("c").username] });
   run.check("ordinary member can invite their friend", groupOf(await list("c"), id).group.member_count === 3);
-  run.check("new member history starts read", groupOf(await list("c"), id).unread_count === 0);
+  run.check(
+    "new member baseline is the current seq counter",
+    groupOf(await list("c"), id).unread_count === 0 && groupOf(await list("c"), id).last_seq === 1,
+  );
   const oldHistory = await run.request("c", "GET", `/api/groups/${id}/messages`);
-  run.check("new member sees prejoin history", oldHistory.messages[0].body === "入群前的历史");
+  run.check("new member sees prejoin history", oldHistory.messages[0].body === "入群前的历史" && oldHistory.messages[0].seq === 1);
   await run.request("a", "POST", `/api/groups/${id}/members`, { usernames: [run.users.get("c").username] });
   run.check("duplicate invite ignored", groupOf(await list("a"), id).group.member_count === 3);
   await run.expectError("outsider group read denied", "d", "GET", `/api/groups/${id}`, undefined, 404, "group_not_found");
@@ -140,28 +196,51 @@ async function main() {
   run.check("rename persisted for all members", groupOf(await list("b"), id).group.name === "已改名的验证群");
   for (let index = 0; index < 35; index += 1) await sendGroup("a", id, `group page ${index}`);
   const groupPage = await run.request("b", "GET", `/api/groups/${id}/messages?limit=30`);
-  const groupOlder = await run.request("b", "GET", `/api/groups/${id}/messages?limit=30&before_id=${groupPage.messages[0].id}`);
-  run.check("group history pages without overlap", groupPage.has_more && groupPage.messages.length === 30 && groupOlder.messages.length === 6 && groupOlder.messages.at(-1).id < groupPage.messages[0].id);
-  const groupAfter = await run.request("b", "GET", `/api/groups/${id}/messages?limit=50&after_id=${groupFirst.message.id}`);
-  run.check("group reconnect cursor catches up", groupAfter.messages.length === 35);
-  await run.request("b", "POST", `/api/groups/${id}/read?through_id=${groupFirst.message.id}`);
-  run.check("bounded group read preserves newer unread", groupOf(await list("b"), id).unread_count === 35);
-  const groupLatest = groupPage.messages.at(-1).id;
-  await run.request("b", "POST", `/api/groups/${id}/read?through_id=${groupLatest}`);
-  const groupOldRead = await run.request("b", "POST", `/api/groups/${id}/read?through_id=${groupFirst.message.id}`);
-  run.check("group read position cannot rewind", groupOldRead.last_read_message_id === groupLatest && groupOf(await list("b"), id).unread_count === 0);
-  await run.expectError("invalid group read bound rejected", "b", "POST", `/api/groups/${id}/read?through_id=-1`, undefined, 400, "invalid_request");
-  await run.expectError("conflicting group cursors rejected", "a", "GET", `/api/groups/${id}/messages?before_id=10&after_id=1`, undefined, 400, "invalid_request");
+  const groupOlder = await run.request("b", "GET", `/api/groups/${id}/messages?limit=30&before_seq=${groupPage.messages[0].seq}`);
+  run.check(
+    "group history pages by seq without overlap",
+    groupPage.has_more && groupPage.messages.length === 30 && groupOlder.messages.length === 6
+      && groupOlder.messages.at(-1).seq < groupPage.messages[0].seq,
+  );
+  run.check("group history seqs are contiguous", contiguous(seqsOf(groupPage.messages), 7) && contiguous(seqsOf(groupOlder.messages), 1));
+  const groupAfter = await run.request("b", "GET", `/api/groups/${id}/messages?limit=50&after_seq=1`);
+  run.check("group reconnect cursor catches up by seq", contiguous(seqsOf(groupAfter.messages), 2) && groupAfter.messages.length === 35);
+  const groupBootstrap = await run.request("b", "POST", "/api/bootstrap", {
+    after_id: 0,
+    groups: [{ group_id: id, after_seq: 5 }],
+    limit: 200,
+  });
+  const groupDelta = groupBootstrap.groups.find((item) => item.group_id === id);
+  run.check(
+    "bootstrap group cursor is after_seq in seq units",
+    groupDelta?.cursor === 36 && contiguous(seqsOf(groupDelta.messages), 6),
+  );
+  await until(
+    async () => groupOf(await list("b"), id).unread_count === 35,
+    "group unread did not follow the seq counter",
+  );
+  run.check("group unread follows the seq counter", true);
+  const groupConcurrent = await Promise.all(Array.from({ length: 12 }, (_, index) => sendGroup("a", id, `group concurrent ${index}`)));
+  const groupConcurrentSeqs = groupConcurrent.map((response) => response.message.seq).sort((left, right) => left - right);
+  run.check("concurrent group sends reuse no seq and leave no gap", contiguous(groupConcurrentSeqs, 37));
+  const groupGap = await run.request("b", "GET", `/api/groups/${id}/messages?limit=50&after_seq=36`);
+  run.check("group after_seq backfills a gap", contiguous(seqsOf(groupGap.messages), 37) && groupGap.messages.length === 12);
+  await run.expectStatus("legacy group read endpoint is gone", "b", "POST", `/api/groups/${id}/read`, 404);
+  await run.expectError("conflicting group cursors rejected", "a", "GET", `/api/groups/${id}/messages?before_seq=10&after_seq=1`, undefined, 400, "invalid_request");
   await run.request("a", "DELETE", `/api/groups/${id}/members/${run.users.get("c").username}`);
   await run.expectError("kicked member loses history", "c", "GET", `/api/groups/${id}/messages`, undefined, 404, "group_not_found");
   await run.request("a", "POST", `/api/groups/${id}/members`, { usernames: [run.users.get("c").username] });
-  run.check("reinvited member baseline advances", groupOf(await list("c"), id).unread_count === 0);
+  run.check(
+    "reinvited member baseline advances to the counter",
+    groupOf(await list("c"), id).unread_count === 0 && groupOf(await list("c"), id).last_seq === 48,
+  );
   await run.request("c", "POST", `/api/groups/${id}/leave`);
   run.check("member can leave", !groupOf(await list("c"), id));
   await run.request("a", "DELETE", `/api/friends/${run.users.get("b").username}`);
   await run.expectError("deleted friend private send denied", "a", "POST", `${directPath("b")}/messages`, { body: "no", client_message_id: randomUUID() }, 403, "not_friends");
   run.check("deleted friend private history retained", (await run.request("a", "GET", `${directPath("b")}/messages`)).messages.length > 0);
-  await sendGroup("b", id, "删好友仍可群聊");
+  const afterUnfriend = await sendGroup("b", id, "删好友仍可群聊");
+  run.check("group seq keeps counting after unfriending", afterUnfriend.message.seq === 49);
   run.check("group membership independent of friendship", true);
   const dissolved = await run.request("a", "POST", `/api/groups/${id}/leave`);
   run.check("owner leaving dissolves group", dissolved.dissolved);
@@ -175,10 +254,7 @@ async function main() {
   run.check("group sender never carries own unread", true);
   const peerF = groupOf(await list("f"), statsGroup);
   const peerG = groupOf(await list("g"), statsGroup);
-  run.check(
-    "group unread matches for peers",
-    peerF.unread_count === 1 && peerG.unread_count === 1,
-  );
+  run.check("group unread matches for peers", peerF.unread_count === 1 && peerG.unread_count === 1);
   run.check(
     "bootstrap group unread matches conversations",
     groupOf(await bootstrapOf("f"), statsGroup).unread_count === peerF.unread_count,
@@ -187,47 +263,73 @@ async function main() {
     "group sender has no own unread in bootstrap",
     groupOf(await bootstrapOf("e"), statsGroup).unread_count === 0,
   );
-  const ownStats = await readStats("e", statsGroup, readFirst.message.id);
+  const ownStats = await readStats("e", statsGroup, readFirst.message.seq);
   run.check(
-    "read-stats starts at zero",
-    ownStats.message_id === readFirst.message.id
+    "read-stats takes seq and returns the global message id",
+    ownStats.seq === 1 && ownStats.message_id === readFirst.message.id
       && ownStats.read_count === 0 && ownStats.member_count === 2 && ownStats.all_read === false,
   );
-  await run.expectError("read-stats needs a message id", "e", "GET", statsPath, undefined, 400, "invalid_request");
-  await run.expectError("read-stats rejects zero message id", "e", "GET", `${statsPath}?message_id=0`, undefined, 400, "invalid_request");
-  await run.expectError("read-stats rejects malformed message id", "e", "GET", `${statsPath}?message_id=abc`, undefined, 400, "invalid_request");
-  await run.expectError("outsider cannot read stats or probe messages", "d", "GET", `${statsPath}?message_id=${readFirst.message.id}`, undefined, 404, "group_not_found");
-  await groupReadThrough("f", statsGroup, readFirst.message.id);
-  const oneReader = await readStats("e", statsGroup, readFirst.message.id);
-  run.check(
-    "read-stats counts a partial reader",
-    oneReader.read_count === 1 && oneReader.member_count === 2 && oneReader.all_read === false,
-  );
-  await groupReadThrough("g", statsGroup, readFirst.message.id);
-  const everyone = await readStats("e", statsGroup, readFirst.message.id);
-  run.check(
-    "read-stats reports all read",
-    everyone.read_count === 2 && everyone.member_count === 2 && everyone.all_read === true,
-  );
-  const otherMessage = await sendGroup("g", statsGroup, "他人的消息");
-  await run.expectError("read-stats rejects another member's message", "e", "GET", `${statsPath}?message_id=${otherMessage.message.id}`, undefined, 403, "not_your_message");
-  const readSecond = await sendGroup("e", statsGroup, "已读第二条");
-  await until(async () => groupOf(await list("e"), statsGroup)?.unread_count === 0, "sender unread did not settle for the second message");
-  await groupReadThrough("g", statsGroup, readSecond.message.id);
-  const beforeKick = await readStats("e", statsGroup, readSecond.message.id);
-  run.check(
-    "read-stats tracks the newer message",
-    beforeKick.read_count === 1 && beforeKick.member_count === 2 && beforeKick.all_read === false,
-  );
-  await run.request("e", "DELETE", `/api/groups/${statsGroup}/members/${run.users.get("f").username}`);
-  const afterKick = await readStats("e", statsGroup, readSecond.message.id);
-  run.check(
-    "kicking a non-reader shrinks the denominator",
-    afterKick.read_count === 1 && afterKick.member_count === 1 && afterKick.all_read === true,
-  );
+  await run.expectError("read-stats needs a seq", "e", "GET", statsPath, undefined, 400, "invalid_request");
+  await run.expectError("read-stats rejects zero seq", "e", "GET", `${statsPath}?seq=0`, undefined, 400, "invalid_request");
+  await run.expectError("read-stats rejects malformed seq", "e", "GET", `${statsPath}?seq=abc`, undefined, 400, "invalid_request");
+  await run.expectError("outsider cannot read stats or probe messages", "d", "GET", `${statsPath}?seq=1`, undefined, 404, "group_not_found");
+
+  const readerF = await run.openSocket("f");
+  const readerG = await run.openSocket("g");
+  try {
+    run.check("reader f focuses the group", !(await readerF.focusGroup(statsGroup)).error);
+    await until(async () => (await readStats("e", statsGroup, 1)).read_count === 1, "the focused reader did not read");
+    run.check("read-stats counts a partial reader", true);
+    run.check("reader g focuses the group", !(await readerG.focusGroup(statsGroup)).error);
+    await until(async () => (await readStats("e", statsGroup, 1)).all_read, "the second reader did not read");
+    run.check(
+      "read-stats reports all read",
+      (await readStats("e", statsGroup, 1)).read_count === 2 && (await readStats("e", statsGroup, 1)).member_count === 2,
+    );
+    // Implicit read resolves focus at flush time (100ms after enqueue), so
+    // blurring after the send races the advance. Clear f's focus first.
+    readerF.blur();
+    await delay(150);
+    const otherMessage = await sendGroup("g", statsGroup, "他人的消息");
+    run.check("group seqs are contiguous in the stats group", otherMessage.message.seq === 2);
+    await run.expectError(
+      "read-stats rejects another member's message",
+      "e",
+      "GET",
+      `${statsPath}?seq=${otherMessage.message.seq}`,
+      undefined,
+      403,
+      "not_your_message",
+    );
+    const readSecond = await sendGroup("e", statsGroup, "已读第二条");
+    run.check("group seq reaches three", readSecond.message.seq === 3);
+    run.check("reader g refocuses the group", !(await readerG.focusGroup(statsGroup)).error);
+    await until(async () => (await readStats("e", statsGroup, 3)).read_count === 1, "the focused reader did not catch up");
+    const beforeKick = await readStats("e", statsGroup, readSecond.message.seq);
+    run.check(
+      "read-stats tracks the newer seq",
+      beforeKick.seq === 3 && beforeKick.message_id === readSecond.message.id
+        && beforeKick.read_count === 1 && beforeKick.member_count === 2 && beforeKick.all_read === false,
+    );
+    await until(async () => groupOf(await list("e"), statsGroup)?.unread_count === 0, "sender unread did not settle for the second message");
+    run.check(
+      "blurred reader keeps unread for unread seqs",
+      groupOf(await list("f"), statsGroup).unread_count === 2
+        && groupOf(await list("g"), statsGroup).unread_count === 0,
+    );
+    await run.request("e", "DELETE", `/api/groups/${statsGroup}/members/${run.users.get("f").username}`);
+    const afterKick = await readStats("e", statsGroup, readSecond.message.seq);
+    run.check(
+      "kicking a non-reader shrinks the denominator",
+      afterKick.read_count === 1 && afterKick.member_count === 1 && afterKick.all_read === true,
+    );
+  } finally {
+    readerF.close();
+    readerG.close();
+  }
   await run.request("g", "POST", `/api/groups/${statsGroup}/leave`);
-  await run.expectError("former member cannot read stats", "g", "GET", `${statsPath}?message_id=${otherMessage.message.id}`, undefined, 404, "group_not_found");
-  const alone = await readStats("e", statsGroup, readSecond.message.id);
+  await run.expectError("former member cannot read stats", "g", "GET", `${statsPath}?seq=2`, undefined, 404, "group_not_found");
+  const alone = await readStats("e", statsGroup, 3);
   run.check(
     "alone in the group has no denominator",
     alone.read_count === 0 && alone.member_count === 0 && alone.all_read === false,
@@ -246,60 +348,65 @@ async function implicitReadOverWebSocket() {
     sockets.push(socket);
     return socket;
   };
-  const focusGroup = async (socket, id) => {
-    const from = socket.events.length;
-    socket.send({ type: "focus", kind: "group", group_id: id });
-    return socket.waitFor((event) => event.type === "focus.ack" && event.group_id === id, "group focus was not acknowledged", from);
-  };
   try {
     const live = await run.group("h", "隐式已读群", ["i", "j"]);
     const owner = await open("h");
     const readerI = await open("i");
     const readerJ = await open("j");
-    run.check("viewers focus the group", !(await focusGroup(readerI, live)).error && !(await focusGroup(readerJ, live)).error);
+    run.check("viewers focus the group", !(await readerI.focusGroup(live)).error && !(await readerJ.focusGroup(live)).error);
 
     const ownerFrom = owner.events.length;
     const first = await sendGroup("h", live, "隐式已读群消息");
+    run.check("the first group message gets seq 1", first.message.seq === 1);
     await owner.waitFor((event) => event.type === "group.read" && event.group_id === live, "the sender never received group.read", ownerFrom);
     run.check("sender receives group.read when focused viewers read", true);
-    await until(async () => (await readStats("h", live, first.message.id)).all_read, "focused viewers did not complete the receipt");
-    const stats = await readStats("h", live, first.message.id);
-    run.check("focused viewers implicitly read the message", stats.read_count === 2 && stats.member_count === 2);
+    await until(async () => (await readStats("h", live, 1)).all_read, "focused viewers did not complete the receipt");
+    const stats = await readStats("h", live, 1);
+    run.check(
+      "focused viewers implicitly read the seq",
+      stats.seq === 1 && stats.message_id === first.message.id && stats.read_count === 2 && stats.member_count === 2,
+    );
     run.check(
       "no member has unread after implicit read",
       (await Promise.all(["h", "i", "j"].map((key) => list(key)))).every((conversations) => groupOf(conversations, live).unread_count === 0),
     );
 
-    readerJ.send({ type: "blur" });
+    readerJ.blur();
     await delay(150);
     const second = await sendGroup("h", live, "j 已离开");
-    await until(async () => (await readStats("h", live, second.message.id)).read_count === 1, "the focused viewer did not read");
+    run.check("the second group message gets seq 2", second.message.seq === 2);
+    await until(async () => (await readStats("h", live, 2)).read_count === 1, "the focused viewer did not read");
     await delay(400);
     run.check(
       "a blurred viewer is not auto-read",
-      (await readStats("h", live, second.message.id)).read_count === 1 && groupOf(await list("j"), live).unread_count === 1,
+      (await readStats("h", live, 2)).read_count === 1 && groupOf(await list("j"), live).unread_count === 1,
     );
-    const ack = await focusGroup(readerJ, live);
-    await until(async () => (await readStats("h", live, second.message.id)).all_read, "refocus did not catch up");
-    run.check("refocus catches up the missed message", !ack.error && groupOf(await list("j"), live).unread_count === 0);
+    const ack = await readerJ.focusGroup(live);
+    await until(async () => (await readStats("h", live, 2)).all_read, "refocus did not catch up");
+    run.check(
+      "refocus catches up the missed seq",
+      !ack.error && ack.last_read_seq === 2 && groupOf(await list("j"), live).unread_count === 0,
+    );
 
     const outsider = await open("a");
-    run.check("a non-member cannot focus the group", (await focusGroup(outsider, live)).error === "not_group_member");
+    run.check("a non-member cannot focus the group", (await outsider.focusGroup(live)).error === "not_group_member");
 
     const owner2 = owner.events.length;
-    const readerI2 = readerI.events.length;
-    readerI.send({ type: "focus", kind: "direct", username: run.users.get("h").username });
-    const directAck = await readerI.waitFor((event) => event.type === "focus.ack" && event.kind === "direct", "direct focus was not acknowledged", readerI2);
+    const directAck = await readerI.focusDirect(run.users.get("h").username);
     const direct = await run.request("h", "POST", `${directPath("i")}/messages`, { body: "私聊隐式已读", client_message_id: randomUUID() });
+    run.check("the first private message gets seq 1", direct.message.seq === 1);
     const readEvent = await owner.waitFor(
-      (event) => event.type === "messages.read" && event.last_read_message_id >= direct.message.id,
+      (event) => event.type === "messages.read" && event.last_read_seq >= direct.message.seq,
       "the sender never received messages.read",
       owner2,
     );
-    run.check("private focus reads without any read request", !directAck.error && readEvent.reader === run.users.get("i").username);
     run.check(
-      "private receipt and unread settle",
-      directOf(await list("h"), run.users.get("i").username).peer_last_read_message_id >= direct.message.id
+      "private focus reads without any read request",
+      !directAck.error && directAck.last_read_seq === 0 && readEvent.reader === run.users.get("i").username,
+    );
+    run.check(
+      "private receipt and unread settle by seq",
+      directOf(await list("h"), run.users.get("i").username).peer_last_read_seq >= direct.message.seq
         && directOf(await list("i"), run.users.get("h").username).unread_count === 0,
     );
     const refused = readerI.events.length;

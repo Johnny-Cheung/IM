@@ -19,7 +19,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/build-release.sh [VERSION] [OUTPUT_DIR]
 
-  VERSION     release label in vX.Y form (default: v0.7)
+  VERSION     release label in vX.Y or vX.Y.Z form (default: v0.7)
   OUTPUT_DIR  new output directory outside the repository
               (default: a unique scratch directory under $TMPDIR)
 
@@ -37,8 +37,8 @@ if [ "$#" -gt 2 ]; then
 fi
 
 VERSION="${1:-v0.7}"
-if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+$ ]]; then
-  die "invalid version '$VERSION'; expected vX.Y (for example v0.7)"
+if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+  die "invalid version '$VERSION'; expected vX.Y or vX.Y.Z (for example v0.7 or v1.8.1)"
 fi
 
 INVOCATION_DIR="$PWD"

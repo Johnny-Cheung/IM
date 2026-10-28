@@ -14,6 +14,7 @@ import {
   api,
   ApiError,
   describeError,
+  isAcceptedSeq,
   isSessionError,
   websocketURL,
   type ChatMessage,
@@ -24,20 +25,26 @@ import {
   type GroupMessage,
   type GroupReadStats,
   type PublicUser,
+  type User,
 } from "../api";
 import {
+  deleteMessagesFrom,
+  deleteOutbox,
+  markOutboxFailed,
   readConversations,
   readFriends,
   readMessages,
+  readOutbox,
   readSyncState,
   removeMessages,
   writeConversations,
   writeFriends,
   writeMessages,
+  writeOutbox,
 } from "../cache";
-import type { CachedMessage } from "../cache";
+import type { CachedMessage, CachedOutbox } from "../cache";
 import { BLUR_FRAME, focusFrame, parseFocusAck, type FocusAck, type FocusTarget } from "../focus";
-import { groupReceiptLabel, lastOwnSentMessageID as findLastOwnSentMessageID } from "../groupReceipt";
+import { groupReceiptLabel, lastOwnSentSeq as findLastOwnSentSeq } from "../groupReceipt";
 import {
   Debouncer,
   READ_STATS_DEBOUNCE_MS,
@@ -46,10 +53,27 @@ import {
   parseGroupReadStats,
   type GroupReadEvent,
 } from "../readStats";
+import {
+  acceptedSeqMap,
+  isReadByPeer,
+  lostOutboxEntries,
+  maxAcceptedSeq,
+  missingSeqs,
+  MissingSeqTracker,
+  nextUnread,
+  planActiveSync,
+  planGapPull,
+  planIncoming,
+  planListRollback,
+  planRollback,
+  shouldReplacePreview,
+  sortConversationMessages,
+} from "../seqSync";
 import { Brand } from "../components/Brand";
 import { useAuth } from "../auth";
 
 const PAGE_SIZE = 30;
+const MAX_GAP_SCAN = 2000;
 const MAX_MESSAGE_LENGTH = 2000;
 const MAX_GROUP_NAME_LENGTH = 30;
 const MAX_RECONNECT_ATTEMPTS = 5;
@@ -71,7 +95,7 @@ type ActiveTarget =
 type ReadEvent = {
   reader: string;
   peer: string;
-  lastReadMessageID: number;
+  lastReadSeq: number;
 };
 
 type GroupChangedEvent = {
@@ -81,7 +105,7 @@ type GroupChangedEvent = {
 
 type GroupReceipt = {
   groupID: number;
-  messageID: number;
+  seq: number;
   stats: GroupReadStats;
 };
 
@@ -172,18 +196,7 @@ function toDisplayMessage(message: CachedMessage): DisplayMessage {
 }
 
 function sortMessages(messages: DisplayMessage[]): DisplayMessage[] {
-  return [...messages].sort((left, right) => {
-    if (left.status === "sent" && right.status === "sent") {
-      return left.id - right.id;
-    }
-    if (left.status === "sent") {
-      return -1;
-    }
-    if (right.status === "sent") {
-      return 1;
-    }
-    return 0;
-  });
+  return sortConversationMessages(messages);
 }
 
 function mergeMessages(
@@ -192,10 +205,34 @@ function mergeMessages(
 ): DisplayMessage[] {
   const merged = [...existing];
   for (const message of incoming) {
-    const index = merged.findIndex((item) =>
-      item.client_message_id === message.client_message_id
-      || (message.id > 0 && item.id === message.id));
+    const confirmed = isAcceptedSeq(message.seq);
+    let index = confirmed
+      ? merged.findIndex((item) =>
+        isAcceptedSeq(item.seq) && item.seq === message.seq)
+      : -1;
+    if (index < 0 && message.client_message_id !== "") {
+      // Any incoming message replaces its local pending copy by client id;
+      // confirmed messages additionally replace by seq above.
+      index = merged.findIndex((item) =>
+        !isAcceptedSeq(item.seq)
+        && item.client_message_id === message.client_message_id);
+    }
     if (index >= 0) {
+      const current = merged[index];
+      if (
+        confirmed
+        && isAcceptedSeq(current.seq)
+        && current.seq === message.seq
+        && current.id !== message.id
+      ) {
+        // A reused seq makes every higher cached seq stale.
+        for (let position = merged.length - 1; position >= 0; position -= 1) {
+          const item = merged[position];
+          if (isAcceptedSeq(item.seq) && item.seq > message.seq) {
+            merged.splice(position, 1);
+          }
+        }
+      }
       merged[index] = message;
     } else {
       merged.push(message);
@@ -315,6 +352,7 @@ function parseIncomingMessage(value: unknown): ChatMessage | null {
   const candidate = event.message as Partial<ChatMessage>;
   if (
     typeof candidate.id !== "number"
+    || !isAcceptedSeq(candidate.seq)
     || typeof candidate.body !== "string"
     || typeof candidate.client_message_id !== "string"
     || typeof candidate.created_at !== "string"
@@ -345,6 +383,7 @@ function parseGroupIncomingMessage(value: unknown): GroupMessage | null {
   const candidate = event.message as Partial<GroupMessage>;
   if (
     typeof candidate.id !== "number"
+    || !isAcceptedSeq(candidate.seq)
     || typeof candidate.group_id !== "number"
     || typeof candidate.body !== "string"
     || typeof candidate.client_message_id !== "string"
@@ -366,20 +405,22 @@ function parseReadEvent(value: unknown): ReadEvent | null {
     type?: unknown;
     reader?: unknown;
     peer?: unknown;
-    last_read_message_id?: unknown;
+    last_read_seq?: unknown;
   };
   if (
     event.type !== "messages.read"
     || typeof event.reader !== "string"
     || typeof event.peer !== "string"
-    || typeof event.last_read_message_id !== "number"
+    || typeof event.last_read_seq !== "number"
+    || !Number.isSafeInteger(event.last_read_seq)
+    || event.last_read_seq < 0
   ) {
     return null;
   }
   return {
     reader: event.reader,
     peer: event.peer,
-    lastReadMessageID: event.last_read_message_id,
+    lastReadSeq: event.last_read_seq,
   };
 }
 
@@ -402,57 +443,175 @@ function parseGroupChangedEvent(value: unknown): GroupChangedEvent | null {
   return { groupID: event.group_id, action: event.action };
 }
 
+function acceptedPage<T extends { seq: number }>(messages: T[]): T[] {
+  // Accepted messages always carry seq >= 1; a page entry without one is
+  // unusable for ordering and must not reach the cache or the list.
+  return messages.filter((message) => isAcceptedSeq(message.seq));
+}
+
 async function fetchInitialPage(
   target: ActiveTarget,
 ): Promise<{ messages: DisplayMessage[]; hasMore: boolean }> {
   if (target.kind === "direct") {
     const page = await api.listMessages(target.username, undefined, PAGE_SIZE);
     return {
-      messages: page.messages.map(toDirectDisplay),
+      messages: acceptedPage(page.messages).map(toDirectDisplay),
       hasMore: page.has_more,
     };
   }
   const page = await api.listGroupMessages(target.groupID, undefined, PAGE_SIZE);
   return {
-    messages: page.messages.map(toGroupDisplay),
+    messages: acceptedPage(page.messages).map(toGroupDisplay),
     hasMore: page.has_more,
   };
 }
 
 async function fetchOlderPage(
   target: ActiveTarget,
-  beforeID: number,
+  beforeSeq: number,
 ): Promise<{ messages: DisplayMessage[]; hasMore: boolean }> {
   if (target.kind === "direct") {
-    const page = await api.listMessages(target.username, beforeID, PAGE_SIZE);
+    const page = await api.listMessages(target.username, beforeSeq, PAGE_SIZE);
     return {
-      messages: page.messages.map(toDirectDisplay),
+      messages: acceptedPage(page.messages).map(toDirectDisplay),
       hasMore: page.has_more,
     };
   }
-  const page = await api.listGroupMessages(target.groupID, beforeID, PAGE_SIZE);
+  const page = await api.listGroupMessages(target.groupID, beforeSeq, PAGE_SIZE);
   return {
-    messages: page.messages.map(toGroupDisplay),
+    messages: acceptedPage(page.messages).map(toGroupDisplay),
     hasMore: page.has_more,
   };
 }
 
 async function fetchAfterPage(
   target: ActiveTarget,
-  afterID: number,
+  afterSeq: number,
 ): Promise<{ messages: DisplayMessage[]; hasMore: boolean }> {
   if (target.kind === "direct") {
-    const page = await api.listMessagesAfter(target.username, afterID, 50);
+    const page = await api.listMessagesAfter(target.username, afterSeq, 50);
     return {
-      messages: page.messages.map(toDirectDisplay),
+      messages: acceptedPage(page.messages).map(toDirectDisplay),
       hasMore: page.has_more,
     };
   }
-  const page = await api.listGroupMessagesAfter(target.groupID, afterID, 50);
+  const page = await api.listGroupMessagesAfter(target.groupID, afterSeq, 50);
   return {
-    messages: page.messages.map(toGroupDisplay),
+    messages: acceptedPage(page.messages).map(toGroupDisplay),
     hasMore: page.has_more,
   };
+}
+
+type TailPull = {
+  messages: DisplayMessage[];
+  lastSeq: number;
+  truncated: boolean;
+};
+
+async function collectAfterSeq(
+  target: ActiveTarget,
+  afterSeq: number,
+): Promise<TailPull> {
+  let after = afterSeq;
+  const messages: DisplayMessage[] = [];
+  for (let round = 0; round < 10; round += 1) {
+    const page = await fetchAfterPage(target, after);
+    if (page.messages.length === 0) {
+      return { messages, lastSeq: after, truncated: false };
+    }
+    messages.push(...page.messages);
+    const next = maxAcceptedSeq(page.messages);
+    if (next <= after) {
+      return { messages, lastSeq: after, truncated: false };
+    }
+    after = next;
+    if (!page.hasMore) {
+      return { messages, lastSeq: after, truncated: false };
+    }
+  }
+  return { messages, lastSeq: after, truncated: true };
+}
+
+// Pulls the ranges the local cache is missing. Seqs the server skips after a
+// pull are marked and never retried, so one lost message cannot loop forever.
+async function pullGaps(
+  target: ActiveTarget,
+  fromSeq: number,
+  toSeq: number,
+  present: Set<number>,
+  tracker: MissingSeqTracker,
+): Promise<DisplayMessage[]> {
+  const collected: DisplayMessage[] = [];
+  for (let round = 0; round < 3; round += 1) {
+    const plan = planGapPull(
+      fromSeq,
+      toSeq,
+      present,
+      tracker.pending(target.key),
+    );
+    if (plan === null) {
+      break;
+    }
+    const pulled = await collectAfterSeq(target, plan.afterSeq);
+    for (const message of pulled.messages) {
+      present.add(message.seq);
+      collected.push(message);
+    }
+    const reached = Math.min(pulled.lastSeq, plan.targetSeq);
+    tracker.mark(
+      target.key,
+      missingSeqs(plan.afterSeq, reached, present),
+    );
+    if (pulled.lastSeq <= plan.afterSeq) {
+      tracker.mark(
+        target.key,
+        missingSeqs(plan.afterSeq, plan.targetSeq, present),
+      );
+      break;
+    }
+    if (!pulled.truncated && pulled.lastSeq < plan.targetSeq) {
+      tracker.mark(
+        target.key,
+        missingSeqs(pulled.lastSeq, plan.targetSeq, present),
+      );
+    }
+  }
+  return collected;
+}
+
+function outboxDisplay(
+  entry: CachedOutbox,
+  user: User,
+): DisplayMessage | null {
+  const base = {
+    id: 0,
+    seq: 0,
+    sender: { username: user.username, nickname: user.nickname },
+    body: entry.body,
+    client_message_id: entry.client_message_id,
+    created_at: entry.created_at,
+    status: "failed" as const,
+  };
+  if (entry.kind === "group") {
+    if (entry.group_id === undefined) {
+      return null;
+    }
+    return { ...base, group_id: entry.group_id };
+  }
+  if (!entry.recipient) {
+    return null;
+  }
+  return { ...base, recipient: entry.recipient };
+}
+
+function outboxFailedMessages(
+  entries: readonly CachedOutbox[],
+  confirmed: Iterable<string>,
+  user: User,
+): DisplayMessage[] {
+  return lostOutboxEntries(entries, new Set(confirmed))
+    .map((entry) => outboxDisplay(entry, user))
+    .filter((message): message is DisplayMessage => message !== null);
 }
 
 export function ChatPage() {
@@ -538,7 +697,14 @@ export function ChatPage() {
   const activeTargetRef = useRef<ActiveTarget | null>(activeTarget);
   const userRef = useRef(user);
   const conversationKeysRef = useRef<Set<string>>(new Set());
-  const conversationLastIDsRef = useRef<Map<string, number>>(new Map());
+  const conversationLastSeqsRef = useRef<Map<string, number>>(new Map());
+  const conversationLastMessagesRef = useRef<Map<string, { id: number; seq: number }>>(
+    new Map(),
+  );
+  const missingSeqTrackerRef = useRef(new MissingSeqTracker());
+  const resyncTailRef = useRef<(target: ActiveTarget, keepSeq: number) => void>(
+    () => {},
+  );
   const messageListRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const websocketRef = useRef<WebSocket | null>(null);
@@ -555,7 +721,7 @@ export function ChatPage() {
   const reconnectAttemptRef = useRef(0);
   const connectRef = useRef<() => void>(() => {});
   const syncingRef = useRef(false);
-  const groupReceiptTargetRef = useRef<{ groupID: number; messageID: number } | null>(null);
+  const groupReceiptTargetRef = useRef<{ groupID: number; seq: number } | null>(null);
   const readStatsGateRef = useRef(new ReadStatsGate());
   const readStatsDebouncerRef = useRef(new Debouncer(READ_STATS_DEBOUNCE_MS));
   const nearBottomRef = useRef(true);
@@ -595,11 +761,23 @@ export function ChatPage() {
 
   useEffect(() => {
     conversationKeysRef.current = new Set(conversations.map(conversationKey));
-    const lastIDs = new Map<string, number>();
+    const lastSeqs = new Map<string, number>();
+    const lastMessages = new Map<string, { id: number; seq: number }>();
     for (const conversation of conversations) {
-      lastIDs.set(conversationKey(conversation), conversation.last_message?.id ?? 0);
+      const key = conversationKey(conversation);
+      lastSeqs.set(key, conversation.last_seq);
+      if (
+        conversation.last_message
+        && isAcceptedSeq(conversation.last_message.seq)
+      ) {
+        lastMessages.set(key, {
+          id: conversation.last_message.id,
+          seq: conversation.last_message.seq,
+        });
+      }
     }
-    conversationLastIDsRef.current = lastIDs;
+    conversationLastSeqsRef.current = lastSeqs;
+    conversationLastMessagesRef.current = lastMessages;
   }, [conversations]);
 
   useEffect(() => {
@@ -649,18 +827,18 @@ export function ChatPage() {
     navigate("/", { replace: true });
   }, [navigate]);
 
-  const clearLocalUnread = useCallback((target: FocusTarget, throughID: number) => {
+  const clearLocalUnread = useCallback((target: FocusTarget, throughSeq: number) => {
     setConversations((previous) => previous.map((conversation) => {
       if (target.kind === "direct") {
         return conversation.type === "direct"
           && sameUsername(conversation.user.username, target.username)
-          && (conversation.last_message?.id ?? 0) <= throughID
+          && conversation.last_seq <= throughSeq
           ? { ...conversation, unread_count: 0 }
           : conversation;
       }
       return conversation.type === "group"
         && conversation.group.id === target.groupID
-        && (conversation.last_message?.id ?? 0) <= throughID
+        && conversation.last_seq <= throughSeq
         ? { ...conversation, unread_count: 0 }
         : conversation;
     }));
@@ -695,25 +873,35 @@ export function ChatPage() {
     }
     const token = readStatsGateRef.current.begin(
       target.groupID,
-      target.messageID,
+      target.seq,
     );
     try {
       const stats = parseGroupReadStats(
-        await api.groupReadStats(target.groupID, target.messageID),
+        await api.groupReadStats(target.groupID, target.seq),
       );
       if (
         stats === null
         || !readStatsGateRef.current.accepts(
           token,
           target.groupID,
-          target.messageID,
+          target.seq,
         )
+        || stats.seq !== target.seq
       ) {
+        return;
+      }
+      // The seq may have been reused by a different message after a rollback;
+      // drop a response that no longer points at the message on screen.
+      const local = messagesRef.current.find((message) =>
+        isGroupMessage(message)
+        && message.group_id === target.groupID
+        && message.seq === target.seq);
+      if (local === undefined || local.id !== stats.message_id) {
         return;
       }
       setGroupReceipt({
         groupID: target.groupID,
-        messageID: stats.message_id,
+        seq: stats.seq,
         stats,
       });
     } catch (error) {
@@ -739,6 +927,64 @@ export function ChatPage() {
     readStatsDebouncerRef.current.cancel();
   }, []);
 
+  const resyncTail = useCallback(async (target: ActiveTarget, keepSeq: number) => {
+    if (!user) {
+      return;
+    }
+    missingSeqTrackerRef.current.clear(target.key);
+    try {
+      const pulled = await collectAfterSeq(target, keepSeq);
+      if (activeTargetRef.current?.key !== target.key) {
+        return;
+      }
+      if (pulled.truncated) {
+        // A long backlog is faster to reload from the newest page; the local
+        // watermark is rebuilt by the write below.
+        const page = await fetchInitialPage(target);
+        if (activeTargetRef.current?.key !== target.key) {
+          return;
+        }
+        const outbox = await readOutbox(user.username, target.key);
+        const confirmed = new Set(
+          page.messages.map((message) => message.client_message_id),
+        );
+        setMessages([
+          ...page.messages,
+          ...outboxFailedMessages(outbox, confirmed, user),
+        ]);
+        setHasMore(page.hasMore);
+        await writeMessages(user.username, target.key, page.messages);
+        scrollToBottomNextRef.current = true;
+        return;
+      }
+      const present = new Set(pulled.messages.map((message) => message.seq));
+      const gapMessages = await pullGaps(
+        target,
+        keepSeq,
+        pulled.lastSeq,
+        present,
+        missingSeqTrackerRef.current,
+      );
+      const messages = [...pulled.messages, ...gapMessages];
+      if (messages.length === 0) {
+        return;
+      }
+      setMessages((previous) => mergeMessages(previous, messages));
+      await writeMessages(user.username, target.key, messages);
+      if (nearBottomRef.current) {
+        scrollToBottomNextRef.current = true;
+      }
+    } catch (error) {
+      handleSessionError(error);
+    }
+  }, [handleSessionError, user]);
+
+  useEffect(() => {
+    resyncTailRef.current = (target, keepSeq) => {
+      void resyncTail(target, keepSeq);
+    };
+  }, [resyncTail]);
+
   const loadConversations = useCallback(async (initial = false) => {
     const requestID = ++conversationRequestRef.current;
     conversationsInFlightRef.current += 1;
@@ -749,6 +995,53 @@ export function ChatPage() {
       const response = await api.listConversations();
       if (requestID !== conversationRequestRef.current) {
         return;
+      }
+      const username = userRef.current?.username ?? "";
+      const rolledBack: Array<{ key: string; keepSeq: number }> = [];
+      if (username !== "") {
+        const sync = await readSyncState(username);
+        if (requestID !== conversationRequestRef.current) {
+          return;
+        }
+        for (const conversation of response.conversations) {
+          const key = conversationKey(conversation);
+          // Compare the server list against the locally persisted watermark,
+          // never against the server value under suspicion.
+          const liveMax = activeTargetRef.current?.key === key
+            ? maxAcceptedSeq(messagesRef.current.filter((message) =>
+              conversation.type === "group"
+                ? isGroupMessage(message)
+                  && message.group_id === conversation.group.id
+                : !isGroupMessage(message)
+                  && (sameUsername(message.sender.username, conversation.user.username)
+                    || sameUsername(message.recipient.username, conversation.user.username))))
+            : 0;
+          const localMax = Math.max(sync.localSeq[key] ?? 0, liveMax);
+          const rollback = planRollback(conversation.last_seq, localMax);
+          if (rollback !== null) {
+            rolledBack.push({ key, keepSeq: rollback.fromSeq - 1 });
+          }
+        }
+      }
+      if (rolledBack.length > 0 && username !== "") {
+        if (requestID !== conversationRequestRef.current) {
+          return;
+        }
+        await Promise.all(rolledBack.map((entry) =>
+          deleteMessagesFrom(username, entry.key, entry.keepSeq + 1)));
+        // Cache cleanup can outlive this request; a newer list response that
+        // already landed must not be overwritten by this stale snapshot.
+        if (requestID !== conversationRequestRef.current) {
+          return;
+        }
+        const active = activeTargetRef.current;
+        const current = rolledBack.find((entry) => entry.key === active?.key);
+        if (active && current) {
+          setMessages((previous) => previous.filter((message) =>
+            !isAcceptedSeq(message.seq) || message.seq <= current.keepSeq));
+          missingSeqTrackerRef.current.clear(current.key);
+          resyncTailRef.current(active, current.keepSeq);
+        }
       }
       const pendingReads = pendingFocusReadsRef.current;
       setConversations(sortConversations(response.conversations.map((conversation) =>
@@ -772,7 +1065,7 @@ export function ChatPage() {
     if (!ack.ok) {
       return;
     }
-    clearLocalUnread(ack.target, ack.lastReadMessageID);
+    clearLocalUnread(ack.target, ack.lastReadSeq);
     pendingFocusReadsRef.current.delete(focusTargetKey(ack.target));
     if (conversationsInFlightRef.current === 0) {
       return;
@@ -882,15 +1175,21 @@ export function ChatPage() {
     pendingOlderScrollRef.current = null;
 
     const username = user?.username ?? "";
+    const currentUser = user;
     let cached: CachedMessage[] = [];
     let directComplete = true;
+    let watermark = 0;
+    let outbox: CachedOutbox[] = [];
     if (username !== "") {
-      const [stored, syncState] = await Promise.all([
+      const [stored, syncState, pending] = await Promise.all([
         readMessages(username, target.key),
         readSyncState(username),
+        readOutbox(username, target.key),
       ]);
       cached = stored;
       directComplete = syncState.directComplete;
+      watermark = syncState.localSeq[target.key] ?? 0;
+      outbox = pending;
     }
     if (!isCurrent()) {
       return;
@@ -901,9 +1200,20 @@ export function ChatPage() {
       // stitched. Reload a fresh page instead.
       void removeMessages(username, target.key);
       cached = [];
+      watermark = 0;
     }
+    if (cached.length === 0 && watermark > 0 && username !== "") {
+      // A watermark with no cached messages behind it cannot be compared.
+      void removeMessages(username, target.key);
+      watermark = 0;
+    }
+    const failedOutbox = (confirmed: Iterable<string>): DisplayMessage[] =>
+      currentUser === null ? [] : outboxFailedMessages(outbox, confirmed, currentUser);
     if (cached.length > 0) {
-      setMessages(cached.map(toDisplayMessage));
+      setMessages([
+        ...cached.map(toDisplayMessage),
+        ...failedOutbox(new Set(cached.map((message) => message.client_message_id))),
+      ]);
       setMessagesLoading(false);
       setHasMore(true);
       scrollToBottomNextRef.current = true;
@@ -911,57 +1221,132 @@ export function ChatPage() {
     if (offlineRef.current) {
       setMessagesLoading(false);
       if (cached.length === 0) {
-        setMessagesError("当前离线，这个会话没有缓存。");
+        setMessages(failedOutbox(new Set()));
+        if (outbox.length === 0) {
+          setMessagesError("当前离线，这个会话没有缓存。");
+        }
       }
       return;
     }
 
     try {
-      const newest = cached.reduce(
-        (latest, message) => Math.max(latest, message.id),
-        0,
-      );
-      const knownLast = conversationLastIDsRef.current.get(target.key) ?? 0;
-      if (newest > 0 && knownLast > 0 && knownLast <= newest) {
-        if (nearBottomRef.current) {
-          scrollToBottomNextRef.current = true;
+      let localMax = maxAcceptedSeq(cached);
+      const knownLast = conversationLastSeqsRef.current.get(target.key);
+      const rollback = localMax > 0
+        ? planListRollback(knownLast, localMax)
+        : null;
+      if (rollback !== null) {
+        // Server counter went backwards: drop the reusable tail and reload.
+        if (username !== "") {
+          await deleteMessagesFrom(username, target.key, rollback.fromSeq);
         }
-      } else if (newest === 0) {
+        cached = cached.filter((message) => message.seq < rollback.fromSeq);
+        localMax = rollback.fromSeq - 1;
+        missingSeqTrackerRef.current.clear(target.key);
+        setMessages((previous) => previous.filter((message) =>
+          !isAcceptedSeq(message.seq) || message.seq <= localMax));
+      }
+
+      const serverLast = conversationLastMessagesRef.current.get(target.key);
+      const cachedNewest = cached.length > 0 ? cached[cached.length - 1] : null;
+      if (
+        serverLast !== undefined
+        && cachedNewest !== null
+        && cachedNewest.seq === serverLast.seq
+        && cachedNewest.id !== serverLast.id
+      ) {
+        // Same seq, different global id: the server reused the tail.
+        if (username !== "") {
+          await deleteMessagesFrom(username, target.key, serverLast.seq);
+        }
+        cached = cached.filter((message) => message.seq < serverLast.seq);
+        localMax = serverLast.seq - 1;
+        missingSeqTrackerRef.current.clear(target.key);
+        setMessages((previous) => previous.filter((message) =>
+          !isAcceptedSeq(message.seq) || message.seq <= localMax));
+      }
+
+      if (localMax === 0 || cached.length === 0) {
         const page = await fetchInitialPage(target);
         if (!isCurrent()) {
           return;
         }
-        setMessages(page.messages);
+        const confirmed = new Set(
+          page.messages.map((message) => message.client_message_id),
+        );
+        setMessages([...page.messages, ...failedOutbox(confirmed)]);
         setHasMore(page.hasMore);
         scrollToBottomNextRef.current = true;
         if (username !== "") {
           void writeMessages(username, target.key, page.messages);
         }
-      } else {
-        let after = newest;
-        for (let round = 0; round < 10; round += 1) {
-          const page = await fetchAfterPage(target, after);
+      } else if (knownLast === undefined || knownLast > localMax) {
+        const pulled = await collectAfterSeq(target, localMax);
+        if (!isCurrent()) {
+          return;
+        }
+        if (pulled.truncated) {
+          const page = await fetchInitialPage(target);
           if (!isCurrent()) {
             return;
           }
-          if (page.messages.length === 0) {
-            break;
-          }
-          setMessages((previous) => mergeMessages(previous, page.messages));
+          const confirmed = new Set(
+            page.messages.map((message) => message.client_message_id),
+          );
+          setMessages([...page.messages, ...failedOutbox(confirmed)]);
+          setHasMore(page.hasMore);
           if (username !== "") {
             void writeMessages(username, target.key, page.messages);
           }
-          const nextAfter = page.messages[page.messages.length - 1].id;
-          if (nextAfter <= after) {
-            break;
+        } else {
+          const present = new Set(pulled.messages.map((message) => message.seq));
+          setMessages((previous) => mergeMessages(previous, pulled.messages));
+          if (username !== "") {
+            void writeMessages(username, target.key, pulled.messages);
           }
-          after = nextAfter;
-          if (!page.hasMore) {
-            break;
+          const gapMessages = await pullGaps(
+            target,
+            localMax,
+            Math.max(pulled.lastSeq, knownLast ?? 0),
+            present,
+            missingSeqTrackerRef.current,
+          );
+          if (!isCurrent()) {
+            return;
+          }
+          if (gapMessages.length > 0) {
+            setMessages((previous) => mergeMessages(previous, gapMessages));
+            if (username !== "") {
+              void writeMessages(username, target.key, gapMessages);
+            }
           }
         }
         if (nearBottomRef.current) {
           scrollToBottomNextRef.current = true;
+        }
+      } else if (cached.length > 1) {
+        // Cached pages can have holes of their own (a lost push that the
+        // server later skipped). Fill them once; leftovers stay marked.
+        const seqs = cached
+          .filter((message) => isAcceptedSeq(message.seq))
+          .map((message) => message.seq);
+        const minSeq = Math.min(...seqs);
+        const maxSeq = Math.max(...seqs);
+        if (seqs.length > 1 && maxSeq - minSeq + 1 <= MAX_GAP_SCAN) {
+          const present = new Set(seqs);
+          const gapMessages = await pullGaps(
+            target,
+            minSeq - 1,
+            maxSeq,
+            present,
+            missingSeqTrackerRef.current,
+          );
+          if (isCurrent() && gapMessages.length > 0) {
+            setMessages((previous) => mergeMessages(previous, gapMessages));
+            if (username !== "") {
+              void writeMessages(username, target.key, gapMessages);
+            }
+          }
         }
       }
     } catch (error) {
@@ -1109,12 +1494,12 @@ export function ChatPage() {
   const activeUser = activeDirect?.user;
   const messagesBelongToActive = activeKey !== ""
     && messagesKey === activeKey;
-  const peerLastReadMessageID = activeDirect?.peer_last_read_message_id ?? 0;
-  const lastOwnSentMessageID = useMemo(() => {
+  const peerLastReadSeq = activeDirect?.peer_last_read_seq ?? 0;
+  const lastOwnSentSeq = useMemo(() => {
     if (!user || !messagesBelongToActive) {
       return 0;
     }
-    return findLastOwnSentMessageID(messages, user.username);
+    return findLastOwnSentSeq(messages, user.username);
   }, [messages, messagesBelongToActive, user]);
 
   useEffect(() => {
@@ -1123,8 +1508,12 @@ export function ChatPage() {
     if (target !== null && (socket === null || socket.readyState !== WebSocket.OPEN)) {
       // Opening a conversation is a read even without a socket; remember it so
       // the reconnect can focus it and let the server catch the position up.
-      pendingFocusReadsRef.current.set(focusTargetKey(target), target);
-      clearLocalUnread(target, Number.MAX_SAFE_INTEGER);
+      const key = focusTargetKey(target);
+      pendingFocusReadsRef.current.set(key, target);
+      clearLocalUnread(
+        target,
+        conversationLastSeqsRef.current.get(key) ?? 0,
+      );
       return;
     }
     syncFocus();
@@ -1138,8 +1527,8 @@ export function ChatPage() {
     readStatsDebouncerRef.current.cancel();
     readStatsGateRef.current.reset();
     const target = activeGroupID > 0 && messagesBelongToActive
-      && lastOwnSentMessageID > 0
-      ? { groupID: activeGroupID, messageID: lastOwnSentMessageID }
+      && lastOwnSentSeq > 0
+      ? { groupID: activeGroupID, seq: lastOwnSentSeq }
       : null;
     groupReceiptTargetRef.current = target;
     setGroupReceipt(null);
@@ -1149,7 +1538,7 @@ export function ChatPage() {
   }, [
     activeGroupID,
     fetchGroupReadStats,
-    lastOwnSentMessageID,
+    lastOwnSentSeq,
     messagesBelongToActive,
   ]);
 
@@ -1165,7 +1554,7 @@ export function ChatPage() {
     if (!target || !hasMore || loadingOlder || messagesLoading) {
       return;
     }
-    const oldest = messages.find((message) => message.id > 0);
+    const oldest = messages.find((message) => isAcceptedSeq(message.seq));
     if (!oldest) {
       return;
     }
@@ -1175,7 +1564,7 @@ export function ChatPage() {
     const previousTop = container?.scrollTop ?? 0;
     setLoadingOlder(true);
     try {
-      const page = await fetchOlderPage(target, oldest.id);
+      const page = await fetchOlderPage(target, oldest.seq);
       if (version !== conversationVersionRef.current) {
         return;
       }
@@ -1184,7 +1573,11 @@ export function ChatPage() {
       if (user) {
         void writeMessages(user.username, target.key, page.messages);
       }
-      setHasMore(page.hasMore);
+      if (!page.hasMore) {
+        setHasMore(false);
+      } else {
+        setHasMore(true);
+      }
       setMessagesError(null);
     } catch (error) {
       if (version !== conversationVersionRef.current) {
@@ -1249,11 +1642,8 @@ export function ChatPage() {
     }
     const otherUser = sentByCurrent ? message.recipient : message.sender;
     const incoming = receivedByCurrent;
-    void writeMessages(
-      currentUser.username,
-      directKey(otherUser.username),
-      [message],
-    );
+    const key = directKey(otherUser.username);
+    void writeMessages(currentUser.username, key, [message]);
     const target = activeTargetRef.current;
     const targetMatches = target?.kind === "direct"
       && sameUsername(target.username, otherUser.username);
@@ -1261,28 +1651,100 @@ export function ChatPage() {
       && pageVisibleRef.current
       && !replacedRef.current;
 
-    if (conversationKeysRef.current.has(directKey(otherUser.username))) {
+    const knownLast = conversationLastSeqsRef.current.get(key) ?? 0;
+    const openMessages = targetMatches
+      ? messagesRef.current.filter((item) =>
+        !isGroupMessage(item)
+        && (sameUsername(item.sender.username, otherUser.username)
+          || sameUsername(item.recipient.username, otherUser.username)))
+      : [];
+    const seqIDs = targetMatches ? acceptedSeqMap(openMessages) : undefined;
+    const listPlan = planIncoming(message.seq, message.id, {
+      maxSeq: knownLast,
+      seqIDs,
+    });
+    if (!conversationKeysRef.current.has(key)) {
+      void loadConversations(false);
+    } else if (listPlan.kind === "pull" || listPlan.kind === "resync") {
+      // A gap or a reused seq means the server list is the only safe source
+      // for unread and the preview.
+      void loadConversations(false);
+    } else if (listPlan.kind === "append") {
+      const unread = nextUnread(listPlan, 0, !incoming);
+      conversationLastSeqsRef.current.set(
+        key,
+        Math.max(knownLast, message.seq),
+      );
       setConversations((previous) => sortConversations(previous.map((conversation) =>
         conversation.type === "direct"
           && sameUsername(conversation.user.username, otherUser.username)
           ? {
             ...conversation,
-            last_message: message,
-            unread_count: incoming
-              ? (readingNow ? 0 : conversation.unread_count + 1)
-              : conversation.unread_count,
+            last_message: shouldReplacePreview(conversation.last_seq, message.seq)
+              ? message
+              : conversation.last_message,
+            last_seq: Math.max(conversation.last_seq, message.seq),
+            unread_count: readingNow && incoming
+              ? 0
+              : conversation.unread_count + unread.unread,
           }
           : conversation)));
-    } else {
-      void loadConversations(false);
     }
 
-    if (targetMatches) {
-      const wasNearBottom = nearBottomRef.current;
+    if (!target || !targetMatches) {
+      return;
+    }
+    const openPlan = planIncoming(message.seq, message.id, {
+      maxSeq: maxAcceptedSeq(openMessages),
+      seqIDs: acceptedSeqMap(openMessages),
+    });
+    if (openPlan.kind === "duplicate") {
+      return;
+    }
+    const wasNearBottom = nearBottomRef.current;
+    if (openPlan.kind === "append") {
       setMessages((previous) => mergeMessages(previous, [toDirectDisplay(message)]));
-      if (wasNearBottom) {
-        scrollToBottomNextRef.current = true;
-      }
+    } else if (openPlan.kind === "pull") {
+      setMessages((previous) => mergeMessages(previous, [toDirectDisplay(message)]));
+      const present = new Set(
+        openMessages
+          .filter((item) => isAcceptedSeq(item.seq))
+          .map((item) => item.seq),
+      );
+      void (async () => {
+        try {
+          const gapMessages = await pullGaps(
+            target,
+            openPlan.afterSeq,
+            openPlan.targetSeq - 1,
+            present,
+            missingSeqTrackerRef.current,
+          );
+          if (gapMessages.length === 0) {
+            return;
+          }
+          setMessages((previous) => mergeMessages(previous, gapMessages));
+          if (userRef.current) {
+            void writeMessages(userRef.current.username, key, gapMessages);
+          }
+        } catch {
+          // The conversation refresh above already scheduled a retry path.
+        }
+      })();
+    } else {
+      missingSeqTrackerRef.current.clear(key);
+      // Seqs above the reused one are stale; the pushed message itself is
+      // authoritative. It stays out of the delete range and is re-written after
+      // the delete so an aborted resync cannot drop it from the cache.
+      void deleteMessagesFrom(currentUser.username, key, openPlan.fromSeq + 1)
+        .then(() => writeMessages(currentUser.username, key, [message]));
+      setMessages((previous) => mergeMessages(previous, [toDirectDisplay(message)])
+        .filter((item) =>
+          !isAcceptedSeq(item.seq) || item.seq <= openPlan.fromSeq));
+      resyncTailRef.current(target, openPlan.fromSeq);
+    }
+    if (wasNearBottom) {
+      scrollToBottomNextRef.current = true;
     }
   }, [loadConversations]);
 
@@ -1293,37 +1755,103 @@ export function ChatPage() {
     }
     const sentByCurrent = sameUsername(message.sender.username, currentUser.username);
     const target = activeTargetRef.current;
-    const readingNow = target?.kind === "group"
-      && target.groupID === message.group_id
+    const targetMatches = target?.kind === "group"
+      && target.groupID === message.group_id;
+    const readingNow = targetMatches
       && pageVisibleRef.current
       && !replacedRef.current;
-    void writeMessages(
-      currentUser.username,
-      groupKey(message.group_id),
-      [message],
-    );
+    const key = groupKey(message.group_id);
+    void writeMessages(currentUser.username, key, [message]);
 
-    if (conversationKeysRef.current.has(groupKey(message.group_id))) {
+    const knownLast = conversationLastSeqsRef.current.get(key) ?? 0;
+    const openMessages = targetMatches
+      ? messagesRef.current.filter((item) =>
+        isGroupMessage(item) && item.group_id === message.group_id)
+      : [];
+    const seqIDs = targetMatches ? acceptedSeqMap(openMessages) : undefined;
+    const listPlan = planIncoming(message.seq, message.id, {
+      maxSeq: knownLast,
+      seqIDs,
+    });
+    if (!conversationKeysRef.current.has(key)) {
+      void loadConversations(false);
+    } else if (listPlan.kind === "pull" || listPlan.kind === "resync") {
+      void loadConversations(false);
+    } else if (listPlan.kind === "append") {
+      const unread = nextUnread(listPlan, 0, sentByCurrent);
+      conversationLastSeqsRef.current.set(
+        key,
+        Math.max(knownLast, message.seq),
+      );
       setConversations((previous) => sortConversations(previous.map((conversation) =>
         conversation.type === "group" && conversation.group.id === message.group_id
           ? {
             ...conversation,
-            last_message: message,
-            unread_count: sentByCurrent
-              ? conversation.unread_count
-              : (readingNow ? 0 : conversation.unread_count + 1),
+            last_message: shouldReplacePreview(conversation.last_seq, message.seq)
+              ? message
+              : conversation.last_message,
+            last_seq: Math.max(conversation.last_seq, message.seq),
+            unread_count: readingNow && !sentByCurrent
+              ? 0
+              : conversation.unread_count + unread.unread,
           }
           : conversation)));
-    } else {
-      void loadConversations(false);
     }
 
-    if (target?.kind === "group" && target.groupID === message.group_id) {
-      const wasNearBottom = nearBottomRef.current;
+    if (!target || !targetMatches) {
+      return;
+    }
+    const openPlan = planIncoming(message.seq, message.id, {
+      maxSeq: maxAcceptedSeq(openMessages),
+      seqIDs: acceptedSeqMap(openMessages),
+    });
+    if (openPlan.kind === "duplicate") {
+      return;
+    }
+    const wasNearBottom = nearBottomRef.current;
+    if (openPlan.kind === "append") {
       setMessages((previous) => mergeMessages(previous, [toGroupDisplay(message)]));
-      if (wasNearBottom) {
-        scrollToBottomNextRef.current = true;
-      }
+    } else if (openPlan.kind === "pull") {
+      setMessages((previous) => mergeMessages(previous, [toGroupDisplay(message)]));
+      const present = new Set(
+        openMessages
+          .filter((item) => isAcceptedSeq(item.seq))
+          .map((item) => item.seq),
+      );
+      void (async () => {
+        try {
+          const gapMessages = await pullGaps(
+            target,
+            openPlan.afterSeq,
+            openPlan.targetSeq - 1,
+            present,
+            missingSeqTrackerRef.current,
+          );
+          if (gapMessages.length === 0) {
+            return;
+          }
+          setMessages((previous) => mergeMessages(previous, gapMessages));
+          if (userRef.current) {
+            void writeMessages(userRef.current.username, key, gapMessages);
+          }
+        } catch {
+          // The conversation refresh above already scheduled a retry path.
+        }
+      })();
+    } else {
+      missingSeqTrackerRef.current.clear(key);
+      // Seqs above the reused one are stale; the pushed message itself is
+      // authoritative. It stays out of the delete range and is re-written after
+      // the delete so an aborted resync cannot drop it from the cache.
+      void deleteMessagesFrom(currentUser.username, key, openPlan.fromSeq + 1)
+        .then(() => writeMessages(currentUser.username, key, [message]));
+      setMessages((previous) => mergeMessages(previous, [toGroupDisplay(message)])
+        .filter((item) =>
+          !isAcceptedSeq(item.seq) || item.seq <= openPlan.fromSeq));
+      resyncTailRef.current(target, openPlan.fromSeq);
+    }
+    if (wasNearBottom) {
+      scrollToBottomNextRef.current = true;
     }
   }, [loadConversations]);
 
@@ -1338,7 +1866,7 @@ export function ChatPage() {
       setConversations((previous) => previous.map((conversation) =>
         conversation.type === "direct"
           && sameUsername(conversation.user.username, event.peer)
-          && (conversation.last_message?.id ?? 0) <= event.lastReadMessageID
+          && conversation.last_seq <= event.lastReadSeq
           ? { ...conversation, unread_count: 0 }
           : conversation));
       return;
@@ -1349,9 +1877,9 @@ export function ChatPage() {
           && sameUsername(conversation.user.username, event.reader)
           ? {
             ...conversation,
-            peer_last_read_message_id: Math.max(
-              conversation.peer_last_read_message_id ?? 0,
-              event.lastReadMessageID,
+            peer_last_read_seq: Math.max(
+              conversation.peer_last_read_seq ?? 0,
+              event.lastReadSeq,
             ),
           }
           : conversation));
@@ -1408,18 +1936,39 @@ export function ChatPage() {
     if (syncingRef.current || !isCurrent()) {
       return;
     }
-    const newestID = messagesRef.current.reduce((newest, message) => {
-      const belongs = target.kind === "group"
-        ? isGroupMessage(message) && message.group_id === target.groupID
-        : !isGroupMessage(message)
-          && (message.sender.username.toLocaleLowerCase() === target.username.toLocaleLowerCase()
-            || message.recipient.username.toLocaleLowerCase() === target.username.toLocaleLowerCase());
-      return belongs ? Math.max(newest, message.id) : newest;
-    }, 0);
+    const ownMessages = messagesRef.current.filter((message) => {
+      if (target.kind === "group") {
+        return isGroupMessage(message) && message.group_id === target.groupID;
+      }
+      return !isGroupMessage(message)
+        && (sameUsername(message.sender.username, target.username)
+          || sameUsername(message.recipient.username, target.username));
+    });
+    const newest = maxAcceptedSeq(ownMessages);
 
     syncingRef.current = true;
     try {
-      if (newestID === 0) {
+      // The list snapshot only identifies a reused tail message here; a stale
+      // last_seq must not be read as a rollback (loadConversations checks that
+      // against a fresh list response).
+      const knownLast = conversationLastSeqsRef.current.get(target.key) ?? 0;
+      const serverLast = conversationLastMessagesRef.current.get(target.key);
+      const newestMessage = ownMessages.reduce<DisplayMessage | undefined>(
+        (latest, message) => (message.seq === newest ? message : latest),
+        undefined,
+      );
+      const plan = planActiveSync(newest, newestMessage, serverLast);
+      if (plan.kind === "resync") {
+        if (user) {
+          await deleteMessagesFrom(user.username, target.key, plan.fromSeq);
+        }
+        setMessages((previous) => previous.filter((message) =>
+          !isAcceptedSeq(message.seq) || message.seq < plan.fromSeq));
+        resyncTailRef.current(target, plan.fromSeq - 1);
+        return;
+      }
+
+      if (plan.kind === "initial") {
         const page = await fetchInitialPage(target);
         if (!isCurrent()) {
           return;
@@ -1431,25 +1980,36 @@ export function ChatPage() {
           void writeMessages(user.username, target.key, page.messages);
         }
       } else {
-        let afterID = newestID;
-        let more = true;
-        for (let pageIndex = 0; pageIndex < 10 && more; pageIndex += 1) {
-          const page = await fetchAfterPage(target, afterID);
-          if (!isCurrent()) {
-            return;
-          }
-          if (page.messages.length > 0) {
-            setMessages((previous) => mergeMessages(previous, page.messages));
-            if (user) {
-              void writeMessages(user.username, target.key, page.messages);
-            }
-            afterID = page.messages[page.messages.length - 1].id;
-          }
-          more = page.hasMore;
+        const pulled = await collectAfterSeq(target, plan.afterSeq);
+        if (!isCurrent()) {
+          return;
         }
-        if (more && isCurrent()) {
+        if (pulled.truncated && isCurrent()) {
           await loadInitialMessages(target);
           return;
+        }
+        if (pulled.messages.length > 0) {
+          setMessages((previous) => mergeMessages(previous, pulled.messages));
+          if (user) {
+            void writeMessages(user.username, target.key, pulled.messages);
+          }
+        }
+        const present = new Set(pulled.messages.map((message) => message.seq));
+        const gapMessages = await pullGaps(
+          target,
+          newest,
+          Math.max(pulled.lastSeq, knownLast),
+          present,
+          missingSeqTrackerRef.current,
+        );
+        if (!isCurrent()) {
+          return;
+        }
+        if (gapMessages.length > 0) {
+          setMessages((previous) => mergeMessages(previous, gapMessages));
+          if (user) {
+            void writeMessages(user.username, target.key, gapMessages);
+          }
         }
       }
       if (isCurrent() && nearBottomRef.current) {
@@ -1694,19 +2254,30 @@ export function ChatPage() {
     const version = conversationVersionRef.current;
     const isCurrent = () => isCurrentConversation(target.key, version);
     try {
-      const sent = target.kind === "direct"
-        ? toDirectDisplay((await api.sendMessage(
+      const raw = target.kind === "direct"
+        ? (await api.sendMessage(
           target.username,
           message.body,
           message.client_message_id,
-        )).message)
-        : toGroupDisplay((await api.sendGroupMessage(
+        )).message
+        : (await api.sendGroupMessage(
           target.groupID,
           message.body,
           message.client_message_id,
-        )).message);
+        )).message;
+      if (raw.id <= 0 || !isAcceptedSeq(raw.seq)) {
+        throw new ApiError(0, "invalid_message", "服务器返回的消息号无效。");
+      }
+      const sent = "group_id" in raw
+        ? toGroupDisplay(raw)
+        : toDirectDisplay(raw);
       if (user) {
         void writeMessages(user.username, target.key, [sent]);
+        void deleteOutbox(
+          user.username,
+          target.key,
+          message.client_message_id,
+        );
       }
       if (isCurrent()) {
         setMessages((previous) => mergeMessages(previous, [sent]));
@@ -1716,17 +2287,29 @@ export function ChatPage() {
       if (conversationKeysRef.current.has(target.key)) {
         setConversations((previous) => sortConversations(previous.map((conversation) =>
           conversationKey(conversation) === target.key
-            && (!conversation.last_message || conversation.last_message.id <= sent.id)
-            ? { ...conversation, last_message: sent }
+            ? {
+              ...conversation,
+              last_message: shouldReplacePreview(conversation.last_seq, sent.seq)
+                ? sent
+                : conversation.last_message,
+              last_seq: Math.max(conversation.last_seq, sent.seq),
+            }
             : conversation)));
       } else {
         void loadConversations(false);
       }
       // Sending means the sender has read up to this message. The server's echo
       // only arrives over the socket, so clear locally when it is down.
-      clearLocalUnread(target, sent.id);
+      clearLocalUnread(target, sent.seq);
     } catch (error) {
       if (handleSessionError(error)) {
+        if (user) {
+          void markOutboxFailed(
+            user.username,
+            target.key,
+            message.client_message_id,
+          );
+        }
         return;
       }
       if (
@@ -1743,6 +2326,13 @@ export function ChatPage() {
               === target.username.toLocaleLowerCase()
             ? { ...conversation, is_friend: false }
             : conversation));
+      }
+      if (user) {
+        void markOutboxFailed(
+          user.username,
+          target.key,
+          message.client_message_id,
+        );
       }
       if (isCurrent()) {
         setMessages((previous) => previous.map((item) =>
@@ -1774,17 +2364,42 @@ export function ChatPage() {
       return;
     }
 
+    const createdAt = new Date().toISOString();
+    const clientMessageID = newClientMessageID();
     const base = {
       id: 0,
+      seq: 0,
       sender: { username: user.username, nickname: user.nickname },
       body,
-      client_message_id: newClientMessageID(),
-      created_at: new Date().toISOString(),
+      client_message_id: clientMessageID,
+      created_at: createdAt,
       status: "sending" as const,
     };
     const message: DisplayMessage = target.kind === "direct"
       ? { ...base, recipient: activeDirect!.user }
       : { ...base, group_id: target.groupID };
+    const outbox: CachedOutbox = target.kind === "direct"
+      ? {
+        user: user.username,
+        conversation: target.key,
+        client_message_id: clientMessageID,
+        body,
+        kind: "direct",
+        recipient: activeDirect!.user,
+        created_at: createdAt,
+        status: "sending",
+      }
+      : {
+        user: user.username,
+        conversation: target.key,
+        client_message_id: clientMessageID,
+        body,
+        kind: "group",
+        group_id: target.groupID,
+        created_at: createdAt,
+        status: "sending",
+      };
+    await writeOutbox(outbox);
     setMessages((previous) => mergeMessages(previous, [message]));
     setDraft("");
     setDraftError(null);
@@ -1795,9 +2410,31 @@ export function ChatPage() {
 
   async function retryMessage(message: DisplayMessage) {
     const target = activeTarget;
-    if (!target || isReadOnly || isReplaced) {
+    if (!target || !user || isReadOnly || isReplaced) {
       return;
     }
+    const outbox: CachedOutbox = isGroupMessage(message)
+      ? {
+        user: user.username,
+        conversation: target.key,
+        client_message_id: message.client_message_id,
+        body: message.body,
+        kind: "group",
+        group_id: message.group_id,
+        created_at: message.created_at,
+        status: "sending",
+      }
+      : {
+        user: user.username,
+        conversation: target.key,
+        client_message_id: message.client_message_id,
+        body: message.body,
+        kind: "direct",
+        recipient: message.recipient,
+        created_at: message.created_at,
+        status: "sending",
+      };
+    await writeOutbox(outbox);
     setMessages((previous) => previous.map((item) =>
       item.client_message_id === message.client_message_id
         ? { ...item, status: "sending" }
@@ -1868,6 +2505,7 @@ export function ChatPage() {
         group: detail.group,
         is_owner: detail.is_owner,
         last_message: null,
+        last_seq: 0,
         unread_count: 0,
       };
       setConversations((previous) => sortConversations([
@@ -2342,6 +2980,7 @@ export function ChatPage() {
                               className={`message-row${mine ? " message-row--mine" : ""}`}
                               data-client-message-id={message.client_message_id}
                               data-message-id={message.id || undefined}
+                              data-seq={message.seq || undefined}
                               data-status={message.status}
                             >
                               <div className="avatar avatar--tiny" aria-hidden="true">
@@ -2371,19 +3010,19 @@ export function ChatPage() {
                                   {mine
                                     && !groupMessage
                                     && message.status === "sent"
-                                    && message.id > 0
-                                    && message.id === lastOwnSentMessageID && (
-                                      <span className={`read-state${peerLastReadMessageID >= message.id ? " read-state--read" : ""}`}>
-                                        {peerLastReadMessageID >= message.id ? "已读" : "未读"}
+                                    && isAcceptedSeq(message.seq)
+                                    && message.seq === lastOwnSentSeq && (
+                                      <span className={`read-state${isReadByPeer(message.seq, peerLastReadSeq) ? " read-state--read" : ""}`}>
+                                        {isReadByPeer(message.seq, peerLastReadSeq) ? "已读" : "未读"}
                                       </span>
                                     )}
                                   {mine
                                     && groupMessage
                                     && message.status === "sent"
-                                    && message.id > 0
-                                    && message.id === lastOwnSentMessageID
+                                    && isAcceptedSeq(message.seq)
+                                    && message.seq === lastOwnSentSeq
                                     && groupReceipt?.groupID === message.group_id
-                                    && groupReceipt.messageID === message.id
+                                    && groupReceipt.seq === message.seq
                                     && groupReceipt.stats.member_count > 0 && (
                                       <span
                                         className={`read-state${groupReceipt.stats.all_read ? " read-state--read" : ""}`}

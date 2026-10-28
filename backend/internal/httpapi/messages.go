@@ -13,7 +13,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Johnny-Cheung/IM/backend/internal/auth"
 	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/gin-gonic/gin"
@@ -25,13 +24,13 @@ const (
 	defaultSyncPageSize    = 200
 	maxSyncPageSize        = 200
 	maxMessageRunes        = 2000
-	maxBatchReadItems      = 50
 )
 
 var clientMessageIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
 
 type messageResponse struct {
 	ID              uint64             `json:"id"`
+	Seq             uint64             `json:"seq"`
 	Sender          publicUserResponse `json:"sender"`
 	Recipient       publicUserResponse `json:"recipient"`
 	Body            string             `json:"body"`
@@ -41,6 +40,7 @@ type messageResponse struct {
 
 type conversationMessageResponse struct {
 	ID              uint64              `json:"id"`
+	Seq             uint64              `json:"seq"`
 	GroupID         uint64              `json:"group_id,omitempty"`
 	Sender          publicUserResponse  `json:"sender"`
 	Recipient       *publicUserResponse `json:"recipient,omitempty"`
@@ -50,14 +50,15 @@ type conversationMessageResponse struct {
 }
 
 type conversationResponse struct {
-	Type                  string                       `json:"type"`
-	User                  *publicUserResponse          `json:"user,omitempty"`
-	IsFriend              bool                         `json:"is_friend"`
-	Group                 *groupSummaryResponse        `json:"group,omitempty"`
-	IsOwner               bool                         `json:"is_owner"`
-	LastMessage           *conversationMessageResponse `json:"last_message"`
-	UnreadCount           int                          `json:"unread_count"`
-	PeerLastReadMessageID uint64                       `json:"peer_last_read_message_id,omitempty"`
+	Type            string                       `json:"type"`
+	User            *publicUserResponse          `json:"user,omitempty"`
+	IsFriend        bool                         `json:"is_friend"`
+	Group           *groupSummaryResponse        `json:"group,omitempty"`
+	IsOwner         bool                         `json:"is_owner"`
+	LastMessage     *conversationMessageResponse `json:"last_message"`
+	UnreadCount     int                          `json:"unread_count"`
+	LastSeq         uint64                       `json:"last_seq"`
+	PeerLastReadSeq uint64                       `json:"peer_last_read_seq,omitempty"`
 }
 
 type conversationListResponse struct {
@@ -87,30 +88,6 @@ type sendMessageRequest struct {
 
 type sendMessageResponse struct {
 	Message messageResponse `json:"message"`
-}
-
-type readStateResponse struct {
-	LastReadMessageID uint64 `json:"last_read_message_id"`
-}
-
-type batchReadItem struct {
-	Username  string `json:"username"`
-	ThroughID uint64 `json:"through_id"`
-}
-
-type batchReadRequest struct {
-	Reads []batchReadItem `json:"reads"`
-}
-
-type batchReadResult struct {
-	Username          string `json:"username"`
-	LastReadMessageID uint64 `json:"last_read_message_id"`
-	Advanced          bool   `json:"advanced"`
-	Error             string `json:"error,omitempty"`
-}
-
-type batchReadResponse struct {
-	Reads []batchReadResult `json:"reads"`
 }
 
 func (a *API) listConversations(c *gin.Context) {
@@ -165,7 +142,7 @@ func (a *API) buildConversations(
 				if !ok {
 					continue
 				}
-				if conversations[index].LastMessage == nil || message.ID > conversations[index].LastMessage.ID {
+				if conversations[index].LastMessage == nil || message.Seq > conversations[index].LastMessage.Seq {
 					messageCopy := message
 					conversations[index].LastMessage = &messageCopy
 				}
@@ -192,11 +169,12 @@ func (a *API) buildConversations(
 			Nickname: conversation.User.Nickname,
 		}
 		item := conversationResponse{
-			Type:                  "direct",
-			User:                  &other,
-			IsFriend:              conversation.IsFriend,
-			UnreadCount:           conversation.UnreadCount,
-			PeerLastReadMessageID: conversation.PeerLastReadMessageID,
+			Type:            "direct",
+			User:            &other,
+			IsFriend:        conversation.IsFriend,
+			UnreadCount:     conversation.UnreadCount,
+			LastSeq:         conversation.LastSeq,
+			PeerLastReadSeq: conversation.PeerLastReadSeq,
 		}
 		if conversation.LastMessage != nil {
 			message := toConversationMessage(toMessageResponse(*conversation.LastMessage, current, other))
@@ -211,6 +189,7 @@ func (a *API) buildConversations(
 			Group:       &summary,
 			IsOwner:     conversation.IsOwner,
 			UnreadCount: conversation.UnreadCount,
+			LastSeq:     conversation.LastSeq,
 		}
 		if conversation.LastMessage != nil {
 			message := toConversationMessageFromGroup(toGroupMessageResponse(*conversation.LastMessage))
@@ -223,8 +202,9 @@ func (a *API) buildConversations(
 	return response.Conversations, nil
 }
 
-// applyDirectReadState fills unread counts and peer read positions from the
-// Redis read model. It never consults MySQL for read state.
+// applyDirectReadState fills unread counts, the conversation counter and the
+// peer read position from one Redis read-model snapshot. It never consults
+// MySQL for read state.
 func (a *API) applyDirectReadState(
 	ctx context.Context,
 	userID uint64,
@@ -254,23 +234,15 @@ func (a *API) applyDirectReadState(
 		return nil
 	}
 
-	positions, err := a.directReads.ReadPositions(ctx, userID)
+	states, err := a.directReads.States(ctx, userID, peerIDs)
 	if err != nil {
 		return fmt.Errorf("%w: %v", messaging.ErrMessageServiceUnavailable, err)
 	}
-	unread, err := a.directReads.UnreadCounts(ctx, userID, peerIDs, positions)
-	if err != nil {
-		return fmt.Errorf("%w: %v", messaging.ErrMessageServiceUnavailable, err)
-	}
-	peerPositions, err := a.directReads.PeerReadPositions(ctx, userID, peerIDs)
-	if err != nil {
-		return fmt.Errorf("%w: %v", messaging.ErrMessageServiceUnavailable, err)
-	}
-
 	for index := range conversations {
-		peerID := conversations[index].UserID
-		conversations[index].UnreadCount = unread[peerID]
-		conversations[index].PeerLastReadMessageID = peerPositions[peerID]
+		state := states[conversations[index].UserID]
+		conversations[index].UnreadCount = int(state.Unread)
+		conversations[index].LastSeq = state.LastSeq
+		conversations[index].PeerLastReadSeq = state.PeerReadSeq
 	}
 	return nil
 }
@@ -285,8 +257,8 @@ func (a *API) listGroupConversations(
 	return a.store.ListGroupConversationsWithoutUnread(ctx, userID)
 }
 
-// applyGroupReadState fills unread counts from the Redis read model. It never
-// consults MySQL for read state.
+// applyGroupReadState fills unread counts and the group counter from one Redis
+// read-model snapshot. It never consults MySQL for read state.
 func (a *API) applyGroupReadState(
 	ctx context.Context,
 	userID uint64,
@@ -319,12 +291,14 @@ func (a *API) applyGroupReadState(
 		return nil
 	}
 
-	unread, err := a.groupReads.UnreadCounts(ctx, userID, groupIDs)
+	states, err := a.groupReads.States(ctx, userID, groupIDs)
 	if err != nil {
 		return fmt.Errorf("%w: %v", messaging.ErrMessageServiceUnavailable, err)
 	}
 	for index := range conversations {
-		conversations[index].UnreadCount = unread[conversations[index].Group.ID]
+		state := states[conversations[index].Group.ID]
+		conversations[index].UnreadCount = int(state.Unread)
+		conversations[index].LastSeq = state.LastSeq
 	}
 	return nil
 }
@@ -377,6 +351,7 @@ func toConversationMessage(message messageResponse) conversationMessageResponse 
 	recipient := message.Recipient
 	return conversationMessageResponse{
 		ID:              message.ID,
+		Seq:             message.Seq,
 		Sender:          message.Sender,
 		Recipient:       &recipient,
 		Body:            message.Body,
@@ -388,6 +363,7 @@ func toConversationMessage(message messageResponse) conversationMessageResponse 
 func toConversationMessageFromGroup(message groupMessageResponse) conversationMessageResponse {
 	return conversationMessageResponse{
 		ID:              message.ID,
+		Seq:             message.Seq,
 		GroupID:         message.GroupID,
 		Sender:          message.Sender,
 		Body:            message.Body,
@@ -422,13 +398,13 @@ func (a *API) listMessages(c *gin.Context) {
 		return
 	}
 
-	beforeID, err := parseBeforeID(c.Query("before_id"))
+	beforeSeq, err := parseBeforeSeq(c.Query("before_seq"))
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
 		return
 	}
-	afterID, err := parseAfterID(c.Query("after_id"))
-	if err != nil || (beforeID > 0 && afterID > 0) {
+	afterSeq, err := parseAfterSeq(c.Query("after_seq"))
+	if err != nil || (beforeSeq > 0 && afterSeq > 0) {
 		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
 		return
 	}
@@ -444,12 +420,12 @@ func (a *API) listMessages(c *gin.Context) {
 	hotAvailable := false
 	if a.directReader != nil {
 		var hot messaging.ConversationPage
-		if afterID > 0 {
+		if afterSeq > 0 {
 			hot, err = a.directReader.ReadConversationAfter(
 				c.Request.Context(),
 				current.ID,
 				target.ID,
-				afterID,
+				afterSeq,
 				limit,
 			)
 		} else {
@@ -457,7 +433,7 @@ func (a *API) listMessages(c *gin.Context) {
 				c.Request.Context(),
 				current.ID,
 				target.ID,
-				beforeID,
+				beforeSeq,
 				limit,
 			)
 		}
@@ -474,12 +450,12 @@ func (a *API) listMessages(c *gin.Context) {
 	}
 
 	if !servedFromRedis {
-		if afterID > 0 {
+		if afterSeq > 0 {
 			page, err = a.store.ListMessagesAfter(
 				c.Request.Context(),
 				current.ID,
 				target.ID,
-				afterID,
+				afterSeq,
 				limit,
 			)
 		} else {
@@ -487,7 +463,7 @@ func (a *API) listMessages(c *gin.Context) {
 				c.Request.Context(),
 				current.ID,
 				target.ID,
-				beforeID,
+				beforeSeq,
 				limit,
 			)
 		}
@@ -497,7 +473,7 @@ func (a *API) listMessages(c *gin.Context) {
 			return
 		}
 		if hotAvailable {
-			page = mergeMessagePages(page, hotPage, beforeID > 0 || afterID == 0, limit)
+			page = mergeMessagePages(page, hotPage, beforeSeq > 0 || afterSeq == 0, limit)
 		}
 	}
 
@@ -512,22 +488,28 @@ func (a *API) listMessages(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+// mergeMessagePages merges the persisted page with the Redis page of the same
+// seq range. The Redis copy wins, because a message that only exists in Redis
+// has not been persisted yet and must stay visible.
 func mergeMessagePages(primary, hot store.MessagePage, beforeDirection bool, limit int) store.MessagePage {
 	byID := make(map[uint64]store.Message, len(primary.Messages)+len(hot.Messages))
 	for _, message := range primary.Messages {
 		byID[message.ID] = message
 	}
 	for _, message := range hot.Messages {
-		if _, exists := byID[message.ID]; !exists {
-			byID[message.ID] = message
-		}
+		byID[message.ID] = message
 	}
 
 	messages := make([]store.Message, 0, len(byID))
 	for _, message := range byID {
 		messages = append(messages, message)
 	}
-	sort.Slice(messages, func(i, j int) bool { return messages[i].ID < messages[j].ID })
+	sort.Slice(messages, func(i, j int) bool {
+		if messages[i].Seq != messages[j].Seq {
+			return messages[i].Seq < messages[j].Seq
+		}
+		return messages[i].ID < messages[j].ID
+	})
 
 	hasMore := primary.HasMore || hot.HasMore || len(messages) > limit
 	if len(messages) > limit {
@@ -548,7 +530,7 @@ func (a *API) syncMessages(c *gin.Context) {
 		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
 		return
 	}
-	afterID, err := parseAfterID(c.Query("after_id"))
+	afterID, err := parseUintQuery(c.Query("after_id"))
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "invalid_request", "同步游标不正确")
 		return
@@ -694,7 +676,7 @@ func (a *API) sendMessage(c *gin.Context) {
 			target.ID,
 			current.Username,
 			target.Username,
-			message.ID,
+			message.Seq,
 		)
 	}
 
@@ -727,182 +709,6 @@ func parseMessagePayload(c *gin.Context) (string, string, bool) {
 	return body, request.ClientMessageID, true
 }
 
-func (a *API) markConversationRead(c *gin.Context) {
-	current, ok := currentUser(c)
-	if !ok {
-		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
-		return
-	}
-
-	target, ok := a.findUser(c, c.Param("username"))
-	if !ok {
-		return
-	}
-	if target.ID == current.ID {
-		writeError(c, http.StatusBadRequest, "cannot_message_self", "不能给自己标记已读")
-		return
-	}
-
-	throughID, ok := parseReadThroughID(c)
-	if !ok {
-		return
-	}
-	if !a.ensureReadModelReady(c) {
-		return
-	}
-	lastReadMessageID, advanced, err := a.advanceDirectRead(
-		c.Request.Context(),
-		current,
-		target,
-		throughID,
-	)
-	if err != nil {
-		a.writeMessageError(c, err)
-		return
-	}
-	if advanced {
-		a.PublishRead(
-			current.ID,
-			target.ID,
-			current.Username,
-			target.Username,
-			lastReadMessageID,
-		)
-	}
-
-	c.JSON(http.StatusOK, readStateResponse{LastReadMessageID: lastReadMessageID})
-}
-
-// markReadBatch advances several direct conversations in one request. Each
-// item is independent: a missing or invalid target does not stop the others.
-func (a *API) markReadBatch(c *gin.Context) {
-	current, ok := currentUser(c)
-	if !ok {
-		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
-		return
-	}
-
-	var request batchReadRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
-		writeError(c, http.StatusBadRequest, "invalid_request", "同步参数不正确")
-		return
-	}
-	if len(request.Reads) > maxBatchReadItems {
-		writeError(c, http.StatusBadRequest, "invalid_request", "已读项过多")
-		return
-	}
-	if !a.ensureReadModelReady(c) {
-		return
-	}
-
-	ctx := c.Request.Context()
-	response := batchReadResponse{Reads: make([]batchReadResult, 0, len(request.Reads))}
-	for _, item := range request.Reads {
-		result := batchReadResult{Username: item.Username}
-		usernameKey := auth.UsernameKey(item.Username)
-		if usernameKey == "" {
-			result.Error = "invalid_username"
-			response.Reads = append(response.Reads, result)
-			continue
-		}
-
-		target, err := a.store.GetUserByUsernameKey(ctx, usernameKey)
-		if errors.Is(err, store.ErrUserNotFound) {
-			result.Error = "user_not_found"
-			response.Reads = append(response.Reads, result)
-			continue
-		}
-		if err != nil {
-			log.Printf("resolve batch read user: %v", err)
-			writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
-			return
-		}
-		if target.ID == current.ID {
-			result.Error = "cannot_message_self"
-			response.Reads = append(response.Reads, result)
-			continue
-		}
-
-		lastReadMessageID, advanced, err := a.advanceDirectRead(ctx, current, target, item.ThroughID)
-		if err != nil {
-			a.writeMessageError(c, err)
-			return
-		}
-		result.Username = target.Username
-		result.LastReadMessageID = lastReadMessageID
-		result.Advanced = advanced
-		response.Reads = append(response.Reads, result)
-		if advanced {
-			a.PublishRead(
-				current.ID,
-				target.ID,
-				current.Username,
-				target.Username,
-				lastReadMessageID,
-			)
-		}
-	}
-
-	c.JSON(http.StatusOK, response)
-}
-
-func (a *API) ensureReadModelReady(c *gin.Context) bool {
-	if a.directReads == nil {
-		return true
-	}
-	ready, err := a.directReads.ReadModelReady(c.Request.Context())
-	if err != nil {
-		log.Printf("check direct read model: %v", err)
-		writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂时不可用")
-		return false
-	}
-	if !ready {
-		writeError(c, http.StatusServiceUnavailable, "read_model_not_ready", "已读服务尚未就绪")
-		return false
-	}
-	return true
-}
-
-func (a *API) advanceDirectRead(
-	ctx context.Context,
-	current, target store.User,
-	throughID uint64,
-) (uint64, bool, error) {
-	if throughID > store.MaxSafeMessageID {
-		throughID = store.MaxSafeMessageID
-	}
-	if a.directReads == nil {
-		return a.store.MarkConversationRead(
-			ctx,
-			current.ID,
-			target.ID,
-			throughID,
-			time.Now().UTC(),
-		)
-	}
-
-	result, err := a.directReads.AdvanceRead(
-		ctx,
-		current.ID,
-		target.ID,
-		throughID,
-		time.Now().UTC(),
-	)
-	if err != nil {
-		log.Printf("advance direct read: %v", err)
-		return 0, false, messaging.ErrMessageServiceUnavailable
-	}
-	if result.StreamError {
-		log.Printf(
-			"append direct read event: user=%d peer=%d position=%d",
-			current.ID,
-			target.ID,
-			result.LastReadMessageID,
-		)
-	}
-	return result.LastReadMessageID, result.Advanced, nil
-}
-
 func (a *API) writeMessageError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFriends):
@@ -923,7 +729,7 @@ func (a *API) writeMessageError(c *gin.Context, err error) {
 	}
 }
 
-func parseBeforeID(raw string) (uint64, error) {
+func parseUintQuery(raw string) (uint64, error) {
 	if raw == "" {
 		return 0, nil
 	}
@@ -934,17 +740,12 @@ func parseBeforeID(raw string) (uint64, error) {
 	return value, nil
 }
 
-func parseAfterID(raw string) (uint64, error) {
-	return parseBeforeID(raw)
+func parseBeforeSeq(raw string) (uint64, error) {
+	return parseUintQuery(raw)
 }
 
-func parseReadThroughID(c *gin.Context) (uint64, bool) {
-	throughID, err := parseBeforeID(c.Query("through_id"))
-	if err != nil {
-		writeError(c, http.StatusBadRequest, "invalid_request", "已读消息位置不正确")
-		return 0, false
-	}
-	return throughID, true
+func parseAfterSeq(raw string) (uint64, error) {
+	return parseUintQuery(raw)
 }
 
 func parseMessageLimit(raw string) (int, error) {
@@ -984,6 +785,7 @@ func toMessageResponse(
 	}
 	return messageResponse{
 		ID:              message.ID,
+		Seq:             message.Seq,
 		Sender:          sender,
 		Recipient:       recipient,
 		Body:            message.Body,

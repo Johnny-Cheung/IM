@@ -52,6 +52,7 @@ export type SendFriendRequestResult = {
 
 export type ChatMessage = {
   id: number;
+  seq: number;
   sender: PublicUser;
   recipient: PublicUser;
   body: string;
@@ -61,6 +62,7 @@ export type ChatMessage = {
 
 export type ConversationMessage = {
   id: number;
+  seq: number;
   group_id?: number;
   sender: PublicUser;
   recipient?: PublicUser;
@@ -74,8 +76,9 @@ export type DirectConversation = {
   user: PublicUser;
   is_friend: boolean;
   last_message: ConversationMessage | null;
+  last_seq: number;
   unread_count: number;
-  peer_last_read_message_id?: number;
+  peer_last_read_seq?: number;
 };
 
 export type GroupSummary = {
@@ -91,6 +94,7 @@ export type GroupConversation = {
   group: GroupSummary;
   is_owner: boolean;
   last_message: ConversationMessage | null;
+  last_seq: number;
   unread_count: number;
 };
 
@@ -98,6 +102,7 @@ export type Conversation = DirectConversation | GroupConversation;
 
 export type GroupMessage = {
   id: number;
+  seq: number;
   group_id: number;
   sender: PublicUser;
   body: string;
@@ -127,6 +132,7 @@ export type SendGroupMessageResponse = {
 };
 
 export type GroupReadStats = {
+  seq: number;
   message_id: number;
   read_count: number;
   member_count: number;
@@ -151,9 +157,10 @@ export type SyncMessagePageResponse = {
 
 export type BootstrapGroupCursor = {
   group_id: number;
-  after_id: number;
+  after_seq: number;
 };
 
+// The private feed is the only cursor that stays on the global message id.
 export type BootstrapDirect = {
   messages: ChatMessage[];
   has_more: boolean;
@@ -166,6 +173,7 @@ export type BootstrapGroupDelta = {
   messages: GroupMessage[];
   has_more: boolean;
   complete: boolean;
+  // Group conversation cursor, in seq units.
   cursor: number;
 };
 
@@ -211,6 +219,13 @@ export class ApiError extends Error {
     this.status = status;
     this.code = code;
   }
+}
+
+export function isAcceptedSeq(value: unknown): value is number {
+  return typeof value === "number"
+    && Number.isInteger(value)
+    && value >= 1
+    && value <= Number.MAX_SAFE_INTEGER;
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -267,7 +282,6 @@ export const api = {
         limit: input.limit ?? 200,
       }),
     }),
-
   register: (input: RegisterInput) =>
     request<User>("/api/auth/register", {
       method: "POST",
@@ -340,21 +354,21 @@ export const api = {
     return request<SyncMessagePageResponse>(`/api/messages/sync?${params.toString()}`);
   },
 
-  listMessages: (username: string, beforeID?: number, limit = 30) => {
+  listMessages: (username: string, beforeSeq?: number, limit = 30) => {
     const params = new URLSearchParams();
     params.set("limit", String(limit));
-    if (beforeID && beforeID > 0) {
-      params.set("before_id", String(beforeID));
+    if (beforeSeq && beforeSeq > 0) {
+      params.set("before_seq", String(beforeSeq));
     }
     return request<MessagePageResponse>(
       `/api/conversations/${encodeURIComponent(username)}/messages?${params.toString()}`,
     );
   },
 
-  listMessagesAfter: (username: string, afterID: number, limit = 50) => {
+  listMessagesAfter: (username: string, afterSeq: number, limit = 50) => {
     const params = new URLSearchParams();
     params.set("limit", String(limit));
-    params.set("after_id", String(afterID));
+    params.set("after_seq", String(afterSeq));
     return request<MessagePageResponse>(
       `/api/conversations/${encodeURIComponent(username)}/messages?${params.toString()}`,
     );
@@ -407,29 +421,29 @@ export const api = {
       method: "POST",
     }),
 
-  listGroupMessages: (groupID: number, beforeID?: number, limit = 30) => {
+  listGroupMessages: (groupID: number, beforeSeq?: number, limit = 30) => {
     const params = new URLSearchParams();
     params.set("limit", String(limit));
-    if (beforeID && beforeID > 0) {
-      params.set("before_id", String(beforeID));
+    if (beforeSeq && beforeSeq > 0) {
+      params.set("before_seq", String(beforeSeq));
     }
     return request<GroupMessagePageResponse>(
       `/api/groups/${groupID}/messages?${params.toString()}`,
     );
   },
 
-  listGroupMessagesAfter: (groupID: number, afterID: number, limit = 50) => {
+  listGroupMessagesAfter: (groupID: number, afterSeq: number, limit = 50) => {
     const params = new URLSearchParams();
     params.set("limit", String(limit));
-    params.set("after_id", String(afterID));
+    params.set("after_seq", String(afterSeq));
     return request<GroupMessagePageResponse>(
       `/api/groups/${groupID}/messages?${params.toString()}`,
     );
   },
 
-  groupReadStats: (groupID: number, messageID: number) =>
+  groupReadStats: (groupID: number, seq: number) =>
     request<GroupReadStats>(
-      `/api/groups/${groupID}/read-stats?message_id=${messageID}`,
+      `/api/groups/${groupID}/read-stats?seq=${seq}`,
     ),
 
   sendGroupMessage: (groupID: number, body: string, clientMessageID: string) =>

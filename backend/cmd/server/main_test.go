@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/infra"
+	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
 )
 
 type fakeInfraStatus struct {
@@ -29,19 +30,27 @@ func TestInfraStatusExposesSnapshotWithoutChangingReadiness(t *testing.T) {
 	registerInfraStatus(router, fakeInfraStatus{snapshot: infra.Snapshot{
 		Redis:    infra.ComponentStatus{Enabled: true, Connected: true},
 		RabbitMQ: infra.ComponentStatus{Enabled: true, Connected: false},
-	}})
+	}}, func() *messaging.SeqWatcherStatus {
+		return &messaging.SeqWatcherStatus{Ready: true, Conversations: 3}
+	})
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ops/infra", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
 	}
-	var snapshot infra.Snapshot
+	var snapshot struct {
+		infra.Snapshot
+		Seq *messaging.SeqWatcherStatus `json:"seq"`
+	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &snapshot); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 	if !snapshot.Redis.Connected || snapshot.RabbitMQ.Connected {
-		t.Fatalf("snapshot = %#v", snapshot)
+		t.Fatalf("snapshot = %#v", snapshot.Snapshot)
+	}
+	if snapshot.Seq == nil || !snapshot.Seq.Ready || snapshot.Seq.Conversations != 3 {
+		t.Fatalf("seq status = %#v, want ready with 3 conversations", snapshot.Seq)
 	}
 
 	ready := httptest.NewRecorder()

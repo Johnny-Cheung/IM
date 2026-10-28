@@ -6,6 +6,9 @@ import { tmpdir } from "node:os";
 
 export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const sameUsername = (first, second) =>
+  String(first).toLocaleLowerCase() === String(second).toLocaleLowerCase();
+
 export class ApiError extends Error {
   constructor(status, code) {
     super(`HTTP ${status}: ${code}`);
@@ -34,7 +37,7 @@ export class TestRun {
     console.log(`PASS ${name}`);
   }
 
-  async request(user, method, path, body) {
+  async send(user, method, path, body) {
     const headers = {};
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (this.cookies.has(user)) headers.Cookie = this.cookies.get(user);
@@ -51,8 +54,21 @@ export class TestRun {
     const text = await response.text();
     let payload;
     try { payload = text ? JSON.parse(text) : undefined; } catch { payload = text; }
-    if (!response.ok) throw new ApiError(response.status, payload?.error?.code ?? "request_failed");
+    return { status: response.status, ok: response.ok, payload };
+  }
+
+  async request(user, method, path, body) {
+    const { status, ok, payload } = await this.send(user, method, path, body);
+    if (!ok) throw new ApiError(status, payload?.error?.code ?? "request_failed");
     return payload;
+  }
+
+  // Deleted routes and other status-only checks have no JSON error code.
+  async expectStatus(name, user, method, path, status, body) {
+    const response = await this.send(user, method, path, body);
+    assert.equal(response.status, status, `${name}: got HTTP ${response.status}`);
+    this.check(name, true);
+    return response.payload;
   }
 
   async expectError(name, user, method, path, body, status, code) {
@@ -117,6 +133,26 @@ export class TestRun {
         }
         throw new Error(message);
       },
+      async focusDirect(username) {
+        const from = events.length;
+        socket.send(JSON.stringify({ type: "focus", kind: "direct", username }));
+        return this.waitFor(
+          (event) => event.type === "focus.ack" && event.kind === "direct"
+            && sameUsername(event.username, username),
+          `direct focus on ${username} was not acknowledged`,
+          from,
+        );
+      },
+      async focusGroup(groupID) {
+        const from = events.length;
+        socket.send(JSON.stringify({ type: "focus", kind: "group", group_id: groupID }));
+        return this.waitFor(
+          (event) => event.type === "focus.ack" && event.kind === "group" && event.group_id === groupID,
+          `group focus on ${groupID} was not acknowledged`,
+          from,
+        );
+      },
+      blur: () => socket.send(JSON.stringify({ type: "blur" })),
       close: () => socket.close(),
     };
   }

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -45,8 +46,10 @@ func TestListConversationsIncludesGroups(t *testing.T) {
 		{
 			User:     store.PublicUser{Username: "bob", Nickname: "Bob"},
 			IsFriend: true,
+			LastSeq:  4,
 			LastMessage: &store.Message{
 				ID:              4,
+				Seq:             4,
 				SenderID:        2,
 				RecipientID:     1,
 				ClientMessageID: "direct-12345678",
@@ -67,8 +70,10 @@ func TestListConversationsIncludesGroups(t *testing.T) {
 			MemberCount: 3,
 			IsOwner:     true,
 			UnreadCount: 5,
+			LastSeq:     12,
 			LastMessage: &store.GroupMessage{
 				ID:              12,
+				Seq:             12,
 				GroupID:         9,
 				SenderID:        2,
 				Sender:          store.PublicUser{Username: "bob", Nickname: "Bob"},
@@ -102,14 +107,16 @@ func TestListConversationsIncludesGroups(t *testing.T) {
 	first := response.Conversations[0]
 	if first.Type != "group" || first.Group == nil || first.Group.ID != 9 ||
 		first.Group.Owner.Username != "alice" || !first.IsOwner ||
-		first.UnreadCount != 5 || first.LastMessage == nil ||
-		first.LastMessage.GroupID != 9 || first.LastMessage.Recipient != nil ||
+		first.UnreadCount != 5 || first.LastSeq != 12 || first.LastMessage == nil ||
+		first.LastMessage.GroupID != 9 || first.LastMessage.Seq != 12 ||
+		first.LastMessage.Recipient != nil ||
 		first.LastMessage.Body != "group hello" {
 		t.Fatalf("first conversation = %#v", first)
 	}
 	second := response.Conversations[1]
 	if second.Type != "direct" || second.User == nil || second.User.Username != "bob" ||
-		second.LastMessage == nil || second.LastMessage.Body != "direct hello" {
+		second.LastSeq != 4 || second.LastMessage == nil ||
+		second.LastMessage.Seq != 4 || second.LastMessage.Body != "direct hello" {
 		t.Fatalf("second conversation = %#v", second)
 	}
 	third := response.Conversations[2]
@@ -294,6 +301,7 @@ func TestListGroupMessages(t *testing.T) {
 		Messages: []store.GroupMessage{
 			{
 				ID:              11,
+				Seq:             11,
 				GroupID:         7,
 				SenderID:        2,
 				Sender:          store.PublicUser{Username: "bob", Nickname: "Bob"},
@@ -307,14 +315,14 @@ func TestListGroupMessages(t *testing.T) {
 	router := testRouter(dataStore)
 
 	recorder := doJSON(
-		t, router, http.MethodGet, "/api/groups/7/messages?before_id=20&limit=30", nil, authTestCookie(),
+		t, router, http.MethodGet, "/api/groups/7/messages?before_seq=20&limit=30", nil, authTestCookie(),
 	)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
 	response := decodeBody[groupMessagePageResponse](t, recorder)
 	if !response.HasMore || len(response.Messages) != 1 ||
-		response.Messages[0].GroupID != 7 ||
+		response.Messages[0].GroupID != 7 || response.Messages[0].Seq != 11 ||
 		response.Messages[0].Sender.Username != "bob" ||
 		response.Messages[0].Body != "hello group" {
 		t.Fatalf("page = %#v", response)
@@ -322,7 +330,7 @@ func TestListGroupMessages(t *testing.T) {
 
 	recorder = doJSON(
 		t, router, http.MethodGet,
-		"/api/groups/7/messages?before_id=20&after_id=10", nil, authTestCookie(),
+		"/api/groups/7/messages?before_seq=20&after_seq=10", nil, authTestCookie(),
 	)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("conflicting cursor status = %d, want %d", recorder.Code, http.StatusBadRequest)
@@ -334,6 +342,7 @@ func TestSendGroupMessage(t *testing.T) {
 	dataStore := authenticatedChatStore()
 	dataStore.createdGroupMessage = store.GroupMessage{
 		ID:              12,
+		Seq:             12,
 		GroupID:         7,
 		SenderID:        1,
 		Sender:          store.PublicUser{Username: "alice", Nickname: "Alice"},
@@ -353,7 +362,8 @@ func TestSendGroupMessage(t *testing.T) {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusCreated, recorder.Body.String())
 	}
 	response := decodeBody[sendGroupMessageResponse](t, recorder)
-	if response.Message.GroupID != 7 || response.Message.Body != "hello" ||
+	if response.Message.GroupID != 7 || response.Message.Seq != 12 ||
+		response.Message.Body != "hello" ||
 		response.Message.Sender.Username != "alice" {
 		t.Fatalf("message = %#v", response.Message)
 	}
@@ -361,6 +371,21 @@ func TestSendGroupMessage(t *testing.T) {
 		dataStore.createGroupMessageCall.groupID != 7 ||
 		dataStore.createGroupMessageCall.body != "hello" {
 		t.Fatalf("create message call = %#v", dataStore.createGroupMessageCall)
+	}
+}
+
+func TestSendGroupMessageSeqNotReady(t *testing.T) {
+	dataStore := authenticatedChatStore()
+	dataStore.createGroupMessageErr = messaging.ErrSeqNotReady
+	router := testRouter(dataStore)
+
+	recorder := doJSON(t, router, http.MethodPost, "/api/groups/7/messages", map[string]string{
+		"body":              "hello",
+		"client_message_id": "group-client-1",
+	}, authTestCookie())
+	if recorder.Code != http.StatusServiceUnavailable ||
+		errorCode(t, recorder) != "message_service_unavailable" {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -392,21 +417,6 @@ func TestSendGroupMessageValidation(t *testing.T) {
 	}
 }
 
-func TestMarkGroupRead(t *testing.T) {
-	dataStore := authenticatedChatStore()
-	dataStore.markGroupReadResult = 42
-	dataStore.markGroupReadAdvanced = true
-	router := testRouter(dataStore)
-
-	recorder := doJSON(t, router, http.MethodPost, "/api/groups/7/read", nil, authTestCookie())
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
-	}
-	if response := decodeBody[readStateResponse](t, recorder); response.LastReadMessageID != 42 {
-		t.Fatalf("response = %#v", response)
-	}
-}
-
 func TestGetGroupNotFound(t *testing.T) {
 	dataStore := authenticatedChatStore()
 	dataStore.groupDetailErr = store.ErrGroupNotFound
@@ -427,6 +437,7 @@ func TestWebSocketReceivesGroupMessage(t *testing.T) {
 	dataStore := authenticatedChatStore()
 	dataStore.createdGroupMessage = store.GroupMessage{
 		ID:              12,
+		Seq:             12,
 		GroupID:         7,
 		SenderID:        1,
 		Sender:          store.PublicUser{Username: "alice", Nickname: "Alice"},
@@ -477,7 +488,7 @@ func TestWebSocketReceivesGroupMessage(t *testing.T) {
 		t.Fatalf("decode websocket message: %v", err)
 	}
 	if event.Type != "group.message.created" || event.Message.GroupID != 7 ||
-		event.Message.Body != "live group hello" {
+		event.Message.Seq != 12 || event.Message.Body != "live group hello" {
 		t.Fatalf("event = %#v", event)
 	}
 }

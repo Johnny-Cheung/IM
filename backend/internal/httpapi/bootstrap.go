@@ -26,8 +26,8 @@ const (
 )
 
 type bootstrapGroupCursor struct {
-	GroupID uint64 `json:"group_id"`
-	AfterID uint64 `json:"after_id"`
+	GroupID  uint64 `json:"group_id"`
+	AfterSeq uint64 `json:"after_seq"`
 }
 
 type bootstrapRequest struct {
@@ -62,7 +62,7 @@ type bootstrapResponse struct {
 
 type bootstrapGroupResult struct {
 	groupID  uint64
-	afterID  uint64
+	afterSeq uint64
 	response bootstrapGroupResponse
 	ok       bool
 }
@@ -198,8 +198,8 @@ func (a *API) readBootstrapGroups(
 	sem := make(chan struct{}, bootstrapGroupConcurrency)
 	for index, cursor := range planned {
 		results[index] = bootstrapGroupResult{
-			groupID: cursor.GroupID,
-			afterID: cursor.AfterID,
+			groupID:  cursor.GroupID,
+			afterSeq: cursor.AfterSeq,
 		}
 		wg.Add(1)
 		go func(index int, cursor bootstrapGroupCursor) {
@@ -212,7 +212,7 @@ func (a *API) readBootstrapGroups(
 				return
 			}
 			delta, err := a.readGroupDelta(
-				groupCtx, current, cursor.GroupID, cursor.AfterID, bootstrapGroupLimit,
+				groupCtx, current, cursor.GroupID, cursor.AfterSeq, bootstrapGroupLimit,
 			)
 			if err != nil {
 				log.Printf("bootstrap group %d: %v", cursor.GroupID, err)
@@ -230,13 +230,13 @@ func (a *API) readBootstrapGroups(
 func (a *API) readGroupDelta(
 	ctx context.Context,
 	current store.User,
-	groupID, afterID uint64,
+	groupID, afterSeq uint64,
 	limit int,
 ) (bootstrapGroupResponse, error) {
 	if a.groupReader == nil {
 		return bootstrapGroupResponse{}, errMessageServiceUnavailable
 	}
-	hot, err := a.groupReader.ReadGroupAfter(ctx, current.ID, groupID, afterID, limit)
+	hot, err := a.groupReader.ReadGroupAfter(ctx, current.ID, groupID, afterSeq, limit)
 	if err != nil {
 		return bootstrapGroupResponse{}, err
 	}
@@ -246,39 +246,38 @@ func (a *API) readGroupDelta(
 		Messages: make([]groupMessageResponse, 0, len(hot.Page.Messages)),
 		HasMore:  hot.Page.HasMore,
 		Complete: hot.Complete,
-		Cursor:   afterID,
+		Cursor:   afterSeq,
 	}
 	for _, message := range hot.Page.Messages {
 		response.Messages = append(response.Messages, toGroupMessageResponse(message))
-		if message.ID > response.Cursor {
-			response.Cursor = message.ID
+		if message.Seq > response.Cursor {
+			response.Cursor = message.Seq
 		}
 	}
 	return response, nil
 }
 
 // planBootstrapGroups keeps only groups that the user is currently in (proven
-// by the conversation list) and whose last message is newer than the cached
-// cursor. Groups without a cursor are opened lazily and skipped here.
+// by the conversation list) and whose counter is ahead of the cached cursor.
+// Groups without a cursor are opened lazily and skipped here.
 func planBootstrapGroups(
 	conversations []conversationResponse,
 	cursors []bootstrapGroupCursor,
 ) []bootstrapGroupCursor {
 	cursorByGroup := make(map[uint64]uint64, len(cursors))
 	for _, cursor := range cursors {
-		if cursor.GroupID == 0 || cursor.AfterID == 0 {
+		if cursor.GroupID == 0 || cursor.AfterSeq == 0 {
 			continue
 		}
-		if existing, ok := cursorByGroup[cursor.GroupID]; !ok || cursor.AfterID > existing {
-			cursorByGroup[cursor.GroupID] = cursor.AfterID
+		if existing, ok := cursorByGroup[cursor.GroupID]; !ok || cursor.AfterSeq > existing {
+			cursorByGroup[cursor.GroupID] = cursor.AfterSeq
 		}
 	}
 
 	plan := make([]bootstrapGroupCursor, 0, len(cursorByGroup))
 	seen := make(map[uint64]struct{}, len(cursorByGroup))
 	for _, conversation := range conversations {
-		if conversation.Type != "group" || conversation.Group == nil ||
-			conversation.LastMessage == nil {
+		if conversation.Type != "group" || conversation.Group == nil {
 			continue
 		}
 		groupID := conversation.Group.ID
@@ -289,11 +288,11 @@ func planBootstrapGroups(
 		if _, duplicate := seen[groupID]; duplicate {
 			continue
 		}
-		if conversation.LastMessage.ID <= cursor {
+		if conversation.LastSeq <= cursor {
 			continue
 		}
 		seen[groupID] = struct{}{}
-		plan = append(plan, bootstrapGroupCursor{GroupID: groupID, AfterID: cursor})
+		plan = append(plan, bootstrapGroupCursor{GroupID: groupID, AfterSeq: cursor})
 	}
 	return plan
 }
@@ -315,7 +314,7 @@ func assembleBootstrapGroups(
 				Messages: []groupMessageResponse{},
 				HasMore:  true,
 				Complete: item.Complete,
-				Cursor:   result.afterID,
+				Cursor:   result.afterSeq,
 			})
 			continue
 		}
@@ -323,9 +322,9 @@ func assembleBootstrapGroups(
 			item.Messages = item.Messages[:remaining]
 			item.HasMore = true
 			if len(item.Messages) == 0 {
-				item.Cursor = result.afterID
+				item.Cursor = result.afterSeq
 			} else {
-				item.Cursor = item.Messages[len(item.Messages)-1].ID
+				item.Cursor = item.Messages[len(item.Messages)-1].Seq
 			}
 		}
 		remaining -= len(item.Messages)

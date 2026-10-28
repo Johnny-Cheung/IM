@@ -14,6 +14,7 @@ const bob: PublicUser = { username: "Bob", nickname: "Bob" };
 function directMessage(): ChatMessage {
   return {
     id: 1,
+    seq: 1,
     sender: alice,
     recipient: bob,
     body: "hello",
@@ -25,6 +26,7 @@ function directMessage(): ChatMessage {
 function groupMessage(): GroupMessage {
   return {
     id: 2,
+    seq: 1,
     group_id: 9,
     sender: bob,
     body: "hello group",
@@ -49,8 +51,9 @@ describe("conversation keys", () => {
       user: bob,
       is_friend: true,
       last_message: null,
+      last_seq: 0,
       unread_count: 0,
-      peer_last_read_message_id: 0,
+      peer_last_read_seq: 0,
     })).toBe("direct:bob");
     expect(conversationKey({
       type: "group",
@@ -63,6 +66,7 @@ describe("conversation keys", () => {
       },
       is_owner: false,
       last_message: null,
+      last_seq: 0,
       unread_count: 0,
     })).toBe("group:9");
   });

@@ -103,11 +103,13 @@ func (p *GroupProjection) IsMember(ctx context.Context, groupID, userID uint64) 
 	return p.client.SIsMember(ctx, p.keyspace.groupMembersKey(groupID), userID).Result()
 }
 
-func (p *GroupProjection) LastAcceptedID(ctx context.Context, groupID uint64) (uint64, error) {
+// LastSeq returns the group's conversation seq counter, or zero when the
+// group has no accepted message yet.
+func (p *GroupProjection) LastSeq(ctx context.Context, groupID uint64) (uint64, error) {
 	if p == nil || p.client == nil {
 		return 0, ErrMessageServiceUnavailable
 	}
-	value, err := p.client.Get(ctx, p.keyspace.groupLastAcceptedKey(groupID)).Result()
+	value, err := p.client.Get(ctx, p.keyspace.groupSequenceKey(groupID)).Result()
 	if err == redis.Nil {
 		return 0, nil
 	}

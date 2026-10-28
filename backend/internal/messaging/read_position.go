@@ -18,28 +18,38 @@ var readAdvanceScript = redis.NewScript(readAdvanceScriptSource)
 
 const defaultReadStreamMaxLen = int64(10000)
 
-// DirectReadTracker owns direct-chat read positions in Redis.
+// DirectReadTracker owns direct-chat read watermarks in Redis.
 //
-// Only the last read message ID is stored. Unread counts and peer read
-// positions are derived from the existing directional message indexes.
+// Only the last read seq is stored. Unread counts are derived from the
+// conversation counter minus that watermark; no message index is queried.
 type DirectReadTracker struct {
 	client       redis.UniversalClient
 	keyspace     Keyspace
 	streamMaxLen int64
+	gate         *SeqGate
 }
 
 // DirectReadTrackerOptions configures the tracker.
 type DirectReadTrackerOptions struct {
 	Keyspace     Keyspace
 	StreamMaxLen int64
+	Gate         *SeqGate
 }
 
 // DirectReadAdvance reports the outcome of one read-position advance.
 type DirectReadAdvance struct {
-	LastReadMessageID uint64
-	Candidate         uint64
-	Advanced          bool
-	StreamError       bool
+	LastReadSeq uint64
+	Candidate   uint64
+	Advanced    bool
+	StreamError bool
+}
+
+// DirectConversationState is one private conversation's seq snapshot.
+type DirectConversationState struct {
+	LastSeq     uint64
+	ReadSeq     uint64
+	PeerReadSeq uint64
+	Unread      uint64
 }
 
 func NewDirectReadTracker(
@@ -53,32 +63,36 @@ func NewDirectReadTracker(
 		client:       client,
 		keyspace:     options.Keyspace,
 		streamMaxLen: options.StreamMaxLen,
+		gate:         options.Gate,
 	}
 }
 
-// AdvanceRead moves the user's read position for peer forward to the newest
-// incoming message at or below throughID. A zero throughID means the newest
-// accepted incoming message.
+// AdvanceRead moves the user's read position for peer forward to
+// min(throughSeq, conversation counter), or to the counter when throughSeq is
+// zero.
 func (t *DirectReadTracker) AdvanceRead(
 	ctx context.Context,
-	userID, peerID, throughID uint64,
+	userID, peerID, throughSeq uint64,
 	now time.Time,
 ) (DirectReadAdvance, error) {
 	if t == nil || t.client == nil {
 		return DirectReadAdvance{}, ErrMessageServiceUnavailable
+	}
+	if err := t.gate.Ready(); err != nil {
+		return DirectReadAdvance{}, err
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
 
 	keys := []string{
-		t.keyspace.directConversationKey(userID, peerID),
+		t.keyspace.directSequenceKey(userID, peerID),
 		t.keyspace.directReadKey(userID),
 		t.keyspace.directReadStreamKey(),
 	}
 	args := []interface{}{
 		peerID,
-		throughID,
+		throughSeq,
 		now.UTC().UnixMilli(),
 		t.streamMaxLen,
 		userID,
@@ -120,7 +134,7 @@ func (t *DirectReadTracker) ReadPositions(
 }
 
 // PeerReadPositions returns how far each peer has read messages sent by the
-// user. Missing or zero positions are omitted.
+// user, in seq units. Missing or zero positions are omitted.
 func (t *DirectReadTracker) PeerReadPositions(
 	ctx context.Context,
 	userID uint64,
@@ -160,7 +174,62 @@ func (t *DirectReadTracker) PeerReadPositions(
 	return result, nil
 }
 
-// UnreadCounts counts incoming messages above each peer's read position.
+// States reads the counter, the user's watermark and the peer's watermark of
+// several conversations in one pipeline, so they come from a single snapshot.
+func (t *DirectReadTracker) States(
+	ctx context.Context,
+	userID uint64,
+	peerIDs []uint64,
+) (map[uint64]DirectConversationState, error) {
+	if t == nil || t.client == nil {
+		return nil, ErrMessageServiceUnavailable
+	}
+	if err := t.gate.Ready(); err != nil {
+		return nil, err
+	}
+	states := make(map[uint64]DirectConversationState, len(peerIDs))
+	if len(peerIDs) == 0 {
+		return states, nil
+	}
+
+	pipe := t.client.Pipeline()
+	lastCommands := make([]*redis.StringCmd, len(peerIDs))
+	readCommands := make([]*redis.StringCmd, len(peerIDs))
+	peerCommands := make([]*redis.StringCmd, len(peerIDs))
+	userField := strconv.FormatUint(userID, 10)
+	for index, peerID := range peerIDs {
+		lastCommands[index] = pipe.Get(ctx, t.keyspace.directSequenceKey(userID, peerID))
+		readCommands[index] = pipe.HGet(ctx, t.keyspace.directReadKey(userID), strconv.FormatUint(peerID, 10))
+		peerCommands[index] = pipe.HGet(ctx, t.keyspace.directReadKey(peerID), userField)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+
+	for index, peerID := range peerIDs {
+		lastSeq, err := readCounterResult(lastCommands[index])
+		if err != nil {
+			return nil, err
+		}
+		readSeq, err := readPositionResult(readCommands[index])
+		if err != nil {
+			return nil, err
+		}
+		peerReadSeq, err := readPositionResult(peerCommands[index])
+		if err != nil {
+			return nil, err
+		}
+		states[peerID] = DirectConversationState{
+			LastSeq:     lastSeq,
+			ReadSeq:     readSeq,
+			PeerReadSeq: peerReadSeq,
+			Unread:      unreadBetween(lastSeq, readSeq),
+		}
+	}
+	return states, nil
+}
+
+// UnreadCounts returns max(0, counter - position) for every requested peer.
 // Every requested peer is present in the result, including zero counts.
 func (t *DirectReadTracker) UnreadCounts(
 	ctx context.Context,
@@ -177,60 +246,80 @@ func (t *DirectReadTracker) UnreadCounts(
 	}
 
 	pipe := t.client.Pipeline()
-	commands := make([]*redis.IntCmd, len(peerIDs))
+	commands := make([]*redis.StringCmd, len(peerIDs))
 	for index, peerID := range peerIDs {
-		minimum := "(" + strconv.FormatUint(positions[peerID], 10)
-		commands[index] = pipe.ZCount(
-			ctx,
-			t.keyspace.directConversationKey(userID, peerID),
-			minimum,
-			"+inf",
-		)
+		commands[index] = pipe.Get(ctx, t.keyspace.directSequenceKey(userID, peerID))
 	}
-	if _, err := pipe.Exec(ctx); err != nil {
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return nil, err
 	}
 	for index, command := range commands {
-		count, err := command.Result()
+		lastSeq, err := readCounterResult(command)
 		if err != nil {
 			return nil, err
 		}
-		result[peerIDs[index]] = int(count)
+		result[peerIDs[index]] = int(unreadBetween(lastSeq, positions[peerIDs[index]]))
 	}
 	return result, nil
 }
 
-// ReadModelReady reports whether historical backfill has completed.
+// ReadModelReady reports whether the gate is open and seq:ready exists.
 func (t *DirectReadTracker) ReadModelReady(ctx context.Context) (bool, error) {
 	if t == nil || t.client == nil {
 		return false, ErrMessageServiceUnavailable
 	}
-	value, err := t.client.Get(ctx, t.keyspace.directReadReadyKey()).Result()
-	if errors.Is(err, redis.Nil) {
+	if t.gate.Ready() != nil {
 		return false, nil
 	}
+	exists, err := t.client.Exists(ctx, t.keyspace.sequenceReadyKey()).Result()
 	if err != nil {
 		return false, err
 	}
-	return value == "1", nil
+	return exists > 0, nil
 }
 
-// MarkReadModelReady records that historical backfill has completed.
+// MarkReadModelReady records that history and counters are complete.
 func (t *DirectReadTracker) MarkReadModelReady(ctx context.Context) error {
 	if t == nil || t.client == nil {
 		return ErrMessageServiceUnavailable
 	}
-	if err := t.client.Set(ctx, t.keyspace.directReadReadyKey(), "1", 0).Err(); err != nil {
-		return fmt.Errorf("mark read model ready: %w", err)
+	if err := t.client.Set(ctx, t.keyspace.sequenceReadyKey(), "1", 0).Err(); err != nil {
+		return fmt.Errorf("mark sequence ready: %w", err)
 	}
 	return nil
+}
+
+func unreadBetween(lastSeq, readSeq uint64) uint64 {
+	if lastSeq <= readSeq {
+		return 0
+	}
+	return lastSeq - readSeq
+}
+
+func readCounterResult(command *redis.StringCmd) (uint64, error) {
+	return readOptionalUint(command)
+}
+
+func readPositionResult(command *redis.StringCmd) (uint64, error) {
+	return readOptionalUint(command)
+}
+
+func readOptionalUint(command *redis.StringCmd) (uint64, error) {
+	raw, err := command.Result()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(raw, 10, 64)
 }
 
 func parseReadAdvance(values []interface{}) (DirectReadAdvance, error) {
 	if len(values) < 3 {
 		return DirectReadAdvance{}, ErrMessageServiceUnavailable
 	}
-	lastReadMessageID, err := parseRedisUint(values[0])
+	lastReadSeq, err := parseRedisUint(values[0])
 	if err != nil {
 		return DirectReadAdvance{}, err
 	}
@@ -247,10 +336,10 @@ func parseReadAdvance(values []interface{}) (DirectReadAdvance, error) {
 		streamError = fmt.Sprint(values[3]) == "stream_error"
 	}
 	return DirectReadAdvance{
-		LastReadMessageID: lastReadMessageID,
-		Candidate:         candidate,
-		Advanced:          advanced,
-		StreamError:       streamError,
+		LastReadSeq: lastReadSeq,
+		Candidate:   candidate,
+		Advanced:    advanced,
+		StreamError: streamError,
 	}, nil
 }
 

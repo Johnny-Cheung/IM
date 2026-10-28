@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例已切换为 v1.7 群聊已读与 WebSocket 隐式已读：MySQL、正式 `8198` 和验证 `8199`。v1.1 基础设施已就绪，v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）仍在开发和隔离验证中，正式切换步骤见下文“v1.8.1 切换步骤与回滚（待执行）”；在该节完成前不要对正式实例执行其步骤。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -17,8 +17,9 @@
 git status --short
 git branch --show-current
 scripts/build-release.sh
-# 也可以指定版本和输出目录
+# 也可以指定版本和输出目录；版本支持两段式和三段式
 scripts/build-release.sh v0.7 /tmp/im-v0.7
+scripts/build-release.sh v1.8.1 /tmp/im-v1.8.1
 ```
 
 脚本不会自动切换分支或推送。工作区不干净、分支不是 `refactor/im` 或输出目录已存在时会直接失败。产物目录包含：
@@ -45,16 +46,20 @@ sha256sum -c SHA256SUMS         # Linux
 | 路径 | 含义 |
 | --- | --- |
 | `/health` | HTTP 进程可响应即返回 200；不检查 MySQL。 |
-| `/ready` | 2 秒内成功 ping MySQL 时返回 200（`database=ok`）；否则返回 503（`database=unavailable`）。 |
+| `/ready` | 2 秒内成功 ping MySQL 时返回 200（`database=ok`）；否则返回 503（`database=unavailable`）。它仍然只检查 MySQL，不反映消息号闸门。 |
+| `/ops/infra` | 基础设施连通性和 v1.8.1 的 seq 就绪/校准状态（`seq:ready`、校准中、run_id）。切换后用它判断接纳是否可用。 |
 
 ```bash
 /opt/IM-Rebuild/imctl health
 /opt/IM-Rebuild/imctl status
 curl -fsS http://127.0.0.1:8198/health
 curl -fsS http://127.0.0.1:8198/ready
+curl -fsS http://127.0.0.1:8198/ops/infra
 ```
 
 `imctl health` 只在 `/health` 和 `/ready` 都返回 200 时成功，任一失败或连接失败都返回非零。`imctl status` 仅用于查看 backend、MySQL、私有 Docker 和 `RELEASE`，是可读状态展示，不作为发布是否成功的判据。`/health` 为 200 但 `/ready` 为 503 表示进程在、数据库不可用，应先检查 `imctl mysql-status` 和 `imctl logs mysql`。
+
+v1.8.1 起，`/health` 和 `/ready` 全绿不代表发送可用：启动校准完成前、Redis 重启后的重新校准期间、`seq:ready` 丢失或某个会话计数器缺失但索引非空时，发送、`focus`、未读和 `read-stats` 返回 503，历史读取照常。必须同时观察 `/ops/infra` 的 seq 状态与后端日志，不要按 `/ready` 判断切换完成。
 
 ## 重启和开机后拉起
 
@@ -111,7 +116,98 @@ curl -fsS http://127.0.0.1:8198/health
 curl -fsS http://127.0.0.1:8198/ready
 ```
 
-新二进制启动时会自动执行迁移。切换只替换应用文件，不停止 MySQL、不恢复数据库；迁移只向前执行，应用回滚时不要回滚或覆盖 MySQL 数据。
+新二进制启动时会自动执行迁移。切换只替换应用文件，不停止 MySQL、不恢复数据库；迁移只向前执行，应用回滚时不要回滚或覆盖 MySQL 数据。v1.8.1 改变了 Redis 键和已读单位，不能只按本节替换文件，必须按下一节执行排空队列和 `backfill-seq`。
+
+## v1.8.1 切换步骤与回滚（待执行）
+
+v1.8.1 把全局消息号改为“会话内连续消息号 `seq`”：私聊两个方向合并成 `dm:pair`，会话计数器为 `dm:seq`/`group:{G}:seq`，已读水位改用 `seq`，三个旧 HTTP 已读接口删除，就绪标记统一为 `seq:ready`。以下步骤尚未执行，执行后把结果补在本节。
+
+### 前置检查
+
+```bash
+# 当前版本健康、队列排空（只读；正式 vhost im_v11）
+/opt/IM-Rebuild/imctl health
+/opt/IM-Rebuild/imctl queue-status
+# 备份 MySQL 与应用文件，并保留旧控制脚本供回滚
+BACKUP="$(/opt/IM-Rebuild/imctl backup)"
+( cd "$BACKUP" && sha256sum -c SHA256SUMS )
+/opt/IM-Rebuild/imctl restore-check "$BACKUP"
+PRE=/opt/IM-Rebuild/imctl.pre-v1.8.1
+if [ ! -e "$PRE" ]; then
+  cp -p /opt/IM-Rebuild/imctl "$PRE"
+fi
+grep -q 'backfill-group-read' "$PRE" \
+  || { echo "错误：$PRE 不是 v1.7 控制脚本，回滚将无法执行；请从 refactor/im 的 v1.7 提交取回 deploy/imctl" >&2; exit 1; }
+```
+
+本块只执行一次。副本已存在时不会覆盖；`imctl.pre-v1.8.1` 必须是旧脚本，新脚本没有 `backfill-read`/`backfill-group-read`。
+
+- `imctl queue-status` 读取正式 vhost 的 `im.v12.messages.persist` 和 `im.v12.group.messages.persist`，`ready` 与 `unacknowledged` 都为 0 才算排空；`--verify` 形式检查验证 vhost `im_v13_verify`，不会碰正式队列。
+- 新 `deploy/imctl` 提供 `backfill-seq` 和 `queue-status`；切换前用 relay 上传并安装为 `/opt/IM-Rebuild/imctl`，旧脚本已复制为 `imctl.pre-v1.8.1`。`imctl` 不在发布包里，也不在 `backup` 中，必须单独保留旧副本。
+- `imctl backup` 只包含 MySQL 和应用文件，不含 Redis。`seq` 计数器、`dm:pair`、`seq:ready` 不备份，靠 `backfill-seq` 从 MySQL 重建。
+- 保留 `imctl.pre-v1.8.1` 是因为新脚本删除了 `backfill-read`/`backfill-group-read`，回滚只能由旧脚本发起。该副本只生成一次；重复执行上面的块不会把已安装的新脚本复制覆盖它。
+- 新包用 `scripts/build-release.sh v1.8.1 <目录>` 构建；脚本接受两段式和三段式版本号。
+
+### 切换顺序
+
+1. 备份，并在 Redis 容器内记录只读诊断：`INFO memory`、`INFO server` 的 `run_id`，以及 `dm:conv:*`、`group:{G}:inbox`、`index:epoch` 的键数量。不要手工删除正式键。
+2. 确认持久化队列已排空：`/opt/IM-Rebuild/imctl queue-status`。非 0 时等待 relay 和 consumer 消费后重试。
+3. 停后端：`/opt/IM-Rebuild/imctl backend-stop`。`backfill-seq` 会拒绝在后端 active 时执行。
+4. 校验新包并替换 `bin/`、`web/`、`RELEASE`（步骤同“发布切换”第 2 步）。
+5. 执行回填：`/opt/IM-Rebuild/imctl backfill-seq`（验证实例为 `/opt/IM-Rebuild/imctl --verify backfill-seq`）。命令先执行迁移，再填充 MySQL 的会话列与 `seq`、重建 Redis 计数器/`dm:pair`/群 inbox、换算水位、校验，全部通过后写入 `seq:ready`（正式 `im:v12:seq:ready`，验证 `im:v13-verify:seq:ready`）；失败时不写标记。
+6. 启动：`/opt/IM-Rebuild/imctl backend-start`。缺少 `seq:ready` 时后端拒绝启动。
+7. 启动后验证：
+   - `/ready` 200（仍只查 MySQL），并观察 `/ops/infra` 的 seq 就绪与校准状态；校准完成前发送、`focus`、未读、`read-stats` 返回 503，历史读取正常。
+   - `imctl health`、`imctl status`、`imctl logs backend` 无 `seq:ready`、校准或唯一索引错误。
+   - `imctl queue-status` 在回归后重新排空；`infractl status` 观察 Redis 内存变化（新的 `dm:seq`/`dm:pair` 取代两个方向的 `dm:conv`，容量治理留到 v1.9）。
+   - 用独立验证账号回归**正式切换后的 8198**（必须显式设置 `BASE_URL`；不设置时 smoke 默认打 8199 canary）：`BASE_URL=http://10.12.75.191:8198 node scripts/smoke.mjs`、`BASE_URL=http://10.12.75.191:8198 node scripts/browser-smoke.mjs`、`BASE_URL=http://10.12.75.191:8198 node scripts/cache-smoke.mjs`；在开发机上执行时用 `http://127.0.0.1:8198`。每个会话 `seq` 从 1 连续、重复发送返回同一 `seq`、未读等于 `last_seq - read_seq`、三个旧已读接口 404。本轮 manifest 必须用数据库 `im` 清理。
+   - 已读人数核对：`read-stats` 用 `seq` 查询，响应里的 `message_id` 与该 `seq` 的全局消息号一致。
+   - 实测统计（消息数、群数、水位、内存、队列）执行后补写，不预先填写。
+
+### 键与容量（v1.8.1 起）
+
+- 新增 `dm:seq:{low}:{high}`（STRING，私聊会话计数器）、`dm:pair:{low}:{high}`（ZSET，成员为全局消息号、分数为 `seq`）、`group:{G}:seq`（STRING）和 `seq:ready`，全部带命名空间前缀（正式 `im:v12:`，验证 `im:v13-verify:`），且都不设 TTL。
+- 每个好友对只保留一份 `dm:pair`，取代 v1.7 的两个方向 `dm:conv`；`group:{G}:inbox` 保留但分数改为 `seq`。回填会删除 `dm:conv:*`、`group:{G}:last_accepted_id` 和旧的读事件 Stream；`dm:read:ready`/`group-read:ready` 不再被检查，统一由 `seq:ready` 取代。
+- 计数器与会话索引随会话数增长，容量治理和 TTL 留到 v1.9；切换后按 `INFO memory` 记录实际增长，不预先填写数字。
+
+### 503 的含义与观察方式
+
+- 闸门关闭期间（启动校准、检测到 Redis 重启后的重新校准、`seq:ready` 丢失、计数器缺失但会话索引非空），发送、`focus`、未读和 `read-stats` 返回 503；历史读取照常，缺失部分从 MySQL 补。
+- Redis 不可用同样返回 503，不回落 MySQL；MySQL 不可用时编号、未读、已读照常，但校准无法完成，发送保持 503。
+- `/ready` 与 `imctl health` 不反映闸门，全绿也可能发送 503。以 `/ops/infra`、后端日志和 503 响应码为准。
+- `seq:ready` 丢失后必须重新执行 `backfill-seq`，不能手工补键。
+
+### 回滚（v1.8.1 → v1.7）
+
+回滚会丢弃切换后产生的消息和已读数据，不做新旧单位的双写。步骤：
+
+1. `/opt/IM-Rebuild/imctl backend-stop`。
+2. 恢复切换前的 MySQL 备份（`$BACKUP/database.sql` 对应的切换前库）和应用文件 `bin/`、`web/`、`RELEASE`（见“回滚应用文件”）。恢复正式库必须单独评审并保留完整备份；`restore-check` 只做演练，不做恢复。
+3. 清空整个 v1.8.1 命名空间（仅正式前缀 `im:v12:*`）：用 `SCAN MATCH im:v12:* COUNT 100` 分批 `UNLINK`。必须清空整个命名空间，不能只按新键前缀删除 `dm:seq`、`dm:pair`、`group:{G}:seq`、`seq:ready` 等：`dm:read`、`group:{G}:read` 和 `group:{G}:inbox` 的分数/值已经改成 `seq`，切换后的消息实体、`dm:feed`、`index:epoch` 和两个 Stream 也属于应丢弃的切换后数据；v1.7 的 `backfill-read`/`backfill-group-read` 只补缺和抬高水位（`group_read_reconcile.lua` 永不降低已有分数，校验也只检查 Redis 不小于 MySQL），无法把残留的 `seq` 水位还原成全局消息号，残留会让未读和已读人数算错。**绝不要 `FLUSHDB`/`FLUSHALL`**。旧版启动会从 MySQL 重新播种全局消息号、`index:epoch`、好友投影和群成员投影。
+4. 用旧控制脚本和恢复后的旧二进制回填旧模型：
+   ```bash
+   /opt/IM-Rebuild/imctl.pre-v1.8.1 backfill-read
+   /opt/IM-Rebuild/imctl.pre-v1.8.1 backfill-group-read
+   ```
+   群 inbox 分数和群已读单位在 v1.8.1 已改成 `seq`，因此两个命令都要执行，不能只 `backfill-read`。
+5. 启动旧版并验证：`/opt/IM-Rebuild/imctl.pre-v1.8.1 backend-start`，`health`，再用旧版 smoke 回归。回填后抽查单位：`dm:read` 的每个值、`group:{G}:read` 的每个分数都不应大于恢复库中对应会话的最大全局消息号（`messages.id` / `group_messages.id`）。出现更大的值说明第 3 步没有清空整个命名空间，停止回滚并重新执行第 3 步。
+6. 启动前确认第 3 步已清空整个命名空间；`seq:ready`、`seq` 计数器、`dm:read`/`group:{G}:read`/`group:{G}:inbox` 的 `seq` 残留必须一起清除，不能留到下一次切换。旧版不读取这些键，但保留它们就意味着第 3 步没有执行，同单位的残留读状态也会一起保留。回滚完成后不要再做额外的通配删除，但第 3 步的 `SCAN`/`UNLINK` 是回滚的必需步骤。
+
+### 恢复测试注意事项
+
+- 验证实例 `8199` 与正式 `8198` 共用同一个 Redis 容器 `im-v11-redis`，只是 DB 与命名空间不同。`infractl redis-restart`/`redis-recreate` 会影响正式实例，必须单独确认并选择窗口后再执行。
+- `redis-restart` 保留数据目录，不会制造“计数器落后”。要验证校准：先停 canary，在 `im:v13-verify` 命名空间把某个 `dm:seq:*` 或 `group:*:seq` 改小，再重启 Redis（或等待 run_id 变化）并启动 canary；观察发送先返回 503、校准后从 MySQL 的最大 `seq` 继续，且新消息不撞号。
+- 不要在正式命名空间手工改计数器，不要 `FLUSHDB 0`。测试 `seq:ready` 丢失时只删 `im:v13-verify:seq:ready`，并重新执行 `imctl --verify backfill-seq`。
+- 掉电丢尾无法在 smoke 中复现，使用人工清单。
+
+### 人工验证清单
+
+- [ ] 掉电丢尾重发：**不要停止、重启或重建共享的 `im-v11-redis` 容器**——正式 8198 的 DB 0 与验证 DB 1 在同一进程和同一份 AOF 内，容器级操作会中断正式实例，并可能丢掉最多约 1 秒的正式写入。在验证命名空间模拟：`/opt/IM-Rebuild/imctl --verify stop`，记下刚发送消息的全局号，在 `im:v13-verify` 删除 `messages:{id}` 或 `group-messages:{id}`、`dm:pair`/`group:{G}:inbox` 中该消息的成员、原 `client_message_id` 对应的 `dedup`/`group-dedup`、Stream 中该消息的事件以及 `dm:conv-last` 中指向它的字段；若该消息已异步落库，同时删除 `im_v07_verify` 中对应的 `messages`/`group_messages` 行；再 `/opt/IM-Rebuild/imctl --verify start` 并刷新浏览器；本地“已发送”消息应变为发送失败，点击重试用原 `client_message_id` 成功且不重复。真正的 SIGKILL/AOF 丢尾只能在独立的 Redis 进程上验证；如果必须对共享容器做容器级恢复测试，按生产维护窗口停 8198、排空队列并单独评审，不能当作只影响验证实例。
+- [ ] 客户端缺口恢复：浏览器 smoke 已用合成跳号帧覆盖；人工再用真实弱网或切后台验证一次补拉日志。
+- [ ] 服务端回退：在验证命名空间把会话计数器改小，客户端应丢弃本地多出的尾部并按服务端重新同步。
+- [ ] 校准期间 503：改小计数器后重启，确认发送/未读/`focus`/`read-stats` 先 503，校准完成后恢复。
+- [ ] 旧三个 HTTP 已读接口均返回 404，浏览器前台收消息不发任何已读 HTTP 请求。
+- [ ] 群已读人数：`read-stats` 的 `message_id` 与本地该 `seq` 的全局号一致，`all_read`/分母在踢人后正确。
 
 ## 回滚应用文件
 
@@ -135,11 +231,13 @@ install -m 0644 "$BACKUP/RELEASE" /opt/IM-Rebuild/RELEASE
 /opt/IM-Rebuild/imctl status
 ```
 
-确认所选备份确实对应上一版本后再执行。回滚只恢复 `bin/`、`web/` 和 `RELEASE`，不恢复 `database.sql`，不动 MySQL 数据。
+确认所选备份确实对应上一版本后再执行。回滚只恢复 `bin/`、`web/` 和 `RELEASE`，不恢复 `database.sql`，不动 MySQL 数据。v1.8.1 的回滚还要求恢复切换前的 MySQL 备份、清空新 Redis 命名空间并用旧脚本执行 `backfill-read` 与 `backfill-group-read`，见上一节。
 
 ## 数据库备份与恢复检查
 
 `imctl backup` 通过现有 MySQL 容器和容器内受保护密钥生成一致性 SQL dump 和 SHA-256，保存到仅 root 可访问的 `/opt/IM-Rebuild/backups/` 下按 UTC 时间加后缀命名的子目录，并打印路径。备份包含 `database.sql`、行数清单 `counts.tsv`、当前应用的 `bin/`、`web/`、`RELEASE`和 `SHA256SUMS`；保留历史，不自动删除，不把密码写入参数、环境变量或日志。
+
+备份不包含 Redis。v1.8.1 的 `dm:seq`、`dm:pair`、`group:{G}:seq`、`seq:ready` 都不在备份中：Redis 数据丢失或回滚后，用 `backfill-seq` 从 MySQL 重建；回滚到 v1.7 时则清空新命名空间并用旧脚本回填旧模型。切换前可以在 Redis 容器内记录只读的键数量、内存和 `run_id` 作为诊断，不要导出或修改正式键。
 
 ```bash
 BACKUP="$(/opt/IM-Rebuild/imctl backup)"
@@ -184,9 +282,13 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 测试候选版本时，把候选文件放到 `canary-v07/bin/im-server` 和 `canary-v07/web/`，然后执行：
 
 ```bash
+# v1.8.1 候选包必须先回填 seq，再启动；后端缺少 im:v13-verify:seq:ready 会拒绝启动
+/opt/IM-Rebuild/imctl --verify backfill-seq
 /opt/IM-Rebuild/imctl --verify restart
 /opt/IM-Rebuild/imctl --verify health
 ```
+
+canary 的 Redis DB 1 与正式 `8198` 的 DB 0 在同一个 `im-v11-redis` 容器内，只是命名空间不同。重启或重建该容器、制造 AOF 丢尾等恢复测试都会影响正式实例，必须单独确认后执行；不要用 `FLUSHDB` 清库。
 
 恢复 v0.6 基线时，把 `bin/im-server-v06` 复制为 `bin/im-server`、把 `web-v06` 恢复为 `web`，再执行 `imctl --verify restart`。验证结束后用 `imctl --verify stop` 只停止 canary 应用；不要停止共享 runtime/MySQL。临时单元由 `imctl --verify start` 在需要时重建，不影响生产 `8198`。
 
@@ -204,7 +306,9 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 ```
 
 - 单组件重启使用 `redis-restart`、`rabbitmq-restart`；日志使用 `logs redis|rabbitmq|runtime`。
-- 当前正式 `8198` 已接入 v1.2 私聊、v1.3 群聊、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读；不配置开机自启，开发机重启后手动执行 `infractl start` 和 `imctl restart`。
+- v1.8.1 起后端每 5 秒读取 Redis `INFO server` 的 `run_id` 检测容器重启；启动和检测到重启后都把会话计数器校准到不低于 MySQL 最大 `seq`（只抬不降）。校准期间发送、`focus`、未读和 `read-stats` 返回 503，完成后自动恢复；状态通过 `/ops/infra` 观察。
+- `redis-restart` 保留数据目录，不会制造“计数器落后”。恢复测试要在验证命名空间手工把计数器改小（见“v1.8.1 切换步骤与回滚”的恢复测试注意事项），不要操作正式命名空间。
+- 当前正式 `8198` 已接入 v1.2 私聊、v1.3 群聊、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读；v1.8.1 尚未切换。不配置开机自启，开发机重启后手动执行 `infractl start` 和 `imctl restart`。
 
 ## v1.2 私聊消息链路（已切换正式）
 
@@ -225,10 +329,10 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 - v1.3 隔离验证使用临时单元 `im-rebuild-verify`、`im_v07_verify` 数据库和验证命名空间；验证结束后停止临时单元，按 manifest 清理测试账号、群 ID 对应的 Redis 投影键，并只删除 `im:v13-verify:*` 键。
 - v1.3 不做群聊已读、高可用故障转移、pending 接管、死信、对账、压力测试或容量调优。
 
-## v1.4 服务端消息读取链路（已切换正式）
+## v1.4 服务端消息读取链路（已切换正式，v1.8.1 起部分被取代）
 
-- 读取改为按会话的方向索引 `dm:conv:{owner}:{peer}`，另加用户级增量日志 `dm:feed:{user}` 和会话最后消息 `dm:conv-last:{user}`；`inbox`/`outbox` 已停止写入，只保留作回滚兜底。
-- `index:epoch` 标记读取索引的完整边界：epoch 以下一律回落 MySQL。首次启动取 `max(落库最大消息号, Redis 计数器)`，重启保留原值，只有计数器落后于落库最大值时才上调。
+- 读取改为按会话索引，另加用户级增量日志 `dm:feed:{user}` 和会话最后消息 `dm:conv-last:{user}`；`inbox`/`outbox` 已停止写入，只保留作回滚兜底。v1.8.1 起私聊的两个方向索引 `dm:conv:{owner}:{peer}` 被单个 `dm:pair:{low}:{high}` 取代（分数为会话 `seq`），`dm:feed` 和私聊增量同步的 `after_id` 仍使用全局消息号。
+- `index:epoch` 标记读取索引的完整边界：epoch 以下一律回落 MySQL。首次启动取 `max(落库最大消息号, Redis 计数器)`，重启保留原值，只有计数器落后于落库最大值时才上调。v1.8.1 起 `index:epoch` 只保留给私聊 feed；热读按 `seq` 区间进行并由 MySQL 补齐缺失编号。
 - 新增 `GET /api/messages/sync?after_id=N`，一次返回该用户全部私聊增量；`complete=false` 表示补收不完整，需要从会话历史重新同步。
 - 消息实体、`dm:feed`、`dm:conv`、`dm:conv-last` 均不设 TTL，也不再裁剪；Redis 内存不再有固定上限行为，发布后需要持续观察 `used_memory`。观察方式是在私有 Redis 容器内读取 `INFO memory` 的 `used_memory_human`、`maxmemory_human` 和 `maxmemory_policy`，凭据仍由容器内受保护文件提供。
 - 切换后实测 `used_memory` 约 1.64 MB（上限 64 MB），键总数 232；`dm:feed`/`dm:conv`/`dm:conv-last` 在真实用户产生新消息前为空，属于 epoch 设计的预期现象。
@@ -246,33 +350,29 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 - 正式 smoke 产生的少量 Redis 测试索引未按 ID 清理，测试账号已从 MySQL 删除，不影响真实账号；容量治理时统一处理。
 - 回归新增 `node scripts/cache-smoke.mjs`，覆盖冷启动单次 bootstrap、离线只读、断网恢复、退出清理和账号隔离。
 
-## v1.6 私聊已读（已切换正式）
+## v1.6 私聊已读（已切换正式，v1.8.1 起被取代）
 
-- 私聊已读位置保存为 Redis `dm:read:{userID}` HASH；未读用 `dm:conv` 的 `ZCOUNT` 现算，对方回执直接读取对方的位置。已读和未读请求不再查询 `conversation_reads`。
-- 新增批量接口 `POST /api/read`（最多 50 项），保留单会话已读接口；已读位置通过 `dm:read:stream` 异步写回 MySQL，worker 使用 `GREATEST` 幂等落库。
-- 升级前必须执行一次历史回填：
-  ```bash
-  /opt/IM-Rebuild/imctl --verify backfill-read
-  /opt/IM-Rebuild/imctl backfill-read
-  ```
-  回填会索引历史私聊消息和已读位置，校验通过后写入 `dm:read:ready`。启用消息链路时，后端缺少该标记会拒绝启动；Redis 丢数据后也需要重新回填。
+- 私聊已读位置保存为 Redis `dm:read:{userID}` HASH；v1.7 及以前未读用 `dm:conv` 的 `ZCOUNT` 现算。v1.8.1 起 `dm:read` 的值改为 `seq`，未读等于会话计数器的 `last_seq` 减去自己的已读 `seq`（小于 0 按 0），不再对消息索引做 `ZCOUNT`；对方回执比较 `peer_last_read_seq` 与消息的 `seq`。
+- 旧的批量接口 `POST /api/read` 和单会话已读接口在 v1.8.1 删除，已读只通过 WebSocket `focus` 推进；`backfill-read` 只在回滚到 v1.7 时使用。
+- 已读位置通过 `dm:read:stream` 异步写回 MySQL，worker 使用 `GREATEST` 幂等落库；v1.8.1 写入 `last_read_seq`，旧的 `last_read_message_id` 保留但不再维护。
+- 升级到 v1.8.1 前的历史回填由 `backfill-seq` 统一完成（索引历史私聊消息、重建 `dm:pair`、换算已读位置），校验通过后写入 `seq:ready`。启用消息链路时，后端缺少该标记会拒绝启动；Redis 丢数据后需要重新回填。v1.7 及以前使用 `dm:read:ready`，该标记在 v1.8.1 中已被 `seq:ready` 取代。
 - 正式切换前备份为 `/opt/IM-Rebuild/backups/20261027T150410Z-4Z7wA7`；回填统计为 50 条私聊、8 条已读、9 个方向，Redis 内存 1.94 MB → 1.96 MB。
 - 正式环境回归：API smoke 62 项、浏览器 smoke 39 项、缓存 smoke 18 项全部通过；本轮 10 个测试账号按 manifest 删除，生产队列 ready/unack 均为 0。
-- 回滚应用文件仍使用切换前备份。v1.5 不读取新的 Redis 键，MySQL 已读位置由异步 worker 持续写入，回退后继续可用。
+- v1.5 不读取新的 Redis 键，MySQL 已读位置由异步 worker 持续写入，回退后继续可用。
 - 验证实例 `8199` 已停止；验证库测试账号和测试用 `dm:read` 键已清除。测试消息的 `dm:conv` 和实体索引留到 v1.9 容量治理。
-- v1.7 用 WebSocket 隐式已读取代了前台持续上报；本节的批量接口和 `dm:read` 模型继续使用，批量接口保留给旧客户端和回滚。
+- v1.7 用 WebSocket 隐式已读取代了前台持续上报；v1.8.1 又删除了遗留的 HTTP 已读接口，批量接口不再是回滚路径的一部分（回滚到 v1.7 请使用旧控制脚本的 `backfill-read`）。
 
-## v1.7 群聊已读与 WebSocket 隐式已读（已切换正式）
+## v1.7 群聊已读与 WebSocket 隐式已读（已切换正式，v1.8.1 起被取代）
 
-- 群聊已读位置保存为 Redis `group:{G}:read` ZSET；未读用 `group:{G}:inbox` 的 `ZCOUNT` 现算，已读人数由 `GET /api/groups/:id/read-stats` 现算。位置通过 `group-read:stream` 异步写回 `group_members.last_read_message_id`（`GREATEST`，同一成员合并写）。
-- 前台已读改为 WebSocket 隐式已读：客户端发 `focus`/`blur`，服务端在推送消息后异步推进位置，私聊和群聊统一；不再有前台持续上报的 HTTP 请求。`POST /api/read` 等旧接口保留给旧客户端和回滚。
-- 升级前必须执行一次群聊历史回填，并且**必须在停后端之后、启动新版之前**执行，因为 v1.6 的群聊已读只写 MySQL，边运行边回填会漏掉回填之后的新数据：
+- 群聊已读位置保存为 Redis `group:{G}:read` ZSET；v1.7 未读用 `group:{G}:inbox` 的 `ZCOUNT` 现算，已读人数由 `GET /api/groups/:id/read-stats` 现算。v1.8.1 起 `group:{G}:inbox` 的分数和 `group:{G}:read` 的值都改为群会话 `seq`，未读等于群计数器 `last_seq` 减去自己的已读 `seq`；`read-stats` 改用 `?seq=` 查询并返回 `{seq, message_id, read_count, member_count, all_read}`。位置通过 `group-read:stream` 异步写回 `group_members.last_read_seq`（`GREATEST`，同一成员合并写）。
+- 前台已读继续使用 WebSocket 隐式已读：客户端发 `focus`/`blur`，服务端的 `focus.ack` 和 `messages.read` 使用 `last_read_seq`。v1.8.1 删除了 `POST /api/read`、`POST /api/conversations/:username/read`、`POST /api/groups/:id/read`，浏览器只会通过 `focus` 推进已读。
+- v1.8.1 的群聊历史回填补并进 `backfill-seq`，不再有独立的 `backfill-group-read`：
   ```bash
-  /opt/IM-Rebuild/imctl --verify backfill-group-read
-  /opt/IM-Rebuild/imctl backfill-group-read
+  /opt/IM-Rebuild/imctl --verify backfill-seq
+  /opt/IM-Rebuild/imctl backfill-seq
   ```
-  回填会索引历史群消息号，把每个成员的位置设为 `max(已读位置, 该成员最后一条自己的消息)` 并写回 MySQL，校验通过后写入 `group-read:ready`。启用群消息链路时，后端缺少该标记会拒绝启动；Redis 丢数据后需要重新回填，重跑会抬高偏低的旧位置，不会降低已有位置。
-- 正式切换顺序：备份 → 停后端 → 替换文件 → `imctl backfill-group-read` → 启动。正式切换前备份为 `/opt/IM-Rebuild/backups/20261028T073828Z-gsbcbz`；回填统计为 19 条群消息、3 个群（ID 6、7、8）、10 个成员位置，其中 1 个位置被抬高；回填当场 Redis 内存 2.48 MB，没有明显变化，清理测试数据后约 2.68 MB（含本轮私聊测试消息的遗留索引，留到 v1.9）。
+  回填按（群，`seq`）重建 `group:{G}:inbox` 和计数器、换算成员位置，校验通过后写入 `seq:ready`。启用群消息链路时，后端缺少该标记会拒绝启动；Redis 丢数据后需要重新回填。v1.7 当时写入的是 `group-read:ready`，v1.8.1 已统一为 `seq:ready`；旧的 `backfill-group-read` 只保留在回滚路径（用 `imctl.pre-v1.8.1` 执行）。
+- v1.7 当时的切换顺序为“备份 → 停后端 → 替换文件 → `imctl backfill-group-read` → 启动”（历史记录；v1.8.1 起统一改为 `backfill-seq`，不再有独立命令）。正式切换前备份为 `/opt/IM-Rebuild/backups/20261028T073828Z-gsbcbz`；回填统计为 19 条群消息、3 个群（ID 6、7、8）、10 个成员位置，其中 1 个位置被抬高；回填当场 Redis 内存 2.48 MB，没有明显变化，清理测试数据后约 2.68 MB（含本轮私聊测试消息的遗留索引，留到 v1.9）。
 - 正式环境回归：API smoke 94 项、浏览器 smoke 49 项、缓存 smoke 25 项全部通过；本轮 16 个测试账号和 7 个测试群按 manifest 删除（MySQL 与 Redis），账号、私聊、群消息、群成员、已读行数与切换前一致，`group-read:stream` 为空，队列积压为 0。
 - 群成员变更（建群、邀请、踢人、退群、解散）在同一群内串行写 Redis 投影；失败时 `group:{G}:sync_required` 保持置位，由后台修复循环按 MySQL 快照重建，期间该群的发送、已读和未读返回 503。当前串行锁在进程内，多实例留到 v1.8。
 - 回滚应用文件仍使用切换前备份。v1.7 没有数据库迁移，v1.6 不读取新的 Redis 键；v1.7 写入 MySQL 的已读位置只增不减，回退后继续可用。
@@ -292,25 +392,27 @@ bash deploy/imctl_test.sh
 bash deploy/infractl_test.sh
 ```
 
-API 和浏览器脚本使用 Node 26；浏览器脚本默认使用 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`，可通过 `CHROME_PATH` 指定本机 Chrome。通过 `BASE_URL` 指定其他已确认的验证地址。容量脚本会创建 101 个独立账号并验证 100 人边界，仅用于隔离验证库。性能基线脚本串行采样现有 API，只输出 p50/p95/max，不设阈值，也不做压力测试。
+API 和浏览器脚本使用 Node 26；浏览器脚本默认使用 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`，可通过 `CHROME_PATH` 指定本机 Chrome。通过 `BASE_URL` 指定其他已确认的验证地址。容量脚本会创建 101 个独立账号并验证 100 人边界，仅用于隔离验证库。性能基线脚本串行采样发送、会话列表、历史和 WebSocket `focus`，只输出 p50/p95/max，不设阈值，也不做压力测试。
+
+v1.8.1 起 smoke 断言会话内 `seq`：每个会话从 1 连续、私聊两个方向共用一个编号、重复发送返回同一 `seq`、并发发送无重复无空洞、`after_seq` 补拉缺口、未读等于 `last_seq - read_seq`、`read-stats` 用 `seq` 并返回 `message_id`、三个旧 HTTP 已读接口返回 404。浏览器 smoke 用已安装的 WebSocket 包装层丢弃真实推送并合成一帧跳号消息，验证客户端按 `after_seq` 补拉后恢复。缓存 smoke 覆盖 v1.7 缓存升级清理、缓存消息携带 `seq`、未读按服务端计数和重连补读。掉电丢尾重发无法在 smoke 中复现，见“v1.8.1 切换步骤与回滚”的人工验证清单。
 
 脚本随机生成本轮账号和密码，密码只在进程内存中使用。完成后打印独立报告目录，`manifest.json` 只记录服务地址、本轮账号名、群 ID 和检查数；失败截图不包含登录表单。脚本退出非零表示检查未通过；账号清理需按本轮清单执行，不使用宽泛用户名通配符，不操作 `demo_*`。正式发布后的少量写入检查也必须使用本轮独立账号并按清单清理，不重置演示账号或它们的未读位置。
 
-清理脚本先生成 SQL 和同名的 `*.redis.sh`，不直接连接数据库；它只接受已登记的随机测试账号名和群 ID，并核对清单服务端口与所选数据库一致：
+清理脚本生成 SQL 和同名的 `*.redis.sh`，不直接连接数据库；它只接受已登记的随机测试账号名和群 ID，并核对清单服务端口与所选数据库一致：
 
 ```bash
 node scripts/cleanup-test-data.mjs im_v07_verify /tmp/im-cleanup.sql /path/to/manifest.json
 # 多轮清单可依次追加；正式8198的本轮清单需显式选择 im
 ```
 
-输出文件不会覆盖已有文件。核对 SQL 中的数据库和账号清单后，用既有 relay 流程上传到开发机，再在开发机执行（示例使用已上传的文件）：
+输出文件不会覆盖已有文件。核对 SQL 中的数据库和账号清单后，用既有 relay 流程上传到开发机。**先执行 Redis 清理，再执行 SQL**：私聊的 `dm:seq`/`dm:pair`/`dm:read`/`dm:conv-last` 以内部用户 ID 命名，Redis 脚本需要账号仍然存在，才能按清单里的精确用户名从 MySQL 查出 ID 再拼键（示例使用已上传的文件）：
 
 ```bash
-bash -c 'source /opt/IM-Rebuild/imctl; mysql_command mysql < /opt/IM-Rebuild/canary-v07/reports/cleanup.sql'
 bash /opt/IM-Rebuild/canary-v07/reports/cleanup.redis.sh
+bash -c 'source /opt/IM-Rebuild/imctl; mysql_command mysql < /opt/IM-Rebuild/canary-v07/reports/cleanup.sql'
 ```
 
-SQL 仅按明确用户名删除，表名包含固定数据库前缀，删除账号会级联清理这些账号的测试关系、消息和群；不会按用户名通配符清理，也不会修改真实账号或演示账号。`*.redis.sh` 只删除清单中群 ID 对应的验证命名空间键（成员集合、已读位置、inbox、水位、消息实体及两个 Stream 中的群事件），不影响其他群或正式数据。
+SQL 仅按明确用户名删除，表名包含固定数据库前缀，删除账号会级联清理这些账号的测试关系、消息和群；不会按用户名通配符清理，也不会修改真实账号或演示账号。`*.redis.sh` 只删除清单账号对应的私聊键和清单中群 ID 对应的验证命名空间键（成员集合、已读位置、inbox、`group:{G}:seq`、水位、消息实体及两个 Stream 中的群事件），不影响其他账号、群或正式数据，也不会删除 `seq:ready`。清单账号数必须与 MySQL 查到的一致，否则脚本拒绝执行。
 
 ## 凭据和演示数据
 

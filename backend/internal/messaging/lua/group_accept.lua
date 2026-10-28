@@ -1,3 +1,27 @@
+-- KEYS[1] = group:{G}:members
+-- KEYS[2] = group:{G}:dissolved
+-- KEYS[3] = group:{G}:sync_required
+-- KEYS[4] = group-dedup:{G}:{sender}:{client_message_id}
+-- KEYS[5] = messages:next_id (global message ID counter)
+-- KEYS[6] = group:{G}:inbox
+-- KEYS[7] = group:{G}:seq
+-- KEYS[8] = group-messages:stream
+-- KEYS[9] = seq:ready
+-- ARGV[1] = sender ID
+-- ARGV[2] = group ID
+-- ARGV[3] = client message ID
+-- ARGV[4] = body
+-- ARGV[5] = created at (unix milliseconds)
+-- ARGV[6] = body hash
+-- ARGV[7] = global ID seed floor
+-- ARGV[8] = max safe global message ID
+-- ARGV[9] = max safe group seq
+-- ARGV[10] = dedup TTL seconds
+-- ARGV[11] = stream max length
+-- ARGV[12] = message entity key prefix
+-- ARGV[13] = sender username
+-- ARGV[14] = sender nickname
+
 local sender_id = ARGV[1]
 local group_id = ARGV[2]
 local client_message_id = ARGV[3]
@@ -6,11 +30,16 @@ local created_at_ms = ARGV[5]
 local body_hash = ARGV[6]
 local seed_floor = tonumber(ARGV[7])
 local max_safe_id = tonumber(ARGV[8])
-local dedup_ttl = tonumber(ARGV[9])
-local stream_max_len = tonumber(ARGV[10])
-local message_prefix = ARGV[11]
-local sender_username = ARGV[12]
-local sender_nickname = ARGV[13]
+local max_safe_seq = tonumber(ARGV[9])
+local dedup_ttl = tonumber(ARGV[10])
+local stream_max_len = tonumber(ARGV[11])
+local message_prefix = ARGV[12]
+local sender_username = ARGV[13]
+local sender_nickname = ARGV[14]
+
+if redis.call('EXISTS', KEYS[9]) == 0 then
+  return {'seq_not_ready'}
+end
 
 if redis.call('EXISTS', KEYS[3]) == 1 then
   return {'projection_missing'}
@@ -29,13 +58,26 @@ local existing_id = redis.call('HGET', KEYS[4], 'id')
 if existing_id then
   local existing_hash = redis.call('HGET', KEYS[4], 'body_hash')
   if existing_hash == body_hash then
-    return {'duplicate', existing_id, redis.call('HGET', KEYS[4], 'created_at_ms')}
+    local existing_seq = redis.call('HGET', message_prefix .. existing_id, 'seq')
+    if not existing_seq then
+      return {'seq_not_ready'}
+    end
+    return {'duplicate', existing_id, redis.call('HGET', KEYS[4], 'created_at_ms'), existing_seq}
   end
   return {'conflict'}
 end
 
 if seed_floor > max_safe_id then
   return {'id_overflow'}
+end
+
+local last_seq_raw = redis.call('GET', KEYS[7])
+if not last_seq_raw and redis.call('ZCARD', KEYS[6]) > 0 then
+  return {'seq_unavailable'}
+end
+local last_seq = tonumber(last_seq_raw or '0')
+if last_seq >= max_safe_seq then
+  return {'seq_overflow'}
 end
 
 local current = tonumber(redis.call('GET', KEYS[5]) or '0')
@@ -49,6 +91,9 @@ if message_id > max_safe_id then
   return {'id_overflow'}
 end
 
+local seq = last_seq + 1
+redis.call('SET', KEYS[7], tostring(seq))
+
 local message_key = message_prefix .. tostring(message_id)
 redis.call('HSET', message_key,
   'id', tostring(message_id),
@@ -59,7 +104,8 @@ redis.call('HSET', message_key,
   'created_at_ms', created_at_ms,
   'sender_username', sender_username,
   'sender_nickname', sender_nickname,
-  'body_hash', body_hash)
+  'body_hash', body_hash,
+  'seq', tostring(seq))
 
 redis.call('HSET', KEYS[4],
   'id', tostring(message_id),
@@ -67,11 +113,11 @@ redis.call('HSET', KEYS[4],
   'body_hash', body_hash)
 redis.call('EXPIRE', KEYS[4], dedup_ttl)
 
-redis.call('ZADD', KEYS[6], message_id, tostring(message_id))
-redis.call('SET', KEYS[7], tostring(message_id))
+redis.call('ZADD', KEYS[6], seq, tostring(message_id))
 
 redis.call('XADD', KEYS[8], 'MAXLEN', '~', stream_max_len, '*',
   'id', tostring(message_id),
+  'seq', tostring(seq),
   'group_id', group_id,
   'sender_id', sender_id,
   'client_message_id', client_message_id,
@@ -81,4 +127,4 @@ redis.call('XADD', KEYS[8], 'MAXLEN', '~', stream_max_len, '*',
   'sender_nickname', sender_nickname,
   'body_hash', body_hash)
 
-return {'accepted', tostring(message_id), created_at_ms}
+return {'accepted', tostring(message_id), created_at_ms, tostring(seq)}

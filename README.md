@@ -41,6 +41,8 @@ export IM_MYSQL_PASSWORD_FILE="$HOME/.config/im/mysql-app"
 
 后端启动时会自动执行迁移。也可以设置 `IM_MYSQL_DSN` 显式指定完整 DSN，它优先于上面的分项配置和密码文件。默认监听 `127.0.0.1:8080`，可用 `-addr` 修改；未指定 `-web-dir` 时只提供 API。
 
+未配置 Redis（`IM_REDIS_URL`/`IM_REDIS_URL_FILE`）时使用无 Redis 的本地模式：发送、历史和会话列表可用，会话消息号在 MySQL 事务里用 `MAX(seq)+1` 分配，仅用于本地开发。该模式不支持已读：WebSocket `focus` 返回 503，旧的 HTTP 已读接口已删除，未读数不会随阅读清零。
+
 前端开发：
 
 ```bash

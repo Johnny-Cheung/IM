@@ -28,7 +28,7 @@ func TestImplicitGroupReadAdvancesEverySender(t *testing.T) {
 		positions := make(map[uint64]uint64)
 		for _, call := range tracker.snapAdvances() {
 			if call.groupID == 7 {
-				positions[call.userID] = call.throughID
+				positions[call.userID] = call.throughSeq
 			}
 		}
 		return positions[1] == 10 && positions[2] == 11
@@ -40,7 +40,7 @@ func TestImplicitGroupReadAdvancesEverySender(t *testing.T) {
 			continue
 		}
 		want := map[uint64]uint64{1: 10, 2: 11}[call.userID]
-		if call.throughID != want {
+		if call.throughSeq != want {
 			t.Fatalf("advance = %#v, sender %d advanced to a message it did not send",
 				call, call.userID)
 		}
@@ -92,7 +92,7 @@ func TestImplicitReadRequeuesAfterSlowBatch(t *testing.T) {
 	succeeded := make(map[uint64]bool)
 	tracker := newFakeGroupReadTracker()
 	tracker.advanceCtxFn = func(
-		ctx context.Context, groupID, userID, throughID uint64,
+		ctx context.Context, groupID, userID, throughSeq uint64,
 	) (messaging.GroupReadAdvance, error) {
 		if stalled.CompareAndSwap(false, true) {
 			<-ctx.Done()
@@ -102,7 +102,7 @@ func TestImplicitReadRequeuesAfterSlowBatch(t *testing.T) {
 		succeeded[groupID] = true
 		mu.Unlock()
 		return messaging.GroupReadAdvance{
-			UserID: userID, LastReadMessageID: throughID, Advanced: true,
+			UserID: userID, LastReadSeq: throughSeq, Advanced: true,
 		}, nil
 	}
 	api := New(&fakeStore{}, WithGroupReadTracker(tracker))
@@ -119,27 +119,35 @@ func TestImplicitReadRequeuesAfterSlowBatch(t *testing.T) {
 	})
 }
 
-func TestMarkGroupReadLogsStreamFailure(t *testing.T) {
-	dataStore := authenticatedChatStore()
-	dataStore.groupMemberIDs = []uint64{1, 2}
+func TestGroupFocusLogsStreamFailure(t *testing.T) {
+	alice := store.User{ID: 1, Username: "alice", Nickname: "Alice"}
+	dataStore := &fakeStore{
+		sessionByTokenHash: chatSessions(alice),
+		groupMemberIDs:     []uint64{1, 2},
+	}
 	tracker := newFakeGroupReadTracker()
-	tracker.advanceFn = func(_, userID, throughID uint64) (messaging.GroupReadAdvance, error) {
+	tracker.advanceFn = func(_, userID, throughSeq uint64) (messaging.GroupReadAdvance, error) {
 		return messaging.GroupReadAdvance{
-			UserID: userID, LastReadMessageID: throughID, Advanced: true, StreamError: true,
+			UserID: userID, LastReadSeq: throughSeq, Advanced: true, StreamError: true,
 		}, nil
 	}
-	router := testRouter(dataStore, WithGroupReadTracker(tracker))
+	api, _, baseURL := startChatServer(t, dataStore, WithGroupReadTracker(tracker))
+	conn := dialChatSocket(t, baseURL, "alice")
+	waitFor(t, func() bool { return api.hub.activeCount(1) == 1 })
 
 	var logged bytes.Buffer
 	previous := log.Writer()
 	log.SetOutput(&logged)
 	defer log.SetOutput(previous)
 
-	recorder := doJSON(
-		t, router, http.MethodPost, "/api/groups/7/read?through_id=42", nil, authTestCookie(),
-	)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	if err := conn.WriteJSON(map[string]any{
+		"type": "focus", "kind": "group", "group_id": 7,
+	}); err != nil {
+		t.Fatalf("write focus frame: %v", err)
+	}
+	ack := readWSEventType(t, conn, "focus.ack")
+	if ack["error"] != nil {
+		t.Fatalf("ack = %#v", ack)
 	}
 	if !strings.Contains(logged.String(), "group read stream append failed") {
 		t.Fatalf("stream failure was not logged: %q", logged.String())
@@ -147,17 +155,21 @@ func TestMarkGroupReadLogsStreamFailure(t *testing.T) {
 }
 
 func TestGroupFocusHidesGroupState(t *testing.T) {
-	cases := map[string]error{
-		"not_member": messaging.ErrGroupNotMember,
-		"dissolved":  messaging.ErrGroupDissolved,
-		"missing":    messaging.ErrMessageServiceUnavailable,
+	cases := map[string]struct {
+		err  error
+		code string
+	}{
+		"not_member": {err: messaging.ErrGroupNotMember, code: "not_group_member"},
+		"dissolved":  {err: messaging.ErrGroupDissolved, code: "not_group_member"},
+		"missing":    {err: messaging.ErrMessageServiceUnavailable, code: "message_service_unavailable"},
+		"seq_gate":   {err: messaging.ErrSeqNotReady, code: "message_service_unavailable"},
 	}
-	for name, advanceErr := range cases {
+	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {
 			alice := store.User{ID: 1, Username: "alice", Nickname: "Alice"}
 			dataStore := &fakeStore{sessionByTokenHash: chatSessions(alice)}
 			tracker := newFakeGroupReadTracker()
-			tracker.advanceErr = advanceErr
+			tracker.advanceErr = testCase.err
 			api, _, baseURL := startChatServer(t, dataStore, WithGroupReadTracker(tracker))
 			conn := dialChatSocket(t, baseURL, "alice")
 			waitFor(t, func() bool { return api.hub.activeCount(1) == 1 })
@@ -168,8 +180,8 @@ func TestGroupFocusHidesGroupState(t *testing.T) {
 				t.Fatalf("write focus frame: %v", err)
 			}
 			ack := readWSEventType(t, conn, "focus.ack")
-			if ack["error"] != "not_group_member" {
-				t.Fatalf("ack = %#v, want one code for every unavailable group", ack)
+			if ack["error"] != testCase.code {
+				t.Fatalf("ack = %#v, want error %q", ack, testCase.code)
 			}
 		})
 	}
@@ -185,8 +197,8 @@ func TestWebSocketFocusDirectAllowsExistingConversation(t *testing.T) {
 		hasConversation:    true,
 	}
 	tracker := newRecordingDirectReadTracker()
-	tracker.advanceFn = func(_, _, throughID uint64) (messaging.DirectReadAdvance, error) {
-		return messaging.DirectReadAdvance{LastReadMessageID: throughID, Advanced: true}, nil
+	tracker.advanceFn = func(_, _, throughSeq uint64) (messaging.DirectReadAdvance, error) {
+		return messaging.DirectReadAdvance{LastReadSeq: throughSeq, Advanced: true}, nil
 	}
 	api, _, baseURL := startChatServer(t, dataStore, WithDirectReadTracker(tracker))
 	conn := dialChatSocket(t, baseURL, "alice")
@@ -212,15 +224,43 @@ func TestWebSocketFocusDirectAllowsExistingConversation(t *testing.T) {
 func TestGroupReadStatsHidesMessageExistenceFromNonMembers(t *testing.T) {
 	dataStore := authenticatedFriendStore()
 	tracker := newFakeGroupReadTracker()
-	tracker.senderFound = true
-	tracker.senderID = 2
 	tracker.statsErr = messaging.ErrGroupNotMember
 	router := testRouter(dataStore, WithGroupReadTracker(tracker))
 
 	recorder := doJSON(
-		t, router, http.MethodGet, "/api/groups/7/read-stats?message_id=345", nil, authTestCookie(),
+		t, router, http.MethodGet, "/api/groups/7/read-stats?seq=4", nil, authTestCookie(),
 	)
 	if recorder.Code != http.StatusNotFound || errorCode(t, recorder) != "group_not_found" {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestWebSocketFocusDirectReportsSeqGate(t *testing.T) {
+	alice := store.User{ID: 1, Username: "alice", Nickname: "Alice"}
+	bob := store.User{ID: 2, Username: "bob", Nickname: "Bob"}
+	dataStore := &fakeStore{
+		sessionByTokenHash: chatSessions(alice, bob),
+		usersByKey:         map[string]store.User{"bob": bob},
+		relationship:       store.RelationshipFriend,
+	}
+	tracker := newRecordingDirectReadTracker()
+	tracker.advanceFn = func(_, _, _ uint64) (messaging.DirectReadAdvance, error) {
+		return messaging.DirectReadAdvance{}, messaging.ErrSeqNotReady
+	}
+	api, _, baseURL := startChatServer(t, dataStore, WithDirectReadTracker(tracker))
+	conn := dialChatSocket(t, baseURL, "alice")
+	waitFor(t, func() bool { return api.hub.activeCount(1) == 1 })
+
+	if err := conn.WriteJSON(map[string]any{
+		"type": "focus", "kind": "direct", "username": "bob",
+	}); err != nil {
+		t.Fatalf("write focus frame: %v", err)
+	}
+	ack := readWSEventType(t, conn, "focus.ack")
+	if ack["error"] != "message_service_unavailable" {
+		t.Fatalf("ack = %#v, want a service-unavailable error", ack)
+	}
+	if api.hub.isDirectFocus(1, 2) {
+		t.Fatal("focus was recorded while the gate was closed")
 	}
 }

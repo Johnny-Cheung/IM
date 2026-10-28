@@ -2,7 +2,7 @@ package messaging
 
 import (
 	"context"
-	"strconv"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -11,23 +11,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-func seedConversationIndex(
-	t *testing.T,
-	client *redis.Client,
-	ownerID, peerID uint64,
-	messageIDs ...uint64,
-) {
+func newDirectReadTestClient(t *testing.T) *redis.Client {
 	t.Helper()
-	ctx := context.Background()
-	for _, messageID := range messageIDs {
-		if err := client.ZAdd(
-			ctx,
-			directConversationKey(ownerID, peerID),
-			redis.Z{Score: float64(messageID), Member: strconv.FormatUint(messageID, 10)},
-		).Err(); err != nil {
-			t.Fatalf("seed conversation message %d: %v", messageID, err)
-		}
-	}
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	return client
 }
 
 func newReadTracker(t *testing.T, client *redis.Client) *DirectReadTracker {
@@ -36,20 +25,18 @@ func newReadTracker(t *testing.T, client *redis.Client) *DirectReadTracker {
 }
 
 func TestDirectReadTrackerAdvancesMonotonically(t *testing.T) {
-	server := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	defer client.Close()
+	client := newDirectReadTestClient(t)
 	ctx := context.Background()
 	now := time.UnixMilli(1700000000000).UTC()
 
-	seedConversationIndex(t, client, 2, 1, 10, 20, 30)
+	setDirectSequence(t, client, 2, 1, 30)
 	tracker := newReadTracker(t, client)
 
 	first, err := tracker.AdvanceRead(ctx, 2, 1, 20, now)
 	if err != nil {
 		t.Fatalf("first advance: %v", err)
 	}
-	if !first.Advanced || first.LastReadMessageID != 20 || first.Candidate != 20 {
+	if !first.Advanced || first.LastReadSeq != 20 || first.Candidate != 20 {
 		t.Fatalf("first advance = %#v, want position 20 advanced", first)
 	}
 	if got := client.HGet(ctx, directReadKey(2), "1").Val(); got != "20" {
@@ -63,7 +50,7 @@ func TestDirectReadTrackerAdvancesMonotonically(t *testing.T) {
 	if err != nil {
 		t.Fatalf("backwards advance: %v", err)
 	}
-	if backwards.Advanced || backwards.LastReadMessageID != 20 || backwards.Candidate != 10 {
+	if backwards.Advanced || backwards.LastReadSeq != 20 || backwards.Candidate != 15 {
 		t.Fatalf("backwards advance = %#v, want unchanged position 20", backwards)
 	}
 	if got := client.XLen(ctx, directReadStreamKey()).Val(); got != 1 {
@@ -74,15 +61,15 @@ func TestDirectReadTrackerAdvancesMonotonically(t *testing.T) {
 	if err != nil {
 		t.Fatalf("forward advance: %v", err)
 	}
-	if !forward.Advanced || forward.LastReadMessageID != 30 {
-		t.Fatalf("forward advance = %#v, want position 30 advanced", forward)
+	if !forward.Advanced || forward.LastReadSeq != 30 || forward.Candidate != 30 {
+		t.Fatalf("forward advance = %#v, want position 30 clamped to the counter", forward)
 	}
 
 	unbounded, err := tracker.AdvanceRead(ctx, 2, 1, 0, now.Add(3*time.Second))
 	if err != nil {
 		t.Fatalf("unbounded advance: %v", err)
 	}
-	if unbounded.Advanced || unbounded.LastReadMessageID != 30 || unbounded.Candidate != 30 {
+	if unbounded.Advanced || unbounded.LastReadSeq != 30 || unbounded.Candidate != 30 {
 		t.Fatalf("unbounded advance = %#v, want unchanged position 30", unbounded)
 	}
 
@@ -103,23 +90,24 @@ func TestDirectReadTrackerAdvancesMonotonically(t *testing.T) {
 	}
 	values := events[0].Values
 	if values["user_id"] != "2" || values["peer_id"] != "1" ||
-		values["last_read_message_id"] != "20" || values["updated_at_ms"] != "1700000000000" {
+		values["last_read_seq"] != "20" || values["updated_at_ms"] != "1700000000000" {
 		t.Fatalf("stream event = %#v", values)
+	}
+	if _, ok := values["last_read_message_id"]; ok {
+		t.Fatalf("stream event still uses last_read_message_id: %#v", values)
 	}
 }
 
-func TestDirectReadTrackerNoIncomingMessage(t *testing.T) {
-	server := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	defer client.Close()
+func TestDirectReadTrackerWithoutCounterDoesNotAdvance(t *testing.T) {
+	client := newDirectReadTestClient(t)
 	ctx := context.Background()
 	tracker := newReadTracker(t, client)
 
 	result, err := tracker.AdvanceRead(ctx, 2, 1, 50, time.Now())
 	if err != nil {
-		t.Fatalf("advance without messages: %v", err)
+		t.Fatalf("advance without a counter: %v", err)
 	}
-	if result.Advanced || result.LastReadMessageID != 0 || result.Candidate != 0 {
+	if result.Advanced || result.LastReadSeq != 0 || result.Candidate != 0 {
 		t.Fatalf("advance = %#v, want no change", result)
 	}
 	if got := client.Exists(ctx, directReadKey(2)).Val(); got != 0 {
@@ -130,41 +118,35 @@ func TestDirectReadTrackerNoIncomingMessage(t *testing.T) {
 	}
 }
 
-func TestDirectReadTrackerClampsToIncomingDirection(t *testing.T) {
-	server := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	defer client.Close()
+func TestDirectReadTrackerClampsToCounter(t *testing.T) {
+	client := newDirectReadTestClient(t)
 	ctx := context.Background()
 
-	// Peer 2 sent 25 to user 1; user 2 only has peer 1's message 10.
-	seedConversationIndex(t, client, 1, 2, 25)
-	seedConversationIndex(t, client, 2, 1, 10)
+	setDirectSequence(t, client, 2, 1, 10)
 	tracker := newReadTracker(t, client)
 
 	result, err := tracker.AdvanceRead(ctx, 2, 1, 999, time.Now())
 	if err != nil {
 		t.Fatalf("advance: %v", err)
 	}
-	if result.LastReadMessageID != 10 || !result.Advanced {
+	if result.LastReadSeq != 10 || !result.Advanced || result.Candidate != 10 {
 		t.Fatalf("advance = %#v, want position 10", result)
 	}
 
 	below, err := tracker.AdvanceRead(ctx, 2, 1, 5, time.Now())
 	if err != nil {
-		t.Fatalf("advance below all messages: %v", err)
+		t.Fatalf("advance below: %v", err)
 	}
-	if below.Advanced || below.LastReadMessageID != 10 || below.Candidate != 0 {
+	if below.Advanced || below.LastReadSeq != 10 || below.Candidate != 5 {
 		t.Fatalf("advance below = %#v, want unchanged position 10", below)
 	}
 }
 
 func TestDirectReadTrackerDerivesUnreadAndPeerPositions(t *testing.T) {
-	server := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	defer client.Close()
+	client := newDirectReadTestClient(t)
 	ctx := context.Background()
 
-	seedConversationIndex(t, client, 2, 1, 10, 20, 30, 40)
+	setDirectSequence(t, client, 2, 1, 40)
 	tracker := newReadTracker(t, client)
 	if _, err := tracker.AdvanceRead(ctx, 2, 1, 25, time.Now()); err != nil {
 		t.Fatalf("advance: %v", err)
@@ -181,11 +163,19 @@ func TestDirectReadTrackerDerivesUnreadAndPeerPositions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unread counts: %v", err)
 	}
-	if unread[1] != 2 {
-		t.Fatalf("unread for peer 1 = %d, want 2", unread[1])
+	if unread[1] != 15 {
+		t.Fatalf("unread for peer 1 = %d, want 40-25=15", unread[1])
 	}
 	if unread[3] != 0 {
 		t.Fatalf("unread for peer 3 = %d, want 0", unread[3])
+	}
+
+	clamped, err := tracker.UnreadCounts(ctx, 2, []uint64{1}, map[uint64]uint64{1: 100})
+	if err != nil {
+		t.Fatalf("clamped unread: %v", err)
+	}
+	if clamped[1] != 0 {
+		t.Fatalf("clamped unread = %d, want 0", clamped[1])
 	}
 
 	peerPositions, err := tracker.PeerReadPositions(ctx, 2, []uint64{1, 3})
@@ -200,33 +190,59 @@ func TestDirectReadTrackerDerivesUnreadAndPeerPositions(t *testing.T) {
 	}
 }
 
-func TestDirectReadTrackerConcurrentAdvancesStayMonotonic(t *testing.T) {
-	server := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	defer client.Close()
+func TestDirectReadTrackerStates(t *testing.T) {
+	client := newDirectReadTestClient(t)
 	ctx := context.Background()
 
-	ids := make([]uint64, 0, 10)
-	for index := uint64(1); index <= 10; index++ {
-		ids = append(ids, index*10)
+	setDirectSequence(t, client, 2, 1, 40)
+	setDirectSequence(t, client, 2, 3, 8)
+	if err := client.HSet(ctx, directReadKey(2), "1", "25").Err(); err != nil {
+		t.Fatalf("seed read position: %v", err)
 	}
-	seedConversationIndex(t, client, 2, 1, ids...)
+	if err := client.HSet(ctx, directReadKey(1), "2", "35").Err(); err != nil {
+		t.Fatalf("seed peer read position: %v", err)
+	}
 	tracker := newReadTracker(t, client)
 
-	var wg sync.WaitGroup
-	errors := make(chan error, len(ids))
-	for _, throughID := range ids {
-		wg.Add(1)
-		go func(throughID uint64) {
-			defer wg.Done()
-			if _, err := tracker.AdvanceRead(ctx, 2, 1, throughID, time.Now()); err != nil {
-				errors <- err
-			}
-		}(throughID)
+	states, err := tracker.States(ctx, 2, []uint64{1, 3, 4})
+	if err != nil {
+		t.Fatalf("States() error = %v", err)
 	}
-	wg.Wait()
-	close(errors)
-	for err := range errors {
+	peer := states[1]
+	if peer.LastSeq != 40 || peer.ReadSeq != 25 || peer.PeerReadSeq != 35 || peer.Unread != 15 {
+		t.Fatalf("peer state = %#v", peer)
+	}
+	other := states[3]
+	if other.LastSeq != 8 || other.ReadSeq != 0 || other.Unread != 8 {
+		t.Fatalf("other state = %#v", other)
+	}
+	missing := states[4]
+	if missing.LastSeq != 0 || missing.Unread != 0 {
+		t.Fatalf("missing state = %#v", missing)
+	}
+}
+
+func TestDirectReadTrackerConcurrentAdvancesStayMonotonic(t *testing.T) {
+	client := newDirectReadTestClient(t)
+	ctx := context.Background()
+
+	setDirectSequence(t, client, 2, 1, 100)
+	tracker := newReadTracker(t, client)
+
+	var wait sync.WaitGroup
+	failures := make(chan error, 10)
+	for index := uint64(1); index <= 10; index++ {
+		wait.Add(1)
+		go func(through uint64) {
+			defer wait.Done()
+			if _, err := tracker.AdvanceRead(ctx, 2, 1, through*10, time.Now()); err != nil {
+				failures <- err
+			}
+		}(index)
+	}
+	wait.Wait()
+	close(failures)
+	for err := range failures {
 		t.Fatalf("concurrent advance: %v", err)
 	}
 
@@ -234,7 +250,7 @@ func TestDirectReadTrackerConcurrentAdvancesStayMonotonic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("final advance: %v", err)
 	}
-	if final.LastReadMessageID != 100 || final.Advanced {
+	if final.LastReadSeq != 100 || final.Advanced {
 		t.Fatalf("final advance = %#v, want position 100 already applied", final)
 	}
 	streamLength := client.XLen(ctx, directReadStreamKey()).Val()
@@ -244,40 +260,61 @@ func TestDirectReadTrackerConcurrentAdvancesStayMonotonic(t *testing.T) {
 }
 
 func TestDirectReadTrackerReadModelReady(t *testing.T) {
-	server := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	defer client.Close()
+	client := newDirectReadTestClient(t)
 	ctx := context.Background()
-	tracker := newReadTracker(t, client)
+	gate := NewSeqGate()
+	tracker := NewDirectReadTracker(client, DirectReadTrackerOptions{Gate: gate})
 
 	ready, err := tracker.ReadModelReady(ctx)
 	if err != nil {
 		t.Fatalf("initial ready: %v", err)
 	}
 	if ready {
-		t.Fatalf("initial ready = true, want false")
+		t.Fatal("initial ready = true, want false without seq:ready")
 	}
 	if err := tracker.MarkReadModelReady(ctx); err != nil {
 		t.Fatalf("mark ready: %v", err)
 	}
 	ready, err = tracker.ReadModelReady(ctx)
-	if err != nil {
-		t.Fatalf("ready after mark: %v", err)
+	if err != nil || !ready {
+		t.Fatalf("ready after mark = %v, %v; want true", ready, err)
 	}
-	if !ready {
-		t.Fatalf("ready after mark = false, want true")
+
+	gate.Close()
+	ready, err = tracker.ReadModelReady(ctx)
+	if err != nil || ready {
+		t.Fatalf("ready with closed gate = %v, %v; want false", ready, err)
+	}
+}
+
+func TestDirectReadTrackerGate(t *testing.T) {
+	client := newDirectReadTestClient(t)
+	ctx := context.Background()
+	gate := NewSeqGate()
+	tracker := NewDirectReadTracker(client, DirectReadTrackerOptions{Gate: gate})
+	gate.Close()
+
+	if _, err := tracker.AdvanceRead(ctx, 2, 1, 0, time.Now()); !errors.Is(err, ErrSeqNotReady) {
+		t.Fatalf("AdvanceRead() error = %v, want ErrSeqNotReady", err)
+	}
+	if _, err := tracker.States(ctx, 2, []uint64{1}); !errors.Is(err, ErrSeqNotReady) {
+		t.Fatalf("States() error = %v, want ErrSeqNotReady", err)
 	}
 }
 
 func TestDirectReadTrackerRequiresRedis(t *testing.T) {
 	tracker := NewDirectReadTracker(nil, DirectReadTrackerOptions{})
-	if _, err := tracker.AdvanceRead(context.Background(), 1, 2, 10, time.Now()); err == nil {
+	ctx := context.Background()
+	if _, err := tracker.AdvanceRead(ctx, 1, 2, 10, time.Now()); err == nil {
 		t.Fatalf("AdvanceRead() error = nil, want service unavailable")
 	}
-	if _, err := tracker.ReadPositions(context.Background(), 1); err == nil {
+	if _, err := tracker.ReadPositions(ctx, 1); err == nil {
 		t.Fatalf("ReadPositions() error = nil, want service unavailable")
 	}
-	if _, err := tracker.UnreadCounts(context.Background(), 1, []uint64{2}, nil); err == nil {
+	if _, err := tracker.UnreadCounts(ctx, 1, []uint64{2}, nil); err == nil {
 		t.Fatalf("UnreadCounts() error = nil, want service unavailable")
+	}
+	if _, err := tracker.States(ctx, 1, []uint64{2}); err == nil {
+		t.Fatalf("States() error = nil, want service unavailable")
 	}
 }

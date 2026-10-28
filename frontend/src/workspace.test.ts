@@ -29,6 +29,7 @@ function directMessage(
 ): ChatMessage {
   return {
     id,
+    seq: id,
     sender,
     recipient,
     body: `message-${id}`,
@@ -45,14 +46,16 @@ function directConversation(username: string, lastID: number): Conversation {
     is_friend: true,
     last_message: {
       id: lastID,
+      seq: lastID,
       sender: peer,
       recipient: alice,
       body: `last-${lastID}`,
       client_message_id: `last-client-${lastID}`,
       created_at: "2026-10-26T00:00:00Z",
     },
+    last_seq: lastID,
     unread_count: 0,
-    peer_last_read_message_id: 0,
+    peer_last_read_seq: 0,
   };
 }
 
@@ -69,12 +72,14 @@ function groupConversation(id: number, lastID: number): Conversation {
     is_owner: false,
     last_message: {
       id: lastID,
+      seq: lastID,
       group_id: id,
       sender: bob,
       body: `group-last-${lastID}`,
       client_message_id: `group-last-client-${lastID}`,
       created_at: "2026-10-26T00:00:00Z",
     },
+    last_seq: lastID,
     unread_count: 0,
   };
 }
@@ -83,9 +88,11 @@ function groupMessage(
   id: number,
   groupID: number,
   sender: PublicUser = bob,
+  seq: number = id,
 ): GroupMessage {
   return {
     id,
+    seq,
     group_id: groupID,
     sender,
     body: `group-${id}`,
@@ -275,27 +282,27 @@ describe("applyBootstrapToCache", () => {
     expect((await readSyncState("alice")).groups).toEqual({});
   });
 
-  it("drains a truncated group delta", async () => {
+  it("drains a truncated group delta by seq", async () => {
     const after = vi.spyOn(api, "listGroupMessagesAfter").mockResolvedValue({
-      messages: [groupMessage(42, 9)],
+      messages: [groupMessage(42, 9, bob, 22)],
       has_more: false,
     });
     const payload = bootstrapPayload({
       conversations: [groupConversation(9, 42)],
       groups: [{
         group_id: 9,
-        messages: [groupMessage(41, 9)],
+        messages: [groupMessage(41, 9, bob, 21)],
         has_more: true,
         complete: true,
-        cursor: 41,
+        cursor: 21,
       }],
     });
 
     await applyBootstrapToCache(payload);
 
-    expect(after).toHaveBeenCalledWith(9, 41, 50);
+    expect(after).toHaveBeenCalledWith(9, 21, 50);
     expect((await readMessages("alice", "group:9")).map((item) => item.id))
       .toEqual([41, 42]);
-    expect((await readSyncState("alice")).groups).toEqual({ 9: 42 });
+    expect((await readSyncState("alice")).groups).toEqual({ 9: 22 });
   });
 });

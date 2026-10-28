@@ -15,50 +15,55 @@ import (
 
 // ConversationPage is one direct-message page served from the Redis window.
 //
-// Complete reports whether the window fully covers the requested range. When
-// it is false the caller must consult MySQL before answering.
+// Complete reports whether every seq of the requested range was resolved from
+// a Redis entity. When it is false the caller must consult MySQL before
+// answering.
 type ConversationPage struct {
 	Page     store.MessagePage
 	Complete bool
 }
 
-// RedisMessageReader reads one conversation from the directional indexes.
+// RedisMessageReader reads one private conversation from dm:pair and the
+// bidirectional per-user feed from dm:feed.
 type RedisMessageReader struct {
-	client   redis.UniversalClient
-	keyspace Keyspace
-	epoch    uint64
+	client    redis.UniversalClient
+	keyspace  Keyspace
+	feedEpoch uint64
 }
 
 func NewRedisMessageReader(client redis.UniversalClient) *RedisMessageReader {
 	return NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
 }
 
+// NewRedisMessageReaderWithKeyspace builds a reader. feedEpoch is the
+// global-ID floor of dm:feed only; conversation ranges never use it.
 func NewRedisMessageReaderWithKeyspace(
 	client redis.UniversalClient,
 	keyspace Keyspace,
-	epoch uint64,
+	feedEpoch uint64,
 ) *RedisMessageReader {
-	return &RedisMessageReader{client: client, keyspace: keyspace, epoch: epoch}
+	return &RedisMessageReader{client: client, keyspace: keyspace, feedEpoch: feedEpoch}
 }
 
-// ReadConversation returns the newest messages before beforeID, or the newest
-// messages of the conversation when beforeID is zero. The page is timestamp
-// ordered ascending, matching the store contract.
+// ReadConversation returns the newest messages before beforeSeq, or the newest
+// messages of the conversation when beforeSeq is zero. The page is ordered by
+// seq ascending, matching the store contract.
 func (r *RedisMessageReader) ReadConversation(
 	ctx context.Context,
-	userID, otherID, beforeID uint64,
+	userID, otherID, beforeSeq uint64,
 	limit int,
 ) (ConversationPage, error) {
-	return r.read(ctx, userID, otherID, beforeID, 0, limit)
+	return r.read(ctx, userID, otherID, beforeSeq, 0, limit)
 }
 
-// ReadConversationAfter returns messages newer than afterID, oldest first.
+// ReadConversationAfter returns messages with a seq greater than afterSeq,
+// oldest first.
 func (r *RedisMessageReader) ReadConversationAfter(
 	ctx context.Context,
-	userID, otherID, afterID uint64,
+	userID, otherID, afterSeq uint64,
 	limit int,
 ) (ConversationPage, error) {
-	return r.read(ctx, userID, otherID, 0, afterID, limit)
+	return r.read(ctx, userID, otherID, 0, afterSeq, limit)
 }
 
 // FeedPage is one page of the user's direct-message feed.
@@ -71,7 +76,8 @@ type FeedPage struct {
 }
 
 // ReadFeed returns the messages the user exchanged after afterID, oldest
-// first, across all direct conversations.
+// first, across all direct conversations. The cursor stays a global message
+// ID; returned messages carry their conversation seq.
 func (r *RedisMessageReader) ReadFeed(
 	ctx context.Context,
 	userID, afterID uint64,
@@ -84,7 +90,7 @@ func (r *RedisMessageReader) ReadFeed(
 		return FeedPage{}, fmt.Errorf("invalid feed limit")
 	}
 
-	lower := r.epoch
+	lower := r.feedEpoch
 	if afterID > lower {
 		lower = afterID
 	}
@@ -119,7 +125,7 @@ func (r *RedisMessageReader) ReadFeed(
 	}
 	return FeedPage{
 		Page:     store.MessagePage{Messages: messages, HasMore: hasMore},
-		Complete: !missing && afterID >= r.epoch,
+		Complete: !missing && afterID >= r.feedEpoch,
 	}, nil
 }
 
@@ -168,9 +174,92 @@ func (r *RedisMessageReader) LastConversationMessages(
 	return result, nil
 }
 
+// ReadDirectSequenceCounters reads the current seq counter of several private
+// conversations in one pipeline. Missing counters are reported as zero.
+func ReadDirectSequenceCounters(
+	ctx context.Context,
+	client redis.UniversalClient,
+	keyspace Keyspace,
+	userID uint64,
+	peerIDs []uint64,
+) (map[uint64]uint64, error) {
+	if client == nil {
+		return nil, ErrMessageServiceUnavailable
+	}
+	result := make(map[uint64]uint64, len(peerIDs))
+	if len(peerIDs) == 0 {
+		return result, nil
+	}
+	pipe := client.Pipeline()
+	commands := make([]*redis.StringCmd, len(peerIDs))
+	for index, peerID := range peerIDs {
+		commands[index] = pipe.Get(ctx, keyspace.directSequenceKey(userID, peerID))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+	for index, command := range commands {
+		raw, err := command.Result()
+		if errors.Is(err, redis.Nil) {
+			result[peerIDs[index]] = 0
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		value, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse conversation seq: %w", err)
+		}
+		result[peerIDs[index]] = value
+	}
+	return result, nil
+}
+
+// ReadGroupSequenceCounters reads the current seq counter of several groups in
+// one pipeline. Missing counters are reported as zero.
+func ReadGroupSequenceCounters(
+	ctx context.Context,
+	client redis.UniversalClient,
+	keyspace Keyspace,
+	groupIDs []uint64,
+) (map[uint64]uint64, error) {
+	if client == nil {
+		return nil, ErrMessageServiceUnavailable
+	}
+	result := make(map[uint64]uint64, len(groupIDs))
+	if len(groupIDs) == 0 {
+		return result, nil
+	}
+	pipe := client.Pipeline()
+	commands := make([]*redis.StringCmd, len(groupIDs))
+	for index, groupID := range groupIDs {
+		commands[index] = pipe.Get(ctx, keyspace.groupSequenceKey(groupID))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+	for index, command := range commands {
+		raw, err := command.Result()
+		if errors.Is(err, redis.Nil) {
+			result[groupIDs[index]] = 0
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		value, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse group seq: %w", err)
+		}
+		result[groupIDs[index]] = value
+	}
+	return result, nil
+}
+
 func (r *RedisMessageReader) read(
 	ctx context.Context,
-	userID, otherID, beforeID, afterID uint64,
+	userID, otherID, beforeSeq, afterSeq uint64,
 	limit int,
 ) (ConversationPage, error) {
 	if r == nil || r.client == nil {
@@ -180,98 +269,133 @@ func (r *RedisMessageReader) read(
 		return ConversationPage{}, fmt.Errorf("invalid hot message limit")
 	}
 
-	lower := r.epoch
-	if afterID > lower {
-		lower = afterID
-	}
-
-	keys := []string{
-		r.keyspace.directConversationKey(userID, otherID),
-		r.keyspace.directConversationKey(otherID, userID),
-	}
-	ids := make(map[uint64]struct{}, (limit+1)*2)
-	for _, key := range keys {
-		var values []string
-		var err error
-		switch {
-		case beforeID > 0:
-			values, err = r.client.ZRevRangeByScore(ctx, key, &redis.ZRangeBy{
-				Max:    exclusiveMax(beforeID),
-				Min:    exclusiveMin(lower),
-				Offset: 0,
-				Count:  int64(limit + 1),
-			}).Result()
-		case afterID > 0:
-			values, err = r.client.ZRangeByScore(ctx, key, &redis.ZRangeBy{
-				Min:    exclusiveMin(lower),
-				Max:    "+inf",
-				Offset: 0,
-				Count:  int64(limit + 1),
-			}).Result()
-		default:
-			values, err = r.client.ZRevRangeByScore(ctx, key, &redis.ZRangeBy{
-				Max:    "+inf",
-				Min:    exclusiveMin(lower),
-				Offset: 0,
-				Count:  int64(limit + 1),
-			}).Result()
-		}
-		if err != nil {
-			return ConversationPage{}, err
-		}
-		for _, value := range values {
-			id, parseErr := strconv.ParseUint(value, 10, 64)
-			if parseErr != nil || id == 0 {
-				continue
-			}
-			ids[id] = struct{}{}
-		}
-	}
-
-	ordered := make([]uint64, 0, len(ids))
-	for id := range ids {
-		ordered = append(ordered, id)
-	}
-	if afterID > 0 {
-		sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
-	} else {
-		sort.Slice(ordered, func(i, j int) bool { return ordered[i] > ordered[j] })
-	}
-	if len(ordered) > limit+1 {
-		ordered = ordered[:limit+1]
-	}
-
-	messages, missing, err := r.loadMessages(ctx, ordered)
+	counter, present, err := r.readSequenceCounter(
+		ctx, r.keyspace.directSequenceKey(userID, otherID),
+	)
 	if err != nil {
 		return ConversationPage{}, err
 	}
-	sort.Slice(messages, func(i, j int) bool { return messages[i].ID < messages[j].ID })
+	if !present {
+		// The counter is the only proof of the seq range. Without it the hot
+		// window cannot be trusted, so the caller must read MySQL.
+		return ConversationPage{
+			Page:     store.MessagePage{},
+			Complete: false,
+		}, nil
+	}
 
-	hasMore := len(messages) > limit
-	if hasMore {
-		if afterID > 0 {
+	var low, high uint64
+	var hasMore bool
+	switch {
+	case afterSeq > 0:
+		low = afterSeq
+		high = counter
+		if afterSeq+uint64(limit) < high {
+			high = afterSeq + uint64(limit)
+		}
+		hasMore = high < counter
+	default:
+		high = counter
+		if beforeSeq > 0 {
+			// before_seq is exclusive: the page ends just below it.
+			if upper := beforeSeq - 1; upper < high {
+				high = upper
+			}
+		}
+		if high > uint64(limit) {
+			low = high - uint64(limit)
+		}
+		hasMore = low > 0
+	}
+	if low >= high {
+		return ConversationPage{
+			Page:     store.MessagePage{},
+			Complete: true,
+		}, nil
+	}
+
+	entries, err := r.client.ZRangeByScoreWithScores(
+		ctx,
+		r.keyspace.directPairKey(userID, otherID),
+		&redis.ZRangeBy{
+			Min: exclusiveMin(low),
+			Max: strconv.FormatUint(high, 10),
+		},
+	).Result()
+	if err != nil {
+		return ConversationPage{}, err
+	}
+
+	ids := make([]uint64, 0, len(entries))
+	seqByID := make(map[uint64]uint64, len(entries))
+	for _, entry := range entries {
+		member, ok := entry.Member.(string)
+		if !ok {
+			continue
+		}
+		messageID, parseErr := strconv.ParseUint(member, 10, 64)
+		if parseErr != nil || messageID == 0 {
+			continue
+		}
+		ids = append(ids, messageID)
+		seqByID[messageID] = uint64(entry.Score)
+	}
+
+	loaded, _, err := r.loadMessages(ctx, ids)
+	if err != nil {
+		return ConversationPage{}, err
+	}
+	messages := make([]store.Message, 0, len(loaded))
+	resolved := make(map[uint64]struct{}, len(loaded))
+	for _, message := range loaded {
+		seq, ok := seqByID[message.ID]
+		if !ok || seq == 0 || message.Seq != seq {
+			continue
+		}
+		messages = append(messages, message)
+		resolved[seq] = struct{}{}
+	}
+	sort.Slice(messages, func(i, j int) bool { return messages[i].Seq < messages[j].Seq })
+	if len(messages) > limit {
+		if afterSeq > 0 {
 			messages = messages[:limit]
 		} else {
 			messages = messages[len(messages)-limit:]
 		}
 	}
 
-	complete := false
-	switch {
-	case missing:
-		complete = false
-	case afterID > 0:
-		complete = afterID >= r.epoch
-	case r.epoch == 0:
-		complete = true
-	default:
-		complete = len(ordered) >= limit+1
-	}
-
 	return ConversationPage{
 		Page:     store.MessagePage{Messages: messages, HasMore: hasMore},
-		Complete: complete,
+		Complete: completeSeqRange(resolved, low, high),
 	}, nil
+}
+
+func (r *RedisMessageReader) readSequenceCounter(
+	ctx context.Context,
+	key string,
+) (uint64, bool, error) {
+	raw, err := r.client.Get(ctx, key).Result()
+	if errors.Is(err, redis.Nil) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("read conversation seq: %w", err)
+	}
+	value, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0, false, fmt.Errorf("parse conversation seq: %w", err)
+	}
+	return value, true, nil
+}
+
+// completeSeqRange reports whether every seq in (low, high] was resolved.
+func completeSeqRange(resolved map[uint64]struct{}, low, high uint64) bool {
+	for seq := low + 1; seq <= high; seq++ {
+		if _, ok := resolved[seq]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *RedisMessageReader) loadMessages(
@@ -286,7 +410,7 @@ func (r *RedisMessageReader) loadMessages(
 	commands := make([]*redis.SliceCmd, len(ids))
 	for index, id := range ids {
 		commands[index] = pipe.HMGet(ctx, r.keyspace.messageKey(id),
-			"id", "sender_id", "recipient_id", "client_message_id", "body", "created_at_ms",
+			"id", "seq", "sender_id", "recipient_id", "client_message_id", "body", "created_at_ms",
 		)
 	}
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
@@ -314,45 +438,46 @@ func (r *RedisMessageReader) loadMessages(
 }
 
 func parseMessageValues(values []interface{}) (store.Message, bool, error) {
-	if len(values) != 6 || values[0] == nil {
+	if len(values) != 7 || values[0] == nil || values[1] == nil {
 		return store.Message{}, false, nil
 	}
 	messageID, err := redisValueUint(values[0])
 	if err != nil {
 		return store.Message{}, false, err
 	}
-	senderID, err := redisValueUint(values[1])
+	seq, err := redisValueUint(values[1])
+	if err != nil || seq == 0 {
+		return store.Message{}, false, nil
+	}
+	senderID, err := redisValueUint(values[2])
 	if err != nil {
 		return store.Message{}, false, err
 	}
-	recipientID, err := redisValueUint(values[2])
+	recipientID, err := redisValueUint(values[3])
 	if err != nil {
 		return store.Message{}, false, err
 	}
-	clientMessageID, err := redisValueString(values[3])
+	clientMessageID, err := redisValueString(values[4])
 	if err != nil {
 		return store.Message{}, false, err
 	}
-	body, err := redisValueString(values[4])
+	body, err := redisValueString(values[5])
 	if err != nil {
 		return store.Message{}, false, err
 	}
-	createdAtMS, err := redisValueInt64(values[5])
+	createdAtMS, err := redisValueInt64(values[6])
 	if err != nil {
 		return store.Message{}, false, err
 	}
 	return store.Message{
 		ID:              messageID,
+		Seq:             seq,
 		SenderID:        senderID,
 		RecipientID:     recipientID,
 		ClientMessageID: clientMessageID,
 		Body:            body,
 		CreatedAt:       time.UnixMilli(createdAtMS).UTC(),
 	}, true, nil
-}
-
-func exclusiveMax(id uint64) string {
-	return fmt.Sprintf("(%d", id)
 }
 
 func exclusiveMin(id uint64) string {

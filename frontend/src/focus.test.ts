@@ -29,11 +29,11 @@ describe("focus acknowledgements", () => {
       type: "focus.ack",
       kind: "direct",
       username: "bob",
-      last_read_message_id: 34,
+      last_read_seq: 34,
     })).toEqual({
       ok: true,
       target: { kind: "direct", username: "bob" },
-      lastReadMessageID: 34,
+      lastReadSeq: 34,
     });
   });
 
@@ -42,11 +42,11 @@ describe("focus acknowledgements", () => {
       type: "focus.ack",
       kind: "group",
       group_id: 12,
-      last_read_message_id: 0,
+      last_read_seq: 0,
     })).toEqual({
       ok: true,
       target: { kind: "group", groupID: 12 },
-      lastReadMessageID: 0,
+      lastReadSeq: 0,
     });
   });
 
@@ -66,18 +66,24 @@ describe("focus acknowledgements", () => {
       type: "focus.ack",
       kind: "direct",
       username: "",
-      last_read_message_id: 1,
+      last_read_seq: 1,
     })).toBeNull();
     expect(parseFocusAck({
       type: "focus.ack",
       kind: "group",
       group_id: 0,
-      last_read_message_id: 1,
+      last_read_seq: 1,
     })).toBeNull();
     expect(parseFocusAck({
       type: "focus.ack",
       kind: "group",
       group_id: 4,
+    })).toBeNull();
+    expect(parseFocusAck({
+      type: "focus.ack",
+      kind: "direct",
+      username: "bob",
+      last_read_message_id: 34,
     })).toBeNull();
     expect(parseFocusAck({ type: "group.read", group_id: 4 })).toBeNull();
   });

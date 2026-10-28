@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
@@ -10,6 +11,14 @@ import (
 )
 
 var ErrMessageServiceUnavailable = errors.New("message service unavailable")
+
+// ErrSeqNotReady reports that the conversation sequence is missing, the
+// readiness marker is absent, or calibration has not finished. It wraps
+// ErrMessageServiceUnavailable so existing 503 mapping keeps working.
+var ErrSeqNotReady = fmt.Errorf("%w: conversation sequence not ready", ErrMessageServiceUnavailable)
+
+// ErrSeqOverflow reports that a conversation reached MaxSafeSeq.
+var ErrSeqOverflow = fmt.Errorf("%w: conversation sequence exhausted", ErrMessageServiceUnavailable)
 
 // DirectMessageRequest is the validated input to the Redis acceptance path.
 type DirectMessageRequest struct {
@@ -43,6 +52,8 @@ type RedisAcceptorOptions struct {
 	Keyspace     Keyspace
 	DedupTTL     time.Duration
 	StreamMaxLen int64
+	// Gate blocks acceptance while Redis is being calibrated. Nil means ready.
+	Gate *SeqGate
 }
 
 const (
@@ -64,6 +75,9 @@ func (a *RedisAcceptor) Accept(ctx context.Context, request DirectMessageRequest
 	if a == nil || a.client == nil {
 		return DirectMessageResult{}, ErrMessageServiceUnavailable
 	}
+	if err := a.options.Gate.Ready(); err != nil {
+		return DirectMessageResult{}, err
+	}
 	if request.CreatedAt.IsZero() {
 		request.CreatedAt = time.Now().UTC()
 	}
@@ -76,10 +90,12 @@ func (a *RedisAcceptor) Accept(ctx context.Context, request DirectMessageRequest
 		keyspace.dedupKey(request.SenderID, request.RecipientID, request.ClientMessageID),
 		keyspace.directFeedKey(request.SenderID),
 		keyspace.directFeedKey(request.RecipientID),
-		keyspace.directConversationKey(request.RecipientID, request.SenderID),
+		keyspace.directPairKey(request.SenderID, request.RecipientID),
+		keyspace.directSequenceKey(request.SenderID, request.RecipientID),
 		keyspace.directConversationLastKey(request.SenderID),
 		keyspace.directConversationLastKey(request.RecipientID),
 		keyspace.messageStreamKey(),
+		keyspace.sequenceReadyKey(),
 	}
 	args := []interface{}{
 		request.SenderID,
@@ -90,6 +106,7 @@ func (a *RedisAcceptor) Accept(ctx context.Context, request DirectMessageRequest
 		bodyHash,
 		a.options.SeedFloor,
 		store.MaxSafeMessageID,
+		store.MaxSafeSeq,
 		int64(a.options.DedupTTL / time.Second),
 		a.options.StreamMaxLen,
 		keyspace.prefixOrDefault() + "messages:",
@@ -107,7 +124,7 @@ func (a *RedisAcceptor) Accept(ctx context.Context, request DirectMessageRequest
 	}
 	switch status {
 	case "accepted", "duplicate":
-		if len(values) < 3 {
+		if len(values) < 4 {
 			return DirectMessageResult{}, ErrMessageServiceUnavailable
 		}
 		messageID, err := parseRedisUint(values[1])
@@ -118,9 +135,14 @@ func (a *RedisAcceptor) Accept(ctx context.Context, request DirectMessageRequest
 		if err != nil {
 			return DirectMessageResult{}, err
 		}
+		seq, err := parseRedisUint(values[3])
+		if err != nil || seq == 0 {
+			return DirectMessageResult{}, ErrSeqNotReady
+		}
 		return DirectMessageResult{
 			Message: store.Message{
 				ID:              messageID,
+				Seq:             seq,
 				SenderID:        request.SenderID,
 				RecipientID:     request.RecipientID,
 				ClientMessageID: request.ClientMessageID,
@@ -137,6 +159,10 @@ func (a *RedisAcceptor) Accept(ctx context.Context, request DirectMessageRequest
 		return DirectMessageResult{}, store.ErrMessageConflict
 	case "id_overflow":
 		return DirectMessageResult{}, store.ErrMessageIDExhausted
+	case "seq_not_ready", "seq_unavailable":
+		return DirectMessageResult{}, ErrSeqNotReady
+	case "seq_overflow":
+		return DirectMessageResult{}, ErrSeqOverflow
 	default:
 		return DirectMessageResult{}, ErrMessageServiceUnavailable
 	}

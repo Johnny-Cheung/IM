@@ -1,7 +1,7 @@
 -- Make group:{G}:read match the given member set without lowering positions.
 --
 -- KEYS[1] = group:{G}:read
--- ARGV[1,2] = user ID, position, repeated for every current member
+-- ARGV[1,2] = user ID, position (seq), repeated for every current member
 --
 -- Missing members are added with the given position. Entries for users that
 -- are no longer members are removed. Existing scores are never overwritten or

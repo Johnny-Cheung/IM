@@ -1,27 +1,46 @@
 const DB_NAME = "im-cache";
-const DB_VERSION = 1;
+// Version 2 adds seq indexes and the outbox. The upgrade path recreates every
+// store, so pre-seq caches (including global-id cursors) are discarded.
+const DB_VERSION = 2;
 
 export const META_STORE = "meta";
 export const CONVERSATIONS_STORE = "conversations";
 export const MESSAGES_STORE = "messages";
 export const FRIENDS_STORE = "friends";
+export const OUTBOX_STORE = "outbox";
+export const MESSAGES_SEQ_INDEX = "seq";
 
 export type CacheStoreName =
   | typeof META_STORE
   | typeof CONVERSATIONS_STORE
   | typeof MESSAGES_STORE
-  | typeof FRIENDS_STORE;
+  | typeof FRIENDS_STORE
+  | typeof OUTBOX_STORE;
+
+type IndexDefinition = {
+  name: string;
+  keyPath: string | string[];
+};
 
 type StoreDefinition = {
   name: CacheStoreName;
   keyPath: string | string[] | null;
+  indexes?: IndexDefinition[];
 };
 
 const STORE_DEFINITIONS: StoreDefinition[] = [
   { name: META_STORE, keyPath: null },
   { name: CONVERSATIONS_STORE, keyPath: ["user", "key"] },
-  { name: MESSAGES_STORE, keyPath: ["user", "conversation", "id"] },
+  {
+    name: MESSAGES_STORE,
+    keyPath: ["user", "conversation", "id"],
+    indexes: [{
+      name: MESSAGES_SEQ_INDEX,
+      keyPath: ["user", "conversation", "seq"],
+    }],
+  },
   { name: FRIENDS_STORE, keyPath: ["user"] },
+  { name: OUTBOX_STORE, keyPath: ["user", "conversation", "client_message_id"] },
 ];
 
 let dbPromise: Promise<IDBDatabase> | null = null;
@@ -32,10 +51,11 @@ function createStores(db: IDBDatabase): void {
     db.deleteObjectStore(name);
   }
   for (const definition of STORE_DEFINITIONS) {
-    if (definition.keyPath === null) {
-      db.createObjectStore(definition.name);
-    } else {
-      db.createObjectStore(definition.name, { keyPath: definition.keyPath });
+    const store = definition.keyPath === null
+      ? db.createObjectStore(definition.name)
+      : db.createObjectStore(definition.name, { keyPath: definition.keyPath });
+    for (const index of definition.indexes ?? []) {
+      store.createIndex(index.name, index.keyPath);
     }
   }
 }

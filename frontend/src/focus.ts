@@ -8,7 +8,7 @@ export type FocusFrame =
   | { type: "blur" };
 
 export type FocusAck =
-  | { ok: true; target: FocusTarget; lastReadMessageID: number }
+  | { ok: true; target: FocusTarget; lastReadSeq: number }
   | { ok: false; error: string };
 
 export const BLUR_FRAME: FocusFrame = { type: "blur" };
@@ -24,7 +24,7 @@ function ackError(event: Record<string, unknown>): string {
 }
 
 function ackPosition(event: Record<string, unknown>): number | null {
-  const position = event.last_read_message_id;
+  const position = event.last_read_seq;
   return typeof position === "number" && Number.isSafeInteger(position) && position >= 0
     ? position
     : null;
@@ -53,7 +53,7 @@ export function parseFocusAck(value: unknown): FocusAck | null {
     return {
       ok: true,
       target: { kind: "direct", username: event.username },
-      lastReadMessageID: position,
+      lastReadSeq: position,
     };
   }
   if (event.kind === "group") {
@@ -70,7 +70,7 @@ export function parseFocusAck(value: unknown): FocusAck | null {
     return {
       ok: true,
       target: { kind: "group", groupID },
-      lastReadMessageID: position,
+      lastReadSeq: position,
     };
   }
   return null;

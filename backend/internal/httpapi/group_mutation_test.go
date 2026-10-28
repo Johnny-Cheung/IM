@@ -39,12 +39,12 @@ func fastGroupRepair(t *testing.T) {
 func TestInviteReadsWatermarkAfterMutation(t *testing.T) {
 	dataStore := inviteTestStore(t)
 	dataStore.groupMemberIDSequence = [][]uint64{{1, 2}, {1, 2, 3}}
-	projector := &fakeGroupProjector{watermark: 55}
+	projector := &fakeGroupProjector{lastSeq: 55}
 	router := testRouter(
 		dataStore,
 		WithGroupReadTracker(newFakeGroupReadTracker()),
 		WithGroupProjector(projector),
-		WithGroupAcceptedWatermarkReader(projector),
+		WithGroupSequenceReader(projector),
 	)
 
 	recorder := doJSON(t, router, http.MethodPost, "/api/groups/7/members", map[string]any{
@@ -53,8 +53,8 @@ func TestInviteReadsWatermarkAfterMutation(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	if projector.watermarkBeforeBegin {
-		t.Fatal("accepted watermark was read before the mutation blocked new sends")
+	if projector.lastSeqBeforeBegin {
+		t.Fatal("accepted lastSeq was read before the mutation blocked new sends")
 	}
 }
 
@@ -62,12 +62,12 @@ func TestInviteGetGroupFailureStillProjects(t *testing.T) {
 	dataStore := inviteTestStore(t)
 	dataStore.groupMemberIDSequence = [][]uint64{{1, 2}, {1, 2, 3}}
 	dataStore.groupDetailErr = store.ErrGroupNotFound
-	projector := &fakeGroupProjector{watermark: 55}
+	projector := &fakeGroupProjector{lastSeq: 55}
 	router := testRouter(
 		dataStore,
 		WithGroupReadTracker(newFakeGroupReadTracker()),
 		WithGroupProjector(projector),
-		WithGroupAcceptedWatermarkReader(projector),
+		WithGroupSequenceReader(projector),
 	)
 
 	recorder := doJSON(t, router, http.MethodPost, "/api/groups/7/members", map[string]any{
@@ -143,13 +143,13 @@ func TestGroupRepairSeedsMissingReadPositions(t *testing.T) {
 	}}
 	tracker := newFakeGroupReadTracker()
 	tracker.setBaselineErr(messaging.ErrMessageServiceUnavailable)
-	projector := &fakeGroupProjector{watermark: 55}
+	projector := &fakeGroupProjector{lastSeq: 55}
 	api, router, _ := startChatServer(
 		t,
 		dataStore,
 		WithGroupReadTracker(tracker),
 		WithGroupProjector(projector),
-		WithGroupAcceptedWatermarkReader(projector),
+		WithGroupSequenceReader(projector),
 	)
 	api.Start()
 	t.Cleanup(api.Stop)
@@ -430,7 +430,7 @@ func TestInviteRejectsNonMemberBeforeBeginMutation(t *testing.T) {
 		dataStore,
 		WithGroupReadTracker(newFakeGroupReadTracker()),
 		WithGroupProjector(projector),
-		WithGroupAcceptedWatermarkReader(projector),
+		WithGroupSequenceReader(projector),
 	)
 
 	recorder := doJSON(t, router, http.MethodPost, "/api/groups/7/members", map[string]any{

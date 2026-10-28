@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/config"
@@ -116,11 +117,19 @@ func (c *RabbitMessageConsumer) handleDelivery(ctx context.Context, delivery amq
 	message, err := decodeDirectMessage(delivery.Body)
 	if err != nil {
 		// A malformed message cannot be repaired by retrying. Ack it so a
-		// poison message cannot block the basic v1.2 queue forever.
+		// poison message cannot block the queue forever.
+		log.Printf("drop malformed direct message delivery: %v", err)
 		return delivery.Ack(false)
 	}
 	if _, err := c.persister.PersistMessage(ctx, message); err != nil {
 		if errors.Is(err, store.ErrMessageConflict) {
+			return delivery.Ack(false)
+		}
+		if errors.Is(err, store.ErrSeqConflict) || errors.Is(err, store.ErrSeqInvalid) {
+			log.Printf(
+				"drop direct message id=%d sender=%d recipient=%d seq=%d: %v",
+				message.ID, message.SenderID, message.RecipientID, message.Seq, err,
+			)
 			return delivery.Ack(false)
 		}
 		if nackErr := delivery.Nack(false, true); nackErr != nil {

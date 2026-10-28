@@ -45,6 +45,8 @@ async function drainDirectFeed(
   user: string,
   startCursor: number,
 ): Promise<void> {
+  // The private feed cursor is a global message id and is the only cursor that
+  // must not be converted to a conversation seq.
   let cursor = startCursor;
   for (let round = 0; round < FEED_DRAIN_ROUNDS; round += 1) {
     let page;
@@ -82,8 +84,9 @@ async function drainGroupFeed(
       return;
     }
     await writeMessages(user, groupKey(groupID), page.messages);
+    // Group drains page and advance by conversation seq.
     const newest = page.messages.reduce(
-      (latest, message) => Math.max(latest, message.id),
+      (latest, message) => (message.seq > latest ? message.seq : latest),
       cursor,
     );
     if (newest <= cursor) {

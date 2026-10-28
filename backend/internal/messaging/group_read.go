@@ -57,10 +57,23 @@ var ErrGroupNotMember = errors.New("group member not found")
 
 // GroupReadAdvance reports the outcome of one member's read-position advance.
 type GroupReadAdvance struct {
-	UserID            uint64
-	LastReadMessageID uint64
-	Advanced          bool
-	StreamError       bool
+	UserID      uint64
+	LastReadSeq uint64
+	Advanced    bool
+	StreamError bool
+}
+
+// GroupConversationState is one group's seq snapshot for a member.
+type GroupConversationState struct {
+	LastSeq uint64
+	ReadSeq uint64
+	Unread  uint64
+}
+
+// MessageRef identifies a group message resolved from its conversation seq.
+type MessageRef struct {
+	ID       uint64
+	SenderID uint64
 }
 
 // GroupReadStats is the read progress of one group message, excluding the
@@ -75,6 +88,7 @@ type GroupReadStats struct {
 type GroupReadTrackerOptions struct {
 	Keyspace     Keyspace
 	StreamMaxLen int64
+	Gate         *SeqGate
 }
 
 // GroupReadTracker owns group read positions in Redis.
@@ -82,6 +96,7 @@ type GroupReadTracker struct {
 	client       redis.UniversalClient
 	keyspace     Keyspace
 	streamMaxLen int64
+	gate         *SeqGate
 }
 
 func NewGroupReadTracker(
@@ -95,18 +110,22 @@ func NewGroupReadTracker(
 		client:       client,
 		keyspace:     options.Keyspace,
 		streamMaxLen: options.StreamMaxLen,
+		gate:         options.Gate,
 	}
 }
 
-// AdvanceRead moves one member's read position forward to the newest accepted
-// group message at or below throughID. A zero throughID means the newest.
+// AdvanceRead moves one member's read position forward to
+// min(throughSeq, group counter). A zero throughSeq means the counter.
 func (t *GroupReadTracker) AdvanceRead(
 	ctx context.Context,
-	groupID, userID, throughID uint64,
+	groupID, userID, throughSeq uint64,
 	now time.Time,
 ) (GroupReadAdvance, error) {
 	if t == nil || t.client == nil {
 		return GroupReadAdvance{}, ErrMessageServiceUnavailable
+	}
+	if err := t.gate.Ready(); err != nil {
+		return GroupReadAdvance{}, err
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -114,7 +133,7 @@ func (t *GroupReadTracker) AdvanceRead(
 
 	args := []interface{}{
 		strconv.FormatUint(userID, 10),
-		strconv.FormatUint(throughID, 10),
+		strconv.FormatUint(throughSeq, 10),
 		now.UTC().UnixMilli(),
 		t.streamMaxLen,
 		strconv.FormatUint(groupID, 10),
@@ -144,10 +163,10 @@ func (t *GroupReadTracker) AdvanceRead(
 		streamError = fmt.Sprint(values[3]) == "stream_error"
 	}
 	return GroupReadAdvance{
-		UserID:            userID,
-		LastReadMessageID: position,
-		Advanced:          advanced,
-		StreamError:       streamError,
+		UserID:      userID,
+		LastReadSeq: position,
+		Advanced:    advanced,
+		StreamError: streamError,
 	}, nil
 }
 
@@ -157,11 +176,14 @@ func (t *GroupReadTracker) AdvanceReadMany(
 	ctx context.Context,
 	groupID uint64,
 	userIDs []uint64,
-	throughID uint64,
+	throughSeq uint64,
 	now time.Time,
 ) ([]GroupReadAdvance, error) {
 	if t == nil || t.client == nil {
 		return nil, ErrMessageServiceUnavailable
+	}
+	if err := t.gate.Ready(); err != nil {
+		return nil, err
 	}
 	advances := make([]GroupReadAdvance, 0, len(userIDs))
 	if len(userIDs) == 0 {
@@ -172,7 +194,7 @@ func (t *GroupReadTracker) AdvanceReadMany(
 	}
 
 	args := []interface{}{
-		strconv.FormatUint(throughID, 10),
+		strconv.FormatUint(throughSeq, 10),
 		now.UTC().UnixMilli(),
 		t.streamMaxLen,
 		strconv.FormatUint(groupID, 10),
@@ -208,10 +230,10 @@ func (t *GroupReadTracker) AdvanceReadMany(
 			return nil, err
 		}
 		advances = append(advances, GroupReadAdvance{
-			UserID:            userID,
-			LastReadMessageID: position,
-			Advanced:          advanced,
-			StreamError:       fmt.Sprint(values[index+3]) == "1",
+			UserID:      userID,
+			LastReadSeq: position,
+			Advanced:    advanced,
+			StreamError: fmt.Sprint(values[index+3]) == "1",
 		})
 	}
 	return advances, nil
@@ -222,7 +244,7 @@ func (t *GroupReadTracker) readKeys(groupID uint64) []string {
 		t.keyspace.groupMembersKey(groupID),
 		t.keyspace.groupDissolvedKey(groupID),
 		t.keyspace.groupSyncRequiredKey(groupID),
-		t.keyspace.groupInboxKey(groupID),
+		t.keyspace.groupSequenceKey(groupID),
 		t.keyspace.groupReadKey(groupID),
 		t.keyspace.groupReadStreamKey(),
 	}
@@ -250,9 +272,72 @@ func groupReadStatusError(values []interface{}) error {
 	}
 }
 
-// UnreadCounts counts accepted group messages above each member's read
-// position. Every requested group is present in the result. Stale membership
-// state fails closed instead of returning a number that may be wrong.
+// States reads the group counter and the member watermark of several groups in
+// one pipeline, so they come from a single snapshot.
+func (t *GroupReadTracker) States(
+	ctx context.Context,
+	userID uint64,
+	groupIDs []uint64,
+) (map[uint64]GroupConversationState, error) {
+	if t == nil || t.client == nil {
+		return nil, ErrMessageServiceUnavailable
+	}
+	if err := t.gate.Ready(); err != nil {
+		return nil, err
+	}
+	states := make(map[uint64]GroupConversationState, len(groupIDs))
+	if len(groupIDs) == 0 {
+		return states, nil
+	}
+
+	pipe := t.client.Pipeline()
+	syncCommands := make([]*redis.IntCmd, len(groupIDs))
+	setCommands := make([]*redis.IntCmd, len(groupIDs))
+	memberCommands := make([]*redis.BoolCmd, len(groupIDs))
+	lastCommands := make([]*redis.StringCmd, len(groupIDs))
+	readCommands := make([]*redis.FloatCmd, len(groupIDs))
+	field := strconv.FormatUint(userID, 10)
+	for index, groupID := range groupIDs {
+		syncCommands[index] = pipe.Exists(ctx, t.keyspace.groupSyncRequiredKey(groupID))
+		setCommands[index] = pipe.Exists(ctx, t.keyspace.groupMembersKey(groupID))
+		memberCommands[index] = pipe.SIsMember(ctx, t.keyspace.groupMembersKey(groupID), userID)
+		lastCommands[index] = pipe.Get(ctx, t.keyspace.groupSequenceKey(groupID))
+		readCommands[index] = pipe.ZScore(ctx, t.keyspace.groupReadKey(groupID), field)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+
+	for index, groupID := range groupIDs {
+		member, err := readGroupMembership(
+			syncCommands[index], setCommands[index], memberCommands[index],
+		)
+		if err != nil {
+			return nil, err
+		}
+		if !member {
+			return nil, ErrMessageServiceUnavailable
+		}
+		lastSeq, err := readCounterResult(lastCommands[index])
+		if err != nil {
+			return nil, err
+		}
+		readSeq, err := optionalZScore(readCommands[index])
+		if err != nil {
+			return nil, err
+		}
+		states[groupID] = GroupConversationState{
+			LastSeq: lastSeq,
+			ReadSeq: readSeq,
+			Unread:  unreadBetween(lastSeq, readSeq),
+		}
+	}
+	return states, nil
+}
+
+// UnreadCounts returns max(0, group counter - member position) for every
+// requested group. Stale membership state fails closed instead of returning a
+// number that may be wrong.
 func (t *GroupReadTracker) UnreadCounts(
 	ctx context.Context,
 	userID uint64,
@@ -271,72 +356,83 @@ func (t *GroupReadTracker) UnreadCounts(
 	setCommands := make([]*redis.IntCmd, len(groupIDs))
 	memberCommands := make([]*redis.BoolCmd, len(groupIDs))
 	positionCommands := make([]*redis.FloatCmd, len(groupIDs))
+	lastCommands := make([]*redis.StringCmd, len(groupIDs))
 	field := strconv.FormatUint(userID, 10)
 	for index, groupID := range groupIDs {
 		syncCommands[index] = pipe.Exists(ctx, t.keyspace.groupSyncRequiredKey(groupID))
 		setCommands[index] = pipe.Exists(ctx, t.keyspace.groupMembersKey(groupID))
 		memberCommands[index] = pipe.SIsMember(ctx, t.keyspace.groupMembersKey(groupID), userID)
 		positionCommands[index] = pipe.ZScore(ctx, t.keyspace.groupReadKey(groupID), field)
+		lastCommands[index] = pipe.Get(ctx, t.keyspace.groupSequenceKey(groupID))
 	}
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return nil, err
 	}
-	positions := make([]uint64, len(groupIDs))
-	for index := range groupIDs {
-		syncRequired, err := syncCommands[index].Result()
+	for index, groupID := range groupIDs {
+		member, err := readGroupMembership(
+			syncCommands[index], setCommands[index], memberCommands[index],
+		)
 		if err != nil {
 			return nil, err
 		}
-		membersExist, err := setCommands[index].Result()
-		if err != nil {
-			return nil, err
-		}
-		isMember, err := memberCommands[index].Result()
-		if err != nil {
-			return nil, err
-		}
-		if syncRequired > 0 || membersExist == 0 || !isMember {
+		if !member {
 			return nil, ErrMessageServiceUnavailable
 		}
-		score, err := positionCommands[index].Result()
-		if errors.Is(err, redis.Nil) {
-			continue
-		}
+		position, err := optionalZScore(positionCommands[index])
 		if err != nil {
 			return nil, err
 		}
-		if score > 0 {
-			positions[index] = uint64(score)
-		}
-	}
-
-	unreadPipe := t.client.Pipeline()
-	unreadCommands := make([]*redis.IntCmd, len(groupIDs))
-	for index, groupID := range groupIDs {
-		unreadCommands[index] = unreadPipe.ZCount(
-			ctx,
-			t.keyspace.groupInboxKey(groupID),
-			"("+strconv.FormatUint(positions[index], 10),
-			"+inf",
-		)
-	}
-	if _, err := unreadPipe.Exec(ctx); err != nil {
-		return nil, err
-	}
-	for index, groupID := range groupIDs {
-		count, err := unreadCommands[index].Result()
+		lastSeq, err := readCounterResult(lastCommands[index])
 		if err != nil {
 			return nil, err
 		}
-		counts[groupID] = int(count)
+		counts[groupID] = int(unreadBetween(lastSeq, position))
 	}
 	return counts, nil
 }
 
-// ReadStats returns how many members have read messageID, excluding userID.
+// readGroupMembership applies the fail-closed guard shared by States and
+// UnreadCounts: a missing member set, a stale projection or a non-member must
+// not produce a number.
+func readGroupMembership(
+	syncCommand *redis.IntCmd,
+	setCommand *redis.IntCmd,
+	memberCommand *redis.BoolCmd,
+) (bool, error) {
+	syncRequired, err := syncCommand.Result()
+	if err != nil {
+		return false, err
+	}
+	membersExist, err := setCommand.Result()
+	if err != nil {
+		return false, err
+	}
+	isMember, err := memberCommand.Result()
+	if err != nil {
+		return false, err
+	}
+	return syncRequired == 0 && membersExist > 0 && isMember, nil
+}
+
+func optionalZScore(command *redis.FloatCmd) (uint64, error) {
+	score, err := command.Result()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if score <= 0 {
+		return 0, nil
+	}
+	return uint64(score), nil
+}
+
+// ReadStats returns how many members have read the message with seq
+// messageSeq, excluding userID.
 func (t *GroupReadTracker) ReadStats(
 	ctx context.Context,
-	groupID, userID, messageID uint64,
+	groupID, userID, messageSeq uint64,
 ) (GroupReadStats, error) {
 	if t == nil || t.client == nil {
 		return GroupReadStats{}, ErrMessageServiceUnavailable
@@ -349,7 +445,7 @@ func (t *GroupReadTracker) ReadStats(
 	}
 	args := []interface{}{
 		strconv.FormatUint(userID, 10),
-		strconv.FormatUint(messageID, 10),
+		strconv.FormatUint(messageSeq, 10),
 	}
 	values, err := groupReadStats.Run(ctx, t.client, keys, args...).Slice()
 	if err != nil {
@@ -376,18 +472,40 @@ func (t *GroupReadTracker) ReadStats(
 	}, nil
 }
 
-// MessageSender reports the sender of a group message entity. A missing entity
-// returns found=false; an entity of another group returns found=true with
-// senderID zero.
-func (t *GroupReadTracker) MessageSender(
+// MessageBySeq resolves (group, seq) to the message entity. A missing index
+// entry or entity returns found=false so the caller falls back to MySQL.
+func (t *GroupReadTracker) MessageBySeq(
 	ctx context.Context,
-	groupID, messageID uint64,
-) (uint64, bool, error) {
+	groupID, seq uint64,
+) (MessageRef, bool, error) {
 	if t == nil || t.client == nil {
-		return 0, false, ErrMessageServiceUnavailable
+		return MessageRef{}, false, ErrMessageServiceUnavailable
 	}
-	if messageID == 0 {
-		return 0, false, nil
+	if err := t.gate.Ready(); err != nil {
+		return MessageRef{}, false, err
+	}
+	if seq == 0 {
+		return MessageRef{}, false, nil
+	}
+	members, err := t.client.ZRangeByScore(
+		ctx,
+		t.keyspace.groupInboxKey(groupID),
+		&redis.ZRangeBy{
+			Min:    strconv.FormatUint(seq, 10),
+			Max:    strconv.FormatUint(seq, 10),
+			Offset: 0,
+			Count:  1,
+		},
+	).Result()
+	if err != nil {
+		return MessageRef{}, false, err
+	}
+	if len(members) == 0 {
+		return MessageRef{}, false, nil
+	}
+	messageID, err := strconv.ParseUint(members[0], 10, 64)
+	if err != nil || messageID == 0 {
+		return MessageRef{}, false, nil
 	}
 	values, err := t.client.HMGet(
 		ctx,
@@ -396,32 +514,30 @@ func (t *GroupReadTracker) MessageSender(
 		"sender_id",
 	).Result()
 	if err != nil {
-		return 0, false, err
+		return MessageRef{}, false, err
 	}
-	if len(values) != 2 || (values[0] == nil && values[1] == nil) {
-		return 0, false, nil
-	}
-	if values[0] == nil {
-		return 0, true, nil
+	if len(values) != 2 || values[0] == nil {
+		return MessageRef{}, false, nil
 	}
 	entityGroupID, err := parseRedisUint(values[0])
 	if err != nil {
-		return 0, false, err
+		return MessageRef{}, false, err
 	}
 	if entityGroupID != groupID {
-		return 0, true, nil
+		return MessageRef{}, false, nil
 	}
-	if values[1] == nil {
-		return 0, true, nil
+	ref := MessageRef{ID: messageID}
+	if values[1] != nil {
+		senderID, err := parseRedisUint(values[1])
+		if err != nil {
+			return MessageRef{}, false, err
+		}
+		ref.SenderID = senderID
 	}
-	senderID, err := parseRedisUint(values[1])
-	if err != nil {
-		return 0, false, err
-	}
-	return senderID, true, nil
+	return ref, true, nil
 }
 
-// SeedMember adds a member's read position only when the member has none.
+// SeedMember adds a member's read position (seq) only when it has none.
 func (t *GroupReadTracker) SeedMember(
 	ctx context.Context,
 	groupID, userID, position uint64,
@@ -438,8 +554,8 @@ func (t *GroupReadTracker) SeedMember(
 	).Err()
 }
 
-// SetMemberBaseline raises a member's read position to the join baseline,
-// never lowering an existing position.
+// SetMemberBaseline raises a member's read position (seq) to the join
+// baseline, never lowering an existing position.
 func (t *GroupReadTracker) SetMemberBaseline(
 	ctx context.Context,
 	groupID, userID, position uint64,
@@ -526,28 +642,28 @@ func (t *GroupReadTracker) ReconcileGroup(
 	).Err()
 }
 
-// ReadModelReady reports whether historical group read backfill has completed.
+// ReadModelReady reports whether the gate is open and seq:ready exists.
 func (t *GroupReadTracker) ReadModelReady(ctx context.Context) (bool, error) {
 	if t == nil || t.client == nil {
 		return false, ErrMessageServiceUnavailable
 	}
-	value, err := t.client.Get(ctx, t.keyspace.groupReadReadyKey()).Result()
-	if errors.Is(err, redis.Nil) {
+	if t.gate.Ready() != nil {
 		return false, nil
 	}
+	exists, err := t.client.Exists(ctx, t.keyspace.sequenceReadyKey()).Result()
 	if err != nil {
 		return false, err
 	}
-	return value == "1", nil
+	return exists > 0, nil
 }
 
-// MarkReadModelReady records that historical group read backfill has completed.
+// MarkReadModelReady records that history and counters are complete.
 func (t *GroupReadTracker) MarkReadModelReady(ctx context.Context) error {
 	if t == nil || t.client == nil {
 		return ErrMessageServiceUnavailable
 	}
-	if err := t.client.Set(ctx, t.keyspace.groupReadReadyKey(), "1", 0).Err(); err != nil {
-		return fmt.Errorf("mark group read model ready: %w", err)
+	if err := t.client.Set(ctx, t.keyspace.sequenceReadyKey(), "1", 0).Err(); err != nil {
+		return fmt.Errorf("mark sequence ready: %w", err)
 	}
 	return nil
 }

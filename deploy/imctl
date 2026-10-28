@@ -50,6 +50,11 @@ fi
 
 D() { "${RUNTIME_DIR}/docker" --host "${DOCKER_SOCK}" "$@"; }
 
+INFRA_DOCKER="${ROOT}/runtime/docker/docker"
+INFRA_DOCKER_SOCK="unix://${INFRA_ROOT}/runtime/run/docker.sock"
+INFRA_RABBITMQ_NAME=im-v11-rabbitmq
+DI() { "${INFRA_DOCKER}" --host "${INFRA_DOCKER_SOCK}" "$@"; }
+
 snapshot() {
   /sbin/iptables-save | grep -v '^#' | sed -E 's/\[[0-9]+:[0-9]+\]/[COUNTERS]/'
   printf 'ip_forward=%s\n' "$(cat /proc/sys/net/ipv4/ip_forward)"
@@ -241,26 +246,48 @@ backend_env_args() {
   fi
 }
 
-backfill_read() {
-  prepare_backend_config
-  if ! infra_ready; then
-    echo "direct read backfill requires Redis configuration" >&2
+# Read-only: reports whether both persist queues are drained. Queue names are
+# derived from the same namespace the backend uses, so --verify checks the
+# isolated vhost and never the production queues.
+queue_status() {
+  local vhost prefix name counts ready unack total=0 output
+  if [ "${VERIFY_MODE}" = "1" ]; then
+    vhost=im_v13_verify
+    prefix=im.v13-verify
+  else
+    vhost=im_v11
+    prefix=im.v12
+  fi
+  if ! output="$(DI exec "${INFRA_RABBITMQ_NAME}" rabbitmqctl list_queues \
+    --quiet -p "${vhost}" name messages_ready messages_unacknowledged 2>/dev/null)"; then
+    echo "queue status unavailable; check infractl health" >&2
     return 1
   fi
-  local -a env_args=()
-  local line
-  while IFS= read -r line; do
-    env_args+=("${line}")
-  done < <(backend_env_args)
-  /usr/bin/env "${env_args[@]}" \
-    "${APP_ROOT}/bin/im-server" -backfill-read \
-    -backfill-batch "${BACKFILL_BATCH:-1000}"
+  for name in "${prefix}.messages.persist" "${prefix}.group.messages.persist"; do
+    counts="$(awk -v queue="${name}" '$1 == queue { print $2" "$3; exit }' <<<"${output}")"
+    if [ -z "${counts}" ]; then
+      printf '%s: not declared (drained)\n' "${name}"
+      continue
+    fi
+    read -r ready unack <<<"${counts}"
+    printf '%s: ready=%s unacknowledged=%s\n' "${name}" "${ready}" "${unack}"
+    total=$((total + ready + unack))
+  done
+  if [ "${total}" -ne 0 ]; then
+    echo "persist queues still hold ${total} message(s); wait for the relay and consumer to drain them" >&2
+    return 1
+  fi
+  echo "persist queues are drained"
 }
 
-backfill_group_read() {
+backfill_seq() {
   prepare_backend_config
   if ! infra_ready; then
-    echo "group read backfill requires Redis configuration" >&2
+    echo "seq backfill requires Redis configuration" >&2
+    return 1
+  fi
+  if systemctl is-active --quiet "${UNIT}"; then
+    echo "stop the backend before running the seq backfill" >&2
     return 1
   fi
   local -a env_args=()
@@ -269,7 +296,7 @@ backfill_group_read() {
     env_args+=("${line}")
   done < <(backend_env_args)
   /usr/bin/env "${env_args[@]}" \
-    "${APP_ROOT}/bin/im-server" -backfill-group-read \
+    "${APP_ROOT}/bin/im-server" -backfill-seq \
     -backfill-batch "${BACKFILL_BATCH:-1000}"
 }
 
@@ -516,8 +543,8 @@ main() {
     restart) restart ;;
     backend-start) backend_start ;;
     backend-stop) backend_stop ;;
-    backfill-read) backfill_read ;;
-    backfill-group-read) backfill_group_read ;;
+    backfill-seq) backfill_seq ;;
+    queue-status) queue_status ;;
     health) health ;;
     status) status ;;
     backup) backup ;;
@@ -529,7 +556,7 @@ main() {
     runtime-stop) runtime_stop ;;
     verify-host) verify_host ;;
     logs) logs "${2:-backend}" "${3:-80}" ;;
-    *) echo "Usage: $0 [--verify] {start|stop|restart|backend-start|backend-stop|backfill-read|backfill-group-read|health|status|backup|restore-check <backup>|mysql-start|mysql-stop|mysql-status|runtime-start|runtime-stop|verify-host|logs [backend|mysql|runtime] [lines]}" >&2; return 2 ;;
+    *) echo "Usage: $0 [--verify] {start|stop|restart|backend-start|backend-stop|backfill-seq|queue-status|health|status|backup|restore-check <backup>|mysql-start|mysql-stop|mysql-status|runtime-start|runtime-stop|verify-host|logs [backend|mysql|runtime] [lines]}" >&2; return 2 ;;
   esac
 }
 

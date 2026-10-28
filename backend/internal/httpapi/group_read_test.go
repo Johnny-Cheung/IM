@@ -3,7 +3,6 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -19,15 +18,21 @@ import (
 )
 
 type groupReadAdvanceCall struct {
-	groupID   uint64
-	userID    uint64
-	throughID uint64
+	groupID    uint64
+	userID     uint64
+	throughSeq uint64
 }
 
 type groupReadManyCall struct {
-	groupID   uint64
-	userIDs   []uint64
-	throughID uint64
+	groupID    uint64
+	userIDs    []uint64
+	throughSeq uint64
+}
+
+type groupReadStatsCall struct {
+	groupID uint64
+	userID  uint64
+	seq     uint64
 }
 
 type groupReadSeedCall struct {
@@ -42,24 +47,25 @@ type fakeGroupReadTracker struct {
 	ready    bool
 	readyErr error
 
-	advanceFn    func(groupID, userID, throughID uint64) (messaging.GroupReadAdvance, error)
+	advanceFn    func(groupID, userID, throughSeq uint64) (messaging.GroupReadAdvance, error)
 	advanceCtxFn func(context.Context, uint64, uint64, uint64) (messaging.GroupReadAdvance, error)
 	advanceErr   error
 	advances     []groupReadAdvanceCall
 
-	manyFn  func(groupID uint64, userIDs []uint64, throughID uint64) ([]messaging.GroupReadAdvance, error)
+	manyFn  func(groupID uint64, userIDs []uint64, throughSeq uint64) ([]messaging.GroupReadAdvance, error)
 	manyErr error
 	many    []groupReadManyCall
 
-	unread    map[uint64]int
-	unreadErr error
+	states    map[uint64]messaging.GroupConversationState
+	statesErr error
 
-	stats    messaging.GroupReadStats
-	statsErr error
+	stats     messaging.GroupReadStats
+	statsErr  error
+	statsCall groupReadStatsCall
 
-	senderID    uint64
-	senderFound bool
-	senderErr   error
+	messageRef   messaging.MessageRef
+	messageFound bool
+	messageErr   error
 
 	seedErr error
 	seeds   []groupReadSeedCall
@@ -86,30 +92,30 @@ func (f *fakeGroupReadTracker) ReadModelReady(context.Context) (bool, error) {
 
 func (f *fakeGroupReadTracker) AdvanceRead(
 	ctx context.Context,
-	groupID, userID, throughID uint64,
+	groupID, userID, throughSeq uint64,
 	_ time.Time,
 ) (messaging.GroupReadAdvance, error) {
 	f.mu.Lock()
 	f.advances = append(f.advances, groupReadAdvanceCall{
-		groupID: groupID, userID: userID, throughID: throughID,
+		groupID: groupID, userID: userID, throughSeq: throughSeq,
 	})
 	ctxFn := f.advanceCtxFn
 	fn := f.advanceFn
 	err := f.advanceErr
 	f.mu.Unlock()
 	if ctxFn != nil {
-		return ctxFn(ctx, groupID, userID, throughID)
+		return ctxFn(ctx, groupID, userID, throughSeq)
 	}
 	if fn != nil {
-		return fn(groupID, userID, throughID)
+		return fn(groupID, userID, throughSeq)
 	}
 	if err != nil {
 		return messaging.GroupReadAdvance{}, err
 	}
 	return messaging.GroupReadAdvance{
-		UserID:            userID,
-		LastReadMessageID: throughID,
-		Advanced:          throughID > 0,
+		UserID:      userID,
+		LastReadSeq: throughSeq,
+		Advanced:    throughSeq > 0,
 	}, nil
 }
 
@@ -117,18 +123,18 @@ func (f *fakeGroupReadTracker) AdvanceReadMany(
 	_ context.Context,
 	groupID uint64,
 	userIDs []uint64,
-	throughID uint64,
+	throughSeq uint64,
 	_ time.Time,
 ) ([]messaging.GroupReadAdvance, error) {
 	f.mu.Lock()
 	f.many = append(f.many, groupReadManyCall{
-		groupID: groupID, userIDs: append([]uint64{}, userIDs...), throughID: throughID,
+		groupID: groupID, userIDs: append([]uint64{}, userIDs...), throughSeq: throughSeq,
 	})
 	fn := f.manyFn
 	err := f.manyErr
 	f.mu.Unlock()
 	if fn != nil {
-		return fn(groupID, userIDs, throughID)
+		return fn(groupID, userIDs, throughSeq)
 	}
 	if err != nil {
 		return nil, err
@@ -136,50 +142,49 @@ func (f *fakeGroupReadTracker) AdvanceReadMany(
 	advances := make([]messaging.GroupReadAdvance, 0, len(userIDs))
 	for _, userID := range userIDs {
 		advances = append(advances, messaging.GroupReadAdvance{
-			UserID:            userID,
-			LastReadMessageID: throughID,
-			Advanced:          throughID > 0,
+			UserID:      userID,
+			LastReadSeq: throughSeq,
+			Advanced:    throughSeq > 0,
 		})
 	}
 	return advances, nil
 }
 
-func (f *fakeGroupReadTracker) UnreadCounts(
+func (f *fakeGroupReadTracker) States(
 	_ context.Context,
 	_ uint64,
 	groupIDs []uint64,
-) (map[uint64]int, error) {
+) (map[uint64]messaging.GroupConversationState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.unreadErr != nil {
-		return nil, f.unreadErr
+	if f.statesErr != nil {
+		return nil, f.statesErr
 	}
-	counts := make(map[uint64]int, len(groupIDs))
+	states := make(map[uint64]messaging.GroupConversationState, len(groupIDs))
 	for _, groupID := range groupIDs {
-		counts[groupID] = f.unread[groupID]
+		states[groupID] = f.states[groupID]
 	}
-	return counts, nil
+	return states, nil
 }
 
 func (f *fakeGroupReadTracker) ReadStats(
-	context.Context,
-	uint64,
-	uint64,
-	uint64,
+	_ context.Context,
+	groupID, userID, seq uint64,
 ) (messaging.GroupReadStats, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.statsCall = groupReadStatsCall{groupID: groupID, userID: userID, seq: seq}
 	return f.stats, f.statsErr
 }
 
-func (f *fakeGroupReadTracker) MessageSender(
+func (f *fakeGroupReadTracker) MessageBySeq(
 	context.Context,
 	uint64,
 	uint64,
-) (uint64, bool, error) {
+) (messaging.MessageRef, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.senderID, f.senderFound, f.senderErr
+	return f.messageRef, f.messageFound, f.messageErr
 }
 
 func (f *fakeGroupReadTracker) SeedMember(
@@ -281,7 +286,7 @@ type recordingDirectReadTracker struct {
 
 	ready     bool
 	calls     []directReadAdvanceCall
-	advanceFn func(userID, peerID, throughID uint64) (messaging.DirectReadAdvance, error)
+	advanceFn func(userID, peerID, throughSeq uint64) (messaging.DirectReadAdvance, error)
 }
 
 func newRecordingDirectReadTracker() *recordingDirectReadTracker {
@@ -290,39 +295,29 @@ func newRecordingDirectReadTracker() *recordingDirectReadTracker {
 
 func (r *recordingDirectReadTracker) AdvanceRead(
 	_ context.Context,
-	userID, peerID, throughID uint64,
+	userID, peerID, throughSeq uint64,
 	_ time.Time,
 ) (messaging.DirectReadAdvance, error) {
 	r.mu.Lock()
 	r.calls = append(r.calls, directReadAdvanceCall{
-		userID: userID, peerID: peerID, throughID: throughID,
+		userID: userID, peerID: peerID, throughSeq: throughSeq,
 	})
 	fn := r.advanceFn
 	r.mu.Unlock()
 	if fn != nil {
-		return fn(userID, peerID, throughID)
+		return fn(userID, peerID, throughSeq)
 	}
 	return messaging.DirectReadAdvance{
-		LastReadMessageID: throughID,
-		Candidate:         throughID,
-		Advanced:          throughID > 0,
+		LastReadSeq: throughSeq,
+		Candidate:   throughSeq,
+		Advanced:    throughSeq > 0,
 	}, nil
 }
 
-func (r *recordingDirectReadTracker) ReadPositions(context.Context, uint64) (map[uint64]uint64, error) {
-	return map[uint64]uint64{}, nil
-}
-
-func (r *recordingDirectReadTracker) PeerReadPositions(
+func (r *recordingDirectReadTracker) States(
 	context.Context, uint64, []uint64,
-) (map[uint64]uint64, error) {
-	return map[uint64]uint64{}, nil
-}
-
-func (r *recordingDirectReadTracker) UnreadCounts(
-	context.Context, uint64, []uint64, map[uint64]uint64,
-) (map[uint64]int, error) {
-	return map[uint64]int{}, nil
+) (map[uint64]messaging.DirectConversationState, error) {
+	return map[uint64]messaging.DirectConversationState{}, nil
 }
 
 func (r *recordingDirectReadTracker) ReadModelReady(context.Context) (bool, error) {
@@ -371,33 +366,36 @@ func waitFor(t *testing.T, condition func() bool) {
 func TestGroupReadStats(t *testing.T) {
 	dataStore := authenticatedFriendStore()
 	tracker := newFakeGroupReadTracker()
-	tracker.senderFound = true
-	tracker.senderID = 1
+	tracker.messageFound = true
+	tracker.messageRef = messaging.MessageRef{ID: 345, SenderID: 1}
 	tracker.stats = messaging.GroupReadStats{ReadCount: 3, MemberCount: 5}
 	router := testRouter(dataStore, WithGroupReadTracker(tracker))
 
 	recorder := doJSON(
-		t, router, http.MethodGet, "/api/groups/7/read-stats?message_id=345", nil, authTestCookie(),
+		t, router, http.MethodGet, "/api/groups/7/read-stats?seq=4", nil, authTestCookie(),
 	)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 	response := decodeBody[groupReadStatsResponse](t, recorder)
-	if response.MessageID != 345 || response.ReadCount != 3 ||
+	if response.Seq != 4 || response.MessageID != 345 || response.ReadCount != 3 ||
 		response.MemberCount != 5 || response.AllRead {
 		t.Fatalf("response = %#v", response)
+	}
+	if tracker.statsCall != (groupReadStatsCall{groupID: 7, userID: 1, seq: 4}) {
+		t.Fatalf("read stats call = %#v", tracker.statsCall)
 	}
 }
 
 func TestGroupReadStatsRejectsOtherSender(t *testing.T) {
 	dataStore := authenticatedFriendStore()
 	tracker := newFakeGroupReadTracker()
-	tracker.senderFound = true
-	tracker.senderID = 2
+	tracker.messageFound = true
+	tracker.messageRef = messaging.MessageRef{ID: 345, SenderID: 2}
 	router := testRouter(dataStore, WithGroupReadTracker(tracker))
 
 	recorder := doJSON(
-		t, router, http.MethodGet, "/api/groups/7/read-stats?message_id=345", nil, authTestCookie(),
+		t, router, http.MethodGet, "/api/groups/7/read-stats?seq=4", nil, authTestCookie(),
 	)
 	if recorder.Code != http.StatusForbidden || errorCode(t, recorder) != "not_your_message" {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
@@ -408,15 +406,29 @@ func TestGroupReadStatsFallsBackToPersistedSender(t *testing.T) {
 	dataStore := authenticatedFriendStore()
 	dataStore.groupMessageSender = 1
 	dataStore.groupMessageSenderFound = true
+	dataStore.groupMessageAfterPage = store.GroupMessagePage{Messages: []store.GroupMessage{{
+		ID:       345,
+		Seq:      4,
+		GroupID:  7,
+		SenderID: 1,
+	}}}
 	tracker := newFakeGroupReadTracker()
 	tracker.stats = messaging.GroupReadStats{ReadCount: 1, MemberCount: 2, AllRead: false}
 	router := testRouter(dataStore, WithGroupReadTracker(tracker))
 
 	recorder := doJSON(
-		t, router, http.MethodGet, "/api/groups/7/read-stats?message_id=345", nil, authTestCookie(),
+		t, router, http.MethodGet, "/api/groups/7/read-stats?seq=4", nil, authTestCookie(),
 	)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	response := decodeBody[groupReadStatsResponse](t, recorder)
+	if response.Seq != 4 || response.MessageID != 345 || response.ReadCount != 1 {
+		t.Fatalf("response = %#v", response)
+	}
+	if dataStore.groupMessageAfterCall.groupID != 7 || dataStore.groupMessageAfterCall.afterSeq != 3 {
+		t.Fatalf("persisted lookup = %#v, want (group 7, after seq 3)",
+			dataStore.groupMessageAfterCall)
 	}
 }
 
@@ -426,19 +438,19 @@ func TestGroupReadStatsMissingMessage(t *testing.T) {
 	router := testRouter(dataStore, WithGroupReadTracker(tracker))
 
 	recorder := doJSON(
-		t, router, http.MethodGet, "/api/groups/7/read-stats?message_id=345", nil, authTestCookie(),
+		t, router, http.MethodGet, "/api/groups/7/read-stats?seq=4", nil, authTestCookie(),
 	)
 	if recorder.Code != http.StatusNotFound || errorCode(t, recorder) != "message_not_found" {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 }
 
-func TestGroupReadStatsRejectsInvalidMessageID(t *testing.T) {
+func TestGroupReadStatsRejectsInvalidSeq(t *testing.T) {
 	dataStore := authenticatedFriendStore()
 	tracker := newFakeGroupReadTracker()
 	router := testRouter(dataStore, WithGroupReadTracker(tracker))
 
-	for _, query := range []string{"", "?message_id=", "?message_id=0", "?message_id=abc"} {
+	for _, query := range []string{"", "?seq=", "?seq=0", "?seq=abc", "?message_id=345"} {
 		recorder := doJSON(
 			t, router, http.MethodGet, "/api/groups/7/read-stats"+query, nil, authTestCookie(),
 		)
@@ -455,7 +467,7 @@ func TestGroupReadStatsRequiresReadModel(t *testing.T) {
 	router := testRouter(dataStore, WithGroupReadTracker(tracker))
 
 	recorder := doJSON(
-		t, router, http.MethodGet, "/api/groups/7/read-stats?message_id=345", nil, authTestCookie(),
+		t, router, http.MethodGet, "/api/groups/7/read-stats?seq=4", nil, authTestCookie(),
 	)
 	if recorder.Code != http.StatusServiceUnavailable ||
 		errorCode(t, recorder) != "read_model_not_ready" {
@@ -466,13 +478,13 @@ func TestGroupReadStatsRequiresReadModel(t *testing.T) {
 func TestGroupReadStatsMapsGroupErrors(t *testing.T) {
 	dataStore := authenticatedFriendStore()
 	tracker := newFakeGroupReadTracker()
-	tracker.senderFound = true
-	tracker.senderID = 1
+	tracker.messageFound = true
+	tracker.messageRef = messaging.MessageRef{ID: 345, SenderID: 1}
 	tracker.statsErr = messaging.ErrGroupNotMember
 	router := testRouter(dataStore, WithGroupReadTracker(tracker))
 
 	recorder := doJSON(
-		t, router, http.MethodGet, "/api/groups/7/read-stats?message_id=345", nil, authTestCookie(),
+		t, router, http.MethodGet, "/api/groups/7/read-stats?seq=4", nil, authTestCookie(),
 	)
 	if recorder.Code != http.StatusNotFound || errorCode(t, recorder) != "group_not_found" {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
@@ -485,7 +497,7 @@ func TestGroupReadStatsRequiresSession(t *testing.T) {
 	router := testRouter(dataStore, WithGroupReadTracker(tracker))
 
 	recorder := doJSON(
-		t, router, http.MethodGet, "/api/groups/7/read-stats?message_id=345", nil, nil,
+		t, router, http.MethodGet, "/api/groups/7/read-stats?seq=4", nil, nil,
 	)
 	if recorder.Code != http.StatusUnauthorized || errorCode(t, recorder) != "unauthenticated" {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
@@ -495,13 +507,28 @@ func TestGroupReadStatsRequiresSession(t *testing.T) {
 func TestGroupReadStatsReturnsUnavailableOnRedisError(t *testing.T) {
 	dataStore := authenticatedFriendStore()
 	tracker := newFakeGroupReadTracker()
-	tracker.senderFound = true
-	tracker.senderID = 1
+	tracker.messageFound = true
+	tracker.messageRef = messaging.MessageRef{ID: 345, SenderID: 1}
 	tracker.statsErr = messaging.ErrMessageServiceUnavailable
 	router := testRouter(dataStore, WithGroupReadTracker(tracker))
 
 	recorder := doJSON(
-		t, router, http.MethodGet, "/api/groups/7/read-stats?message_id=345", nil, authTestCookie(),
+		t, router, http.MethodGet, "/api/groups/7/read-stats?seq=4", nil, authTestCookie(),
+	)
+	if recorder.Code != http.StatusServiceUnavailable ||
+		errorCode(t, recorder) != "message_service_unavailable" {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestGroupReadStatsReturnsUnavailableWhenSeqNotReady(t *testing.T) {
+	dataStore := authenticatedFriendStore()
+	tracker := newFakeGroupReadTracker()
+	tracker.messageErr = messaging.ErrSeqNotReady
+	router := testRouter(dataStore, WithGroupReadTracker(tracker))
+
+	recorder := doJSON(
+		t, router, http.MethodGet, "/api/groups/7/read-stats?seq=4", nil, authTestCookie(),
 	)
 	if recorder.Code != http.StatusServiceUnavailable ||
 		errorCode(t, recorder) != "message_service_unavailable" {
@@ -531,7 +558,10 @@ func TestListConversationsUsesGroupReadTracker(t *testing.T) {
 		},
 	}
 	tracker := newFakeGroupReadTracker()
-	tracker.unread = map[uint64]int{9: 5}
+	tracker.states = map[uint64]messaging.GroupConversationState{
+		9:  {LastSeq: 7, ReadSeq: 2, Unread: 5},
+		10: {},
+	}
 	router := testRouter(dataStore, WithGroupReadTracker(tracker))
 
 	recorder := doJSON(t, router, http.MethodGet, "/api/conversations", nil, authTestCookie())
@@ -575,7 +605,7 @@ func TestListConversationsGroupUnreadFailureIsUnavailable(t *testing.T) {
 		MemberCount: 2,
 	}}
 	tracker := newFakeGroupReadTracker()
-	tracker.unreadErr = messaging.ErrMessageServiceUnavailable
+	tracker.statesErr = messaging.ErrMessageServiceUnavailable
 	router := testRouter(dataStore, WithGroupReadTracker(tracker))
 
 	recorder := doJSON(t, router, http.MethodGet, "/api/conversations", nil, authTestCookie())
@@ -597,7 +627,9 @@ func TestBootstrapUsesGroupReadTracker(t *testing.T) {
 		MemberCount: 3,
 	}}
 	tracker := newFakeGroupReadTracker()
-	tracker.unread = map[uint64]int{9: 4}
+	tracker.states = map[uint64]messaging.GroupConversationState{
+		9: {LastSeq: 6, ReadSeq: 2, Unread: 4},
+	}
 	router := testRouter(dataStore, WithGroupReadTracker(tracker))
 
 	recorder := doJSON(t, router, http.MethodPost, "/api/bootstrap", map[string]any{}, authTestCookie())
@@ -629,53 +661,6 @@ func TestBootstrapGroupReadModelNotReadyIsPartial(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("partial = %#v", response.Partial)
-	}
-}
-
-func TestLegacyMarkGroupReadUsesTracker(t *testing.T) {
-	dataStore := authenticatedChatStore()
-	dataStore.groupMemberIDs = []uint64{1, 2}
-	tracker := newFakeGroupReadTracker()
-	tracker.advanceFn = func(_, _, throughID uint64) (messaging.GroupReadAdvance, error) {
-		return messaging.GroupReadAdvance{
-			UserID:            1,
-			LastReadMessageID: throughID,
-			Advanced:          true,
-		}, nil
-	}
-	router := testRouter(dataStore, WithGroupReadTracker(tracker))
-
-	recorder := doJSON(
-		t, router, http.MethodPost, "/api/groups/7/read?through_id=42", nil, authTestCookie(),
-	)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
-	}
-	if response := decodeBody[readStateResponse](t, recorder); response.LastReadMessageID != 42 {
-		t.Fatalf("response = %#v", response)
-	}
-	advances := tracker.snapAdvances()
-	if len(advances) != 1 || advances[0].groupID != 7 ||
-		advances[0].userID != 1 || advances[0].throughID != 42 {
-		t.Fatalf("advances = %#v", advances)
-	}
-	if dataStore.markGroupReadThrough != 0 {
-		t.Fatalf("MySQL mark group read was called: %#v", dataStore.markGroupReadThrough)
-	}
-}
-
-func TestLegacyMarkGroupReadRequiresReadModel(t *testing.T) {
-	dataStore := authenticatedChatStore()
-	tracker := newFakeGroupReadTracker()
-	tracker.ready = false
-	router := testRouter(dataStore, WithGroupReadTracker(tracker))
-
-	recorder := doJSON(
-		t, router, http.MethodPost, "/api/groups/7/read?through_id=42", nil, authTestCookie(),
-	)
-	if recorder.Code != http.StatusServiceUnavailable ||
-		errorCode(t, recorder) != "read_model_not_ready" {
-		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -743,7 +728,7 @@ func TestWebSocketFocusDirectAdvancesAndAcks(t *testing.T) {
 	}
 	tracker := newRecordingDirectReadTracker()
 	tracker.advanceFn = func(_, _, _ uint64) (messaging.DirectReadAdvance, error) {
-		return messaging.DirectReadAdvance{LastReadMessageID: 42, Advanced: true}, nil
+		return messaging.DirectReadAdvance{LastReadSeq: 42, Advanced: true}, nil
 	}
 	api, _, baseURL := startChatServer(t, dataStore, WithDirectReadTracker(tracker))
 	conn := dialChatSocket(t, baseURL, "alice")
@@ -756,12 +741,12 @@ func TestWebSocketFocusDirectAdvancesAndAcks(t *testing.T) {
 	}
 	ack := readWSEventType(t, conn, "focus.ack")
 	if ack["kind"] != "direct" || ack["username"] != "bob" ||
-		ack["last_read_message_id"] != float64(42) || ack["error"] != nil {
+		ack["last_read_seq"] != float64(42) || ack["error"] != nil {
 		t.Fatalf("ack = %#v", ack)
 	}
 	calls := tracker.snapshot()
 	if len(calls) != 1 || calls[0].userID != 1 || calls[0].peerID != 2 ||
-		calls[0].throughID != 0 {
+		calls[0].throughSeq != 0 {
 		t.Fatalf("advance calls = %#v", calls)
 	}
 	if !api.hub.isDirectFocus(1, 2) {
@@ -809,7 +794,7 @@ func TestWebSocketFocusGroupAdvancesAndAcks(t *testing.T) {
 	tracker := newFakeGroupReadTracker()
 	tracker.advanceFn = func(groupID, userID, _ uint64) (messaging.GroupReadAdvance, error) {
 		return messaging.GroupReadAdvance{
-			UserID: userID, LastReadMessageID: 345, Advanced: true,
+			UserID: userID, LastReadSeq: 345, Advanced: true,
 		}, nil
 	}
 	api, _, baseURL := startChatServer(t, dataStore, WithGroupReadTracker(tracker))
@@ -823,12 +808,12 @@ func TestWebSocketFocusGroupAdvancesAndAcks(t *testing.T) {
 	}
 	ack := readWSEventType(t, conn, "focus.ack")
 	if ack["kind"] != "group" || ack["group_id"] != float64(7) ||
-		ack["last_read_message_id"] != float64(345) || ack["error"] != nil {
+		ack["last_read_seq"] != float64(345) || ack["error"] != nil {
 		t.Fatalf("ack = %#v", ack)
 	}
 	advances := tracker.snapAdvances()
 	if len(advances) != 1 || advances[0].groupID != 7 || advances[0].userID != 1 ||
-		advances[0].throughID != 0 {
+		advances[0].throughSeq != 0 {
 		t.Fatalf("advances = %#v", advances)
 	}
 	users := api.hub.focusedGroupUsers(7)
@@ -925,6 +910,7 @@ func TestImplicitDirectReadAdvancesFocusedRecipientAndSender(t *testing.T) {
 		relationship:       store.RelationshipFriend,
 		createdMessage: store.Message{
 			ID:              21,
+			Seq:             5,
 			SenderID:        1,
 			RecipientID:     2,
 			ClientMessageID: "client-12345678",
@@ -934,13 +920,13 @@ func TestImplicitDirectReadAdvancesFocusedRecipientAndSender(t *testing.T) {
 		createdMessageNew: true,
 	}
 	tracker := newRecordingDirectReadTracker()
-	tracker.advanceFn = func(userID, peerID, throughID uint64) (messaging.DirectReadAdvance, error) {
-		if throughID == 0 {
+	tracker.advanceFn = func(userID, peerID, throughSeq uint64) (messaging.DirectReadAdvance, error) {
+		if throughSeq == 0 {
 			return messaging.DirectReadAdvance{}, nil
 		}
 		return messaging.DirectReadAdvance{
-			LastReadMessageID: throughID,
-			Advanced:          true,
+			LastReadSeq: throughSeq,
+			Advanced:    true,
 		}, nil
 	}
 	api, router, baseURL := startChatServer(t, dataStore, WithDirectReadTracker(tracker))
@@ -968,7 +954,7 @@ func TestImplicitDirectReadAdvancesFocusedRecipientAndSender(t *testing.T) {
 	waitFor(t, func() bool {
 		sender, recipient := false, false
 		for _, call := range tracker.snapshot()[before:] {
-			if call.throughID != 21 {
+			if call.throughSeq != 5 {
 				continue
 			}
 			if call.userID == 1 && call.peerID == 2 {
@@ -994,7 +980,7 @@ func TestImplicitReadMergesWithinWindow(t *testing.T) {
 
 	waitFor(t, func() bool {
 		for _, call := range tracker.snapshot() {
-			if call.throughID == 12 {
+			if call.throughSeq == 12 {
 				return true
 			}
 		}
@@ -1004,7 +990,7 @@ func TestImplicitReadMergesWithinWindow(t *testing.T) {
 
 	calls := tracker.snapshot()
 	if len(calls) != 1 || calls[0].userID != 1 || calls[0].peerID != 2 ||
-		calls[0].throughID != 12 {
+		calls[0].throughSeq != 12 {
 		t.Fatalf("advance calls = %#v", calls)
 	}
 }
@@ -1019,6 +1005,7 @@ func TestImplicitGroupReadAdvancesViewersAndBroadcasts(t *testing.T) {
 		groupMemberIDs:     []uint64{1, 2},
 		createdGroupMessage: store.GroupMessage{
 			ID:              12,
+			Seq:             12,
 			GroupID:         7,
 			SenderID:        1,
 			Sender:          store.PublicUser{Username: "alice", Nickname: "Alice"},
@@ -1029,16 +1016,16 @@ func TestImplicitGroupReadAdvancesViewersAndBroadcasts(t *testing.T) {
 		createdGroupMessageNew: true,
 	}
 	tracker := newFakeGroupReadTracker()
-	tracker.manyFn = func(groupID uint64, userIDs []uint64, throughID uint64) ([]messaging.GroupReadAdvance, error) {
+	tracker.manyFn = func(groupID uint64, userIDs []uint64, throughSeq uint64) ([]messaging.GroupReadAdvance, error) {
 		advances := make([]messaging.GroupReadAdvance, 0, len(userIDs))
 		for _, userID := range userIDs {
 			advances = append(advances, messaging.GroupReadAdvance{
-				UserID: userID, LastReadMessageID: throughID, Advanced: true,
+				UserID: userID, LastReadSeq: throughSeq, Advanced: true,
 			})
 		}
 		return advances, nil
 	}
-	tracker.advanceFn = func(groupID, userID, throughID uint64) (messaging.GroupReadAdvance, error) {
+	tracker.advanceFn = func(groupID, userID, throughSeq uint64) (messaging.GroupReadAdvance, error) {
 		return messaging.GroupReadAdvance{UserID: userID}, nil
 	}
 	api, router, baseURL := startChatServer(t, dataStore, WithGroupReadTracker(tracker))
@@ -1070,7 +1057,7 @@ func TestImplicitGroupReadAdvancesViewersAndBroadcasts(t *testing.T) {
 
 	waitFor(t, func() bool {
 		for _, call := range tracker.snapMany()[before:] {
-			if call.throughID != 12 {
+			if call.throughSeq != 12 {
 				continue
 			}
 			hasAlice, hasBob := false, false
@@ -1108,7 +1095,7 @@ func TestImplicitGroupReadAdvancesViewersAndBroadcasts(t *testing.T) {
 
 	senderCaughtUp := false
 	for _, call := range tracker.snapAdvances() {
-		if call.groupID == 7 && call.userID == 1 && call.throughID == 12 {
+		if call.groupID == 7 && call.userID == 1 && call.throughSeq == 12 {
 			senderCaughtUp = true
 		}
 	}
@@ -1124,9 +1111,9 @@ func TestImplicitGroupReadSkipsBroadcastWhenOnlySenderAdvanced(t *testing.T) {
 		sessionByTokenHash: chatSessions(alice, bob),
 	}
 	tracker := newFakeGroupReadTracker()
-	tracker.advanceFn = func(_, userID, throughID uint64) (messaging.GroupReadAdvance, error) {
+	tracker.advanceFn = func(_, userID, throughSeq uint64) (messaging.GroupReadAdvance, error) {
 		return messaging.GroupReadAdvance{
-			UserID: userID, LastReadMessageID: throughID, Advanced: true,
+			UserID: userID, LastReadSeq: throughSeq, Advanced: true,
 		}, nil
 	}
 	api, _, baseURL := startChatServer(t, dataStore, WithGroupReadTracker(tracker))
@@ -1177,18 +1164,18 @@ func TestAPIImplicitReadStops(t *testing.T) {
 }
 
 type fakeGroupProjector struct {
-	mu           sync.Mutex
-	watermark    uint64
-	watermarkErr error
-	begins       int
-	replaces     int
+	mu         sync.Mutex
+	lastSeq    uint64
+	lastSeqErr error
+	begins     int
+	replaces   int
 
-	watermarkBeforeBegin bool
-	replaceFn            func() error
-	lastGroupID          uint64
-	lastMembers          []uint64
-	lastDissolved        bool
-	replaceSucceeded     int
+	lastSeqBeforeBegin bool
+	replaceFn          func() error
+	lastGroupID        uint64
+	lastMembers        []uint64
+	lastDissolved      bool
+	replaceSucceeded   int
 }
 
 func (p *fakeGroupProjector) Replace(
@@ -1222,47 +1209,13 @@ func (p *fakeGroupProjector) BeginMutation(context.Context, uint64) error {
 	return nil
 }
 
-func (p *fakeGroupProjector) LastAcceptedID(context.Context, uint64) (uint64, error) {
+func (p *fakeGroupProjector) LastSeq(context.Context, uint64) (uint64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.begins == 0 {
-		p.watermarkBeforeBegin = true
+		p.lastSeqBeforeBegin = true
 	}
-	return p.watermark, p.watermarkErr
-}
-
-func TestMarkGroupReadBroadcastsFromRedisMemberSet(t *testing.T) {
-	alice := store.User{ID: 1, Username: "alice", Nickname: "Alice"}
-	bob := store.User{ID: 2, Username: "bob", Nickname: "Bob"}
-	dataStore := &fakeStore{
-		sessionByTokenHash: chatSessions(alice, bob),
-		groupMemberIDsErr:  errors.New("mysql down"),
-	}
-	tracker := newFakeGroupReadTracker()
-	tracker.advanceFn = func(_, userID, throughID uint64) (messaging.GroupReadAdvance, error) {
-		return messaging.GroupReadAdvance{
-			UserID: userID, LastReadMessageID: throughID, Advanced: true,
-		}, nil
-	}
-	tracker.memberIDs = []uint64{1, 2}
-	api, router, baseURL := startChatServer(t, dataStore, WithGroupReadTracker(tracker))
-	api.Start()
-	t.Cleanup(api.Stop)
-
-	bobConn := dialChatSocket(t, baseURL, "bob")
-	waitFor(t, func() bool { return api.hub.activeCount(2) == 1 })
-
-	recorder := doJSON(
-		t, router, http.MethodPost, "/api/groups/7/read?through_id=42", nil,
-		testCookie("alice"),
-	)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
-	}
-	event := readWSEventType(t, bobConn, "group.read")
-	if event["group_id"] != float64(7) {
-		t.Fatalf("group read event = %#v", event)
-	}
+	return p.lastSeq, p.lastSeqErr
 }
 
 func TestCreateGroupSeedsReadPositions(t *testing.T) {
@@ -1304,12 +1257,12 @@ func TestInviteGroupMembersSeedsBaseline(t *testing.T) {
 	dataStore.groupMemberIDSequence = [][]uint64{{1, 2}, {1, 2, 3}}
 	dataStore.inviteGroupBaseline = 60
 	tracker := newFakeGroupReadTracker()
-	projector := &fakeGroupProjector{watermark: 55}
+	projector := &fakeGroupProjector{lastSeq: 55}
 	router := testRouter(
 		dataStore,
 		WithGroupReadTracker(tracker),
 		WithGroupProjector(projector),
-		WithGroupAcceptedWatermarkReader(projector),
+		WithGroupSequenceReader(projector),
 	)
 
 	recorder := doJSON(t, router, http.MethodPost, "/api/groups/7/members", map[string]any{
@@ -1339,12 +1292,12 @@ func TestInviteGroupMembersRejectsWhenWatermarkUnavailable(t *testing.T) {
 	}
 	dataStore.groupDetail = groupTestDetail(now)
 	tracker := newFakeGroupReadTracker()
-	projector := &fakeGroupProjector{watermarkErr: messaging.ErrMessageServiceUnavailable}
+	projector := &fakeGroupProjector{lastSeqErr: messaging.ErrMessageServiceUnavailable}
 	router := testRouter(
 		dataStore,
 		WithGroupReadTracker(tracker),
 		WithGroupProjector(projector),
-		WithGroupAcceptedWatermarkReader(projector),
+		WithGroupSequenceReader(projector),
 	)
 
 	recorder := doJSON(t, router, http.MethodPost, "/api/groups/7/members", map[string]any{
@@ -1370,12 +1323,12 @@ func TestInviteGroupMembersSeedFailureStillProjects(t *testing.T) {
 	dataStore.inviteGroupBaseline = 60
 	tracker := newFakeGroupReadTracker()
 	tracker.baselineErr = messaging.ErrMessageServiceUnavailable
-	projector := &fakeGroupProjector{watermark: 55}
+	projector := &fakeGroupProjector{lastSeq: 55}
 	router := testRouter(
 		dataStore,
 		WithGroupReadTracker(tracker),
 		WithGroupProjector(projector),
-		WithGroupAcceptedWatermarkReader(projector),
+		WithGroupSequenceReader(projector),
 	)
 
 	recorder := doJSON(t, router, http.MethodPost, "/api/groups/7/members", map[string]any{

@@ -2,11 +2,12 @@ import type { GroupReadStats } from "./api";
 
 export type ReceiptMessage = {
   id: number;
+  seq: number;
   status: string;
   sender: { username: string };
 };
 
-export function lastOwnSentMessageID(
+export function lastOwnSentSeq(
   messages: readonly ReceiptMessage[],
   username: string,
 ): number {
@@ -15,10 +16,11 @@ export function lastOwnSentMessageID(
     const message = messages[index];
     if (
       message.status === "sent"
-      && message.id > 0
+      && Number.isInteger(message.seq)
+      && message.seq > 0
       && message.sender.username.toLocaleLowerCase() === own
     ) {
-      return message.id;
+      return message.seq;
     }
   }
   return 0;

@@ -12,9 +12,9 @@ const name = (key) => run.users.get(key).username;
 const directSelector = (key) => `.conversation-item[data-username="${name(key)}"]`;
 const directOf = (conversationList, username) => conversationList.conversations.find((item) => item.type === "direct" && item.user.username === username);
 const conversationsOf = (who) => run.request(who, "GET", "/api/conversations");
-async function unreadOfA() {
-  const item = directOf(await conversationsOf("c"), name("a"));
-  return (item?.last_message?.id ?? 0) > (item?.peer_last_read_message_id ?? 0) ? 1 : 0;
+// a's unread from c: the browser opens b, so only c's message stays unread.
+async function unreadFromC() {
+  return directOf(await conversationsOf("a"), name("c"))?.unread_count ?? 0;
 }
 const same = (first, second) => String(first).toLocaleLowerCase() === String(second).toLocaleLowerCase();
 
@@ -83,20 +83,28 @@ async function cacheState(user) {
       request.onerror = () => reject(request.error);
     });
     if (!db.objectStoreNames.contains("meta") || !db.objectStoreNames.contains("messages")) {
+      const version = db.version;
       db.close();
-      return { active: null, messages: 0 };
+      return { version, active: null, messages: 0, withoutSeq: [] };
     }
+    const version = db.version;
     const result = await new Promise((resolve) => {
       const transaction = db.transaction(["meta", "messages"], "readonly");
       const active = transaction.objectStore("meta").get("active-user");
-      const keys = transaction.objectStore("messages").getAllKeys();
-      transaction.oncomplete = () => resolve({
-        active: active.result ?? null,
-        messages: (keys.result ?? []).filter((key) => Array.isArray(key) && key[0] === ${JSON.stringify(user)}).length,
-      });
+      const rows = transaction.objectStore("messages").getAll();
+      transaction.oncomplete = () => {
+        const cached = (rows.result ?? []).filter((row) => row && row.user === ${JSON.stringify(user)});
+        resolve({
+          active: active.result ?? null,
+          messages: cached.length,
+          withoutSeq: cached
+            .filter((row) => !Number.isInteger(row.seq) || row.seq < 0)
+            .map((row) => row.id),
+        });
+      };
     });
     db.close();
-    return result;
+    return { version, ...result };
   })()`);
 }
 
@@ -133,6 +141,46 @@ async function main() {
 
   await browser.start();
   tab = await browser.tab(run.base);
+  // Seed the old cache from a same-origin document that does not run the app,
+  // so the app cannot upgrade the database before the fixture exists.
+  await tab.send("Page.navigate", { url: `${run.base}/health` });
+  await tab.waitFor(`location.origin === ${JSON.stringify(run.base)} && document.readyState === 'complete'`);
+  const legacyBody = `旧版无编号缓存 ${run.id}`;
+  await tab.evaluate(`(async () => {
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.open("im-cache", 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        db.createObjectStore("meta");
+        db.createObjectStore("conversations", { keyPath: ["user", "key"] });
+        db.createObjectStore("messages", { keyPath: ["user", "conversation", "id"] });
+        db.createObjectStore("friends", { keyPath: ["user"] });
+      };
+      request.onsuccess = () => {
+        const db = request.result;
+        const transaction = db.transaction(["meta", "messages"], "readwrite");
+        transaction.objectStore("meta").put(
+          { afterID: 900, directComplete: true, groups: {}, localSeq: {} },
+          ${JSON.stringify(name("a"))} + ":sync",
+        );
+        transaction.objectStore("messages").put({
+          user: ${JSON.stringify(name("a"))},
+          conversation: "direct:" + ${JSON.stringify(name("b"))},
+          id: 900,
+          body: ${JSON.stringify(legacyBody)},
+          sender: { username: ${JSON.stringify(name("b"))}, nickname: "旧" },
+          recipient: { username: ${JSON.stringify(name("a"))}, nickname: "旧" },
+          client_message_id: "legacy-900",
+          created_at: "2026-01-01T00:00:00Z",
+        });
+        transaction.oncomplete = () => { db.close(); resolve(true); };
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error);
+      };
+      request.onerror = () => reject(request.error);
+    });
+    return true;
+  })()`);
   await tab.login(name("a"), run.password);
   await tab.waitFor("!!document.querySelector('#conversation-list .conversation-item')");
   await delay(300);
@@ -151,6 +199,19 @@ async function main() {
   });
   await tab.waitFor(`!!document.querySelector('#conversation-list ${directSelector("b")}')`);
   await tab.waitFor(`!!document.querySelector('#conversation-list ${directSelector("c")}')`);
+
+  await scenario("a v1.7 cache is discarded on the version upgrade", async () => {
+    const state = await cacheState(name("a"));
+    console.log(`Cache after upgrade: ${JSON.stringify(state)}`);
+    run.check("cache version is upgraded", state.version === 2);
+    run.check("pre-seq cache rows are gone", state.withoutSeq.length === 0);
+    await tab.select(directSelector("b"), `/chat/${name("b")}`);
+    await tab.waitFor(`document.querySelector('#message-list')?.innerText.includes(${JSON.stringify(fromB)})`);
+    run.check(
+      "legacy cached body is not rendered",
+      !await tab.evaluate(`document.body.innerText.includes(${JSON.stringify(legacyBody)})`),
+    );
+  });
 
   await scenario("cold reload renders the cached conversation with one bootstrap", async () => {
     await tab.select(directSelector("b"), `/chat/${name("b")}`);
@@ -192,12 +253,14 @@ async function main() {
       "cold start does not refetch the open conversation",
       !requests.some((path) => path === `/api/conversations/${name("b")}/messages`),
     );
+    const state = await cacheState(name("a"));
+    run.check("cached messages carry conversation seqs", state.withoutSeq.length === 0 && state.messages > 0);
   });
 
   await scenario("offline mode stays readable and disables sending", async () => {
     const reads = trackReadRequests();
     try {
-      run.check("cached conversation starts unread", await unreadOfA() === 1);
+      run.check("cached conversation starts unread", await unreadFromC() === 1);
       await setOffline(true);
       await tab.waitFor("!!document.querySelector('#offline-banner')", 5000);
       run.check(
@@ -214,7 +277,7 @@ async function main() {
       run.check("another cached conversation opens offline", true);
       run.check(
         "offline reading leaves the unread on the server",
-        await unreadOfA() === 1,
+        await unreadFromC() === 1,
       );
       run.check("offline reading sends no read request", reads.paths.length === 0);
     } finally {
@@ -237,7 +300,7 @@ async function main() {
         "reconnect did not refocus the cached conversation",
       );
       await waitUntil(
-        async () => await unreadOfA() === 0,
+        async () => await unreadFromC() === 0,
         "reconnect did not clear the unread on the server",
       );
       run.check("reconnect clears the offline read on the server", true);

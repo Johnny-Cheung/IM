@@ -12,9 +12,9 @@ import (
 )
 
 type groupReadStoreCall struct {
-	GroupID           uint64
-	UserID            uint64
-	LastReadMessageID uint64
+	GroupID     uint64
+	UserID      uint64
+	LastReadSeq uint64
 }
 
 type fakeGroupReadStore struct {
@@ -32,9 +32,9 @@ func (f *fakeGroupReadStore) UpsertGroupRead(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, groupReadStoreCall{
-		GroupID:           groupID,
-		UserID:            userID,
-		LastReadMessageID: lastReadMessageID,
+		GroupID:     groupID,
+		UserID:      userID,
+		LastReadSeq: lastReadMessageID,
 	})
 	if f.failures[groupID] > 0 {
 		f.failures[groupID]--
@@ -107,10 +107,10 @@ func readNewGroupReadEvents(
 
 func groupReadEventValues(groupID, userID, messageID string) map[string]interface{} {
 	return map[string]interface{}{
-		"group_id":             groupID,
-		"user_id":              userID,
-		"last_read_message_id": messageID,
-		"updated_at_ms":        "1700000000123",
+		"group_id":      groupID,
+		"user_id":       userID,
+		"last_read_seq": messageID,
+		"updated_at_ms": "1700000000123",
 	}
 }
 
@@ -128,7 +128,7 @@ func TestGroupReadPersisterProcessesAndAcknowledges(t *testing.T) {
 	}
 
 	calls := store.snapshot()
-	if len(calls) != 1 || calls[0] != (groupReadStoreCall{GroupID: 9, UserID: 2, LastReadMessageID: 42}) {
+	if len(calls) != 1 || calls[0] != (groupReadStoreCall{GroupID: 9, UserID: 2, LastReadSeq: 42}) {
 		t.Fatalf("store calls = %#v", calls)
 	}
 	if got := client.XLen(ctx, defaultKeyspace.groupReadStreamKey()).Val(); got != 0 {
@@ -155,8 +155,8 @@ func TestGroupReadPersisterCoalescesByKey(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("store calls = %#v, want one coalesced call", calls)
 	}
-	if calls[0].LastReadMessageID != 30 {
-		t.Fatalf("coalesced position = %d, want 30", calls[0].LastReadMessageID)
+	if calls[0].LastReadSeq != 30 {
+		t.Fatalf("coalesced position = %d, want 30", calls[0].LastReadSeq)
 	}
 	if got := client.XLen(ctx, defaultKeyspace.groupReadStreamKey()).Val(); got != 0 {
 		t.Fatalf("stream length = %d, want 0", got)
@@ -279,40 +279,40 @@ func TestGroupReadPersisterAcknowledgesRemovedMember(t *testing.T) {
 
 func TestParseGroupReadStreamEvent(t *testing.T) {
 	event, err := parseGroupReadStreamEvent(map[string]interface{}{
-		"group_id":             int64(9),
-		"user_id":              "2",
-		"last_read_message_id": "42",
-		"updated_at_ms":        "1700000000123",
+		"group_id":      int64(9),
+		"user_id":       "2",
+		"last_read_seq": "42",
+		"updated_at_ms": "1700000000123",
 	})
 	if err != nil {
 		t.Fatalf("parse event: %v", err)
 	}
-	if event.GroupID != 9 || event.UserID != 2 || event.LastReadMessageID != 42 {
+	if event.GroupID != 9 || event.UserID != 2 || event.LastReadSeq != 42 {
 		t.Fatalf("event = %#v", event)
 	}
 
 	for name, values := range map[string]map[string]interface{}{
 		"missing group": {
-			"user_id":              "2",
-			"last_read_message_id": "42",
-			"updated_at_ms":        "1700000000123",
+			"user_id":       "2",
+			"last_read_seq": "42",
+			"updated_at_ms": "1700000000123",
 		},
 		"zero user": {
-			"group_id":             "9",
-			"user_id":              "0",
-			"last_read_message_id": "42",
-			"updated_at_ms":        "1700000000123",
+			"group_id":      "9",
+			"user_id":       "0",
+			"last_read_seq": "42",
+			"updated_at_ms": "1700000000123",
 		},
 		"zero position": {
-			"group_id":             "9",
-			"user_id":              "2",
-			"last_read_message_id": "0",
-			"updated_at_ms":        "1700000000123",
+			"group_id":      "9",
+			"user_id":       "2",
+			"last_read_seq": "0",
+			"updated_at_ms": "1700000000123",
 		},
 		"missing timestamp": {
-			"group_id":             "9",
-			"user_id":              "2",
-			"last_read_message_id": "42",
+			"group_id":      "9",
+			"user_id":       "2",
+			"last_read_seq": "42",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

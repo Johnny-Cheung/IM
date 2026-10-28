@@ -1,11 +1,11 @@
--- Snapshot one group's read stats for a message.
+-- Snapshot one group's read stats for a message seq.
 --
 -- KEYS[1] = group:{G}:members
 -- KEYS[2] = group:{G}:dissolved
 -- KEYS[3] = group:{G}:sync_required
 -- KEYS[4] = group:{G}:read
 -- ARGV[1] = requesting user ID
--- ARGV[2] = message ID
+-- ARGV[2] = message seq
 --
 -- Returns {status} on a failure, otherwise {ok, read count, member count,
 -- all read}. The requesting member is excluded from both counts.
@@ -24,10 +24,10 @@ if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
 end
 
 local members = redis.call('SCARD', KEYS[1])
-local message_id = tonumber(ARGV[2])
+local message_seq = tonumber(ARGV[2])
 local readers = redis.call('ZCOUNT', KEYS[4], ARGV[2], '+inf')
 local mine = tonumber(redis.call('ZSCORE', KEYS[4], ARGV[1]) or '0')
-if mine >= message_id then
+if mine >= message_seq then
   readers = readers - 1
 end
 

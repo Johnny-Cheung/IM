@@ -17,7 +17,7 @@ import (
 type DirectReadPersistenceStore interface {
 	UpsertConversationRead(
 		ctx context.Context,
-		userID, peerID, lastReadMessageID uint64,
+		userID, peerID, lastReadSeq uint64,
 		updatedAt time.Time,
 	) error
 }
@@ -33,10 +33,10 @@ type DirectReadPersister struct {
 }
 
 type readStreamEvent struct {
-	UserID            uint64
-	PeerID            uint64
-	LastReadMessageID uint64
-	UpdatedAt         time.Time
+	UserID      uint64
+	PeerID      uint64
+	LastReadSeq uint64
+	UpdatedAt   time.Time
 }
 
 func NewDirectReadPersister(
@@ -170,7 +170,7 @@ func (p *DirectReadPersister) processEntry(ctx context.Context, entry redis.XMes
 		ctx,
 		event.UserID,
 		event.PeerID,
-		event.LastReadMessageID,
+		event.LastReadSeq,
 		event.UpdatedAt,
 	); err != nil {
 		if isPermanentReadPersistError(err) {
@@ -225,22 +225,22 @@ func parseReadStreamEvent(values map[string]interface{}) (readStreamEvent, error
 	if err != nil {
 		return readStreamEvent{}, fmt.Errorf("peer_id: %w", err)
 	}
-	lastReadMessageID, err := parseRedisUint(values["last_read_message_id"])
+	lastReadSeq, err := parseRedisUint(values["last_read_seq"])
 	if err != nil {
-		return readStreamEvent{}, fmt.Errorf("last_read_message_id: %w", err)
+		return readStreamEvent{}, fmt.Errorf("last_read_seq: %w", err)
 	}
 	updatedAtMS, err := parseRedisInt64(values["updated_at_ms"])
 	if err != nil {
 		return readStreamEvent{}, fmt.Errorf("updated_at_ms: %w", err)
 	}
-	if userID == 0 || peerID == 0 || userID == peerID || lastReadMessageID == 0 {
+	if userID == 0 || peerID == 0 || userID == peerID || lastReadSeq == 0 {
 		return readStreamEvent{}, fmt.Errorf("invalid read event identity")
 	}
 	return readStreamEvent{
-		UserID:            userID,
-		PeerID:            peerID,
-		LastReadMessageID: lastReadMessageID,
-		UpdatedAt:         time.UnixMilli(updatedAtMS).UTC(),
+		UserID:      userID,
+		PeerID:      peerID,
+		LastReadSeq: lastReadSeq,
+		UpdatedAt:   time.UnixMilli(updatedAtMS).UTC(),
 	}, nil
 }
 

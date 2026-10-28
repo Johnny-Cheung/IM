@@ -118,8 +118,20 @@ async function main() {
   tab = await browser.tab(run.base);
   await tab.send("Page.addScriptToEvaluateOnNewDocument", { source: `
     window.__imTestSockets = [];
+    window.__imDropInbound = null;
     window.WebSocket = class extends WebSocket {
       constructor(...args) { super(...args); window.__imTestSockets.push(this); }
+      set onmessage(handler) {
+        super.onmessage = (event) => {
+          try {
+            if (window.__imDropInbound && window.__imDropInbound(event)) return;
+          } catch {
+            // Never let the test hook break the app's event handling.
+          }
+          handler.call(this, event);
+        };
+      }
+      get onmessage() { return super.onmessage; }
     };
   ` });
   await tab.login(name("a"), run.password);
@@ -353,9 +365,21 @@ async function main() {
       await tab.waitFor(`(() => {
         const row = [...document.querySelectorAll('#message-list .message-row')]
           .find((el) => el.innerText.includes('回执测试'));
-        return !!row && row.dataset.status === 'sent' && Number(row.dataset.messageId) > 0;
+        return !!row && row.dataset.status === 'sent' && Number(row.dataset.seq) > 0;
       })()`, 5000);
-      await run.request("b", "POST", `/api/conversations/${name("a")}/read`);
+      const sentSeq = await tab.evaluate(`(() => {
+        const row = [...document.querySelectorAll('#message-list .message-row')]
+          .find((el) => el.innerText.includes('回执测试'));
+        return row ? Number(row.dataset.seq) : 0;
+      })()`);
+      run.check("sent message carries a seq", Number.isInteger(sentSeq) && sentSeq >= 1);
+      const readerB = await run.openSocket("b");
+      try {
+        const ack = await readerB.focusDirect(name("a"));
+        run.check("the peer acknowledges the message seq", !ack.error && ack.last_read_seq >= sentSeq);
+      } finally {
+        readerB.close();
+      }
       await tab.waitFor(`(() => {
         const row = [...document.querySelectorAll('#message-list .message-row')]
           .find((el) => el.innerText.includes('回执测试'));
@@ -377,6 +401,78 @@ async function main() {
     await tab.waitFor("document.querySelectorAll('#message-list .message-row').length > 0");
   });
 
+  await scenario("a skipped push is backfilled with after_seq", async () => {
+    await tab.select(directSelector("b"), `/chat/${name("b")}`);
+    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length > 0");
+    const startSeq = directOf(await conversationsOf("a"), name("b")).last_seq;
+    await tab.waitFor(`(() => {
+      const rows = [...document.querySelectorAll('#message-list .message-row')];
+      return Math.max(0, ...rows.map((row) => Number(row.dataset.seq) || 0)) === ${startSeq};
+    })()`, 5000);
+    const keys = [randomUUID(), randomUUID(), randomUUID()];
+    const sent = [];
+    await tab.evaluate(`window.__imDropInbound = (event) => {
+      if (window.__imAllowInjected) return false;
+      try {
+        const frame = JSON.parse(event.data);
+        return frame?.type === "message.created"
+          && ${JSON.stringify(keys)}.includes(frame.message?.client_message_id);
+      } catch {
+        return false;
+      }
+    }`);
+    try {
+      for (const [index, key] of keys.entries()) {
+        const response = await run.request("b", "POST", `/api/conversations/${name("a")}/messages`, {
+          body: `缺口消息 ${index + 1}`,
+          client_message_id: key,
+        });
+        sent.push(response.message);
+      }
+      run.check("server assigned the skipped seqs", sent.every((message, index) => message.seq === startSeq + index + 1));
+      const pulled = [];
+      const off = tab.on("Network.requestWillBeSent", ({ request }) => {
+        try {
+          const url = new URL(request.url);
+          if (url.pathname === `/api/conversations/${name("b")}/messages` && url.searchParams.has("after_seq")) {
+            pulled.push(Number(url.searchParams.get("after_seq")));
+          }
+        } catch {
+          // Ignore non-URL requests.
+        }
+      });
+      try {
+        await tab.evaluate(`(() => {
+          const socket = window.__imTestSockets.find((candidate) => candidate.readyState === WebSocket.OPEN);
+          if (!socket) throw new Error("no open WebSocket to inject into");
+          window.__imAllowInjected = true;
+          socket.dispatchEvent(new MessageEvent("message", {
+            data: JSON.stringify({ type: "message.created", message: ${JSON.stringify(sent[2])} }),
+          }));
+          window.__imAllowInjected = false;
+        })()`);
+        for (const message of sent) {
+          await tab.waitFor(`document.querySelector('#message-list')?.innerText.includes(${JSON.stringify(message.body)})`, 5000);
+        }
+        await waitUntil(() => pulled.length > 0, "the client did not request the missing seq range");
+      } finally {
+        off();
+      }
+      console.log(`Gap backfill requests: ${JSON.stringify(pulled)}`);
+      run.check("a skipped push triggers an after_seq backfill", pulled[0] === startSeq);
+      const visible = await tab.evaluate(`(() => {
+        const rows = [...document.querySelectorAll('#message-list .message-row')];
+        return rows.map((row) => Number(row.dataset.seq)).filter((seq) => Number.isInteger(seq) && seq > 0);
+      })()`);
+      run.check(
+        "the backfilled page closes the gap",
+        sent.every((message) => visible.includes(message.seq)),
+      );
+    } finally {
+      await tab.evaluate("window.__imDropInbound = null; window.__imAllowInjected = false");
+    }
+  });
+
   await scenario("group receipts, reader changes and sender switching", async () => {
     const reads = trackReadRequests();
     try {
@@ -387,8 +483,25 @@ async function main() {
       await tab.waitFor(`(${receiptOf("群回执验证")})?.text === '已读 0/2'`, 5000);
       const initial = await tab.evaluate(receiptOf("群回执验证"));
       run.check("group receipt starts at zero", initial.read === "0" && initial.members === "2" && !initial.all);
+      await tab.waitFor(`(() => {
+        const row = [...document.querySelectorAll('#message-list .message-row')]
+          .find((el) => el.innerText.includes('群回执验证'));
+        return !!row && Number(row.dataset.seq) > 0;
+      })()`, 5000);
+      const groupSentSeq = await tab.evaluate(`(() => {
+        const row = [...document.querySelectorAll('#message-list .message-row')]
+          .find((el) => el.innerText.includes('群回执验证'));
+        return row ? Number(row.dataset.seq) : 0;
+      })()`);
+      run.check("sent group message carries a seq", Number.isInteger(groupSentSeq) && groupSentSeq >= 1);
 
-      await run.request("b", "POST", `/api/groups/${live}/read`);
+      const readerB = await run.openSocket("b");
+      try {
+        const ack = await readerB.focusGroup(live);
+        run.check("the group reader acknowledges the message seq", !ack.error && ack.last_read_seq >= groupSentSeq);
+      } finally {
+        readerB.close();
+      }
       await tab.waitFor(`(${receiptOf("群回执验证")})?.text === '已读 1/2'`, 5000);
       run.check("group receipt follows a reader in real time", true);
 

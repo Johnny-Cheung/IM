@@ -48,6 +48,7 @@ func TestSendMessageUsesDirectAcceptor(t *testing.T) {
 			Created: true,
 			Message: store.Message{
 				ID:              42,
+				Seq:             4,
 				SenderID:        1,
 				RecipientID:     2,
 				ClientMessageID: "client-12345678",
@@ -79,7 +80,8 @@ func TestSendMessageUsesDirectAcceptor(t *testing.T) {
 		t.Fatalf("accept request = %#v", acceptor.request)
 	}
 	response := decodeBody[sendMessageResponse](t, recorder)
-	if response.Message.ID != 42 || response.Message.Body != "hello" {
+	if response.Message.ID != 42 || response.Message.Seq != 4 ||
+		response.Message.Body != "hello" {
 		t.Fatalf("response message = %#v", response.Message)
 	}
 }
@@ -93,6 +95,8 @@ func TestSendMessageMapsDirectAcceptorErrors(t *testing.T) {
 	}{
 		{name: "conflict", err: store.ErrMessageConflict, statusCode: http.StatusConflict, code: "client_message_id_conflict"},
 		{name: "unavailable", err: messaging.ErrMessageServiceUnavailable, statusCode: http.StatusServiceUnavailable, code: "message_service_unavailable"},
+		{name: "seq not ready", err: messaging.ErrSeqNotReady, statusCode: http.StatusServiceUnavailable, code: "message_service_unavailable"},
+		{name: "seq overflow", err: messaging.ErrSeqOverflow, statusCode: http.StatusServiceUnavailable, code: "message_service_unavailable"},
 		{name: "id exhausted", err: store.ErrMessageIDExhausted, statusCode: http.StatusServiceUnavailable, code: "message_id_exhausted"},
 	}
 	for _, testCase := range cases {
@@ -132,12 +136,14 @@ func TestListConversations(t *testing.T) {
 	dataStore := authenticatedChatStore()
 	dataStore.conversations = []store.Conversation{
 		{
-			User:                  store.PublicUser{Username: "bob", Nickname: "Bob"},
-			IsFriend:              true,
-			UnreadCount:           2,
-			PeerLastReadMessageID: 4,
+			User:            store.PublicUser{Username: "bob", Nickname: "Bob"},
+			IsFriend:        true,
+			UnreadCount:     2,
+			LastSeq:         7,
+			PeerLastReadSeq: 4,
 			LastMessage: &store.Message{
 				ID:              7,
+				Seq:             7,
 				SenderID:        1,
 				RecipientID:     2,
 				ClientMessageID: "client-12345678",
@@ -152,8 +158,10 @@ func TestListConversations(t *testing.T) {
 		{
 			User:     store.PublicUser{Username: "dave", Nickname: "Dave"},
 			IsFriend: false,
+			LastSeq:  6,
 			LastMessage: &store.Message{
 				ID:              6,
+				Seq:             6,
 				SenderID:        4,
 				RecipientID:     1,
 				ClientMessageID: "client-87654321",
@@ -177,14 +185,15 @@ func TestListConversations(t *testing.T) {
 		first.LastMessage == nil || first.LastMessage.Recipient == nil ||
 		first.LastMessage.Sender.Username != "alice" ||
 		first.LastMessage.Recipient.Username != "bob" ||
-		first.UnreadCount != 2 || first.PeerLastReadMessageID != 4 {
+		first.UnreadCount != 2 || first.LastSeq != 7 || first.PeerLastReadSeq != 4 || first.LastMessage.Seq != 7 {
 		t.Fatalf("first conversation = %#v", first)
 	}
 	second := response.Conversations[1]
 	if second.User == nil || second.IsFriend ||
 		second.LastMessage == nil || second.LastMessage.Recipient == nil ||
 		second.LastMessage.Sender.Username != "dave" ||
-		second.LastMessage.Recipient.Username != "alice" {
+		second.LastMessage.Recipient.Username != "alice" ||
+		second.LastSeq != 6 {
 		t.Fatalf("second conversation = %#v", second)
 	}
 	third := response.Conversations[2]
@@ -235,6 +244,7 @@ func TestListMessagesServesCompleteRedisPageWithoutStore(t *testing.T) {
 	reader := &directReaderStub{page: messaging.ConversationPage{
 		Page: store.MessagePage{Messages: []store.Message{{
 			ID:              42,
+			Seq:             42,
 			SenderID:        2,
 			RecipientID:     1,
 			ClientMessageID: "client-12345678",
@@ -260,7 +270,8 @@ func TestListMessagesServesCompleteRedisPageWithoutStore(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if len(response.Messages) != 1 || response.Messages[0].Body != "from redis" {
+	if len(response.Messages) != 1 || response.Messages[0].Seq != 42 ||
+		response.Messages[0].Body != "from redis" {
 		t.Fatalf("messages = %#v", response.Messages)
 	}
 }
@@ -270,6 +281,7 @@ func TestListMessagesMergesHotPageWhenRedisIsIncomplete(t *testing.T) {
 	dataStore := authenticatedChatStore()
 	dataStore.messagePage = store.MessagePage{Messages: []store.Message{{
 		ID:              41,
+		Seq:             41,
 		SenderID:        2,
 		RecipientID:     1,
 		ClientMessageID: "client-12345678",
@@ -279,6 +291,7 @@ func TestListMessagesMergesHotPageWhenRedisIsIncomplete(t *testing.T) {
 	reader := &directReaderStub{page: messaging.ConversationPage{
 		Page: store.MessagePage{Messages: []store.Message{{
 			ID:              42,
+			Seq:             42,
 			SenderID:        1,
 			RecipientID:     2,
 			ClientMessageID: "client-87654321",
@@ -311,6 +324,42 @@ func TestListMessagesMergesHotPageWhenRedisIsIncomplete(t *testing.T) {
 	}
 }
 
+func TestListMessagesFallsBackWhenCounterIsMissing(t *testing.T) {
+	now := time.Now().UTC()
+	dataStore := authenticatedChatStore()
+	dataStore.messagePage = store.MessagePage{Messages: []store.Message{{
+		ID:              41,
+		Seq:             41,
+		SenderID:        2,
+		RecipientID:     1,
+		ClientMessageID: "client-12345678",
+		Body:            "from mysql",
+		CreatedAt:       now,
+	}}}
+	// The reader reports the empty, incomplete page produced by a lost counter.
+	reader := &directReaderStub{page: messaging.ConversationPage{Complete: false}}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	New(dataStore, WithDirectMessageReader(reader)).Register(router)
+
+	recorder := doJSON(t, router, http.MethodGet, "/api/conversations/bob/messages", nil, authTestCookie())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if dataStore.listMessagesCall.userID != 1 {
+		t.Fatal("store was not queried when the seq counter was missing")
+	}
+
+	var response messagePageResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Messages) != 1 || response.Messages[0].Body != "from mysql" {
+		t.Fatalf("messages = %#v, want the MySQL history", response.Messages)
+	}
+}
+
 func TestSyncMessagesReturnsFeedWithPeers(t *testing.T) {
 	now := time.Now().UTC()
 	dataStore := authenticatedFriendStore()
@@ -322,6 +371,7 @@ func TestSyncMessagesReturnsFeedWithPeers(t *testing.T) {
 			Messages: []store.Message{
 				{
 					ID:              11,
+					Seq:             4,
 					SenderID:        2,
 					RecipientID:     1,
 					ClientMessageID: "client-00000001",
@@ -330,6 +380,7 @@ func TestSyncMessagesReturnsFeedWithPeers(t *testing.T) {
 				},
 				{
 					ID:              12,
+					Seq:             5,
 					SenderID:        1,
 					RecipientID:     2,
 					ClientMessageID: "client-00000002",
@@ -367,6 +418,9 @@ func TestSyncMessagesReturnsFeedWithPeers(t *testing.T) {
 	if response.Messages[0].Body != "incoming" || response.Messages[1].Body != "outgoing" {
 		t.Fatalf("bodies = %#v", response.Messages)
 	}
+	if response.Messages[0].Seq != 4 || response.Messages[1].Seq != 5 {
+		t.Fatalf("sync seq = %#v", response.Messages)
+	}
 }
 
 func TestSyncMessagesFallsBackWithoutRedis(t *testing.T) {
@@ -386,6 +440,7 @@ func TestListConversationsUsesHotLastMessage(t *testing.T) {
 	dataStore := authenticatedFriendStore()
 	stored := store.Message{
 		ID:              5,
+		Seq:             5,
 		SenderID:        2,
 		RecipientID:     1,
 		ClientMessageID: "client-00000005",
@@ -401,6 +456,7 @@ func TestListConversationsUsesHotLastMessage(t *testing.T) {
 	reader := &directReaderStub{lastMessages: map[uint64]store.Message{
 		2: {
 			ID:              9,
+			Seq:             9,
 			SenderID:        2,
 			RecipientID:     1,
 			ClientMessageID: "client-00000009",
@@ -438,6 +494,7 @@ func TestListMessages(t *testing.T) {
 		Messages: []store.Message{
 			{
 				ID:              9,
+				Seq:             3,
 				SenderID:        2,
 				RecipientID:     1,
 				ClientMessageID: "client-12345678",
@@ -451,7 +508,7 @@ func TestListMessages(t *testing.T) {
 
 	recorder := doJSON(
 		t, router, http.MethodGet,
-		"/api/conversations/bob/messages?before_id=20&limit=10",
+		"/api/conversations/bob/messages?before_seq=20&limit=10",
 		nil, authTestCookie(),
 	)
 	if recorder.Code != http.StatusOK {
@@ -459,7 +516,7 @@ func TestListMessages(t *testing.T) {
 	}
 	if dataStore.listMessagesCall.userID != 1 ||
 		dataStore.listMessagesCall.otherID != 2 ||
-		dataStore.listMessagesCall.beforeID != 20 ||
+		dataStore.listMessagesCall.beforeSeq != 20 ||
 		dataStore.listMessagesCall.limit != 10 {
 		t.Fatalf("list messages call = %#v", dataStore.listMessagesCall)
 	}
@@ -468,7 +525,7 @@ func TestListMessages(t *testing.T) {
 		t.Fatalf("response = %#v", response)
 	}
 	message := response.Messages[0]
-	if message.Body != "hi alice" || message.Sender.Username != "bob" ||
+	if message.Seq != 3 || message.Body != "hi alice" || message.Sender.Username != "bob" ||
 		message.Recipient.Username != "alice" {
 		t.Fatalf("message = %#v", message)
 	}
@@ -482,7 +539,7 @@ func TestListMessagesDefaults(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
 	}
-	if dataStore.listMessagesCall.beforeID != 0 || dataStore.listMessagesCall.limit != defaultMessagePageSize {
+	if dataStore.listMessagesCall.beforeSeq != 0 || dataStore.listMessagesCall.limit != defaultMessagePageSize {
 		t.Fatalf("list messages call = %#v", dataStore.listMessagesCall)
 	}
 }
@@ -491,7 +548,7 @@ func TestListMessagesRejectsInvalidPaging(t *testing.T) {
 	router := testRouter(authenticatedChatStore())
 
 	for _, path := range []string{
-		"/api/conversations/bob/messages?before_id=abc",
+		"/api/conversations/bob/messages?before_seq=abc",
 		"/api/conversations/bob/messages?limit=0",
 		"/api/conversations/bob/messages?limit=51",
 	} {
@@ -513,6 +570,7 @@ func TestListMessagesAfter(t *testing.T) {
 	dataStore.messageAfterPage = store.MessagePage{
 		Messages: []store.Message{{
 			ID:              12,
+			Seq:             12,
 			SenderID:        1,
 			RecipientID:     2,
 			ClientMessageID: "client-12345678",
@@ -525,7 +583,7 @@ func TestListMessagesAfter(t *testing.T) {
 
 	recorder := doJSON(
 		t, router, http.MethodGet,
-		"/api/conversations/bob/messages?after_id=11&limit=10",
+		"/api/conversations/bob/messages?after_seq=11&limit=10",
 		nil, authTestCookie(),
 	)
 	if recorder.Code != http.StatusOK {
@@ -533,13 +591,13 @@ func TestListMessagesAfter(t *testing.T) {
 	}
 	if dataStore.listMessagesAfterCall.userID != 1 ||
 		dataStore.listMessagesAfterCall.otherID != 2 ||
-		dataStore.listMessagesAfterCall.afterID != 11 ||
+		dataStore.listMessagesAfterCall.afterSeq != 11 ||
 		dataStore.listMessagesAfterCall.limit != 10 {
 		t.Fatalf("list messages after call = %#v", dataStore.listMessagesAfterCall)
 	}
 	response := decodeBody[messagePageResponse](t, recorder)
 	if !response.HasMore || len(response.Messages) != 1 ||
-		response.Messages[0].Body != "after cursor" {
+		response.Messages[0].Seq != 12 || response.Messages[0].Body != "after cursor" {
 		t.Fatalf("response = %#v", response)
 	}
 }
@@ -549,7 +607,7 @@ func TestListMessagesRejectsTwoCursors(t *testing.T) {
 
 	recorder := doJSON(
 		t, router, http.MethodGet,
-		"/api/conversations/bob/messages?before_id=20&after_id=10",
+		"/api/conversations/bob/messages?before_seq=20&after_seq=10",
 		nil, authTestCookie(),
 	)
 	if recorder.Code != http.StatusBadRequest {
@@ -560,72 +618,12 @@ func TestListMessagesRejectsTwoCursors(t *testing.T) {
 	}
 }
 
-func TestMarkConversationRead(t *testing.T) {
-	dataStore := authenticatedChatStore()
-	dataStore.markReadResult = 42
-	dataStore.markReadAdvanced = true
-	router := testRouter(dataStore)
-
-	recorder := doJSON(t, router, http.MethodPost, "/api/conversations/bob/read", nil, authTestCookie())
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
-	}
-	if dataStore.markReadCall.userID != 1 ||
-		dataStore.markReadCall.peerID != 2 ||
-		dataStore.markReadCall.now.IsZero() {
-		t.Fatalf("mark read call = %#v", dataStore.markReadCall)
-	}
-	response := decodeBody[readStateResponse](t, recorder)
-	if response.LastReadMessageID != 42 {
-		t.Fatalf("last read message id = %d, want 42", response.LastReadMessageID)
-	}
-}
-
-func TestReadPositionBounds(t *testing.T) {
-	for _, path := range []string{"/api/conversations/bob/read", "/api/groups/7/read"} {
-		t.Run(path, func(t *testing.T) {
-			dataStore := authenticatedChatStore()
-			router := testRouter(dataStore)
-			recorder := doJSON(t, router, http.MethodPost, path+"?through_id=21", nil, authTestCookie())
-			if recorder.Code != http.StatusOK {
-				t.Fatalf("bounded read status = %d", recorder.Code)
-			}
-			if strings.Contains(path, "/groups/") {
-				if dataStore.markGroupReadThrough != 21 {
-					t.Fatalf("group bound = %d, want 21", dataStore.markGroupReadThrough)
-				}
-			} else if dataStore.markReadCall.throughID != 21 {
-				t.Fatalf("private bound = %d, want 21", dataStore.markReadCall.throughID)
-			}
-			for _, bound := range []string{"-1", "abc", "18446744073709551616"} {
-				recorder = doJSON(t, router, http.MethodPost, path+"?through_id="+bound, nil, authTestCookie())
-				if recorder.Code != http.StatusBadRequest || errorCode(t, recorder) != "invalid_request" {
-					t.Fatalf("bound %q status = %d, body = %s", bound, recorder.Code, recorder.Body.String())
-				}
-			}
-		})
-	}
-}
-
-func TestMarkConversationReadToSelf(t *testing.T) {
-	dataStore := authenticatedChatStore()
-	dataStore.user = store.User{ID: 1, Username: "alice", Nickname: "Alice"}
-	router := testRouter(dataStore)
-
-	recorder := doJSON(t, router, http.MethodPost, "/api/conversations/alice/read", nil, authTestCookie())
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
-	}
-	if got := errorCode(t, recorder); got != "cannot_message_self" {
-		t.Fatalf("error code = %q, want cannot_message_self", got)
-	}
-}
-
 func TestSendMessage(t *testing.T) {
 	now := time.Now().UTC()
 	dataStore := authenticatedChatStore()
 	dataStore.createdMessage = store.Message{
 		ID:              15,
+		Seq:             9,
 		SenderID:        1,
 		RecipientID:     2,
 		ClientMessageID: "client-12345678",
@@ -649,7 +647,8 @@ func TestSendMessage(t *testing.T) {
 		t.Fatalf("create message call = %#v", dataStore.createMessageCall)
 	}
 	response := decodeBody[sendMessageResponse](t, recorder)
-	if response.Message.ID != 15 || response.Message.Body != "hello bob" ||
+	if response.Message.ID != 15 || response.Message.Seq != 9 ||
+		response.Message.Body != "hello bob" ||
 		response.Message.Sender.Username != "alice" ||
 		response.Message.Recipient.Username != "bob" {
 		t.Fatalf("response = %#v", response)
@@ -660,6 +659,7 @@ func TestSendMessageDuplicate(t *testing.T) {
 	dataStore := authenticatedChatStore()
 	dataStore.createdMessage = store.Message{
 		ID:              15,
+		Seq:             9,
 		SenderID:        1,
 		RecipientID:     2,
 		ClientMessageID: "client-12345678",
@@ -677,7 +677,7 @@ func TestSendMessageDuplicate(t *testing.T) {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
 	}
 	response := decodeBody[sendMessageResponse](t, recorder)
-	if response.Message.ID != 15 {
+	if response.Message.ID != 15 || response.Message.Seq != 9 {
 		t.Fatalf("message = %#v", response.Message)
 	}
 }
@@ -768,7 +768,6 @@ func TestChatEndpointsRequireSession(t *testing.T) {
 		{method: http.MethodGet, path: "/api/conversations"},
 		{method: http.MethodGet, path: "/api/conversations/bob/messages"},
 		{method: http.MethodPost, path: "/api/conversations/bob/messages"},
-		{method: http.MethodPost, path: "/api/conversations/bob/read"},
 		{method: http.MethodGet, path: "/api/ws"},
 	}
 
@@ -791,6 +790,7 @@ func TestWebSocketReceivesSavedMessage(t *testing.T) {
 	dataStore := authenticatedChatStore()
 	dataStore.createdMessage = store.Message{
 		ID:              21,
+		Seq:             11,
 		SenderID:        1,
 		RecipientID:     2,
 		ClientMessageID: "client-12345678",
@@ -842,7 +842,7 @@ func TestWebSocketReceivesSavedMessage(t *testing.T) {
 		t.Fatalf("decode websocket message: %v", err)
 	}
 	if event.Type != "message.created" || event.Message.ID != 21 ||
-		event.Message.Body != "live hello" {
+		event.Message.Seq != 11 || event.Message.Body != "live hello" {
 		t.Fatalf("event = %#v", event)
 	}
 }
@@ -886,49 +886,5 @@ func TestWebSocketReplacesExistingConnection(t *testing.T) {
 	_ = first.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, _, err := first.ReadMessage(); !websocket.IsCloseError(err, wsCloseReplaced) {
 		t.Fatalf("first connection error = %v, want close code %d", err, wsCloseReplaced)
-	}
-}
-
-func TestWebSocketReceivesReadEvent(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	dataStore := authenticatedChatStore()
-	dataStore.markReadResult = 42
-	dataStore.markReadAdvanced = true
-	api := New(dataStore)
-	router := gin.New()
-	api.Register(router)
-	server := httptest.NewServer(router)
-	defer server.Close()
-
-	header := http.Header{"Cookie": []string{sessionCookieName + "=token"}}
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/ws"
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
-	if err != nil {
-		t.Fatalf("dial websocket: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for api.hub.activeCount(1) == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	recorder := doJSON(t, router, http.MethodPost, "/api/conversations/bob/read", nil, authTestCookie())
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("read status = %d, want %d", recorder.Code, http.StatusOK)
-	}
-
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, payload, err := conn.ReadMessage()
-	if err != nil {
-		t.Fatalf("read websocket event: %v", err)
-	}
-	var event wsReadEvent
-	if err := json.Unmarshal(payload, &event); err != nil {
-		t.Fatalf("decode read event: %v", err)
-	}
-	if event.Type != "messages.read" || event.Reader != "alice" ||
-		event.Peer != "bob" || event.LastReadMessageID != 42 {
-		t.Fatalf("event = %#v", event)
 	}
 }

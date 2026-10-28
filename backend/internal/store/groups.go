@@ -56,9 +56,11 @@ type GroupDetail struct {
 }
 
 // GroupMessage is a persisted group chat message. ID is the public server
-// message ID; the MySQL auto-increment primary key is internal only.
+// message ID; the MySQL auto-increment primary key is internal only. Seq is the
+// per-group sequence.
 type GroupMessage struct {
 	ID              uint64
+	Seq             uint64
 	GroupID         uint64
 	SenderID        uint64
 	Sender          PublicUser
@@ -73,13 +75,15 @@ type GroupMessagePage struct {
 	HasMore  bool
 }
 
-// GroupConversation is a group entry in the unified chat list.
+// GroupConversation is a group entry in the unified chat list. LastSeq is the
+// group conversation counter.
 type GroupConversation struct {
 	Group       Group
 	MemberCount int
 	IsOwner     bool
 	LastMessage *GroupMessage
 	UnreadCount int
+	LastSeq     uint64
 }
 
 // CreateGroup creates a group owned by ownerID with the given members. Every
@@ -124,7 +128,7 @@ func (s *Store) CreateGroup(
 	}
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO group_members (group_id, user_id, joined_at, last_read_message_id)
+		`INSERT INTO group_members (group_id, user_id, joined_at, last_read_seq)
 		 VALUES (?, ?, ?, 0)`,
 		groupID, ownerID, now,
 	); err != nil {
@@ -132,7 +136,7 @@ func (s *Store) CreateGroup(
 	}
 	for _, memberID := range members {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO group_members (group_id, user_id, joined_at, last_read_message_id)
+			`INSERT INTO group_members (group_id, user_id, joined_at, last_read_seq)
 			 VALUES (?, ?, ?, 0)`,
 			groupID, memberID, now,
 		); err != nil {
@@ -218,8 +222,11 @@ func (s *Store) listGroupConversations(
 	}
 
 	latestRows, err := s.db.QueryContext(ctx,
-		`SELECT gm.server_message_id, gm.group_id, gm.sender_id, sender.username, sender.nickname,
-		        gm.client_message_id, gm.body, gm.created_at
+		`SELECT gm.server_message_id, COALESCE(gm.seq, 0), gm.group_id, gm.sender_id,
+		        sender.username, sender.nickname, gm.client_message_id, gm.body, gm.created_at,
+		        (SELECT COALESCE(MAX(stats.seq), 0)
+		         FROM group_messages stats
+		         WHERE stats.group_id = gm.group_id)
 		 FROM group_messages gm
 		 JOIN chat_groups g ON g.id = gm.group_id AND g.dissolved_at IS NULL
 		 JOIN group_members member
@@ -240,8 +247,10 @@ func (s *Store) listGroupConversations(
 	}
 	for latestRows.Next() {
 		var message GroupMessage
+		var lastSeq uint64
 		if err := latestRows.Scan(
 			&message.ID,
+			&message.Seq,
 			&message.GroupID,
 			&message.SenderID,
 			&message.Sender.Username,
@@ -249,6 +258,7 @@ func (s *Store) listGroupConversations(
 			&message.ClientMessageID,
 			&message.Body,
 			&message.CreatedAt,
+			&lastSeq,
 		); err != nil {
 			_ = latestRows.Close()
 			return nil, fmt.Errorf("scan latest group message: %w", err)
@@ -256,6 +266,7 @@ func (s *Store) listGroupConversations(
 		if index, ok := indexByGroupID[message.GroupID]; ok {
 			messageCopy := message
 			conversations[index].LastMessage = &messageCopy
+			conversations[index].LastSeq = lastSeq
 		}
 	}
 	if err := latestRows.Err(); err != nil {
@@ -273,7 +284,7 @@ func (s *Store) listGroupConversations(
 			 JOIN group_members member
 			   ON member.group_id = gm.group_id AND member.user_id = ?
 			 JOIN chat_groups g ON g.id = gm.group_id AND g.dissolved_at IS NULL
-			 WHERE gm.server_message_id > member.last_read_message_id
+			 WHERE COALESCE(gm.seq, 0) > member.last_read_seq
 			   AND gm.sender_id <> ?
 			 GROUP BY gm.group_id`,
 			userID, userID,
@@ -550,7 +561,7 @@ func (s *Store) ListGroupMemberIDs(ctx context.Context, groupID uint64) ([]uint6
 // rows for rebuilding the Redis group projection.
 func (s *Store) ListGroupMembershipProjections(ctx context.Context) ([]GroupMembershipProjection, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT g.id, g.dissolved_at, member.user_id, member.last_read_message_id
+		`SELECT g.id, g.dissolved_at, member.user_id, member.last_read_seq
 		 FROM chat_groups g
 		 LEFT JOIN group_members member ON member.group_id = g.id
 		 ORDER BY g.id, member.user_id`,
@@ -565,8 +576,8 @@ func (s *Store) ListGroupMembershipProjections(ctx context.Context) ([]GroupMemb
 	for rows.Next() {
 		var groupID uint64
 		var dissolvedAt sql.NullTime
-		var memberID, lastReadMessageID sql.NullInt64
-		if err := rows.Scan(&groupID, &dissolvedAt, &memberID, &lastReadMessageID); err != nil {
+		var memberID, lastReadSeq sql.NullInt64
+		if err := rows.Scan(&groupID, &dissolvedAt, &memberID, &lastReadSeq); err != nil {
 			return nil, fmt.Errorf("scan group membership projection: %w", err)
 		}
 		index, ok := indexByGroupID[groupID]
@@ -584,8 +595,8 @@ func (s *Store) ListGroupMembershipProjections(ctx context.Context) ([]GroupMemb
 			if projections[index].Positions == nil {
 				projections[index].Positions = make(map[uint64]uint64)
 			}
-			if lastReadMessageID.Valid && lastReadMessageID.Int64 > 0 {
-				projections[index].Positions[member] = uint64(lastReadMessageID.Int64)
+			if lastReadSeq.Valid && lastReadSeq.Int64 > 0 {
+				projections[index].Positions[member] = uint64(lastReadSeq.Int64)
 			} else {
 				projections[index].Positions[member] = 0
 			}
@@ -597,28 +608,29 @@ func (s *Store) ListGroupMembershipProjections(ctx context.Context) ([]GroupMemb
 	return projections, nil
 }
 
-// ListGroupMessages returns a page of group messages. A beforeID of zero
-// starts from the newest message. Messages are returned oldest first.
+// ListGroupMessages returns a page of group messages ordered by seq. A
+// beforeSeq of zero starts from the newest message. Messages are returned
+// oldest first.
 func (s *Store) ListGroupMessages(
 	ctx context.Context,
-	userID, groupID, beforeID uint64,
+	userID, groupID, beforeSeq uint64,
 	limit int,
 ) (GroupMessagePage, error) {
 	if err := s.ensureGroupMember(ctx, userID, groupID); err != nil {
 		return GroupMessagePage{}, err
 	}
 
-	query := `SELECT gm.server_message_id, gm.group_id, gm.sender_id, sender.username, sender.nickname,
-	                 gm.client_message_id, gm.body, gm.created_at
+	query := `SELECT gm.server_message_id, COALESCE(gm.seq, 0), gm.group_id, gm.sender_id,
+	                 sender.username, sender.nickname, gm.client_message_id, gm.body, gm.created_at
 	          FROM group_messages gm
 	          JOIN users sender ON sender.id = gm.sender_id
 	          WHERE gm.group_id = ?`
 	args := []any{groupID}
-	if beforeID > 0 {
-		query += ` AND gm.server_message_id < ?`
-		args = append(args, beforeID)
+	if beforeSeq > 0 {
+		query += ` AND gm.seq < ?`
+		args = append(args, beforeSeq)
 	}
-	query += ` ORDER BY gm.server_message_id DESC LIMIT ?`
+	query += ` ORDER BY gm.seq DESC LIMIT ?`
 	args = append(args, limit+1)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -632,6 +644,7 @@ func (s *Store) ListGroupMessages(
 		var message GroupMessage
 		if err := rows.Scan(
 			&message.ID,
+			&message.Seq,
 			&message.GroupID,
 			&message.SenderID,
 			&message.Sender.Username,
@@ -659,10 +672,11 @@ func (s *Store) ListGroupMessages(
 	return GroupMessagePage{Messages: messages, HasMore: hasMore}, nil
 }
 
-// ListGroupMessagesAfter returns messages newer than afterID, oldest first.
+// ListGroupMessagesAfter returns messages with a seq greater than afterSeq,
+// oldest first.
 func (s *Store) ListGroupMessagesAfter(
 	ctx context.Context,
-	userID, groupID, afterID uint64,
+	userID, groupID, afterSeq uint64,
 	limit int,
 ) (GroupMessagePage, error) {
 	if err := s.ensureGroupMember(ctx, userID, groupID); err != nil {
@@ -670,13 +684,13 @@ func (s *Store) ListGroupMessagesAfter(
 	}
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT gm.server_message_id, gm.group_id, gm.sender_id, sender.username, sender.nickname,
-		        gm.client_message_id, gm.body, gm.created_at
+		`SELECT gm.server_message_id, COALESCE(gm.seq, 0), gm.group_id, gm.sender_id,
+		        sender.username, sender.nickname, gm.client_message_id, gm.body, gm.created_at
 		 FROM group_messages gm
 		 JOIN users sender ON sender.id = gm.sender_id
-		 WHERE gm.group_id = ? AND gm.server_message_id > ?
-		 ORDER BY gm.server_message_id ASC LIMIT ?`,
-		groupID, afterID, limit+1,
+		 WHERE gm.group_id = ? AND gm.seq > ?
+		 ORDER BY gm.seq ASC LIMIT ?`,
+		groupID, afterSeq, limit+1,
 	)
 	if err != nil {
 		return GroupMessagePage{}, fmt.Errorf("list group messages after: %w", err)
@@ -688,6 +702,7 @@ func (s *Store) ListGroupMessagesAfter(
 		var message GroupMessage
 		if err := rows.Scan(
 			&message.ID,
+			&message.Seq,
 			&message.GroupID,
 			&message.SenderID,
 			&message.Sender.Username,
@@ -771,11 +786,17 @@ func (s *Store) CreateGroupMessage(
 	if serverMessageID > MaxSafeMessageID {
 		return GroupMessage{}, false, ErrMessageIDExhausted
 	}
+	// The chat_groups row is locked above, which serializes group seq
+	// allocation.
+	seq, err := nextGroupSeq(ctx, tx, groupID)
+	if err != nil {
+		return GroupMessage{}, false, err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO group_messages
-		   (server_message_id, group_id, sender_id, client_message_id, body, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		serverMessageID, groupID, senderID, clientMessageID, body, now,
+		   (server_message_id, seq, group_id, sender_id, client_message_id, body, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		serverMessageID, seq, groupID, senderID, clientMessageID, body, now,
 	); err != nil {
 		return GroupMessage{}, false, fmt.Errorf("insert group message: %w", err)
 	}
@@ -788,6 +809,7 @@ func (s *Store) CreateGroupMessage(
 	}
 	return GroupMessage{
 		ID:              serverMessageID,
+		Seq:             seq,
 		GroupID:         groupID,
 		SenderID:        senderID,
 		Sender:          sender,
@@ -797,63 +819,16 @@ func (s *Store) CreateGroupMessage(
 	}, true, nil
 }
 
-// AdvanceGroupReadThrough advances a member's group read position without
-// requiring the message to be present in MySQL yet. The accepted watermark is
-// supplied by the Redis message path.
-func (s *Store) AdvanceGroupReadThrough(
-	ctx context.Context,
-	userID, groupID, throughID uint64,
-) (uint64, bool, error) {
-	if throughID == 0 {
-		return 0, false, nil
-	}
-	if err := s.ensureGroupMember(ctx, userID, groupID); err != nil {
-		return 0, false, err
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, false, fmt.Errorf("begin advance group read transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	var existing uint64
-	if err := tx.QueryRowContext(ctx,
-		`SELECT last_read_message_id
-		 FROM group_members
-		 WHERE group_id = ? AND user_id = ?
-		 FOR UPDATE`,
-		groupID, userID,
-	).Scan(&existing); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, false, ErrGroupNotFound
-		}
-		return 0, false, fmt.Errorf("load group read position: %w", err)
-	}
-	if throughID <= existing {
-		if err := tx.Commit(); err != nil {
-			return 0, false, fmt.Errorf("commit unchanged group read position: %w", err)
-		}
-		return existing, false, nil
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE group_members SET last_read_message_id = ?
-		 WHERE group_id = ? AND user_id = ?`,
-		throughID, groupID, userID,
-	); err != nil {
-		return 0, false, fmt.Errorf("update group read position: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, false, fmt.Errorf("commit group read position: %w", err)
-	}
-	return throughID, true, nil
-}
-
 // PersistGroupMessage inserts an asynchronously accepted group message
 // idempotently. It does not re-check membership because acceptance already did.
+// A seq that already belongs to a different message returns ErrSeqConflict so
+// the consumer can acknowledge instead of retrying forever.
 func (s *Store) PersistGroupMessage(ctx context.Context, message GroupMessage) (bool, error) {
 	if message.ID == 0 || message.ID > MaxSafeMessageID {
 		return false, ErrMessageIDExhausted
+	}
+	if message.Seq == 0 || message.Seq > MaxSafeSeq {
+		return false, ErrSeqInvalid
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -864,10 +839,11 @@ func (s *Store) PersistGroupMessage(ctx context.Context, message GroupMessage) (
 
 	result, err := tx.ExecContext(ctx,
 		`INSERT INTO group_messages
-		   (server_message_id, group_id, sender_id, client_message_id, body, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		   (server_message_id, seq, group_id, sender_id, client_message_id, body, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON DUPLICATE KEY UPDATE id = id`,
 		message.ID,
+		message.Seq,
 		message.GroupID,
 		message.SenderID,
 		message.ClientMessageID,
@@ -895,6 +871,20 @@ func (s *Store) PersistGroupMessage(ctx context.Context, message GroupMessage) (
 	if errors.Is(err, sql.ErrNoRows) {
 		existing, err = loadGroupMessageByClientID(ctx, tx, message.GroupID, message.SenderID, message.ClientMessageID)
 	}
+	if errors.Is(err, sql.ErrNoRows) {
+		conflicting, conflictErr := loadGroupMessageByGroupSeq(ctx, tx, message.GroupID, message.Seq)
+		switch {
+		case conflictErr == nil:
+			return false, fmt.Errorf(
+				"%w: group %d seq %d belongs to message %d",
+				ErrSeqConflict, message.GroupID, message.Seq, conflicting.ID,
+			)
+		case !errors.Is(conflictErr, sql.ErrNoRows):
+			return false, conflictErr
+		default:
+			return false, ErrMessageConflict
+		}
+	}
 	if err != nil {
 		return false, fmt.Errorf("load duplicate persisted group message: %w", err)
 	}
@@ -909,76 +899,12 @@ func (s *Store) PersistGroupMessage(ctx context.Context, message GroupMessage) (
 
 func sameGroupMessage(left, right GroupMessage) bool {
 	return left.ID == right.ID &&
+		left.Seq == right.Seq &&
 		left.GroupID == right.GroupID &&
 		left.SenderID == right.SenderID &&
 		left.ClientMessageID == right.ClientMessageID &&
 		left.Body == right.Body &&
 		left.CreatedAt.Truncate(time.Millisecond).Equal(right.CreatedAt.Truncate(time.Millisecond))
-}
-
-// MarkGroupRead advances the member's read position to the latest group
-// message, capped at throughID when nonzero. The returned bool reports whether
-// it advanced.
-func (s *Store) MarkGroupRead(
-	ctx context.Context,
-	userID, groupID, throughID uint64,
-) (uint64, bool, error) {
-	if err := s.ensureGroupMember(ctx, userID, groupID); err != nil {
-		return 0, false, err
-	}
-
-	var latest uint64
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(server_message_id), 0) FROM group_messages
-		 WHERE group_id = ? AND (? = 0 OR server_message_id <= ?)`,
-		groupID, throughID, throughID,
-	).Scan(&latest); err != nil {
-		return 0, false, fmt.Errorf("find latest group message: %w", err)
-	}
-	if latest == 0 {
-		return 0, false, nil
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, false, fmt.Errorf("begin mark group read transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	var existing uint64
-	err = tx.QueryRowContext(ctx,
-		`SELECT last_read_message_id
-		 FROM group_members
-		 WHERE group_id = ? AND user_id = ?
-		 FOR UPDATE`,
-		groupID, userID,
-	).Scan(&existing)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, false, ErrGroupNotFound
-	}
-	if err != nil {
-		return 0, false, fmt.Errorf("load group read position: %w", err)
-	}
-
-	advanced := false
-	if latest > existing {
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE group_members SET last_read_message_id = ?
-			 WHERE group_id = ? AND user_id = ?`,
-			latest, groupID, userID,
-		); err != nil {
-			return 0, false, fmt.Errorf("update group read position: %w", err)
-		}
-		advanced = true
-	}
-
-	if err := tx.Commit(); err != nil {
-		return 0, false, fmt.Errorf("commit group read position: %w", err)
-	}
-	if advanced {
-		return latest, true, nil
-	}
-	return existing, false, nil
 }
 
 func (s *Store) ensureGroupMember(ctx context.Context, userID, groupID uint64) error {
@@ -1090,8 +1016,8 @@ func loadGroupMessageByServerID(
 ) (GroupMessage, error) {
 	var message GroupMessage
 	err := tx.QueryRowContext(ctx,
-		`SELECT gm.server_message_id, gm.group_id, gm.sender_id, sender.username, sender.nickname,
-		        gm.client_message_id, gm.body, gm.created_at
+		`SELECT gm.server_message_id, COALESCE(gm.seq, 0), gm.group_id, gm.sender_id,
+		        sender.username, sender.nickname, gm.client_message_id, gm.body, gm.created_at
 		 FROM group_messages gm
 		 JOIN users sender ON sender.id = gm.sender_id
 		 WHERE gm.server_message_id = ?
@@ -1099,6 +1025,7 @@ func loadGroupMessageByServerID(
 		serverMessageID,
 	).Scan(
 		&message.ID,
+		&message.Seq,
 		&message.GroupID,
 		&message.SenderID,
 		&message.Sender.Username,
@@ -1124,8 +1051,8 @@ func loadGroupMessageByClientID(
 ) (GroupMessage, error) {
 	var message GroupMessage
 	err := tx.QueryRowContext(ctx,
-		`SELECT gm.server_message_id, gm.group_id, gm.sender_id, sender.username, sender.nickname,
-		        gm.client_message_id, gm.body, gm.created_at
+		`SELECT gm.server_message_id, COALESCE(gm.seq, 0), gm.group_id, gm.sender_id,
+		        sender.username, sender.nickname, gm.client_message_id, gm.body, gm.created_at
 		 FROM group_messages gm
 		 JOIN users sender ON sender.id = gm.sender_id
 		 WHERE gm.group_id = ? AND gm.sender_id = ? AND gm.client_message_id = ?
@@ -1133,6 +1060,7 @@ func loadGroupMessageByClientID(
 		groupID, senderID, clientMessageID,
 	).Scan(
 		&message.ID,
+		&message.Seq,
 		&message.GroupID,
 		&message.SenderID,
 		&message.Sender.Username,
@@ -1146,6 +1074,40 @@ func loadGroupMessageByClientID(
 	}
 	if err != nil {
 		return GroupMessage{}, fmt.Errorf("load group message by client id: %w", err)
+	}
+	return message, nil
+}
+
+func loadGroupMessageByGroupSeq(
+	ctx context.Context,
+	tx *sql.Tx,
+	groupID, seq uint64,
+) (GroupMessage, error) {
+	var message GroupMessage
+	err := tx.QueryRowContext(ctx,
+		`SELECT gm.server_message_id, COALESCE(gm.seq, 0), gm.group_id, gm.sender_id,
+		        sender.username, sender.nickname, gm.client_message_id, gm.body, gm.created_at
+		 FROM group_messages gm
+		 JOIN users sender ON sender.id = gm.sender_id
+		 WHERE gm.group_id = ? AND gm.seq = ?
+		 FOR UPDATE`,
+		groupID, seq,
+	).Scan(
+		&message.ID,
+		&message.Seq,
+		&message.GroupID,
+		&message.SenderID,
+		&message.Sender.Username,
+		&message.Sender.Nickname,
+		&message.ClientMessageID,
+		&message.Body,
+		&message.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return GroupMessage{}, sql.ErrNoRows
+	}
+	if err != nil {
+		return GroupMessage{}, fmt.Errorf("load group message by group seq: %w", err)
 	}
 	return message, nil
 }

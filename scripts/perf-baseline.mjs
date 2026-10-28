@@ -2,7 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { TestRun } from "./lib/test-client.mjs";
+import { delay, TestRun } from "./lib/test-client.mjs";
 
 const WARMUP_ROUNDS = 3;
 const SAMPLE_ROUNDS = 20;
@@ -60,37 +60,39 @@ async function prepare() {
   await run.befriend("a", "c");
   const groupID = await run.group("a", "基线群", ["b", "c"]);
 
-  let latestDirect;
-  let latestGroup;
   for (let index = 0; index < 31; index += 1) {
-    latestDirect = await sendDirect("a", "b", `baseline private history ${index}`);
-    latestGroup = await sendGroup("a", groupID, `baseline group history ${index}`);
+    await sendDirect("a", "b", `baseline private history ${index}`);
+    await sendGroup("a", groupID, `baseline group history ${index}`);
   }
-  await run.request("b", "POST", `${directPath("a")}/read?through_id=${latestDirect.message.id}`);
-  await run.request("b", "POST", `/api/groups/${groupID}/read?through_id=${latestGroup.message.id}`);
-  return { groupID };
+  const reader = await run.openSocket("b");
+  await reader.focusDirect(run.users.get("a").username);
+  await reader.focusGroup(groupID);
+  return { groupID, reader };
 }
 
-async function verifyUnread(groupID) {
-  const direct = await sendDirect("a", "b", "baseline private verify");
-  const group = await sendGroup("a", groupID, "baseline group verify");
+async function verifyUnread(groupID, reader) {
+  // Blur first so neither message is auto-read before the unread check.
+  reader.blur();
+  await delay(150);
+  await sendDirect("a", "b", "baseline private verify");
+  await sendGroup("a", groupID, "baseline group verify");
   const list = await listConversations("b");
   run.check(
     "private unread visible",
     (directConversation(list, run.users.get("a").username)?.unread_count ?? 0) >= 1,
   );
   run.check("group unread visible", (groupConversation(list, groupID)?.unread_count ?? 0) >= 1);
-  await run.request("b", "POST", `${directPath("a")}/read?through_id=${direct.message.id}`);
-  await run.request("b", "POST", `/api/groups/${groupID}/read?through_id=${group.message.id}`);
+  await reader.focusDirect(run.users.get("a").username);
+  await reader.focusGroup(groupID);
 }
 
-async function sampleRound(groupID, enabled) {
-  const direct = await measure(
+async function sampleRound(groupID, enabled, reader) {
+  await measure(
     "direct_send",
     enabled,
     () => sendDirect("a", "b", "baseline private sample"),
   );
-  const group = await measure(
+  await measure(
     "group_send",
     enabled,
     () => sendGroup("a", groupID, "baseline group sample"),
@@ -109,14 +111,14 @@ async function sampleRound(groupID, enabled) {
     () => run.request("b", "GET", `/api/groups/${groupID}/messages?limit=30`),
   );
   await measure(
-    "direct_read",
+    "direct_focus",
     enabled,
-    () => run.request("b", "POST", `${directPath("a")}/read?through_id=${direct.message.id}`),
+    () => reader.focusDirect(run.users.get("a").username),
   );
   await measure(
-    "group_read",
+    "group_focus",
     enabled,
-    () => run.request("b", "POST", `/api/groups/${groupID}/read?through_id=${group.message.id}`),
+    () => reader.focusGroup(groupID),
   );
 }
 
@@ -142,10 +144,14 @@ async function main() {
     run.check(`${path} is healthy`, response.status === 200 && (await response.json()).status === "ok");
   }
 
-  const { groupID } = await prepare();
-  await verifyUnread(groupID);
-  for (let index = 0; index < WARMUP_ROUNDS; index += 1) await sampleRound(groupID, false);
-  for (let index = 0; index < SAMPLE_ROUNDS; index += 1) await sampleRound(groupID, true);
+  const { groupID, reader } = await prepare();
+  try {
+    await verifyUnread(groupID, reader);
+    for (let index = 0; index < WARMUP_ROUNDS; index += 1) await sampleRound(groupID, false, reader);
+    for (let index = 0; index < SAMPLE_ROUNDS; index += 1) await sampleRound(groupID, true, reader);
+  } finally {
+    reader.close();
+  }
 
   const report = await writeReport();
   for (const [name, metric] of Object.entries(report.metrics)) {

@@ -26,8 +26,10 @@ func TestBootstrapReturnsAllSections(t *testing.T) {
 	dataStore.conversations = []store.Conversation{{
 		User:     store.PublicUser{Username: "bob", Nickname: "Bob"},
 		IsFriend: true,
+		LastSeq:  10,
 		LastMessage: &store.Message{
 			ID:              10,
+			Seq:             10,
 			SenderID:        2,
 			RecipientID:     1,
 			ClientMessageID: "client-00000010",
@@ -44,8 +46,10 @@ func TestBootstrapReturnsAllSections(t *testing.T) {
 		},
 		MemberCount: 2,
 		IsOwner:     true,
+		LastSeq:     22,
 		LastMessage: &store.GroupMessage{
 			ID:              22,
+			Seq:             22,
 			GroupID:         9,
 			SenderID:        2,
 			Sender:          store.PublicUser{Username: "bob", Nickname: "Bob"},
@@ -58,6 +62,7 @@ func TestBootstrapReturnsAllSections(t *testing.T) {
 		Page: store.MessagePage{Messages: []store.Message{
 			{
 				ID:              11,
+				Seq:             5,
 				SenderID:        2,
 				RecipientID:     1,
 				ClientMessageID: "client-00000011",
@@ -66,6 +71,7 @@ func TestBootstrapReturnsAllSections(t *testing.T) {
 			},
 			{
 				ID:              12,
+				Seq:             6,
 				SenderID:        1,
 				RecipientID:     2,
 				ClientMessageID: "client-00000012",
@@ -79,6 +85,7 @@ func TestBootstrapReturnsAllSections(t *testing.T) {
 		Page: store.GroupMessagePage{Messages: []store.GroupMessage{
 			{
 				ID:              21,
+				Seq:             21,
 				GroupID:         9,
 				SenderID:        2,
 				Sender:          store.PublicUser{Username: "bob", Nickname: "Bob"},
@@ -88,6 +95,7 @@ func TestBootstrapReturnsAllSections(t *testing.T) {
 			},
 			{
 				ID:              22,
+				Seq:             22,
 				GroupID:         9,
 				SenderID:        2,
 				Sender:          store.PublicUser{Username: "bob", Nickname: "Bob"},
@@ -115,7 +123,7 @@ func TestBootstrapReturnsAllSections(t *testing.T) {
 		map[string]any{
 			"after_id": 10,
 			"groups": []map[string]any{
-				{"group_id": 9, "after_id": 20},
+				{"group_id": 9, "after_seq": 20},
 			},
 		},
 		authTestCookie(),
@@ -147,8 +155,20 @@ func TestBootstrapReturnsAllSections(t *testing.T) {
 		t.Fatalf("groups = %#v", response.Groups)
 	}
 	if response.Groups[0].GroupID != 9 || len(response.Groups[0].Messages) != 2 ||
-		response.Groups[0].Cursor != 22 {
+		response.Groups[0].Cursor != 22 ||
+		response.Groups[0].Messages[0].Seq != 21 {
 		t.Fatalf("group delta = %#v", response.Groups[0])
+	}
+	if response.Direct.Messages[0].Seq != 5 || response.Direct.Messages[1].Seq != 6 {
+		t.Fatalf("direct seq = %#v", response.Direct.Messages)
+	}
+	for _, conversation := range response.Conversations {
+		if conversation.Type == "group" && conversation.LastSeq != 22 {
+			t.Fatalf("group last_seq = %#v", conversation)
+		}
+		if conversation.Type == "direct" && conversation.LastSeq != 10 {
+			t.Fatalf("direct last_seq = %#v", conversation)
+		}
 	}
 	if len(response.Partial) != 0 {
 		t.Fatalf("partial = %#v, want empty", response.Partial)
@@ -166,8 +186,10 @@ func TestBootstrapSkipsUnchangedAndUnknownGroups(t *testing.T) {
 			CreatedAt: now.Add(-time.Hour),
 		},
 		MemberCount: 2,
+		LastSeq:     20,
 		LastMessage: &store.GroupMessage{
 			ID:              20,
+			Seq:             20,
 			GroupID:         9,
 			SenderID:        2,
 			Sender:          store.PublicUser{Username: "bob", Nickname: "Bob"},
@@ -189,8 +211,8 @@ func TestBootstrapSkipsUnchangedAndUnknownGroups(t *testing.T) {
 		"/api/bootstrap",
 		map[string]any{
 			"groups": []map[string]any{
-				{"group_id": 9, "after_id": 20},
-				{"group_id": 99, "after_id": 5},
+				{"group_id": 9, "after_seq": 20},
+				{"group_id": 99, "after_seq": 5},
 			},
 		},
 		authTestCookie(),
@@ -349,17 +371,20 @@ func TestPlanBootstrapGroups(t *testing.T) {
 		{
 			Type:        "direct",
 			User:        &publicUserResponse{Username: "bob"},
-			LastMessage: &conversationMessageResponse{ID: 100},
+			LastSeq:     100,
+			LastMessage: &conversationMessageResponse{ID: 100, Seq: 100},
 		},
 		{
 			Type:        "group",
 			Group:       &groupSummaryResponse{ID: 9},
-			LastMessage: &conversationMessageResponse{ID: 20},
+			LastSeq:     20,
+			LastMessage: &conversationMessageResponse{ID: 20, Seq: 20},
 		},
 		{
 			Type:        "group",
 			Group:       &groupSummaryResponse{ID: 10},
-			LastMessage: &conversationMessageResponse{ID: 30},
+			LastSeq:     30,
+			LastMessage: &conversationMessageResponse{ID: 30, Seq: 30},
 		},
 		{
 			Type:  "group",
@@ -368,35 +393,36 @@ func TestPlanBootstrapGroups(t *testing.T) {
 		{
 			Type:        "group",
 			Group:       &groupSummaryResponse{ID: 12},
-			LastMessage: &conversationMessageResponse{ID: 40},
+			LastSeq:     40,
+			LastMessage: &conversationMessageResponse{ID: 40, Seq: 40},
 		},
 	}
 	cursors := []bootstrapGroupCursor{
-		{GroupID: 9, AfterID: 12},
-		{GroupID: 9, AfterID: 15},
-		{GroupID: 10, AfterID: 30},
-		{GroupID: 11, AfterID: 5},
-		{GroupID: 12, AfterID: 0},
-		{GroupID: 99, AfterID: 1},
+		{GroupID: 9, AfterSeq: 12},
+		{GroupID: 9, AfterSeq: 15},
+		{GroupID: 10, AfterSeq: 30},
+		{GroupID: 11, AfterSeq: 5},
+		{GroupID: 12, AfterSeq: 0},
+		{GroupID: 99, AfterSeq: 1},
 	}
 
 	plan := planBootstrapGroups(conversations, cursors)
 	if len(plan) != 1 {
 		t.Fatalf("plan = %#v, want only group 9", plan)
 	}
-	if plan[0].GroupID != 9 || plan[0].AfterID != 15 {
+	if plan[0].GroupID != 9 || plan[0].AfterSeq != 15 {
 		t.Fatalf("plan[0] = %#v, want group 9 after 15", plan[0])
 	}
 }
 
 func TestPlanBootstrapGroupsPreservesConversationOrder(t *testing.T) {
 	conversations := []conversationResponse{
-		{Type: "group", Group: &groupSummaryResponse{ID: 2}, LastMessage: &conversationMessageResponse{ID: 50}},
-		{Type: "group", Group: &groupSummaryResponse{ID: 1}, LastMessage: &conversationMessageResponse{ID: 40}},
+		{Type: "group", Group: &groupSummaryResponse{ID: 2}, LastSeq: 50, LastMessage: &conversationMessageResponse{ID: 50, Seq: 50}},
+		{Type: "group", Group: &groupSummaryResponse{ID: 1}, LastSeq: 40, LastMessage: &conversationMessageResponse{ID: 40, Seq: 40}},
 	}
 	cursors := []bootstrapGroupCursor{
-		{GroupID: 1, AfterID: 10},
-		{GroupID: 2, AfterID: 10},
+		{GroupID: 1, AfterSeq: 10},
+		{GroupID: 2, AfterSeq: 10},
 	}
 
 	plan := planBootstrapGroups(conversations, cursors)
@@ -408,47 +434,47 @@ func TestPlanBootstrapGroupsPreservesConversationOrder(t *testing.T) {
 func TestAssembleBootstrapGroupsTrimsTotalMessages(t *testing.T) {
 	results := []bootstrapGroupResult{
 		{
-			groupID: 1,
-			afterID: 10,
-			ok:      true,
+			groupID:  1,
+			afterSeq: 10,
+			ok:       true,
 			response: bootstrapGroupResponse{
 				GroupID: 1,
 				Messages: []groupMessageResponse{
-					{ID: 11},
-					{ID: 12},
+					{ID: 11, Seq: 11},
+					{ID: 12, Seq: 12},
 				},
 				Cursor: 12,
 			},
 		},
 		{
-			groupID: 2,
-			afterID: 20,
-			ok:      true,
+			groupID:  2,
+			afterSeq: 20,
+			ok:       true,
 			response: bootstrapGroupResponse{
 				GroupID: 2,
 				Messages: []groupMessageResponse{
-					{ID: 21},
-					{ID: 22},
-					{ID: 23},
+					{ID: 21, Seq: 21},
+					{ID: 22, Seq: 22},
+					{ID: 23, Seq: 23},
 				},
 				Cursor: 23,
 			},
 		},
 		{
-			groupID: 3,
-			afterID: 30,
-			ok:      true,
+			groupID:  3,
+			afterSeq: 30,
+			ok:       true,
 			response: bootstrapGroupResponse{
 				GroupID: 3,
 				Messages: []groupMessageResponse{
-					{ID: 31},
+					{ID: 31, Seq: 31},
 				},
 				Cursor: 31,
 			},
 		},
 		{
-			groupID: 4,
-			afterID: 40,
+			groupID:  4,
+			afterSeq: 40,
 		},
 	}
 
