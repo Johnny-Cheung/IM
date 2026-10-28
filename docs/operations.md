@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例已切换为 v1.6 私聊已读：MySQL、正式 `8198` 和验证 `8199`。v1.1 基础设施已就绪，v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存和 v1.6 私聊已读均已完成正式切换。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例已切换为 v1.7 群聊已读与 WebSocket 隐式已读：MySQL、正式 `8198` 和验证 `8199`。v1.1 基础设施已就绪，v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -163,7 +163,7 @@ BACKUP="$(/opt/IM-Rebuild/imctl backup)"
 - 使用独立 schema/用户 `im_v07_verify`，应用密码文件为 `/opt/IM-Rebuild/canary-v07/mysql-app`（属主 `nobody`，权限 0400）。不得复用生产库 `im`、账号 `im_app` 或生产凭据。自动化检查只使用本轮创建的账号和群，不登录、不修改 `demo_*` 演示数据。
 - v0.6 基线保留为 `/opt/IM-Rebuild/canary-v07/bin/im-server-v06`、`RELEASE.v06` 和初始 v0.6 `web/`。部署候选版本前先备份 canary 当前文件。
 
-canary 应用入口是 `/opt/IM-Rebuild/canary-v07/bin/im-server` 和 `web/`。当前 canary 已部署 v1.6，其 v1.5 备份为 `bin/im-server-v15`、`RELEASE.v15` 和 `web-v15`；v0.6 基线仍保留为 `bin/im-server-v06`、`RELEASE.v06` 和初始 v0.6 `web/`。启动、状态和检查：
+canary 应用入口是 `/opt/IM-Rebuild/canary-v07/bin/im-server` 和 `web/`。当前 canary 已部署 v1.7（验证后已停止），其 v1.6 备份为 `bin/im-server-v16`、`RELEASE.v16` 和 `web-v16`；v1.5 备份为 `bin/im-server-v15`、`RELEASE.v15` 和 `web-v15`；v0.6 基线仍保留为 `bin/im-server-v06`、`RELEASE.v06` 和初始 v0.6 `web/`。启动、状态和检查：
 
 ```bash
 /opt/IM-Rebuild/imctl --verify start
@@ -204,7 +204,7 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 ```
 
 - 单组件重启使用 `redis-restart`、`rabbitmq-restart`；日志使用 `logs redis|rabbitmq|runtime`。
-- 当前正式 `8198` 已接入 v1.2 私聊、v1.3 群聊、v1.4 服务端读取链路、v1.5 本地缓存和 v1.6 私聊已读，群聊已读仍按路线留在 v1.7；不配置开机自启，开发机重启后手动执行 `infractl start` 和 `imctl restart`。
+- 当前正式 `8198` 已接入 v1.2 私聊、v1.3 群聊、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读；不配置开机自启，开发机重启后手动执行 `infractl start` 和 `imctl restart`。
 
 ## v1.2 私聊消息链路（已切换正式）
 
@@ -260,6 +260,23 @@ test -d /opt/IM-Rebuild/canary-v07/web-v06 \
 - 正式环境回归：API smoke 62 项、浏览器 smoke 39 项、缓存 smoke 18 项全部通过；本轮 10 个测试账号按 manifest 删除，生产队列 ready/unack 均为 0。
 - 回滚应用文件仍使用切换前备份。v1.5 不读取新的 Redis 键，MySQL 已读位置由异步 worker 持续写入，回退后继续可用。
 - 验证实例 `8199` 已停止；验证库测试账号和测试用 `dm:read` 键已清除。测试消息的 `dm:conv` 和实体索引留到 v1.9 容量治理。
+- v1.7 用 WebSocket 隐式已读取代了前台持续上报；本节的批量接口和 `dm:read` 模型继续使用，批量接口保留给旧客户端和回滚。
+
+## v1.7 群聊已读与 WebSocket 隐式已读（已切换正式）
+
+- 群聊已读位置保存为 Redis `group:{G}:read` ZSET；未读用 `group:{G}:inbox` 的 `ZCOUNT` 现算，已读人数由 `GET /api/groups/:id/read-stats` 现算。位置通过 `group-read:stream` 异步写回 `group_members.last_read_message_id`（`GREATEST`，同一成员合并写）。
+- 前台已读改为 WebSocket 隐式已读：客户端发 `focus`/`blur`，服务端在推送消息后异步推进位置，私聊和群聊统一；不再有前台持续上报的 HTTP 请求。`POST /api/read` 等旧接口保留给旧客户端和回滚。
+- 升级前必须执行一次群聊历史回填，并且**必须在停后端之后、启动新版之前**执行，因为 v1.6 的群聊已读只写 MySQL，边运行边回填会漏掉回填之后的新数据：
+  ```bash
+  /opt/IM-Rebuild/imctl --verify backfill-group-read
+  /opt/IM-Rebuild/imctl backfill-group-read
+  ```
+  回填会索引历史群消息号，把每个成员的位置设为 `max(已读位置, 该成员最后一条自己的消息)` 并写回 MySQL，校验通过后写入 `group-read:ready`。启用群消息链路时，后端缺少该标记会拒绝启动；Redis 丢数据后需要重新回填，重跑会抬高偏低的旧位置，不会降低已有位置。
+- 正式切换顺序：备份 → 停后端 → 替换文件 → `imctl backfill-group-read` → 启动。正式切换前备份为 `/opt/IM-Rebuild/backups/20261028T073828Z-gsbcbz`；回填统计为 19 条群消息、3 个群（ID 6、7、8）、10 个成员位置，其中 1 个位置被抬高；回填当场 Redis 内存 2.48 MB，没有明显变化，清理测试数据后约 2.68 MB（含本轮私聊测试消息的遗留索引，留到 v1.9）。
+- 正式环境回归：API smoke 94 项、浏览器 smoke 49 项、缓存 smoke 25 项全部通过；本轮 16 个测试账号和 7 个测试群按 manifest 删除（MySQL 与 Redis），账号、私聊、群消息、群成员、已读行数与切换前一致，`group-read:stream` 为空，队列积压为 0。
+- 群成员变更（建群、邀请、踢人、退群、解散）在同一群内串行写 Redis 投影；失败时 `group:{G}:sync_required` 保持置位，由后台修复循环按 MySQL 快照重建，期间该群的发送、已读和未读返回 503。当前串行锁在进程内，多实例留到 v1.8。
+- 回滚应用文件仍使用切换前备份。v1.7 没有数据库迁移，v1.6 不读取新的 Redis 键；v1.7 写入 MySQL 的已读位置只增不减，回退后继续可用。
+- 验证实例 `8199` 已停止；验证库 64 个测试账号和 31 个测试群已清除，测试用 Redis 键已按清单删除。
 
 ## 回归检查
 
