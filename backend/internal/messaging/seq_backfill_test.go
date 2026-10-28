@@ -907,16 +907,14 @@ func TestSeqBackfillConvertsSmallRedisOnlyGlobalID(t *testing.T) {
 	}
 }
 
-func TestSeqBackfillKeepsRedisOnlySeqWhenConversionStarted(t *testing.T) {
+func TestSeqBackfillKeepsRedisOnlySeqWhenReady(t *testing.T) {
 	client, _, dataStore := newEmptySeqBackfill(t)
 	ctx := context.Background()
 	seedBackfillMessages(dataStore, 1, 2, 7, 10)
 	if err := client.HSet(ctx, directReadKey(1), "2", "3").Err(); err != nil {
 		t.Fatalf("seed direct watermark: %v", err)
 	}
-	if err := client.Set(ctx, defaultKeyspace.sequenceConvertingKey(), "1", 0).Err(); err != nil {
-		t.Fatalf("seed conversion marker: %v", err)
-	}
+	seedSequenceReady(t, client)
 
 	backfill := NewSeqBackfill(client, defaultKeyspace, dataStore, 10)
 	if _, err := backfill.Run(ctx); err != nil {
@@ -925,11 +923,52 @@ func TestSeqBackfillKeepsRedisOnlySeqWhenConversionStarted(t *testing.T) {
 	if got := client.HGet(ctx, directReadKey(1), "2").Val(); got != "3" {
 		t.Fatalf("direct watermark = %q, want 3", got)
 	}
-	if err := client.Exists(ctx, defaultKeyspace.sequenceConvertingKey()).Err(); err != nil {
-		t.Fatalf("read marker: %v", err)
+}
+
+func TestSeqBackfillResumesInterruptedRunWithLegacyWatermark(t *testing.T) {
+	client, _, dataStore := newEmptySeqBackfill(t)
+	ctx := context.Background()
+	// A failed run leaves no seq:ready behind. Its remaining Redis watermark is
+	// still a global message ID, and here it is below the conversation counter
+	// (10), so treating "position <= counter" as a seq would wrongly keep 9.
+	seedBackfillMessages(dataStore, 1, 2, 7, 10)
+	dataStore.convReads[[2]uint64{1, 2}] = store.ConversationReadState{
+		UserID: 1, PeerID: 2, LastReadMessageID: 9,
 	}
-	if client.Exists(ctx, defaultKeyspace.sequenceConvertingKey()).Val() != 0 {
-		t.Fatalf("conversion marker still present after success")
+	if err := client.HSet(ctx, directReadKey(1), "2", "9").Err(); err != nil {
+		t.Fatalf("seed direct watermark: %v", err)
+	}
+
+	backfill := NewSeqBackfill(client, defaultKeyspace, dataStore, 10)
+	if _, err := backfill.Run(ctx); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got := client.HGet(ctx, directReadKey(1), "2").Val(); got != "3" {
+		t.Fatalf("direct watermark = %q, want the converted seq 3", got)
+	}
+	if got := dataStore.convReads[[2]uint64{1, 2}].LastReadSeq; got != 3 {
+		t.Fatalf("persisted direct watermark = %d, want 3", got)
+	}
+	if exists := client.Exists(ctx, sequenceReadyKey()).Val(); exists != 1 {
+		t.Fatalf("seq:ready = %d, want 1 after a successful run", exists)
+	}
+}
+
+func TestSeqBackfillReadyKeepsClampedSeq(t *testing.T) {
+	client, _, dataStore := newEmptySeqBackfill(t)
+	ctx := context.Background()
+	seedBackfillMessages(dataStore, 1, 2, 7, 10)
+	if err := client.HSet(ctx, directReadKey(1), "2", "50").Err(); err != nil {
+		t.Fatalf("seed direct watermark: %v", err)
+	}
+	seedSequenceReady(t, client)
+
+	backfill := NewSeqBackfill(client, defaultKeyspace, dataStore, 10)
+	if _, err := backfill.Run(ctx); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got := client.HGet(ctx, directReadKey(1), "2").Val(); got != "10" {
+		t.Fatalf("direct watermark = %q, want the counter clamp 10", got)
 	}
 }
 

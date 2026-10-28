@@ -61,6 +61,7 @@ import {
   missingSeqs,
   MissingSeqTracker,
   nextUnread,
+  outboxDisplayStatus,
   planActiveSync,
   planGapPull,
   planIncoming,
@@ -81,6 +82,11 @@ const RECONNECT_BASE_DELAY = 1000;
 const RECONNECT_MAX_DELAY = 10000;
 const WS_CLOSE_REPLACED = 4001;
 const WS_CLOSE_SESSION = 4002;
+
+// Client ids whose send request is running in this document. A stored outbox
+// row for one of them is still sending; any other stored "sending" row was
+// orphaned by a reload and must surface as failed.
+const inFlightSends = new Set<string>();
 
 type ConnectionStatus = "connecting" | "open" | "closed" | "replaced";
 type MessageStatus = "sent" | "sending" | "failed";
@@ -590,7 +596,10 @@ function outboxDisplay(
     body: entry.body,
     client_message_id: entry.client_message_id,
     created_at: entry.created_at,
-    status: "failed" as const,
+    status: outboxDisplayStatus(
+      entry.status,
+      inFlightSends.has(entry.client_message_id),
+    ),
   };
   if (entry.kind === "group") {
     if (entry.group_id === undefined) {
@@ -612,6 +621,21 @@ function outboxFailedMessages(
   return lostOutboxEntries(entries, new Set(confirmed))
     .map((entry) => outboxDisplay(entry, user))
     .filter((message): message is DisplayMessage => message !== null);
+}
+
+// A rollback writes archived failures after the outbox snapshot was read; add
+// them so a page reload that replaces the list still shows them once.
+function mergeOutboxEntries(
+  current: readonly CachedOutbox[],
+  archived: readonly CachedOutbox[],
+): CachedOutbox[] {
+  const byClientID = new Map(
+    current.map((entry) => [entry.client_message_id, entry]),
+  );
+  for (const entry of archived) {
+    byClientID.set(entry.client_message_id, entry);
+  }
+  return [...byClientID.values()];
 }
 
 export function ChatPage() {
@@ -927,6 +951,28 @@ export function ChatPage() {
     readStatsDebouncerRef.current.cancel();
   }, []);
 
+  // A rollback archives the user's own lost messages into the outbox; keep them
+  // visible as failed rows in the open conversation so they can be retried.
+  const showArchivedFailures = useCallback((
+    target: ActiveTarget,
+    archived: readonly CachedOutbox[],
+  ) => {
+    const currentUser = userRef.current;
+    if (
+      currentUser === null
+      || archived.length === 0
+      || activeTargetRef.current?.key !== target.key
+    ) {
+      return;
+    }
+    const failed = archived
+      .map((entry) => outboxDisplay(entry, currentUser))
+      .filter((message): message is DisplayMessage => message !== null);
+    if (failed.length > 0) {
+      setMessages((previous) => mergeMessages(previous, failed));
+    }
+  }, []);
+
   const resyncTail = useCallback(async (target: ActiveTarget, keepSeq: number) => {
     if (!user) {
       return;
@@ -1027,8 +1073,13 @@ export function ChatPage() {
         if (requestID !== conversationRequestRef.current) {
           return;
         }
-        await Promise.all(rolledBack.map((entry) =>
-          deleteMessagesFrom(username, entry.key, entry.keepSeq + 1)));
+        const archived = new Map<string, CachedOutbox[]>();
+        await Promise.all(rolledBack.map(async (entry) => {
+          archived.set(
+            entry.key,
+            await deleteMessagesFrom(username, entry.key, entry.keepSeq + 1),
+          );
+        }));
         // Cache cleanup can outlive this request; a newer list response that
         // already landed must not be overwritten by this stale snapshot.
         if (requestID !== conversationRequestRef.current) {
@@ -1039,6 +1090,7 @@ export function ChatPage() {
         if (active && current) {
           setMessages((previous) => previous.filter((message) =>
             !isAcceptedSeq(message.seq) || message.seq <= current.keepSeq));
+          showArchivedFailures(active, archived.get(current.key) ?? []);
           missingSeqTrackerRef.current.clear(current.key);
           resyncTailRef.current(active, current.keepSeq);
         }
@@ -1059,7 +1111,7 @@ export function ChatPage() {
         setConversationsLoading(false);
       }
     }
-  }, [handleSessionError]);
+  }, [handleSessionError, showArchivedFailures]);
 
   const handleFocusAck = useCallback((ack: FocusAck) => {
     if (!ack.ok) {
@@ -1237,14 +1289,21 @@ export function ChatPage() {
         : null;
       if (rollback !== null) {
         // Server counter went backwards: drop the reusable tail and reload.
+        let archived: CachedOutbox[] = [];
         if (username !== "") {
-          await deleteMessagesFrom(username, target.key, rollback.fromSeq);
+          archived = await deleteMessagesFrom(
+            username,
+            target.key,
+            rollback.fromSeq,
+          );
         }
         cached = cached.filter((message) => message.seq < rollback.fromSeq);
         localMax = rollback.fromSeq - 1;
         missingSeqTrackerRef.current.clear(target.key);
+        outbox = mergeOutboxEntries(outbox, archived);
         setMessages((previous) => previous.filter((message) =>
           !isAcceptedSeq(message.seq) || message.seq <= localMax));
+        showArchivedFailures(target, archived);
       }
 
       const serverLast = conversationLastMessagesRef.current.get(target.key);
@@ -1256,14 +1315,21 @@ export function ChatPage() {
         && cachedNewest.id !== serverLast.id
       ) {
         // Same seq, different global id: the server reused the tail.
+        let archived: CachedOutbox[] = [];
         if (username !== "") {
-          await deleteMessagesFrom(username, target.key, serverLast.seq);
+          archived = await deleteMessagesFrom(
+            username,
+            target.key,
+            serverLast.seq,
+          );
         }
         cached = cached.filter((message) => message.seq < serverLast.seq);
         localMax = serverLast.seq - 1;
         missingSeqTrackerRef.current.clear(target.key);
+        outbox = mergeOutboxEntries(outbox, archived);
         setMessages((previous) => previous.filter((message) =>
           !isAcceptedSeq(message.seq) || message.seq <= localMax));
+        showArchivedFailures(target, archived);
       }
 
       if (localMax === 0 || cached.length === 0) {
@@ -1368,6 +1434,7 @@ export function ChatPage() {
     handleSessionError,
     isCurrentConversation,
     loseGroupAccess,
+    showArchivedFailures,
     user?.username,
   ]);
 
@@ -1737,7 +1804,10 @@ export function ChatPage() {
       // authoritative. It stays out of the delete range and is re-written after
       // the delete so an aborted resync cannot drop it from the cache.
       void deleteMessagesFrom(currentUser.username, key, openPlan.fromSeq + 1)
-        .then(() => writeMessages(currentUser.username, key, [message]));
+        .then((archived) => {
+          showArchivedFailures(target, archived);
+          return writeMessages(currentUser.username, key, [message]);
+        });
       setMessages((previous) => mergeMessages(previous, [toDirectDisplay(message)])
         .filter((item) =>
           !isAcceptedSeq(item.seq) || item.seq <= openPlan.fromSeq));
@@ -1746,7 +1816,7 @@ export function ChatPage() {
     if (wasNearBottom) {
       scrollToBottomNextRef.current = true;
     }
-  }, [loadConversations]);
+  }, [loadConversations, showArchivedFailures]);
 
   const handleIncomingGroupMessage = useCallback((message: GroupMessage) => {
     const currentUser = userRef.current;
@@ -1844,7 +1914,10 @@ export function ChatPage() {
       // authoritative. It stays out of the delete range and is re-written after
       // the delete so an aborted resync cannot drop it from the cache.
       void deleteMessagesFrom(currentUser.username, key, openPlan.fromSeq + 1)
-        .then(() => writeMessages(currentUser.username, key, [message]));
+        .then((archived) => {
+          showArchivedFailures(target, archived);
+          return writeMessages(currentUser.username, key, [message]);
+        });
       setMessages((previous) => mergeMessages(previous, [toGroupDisplay(message)])
         .filter((item) =>
           !isAcceptedSeq(item.seq) || item.seq <= openPlan.fromSeq));
@@ -1853,7 +1926,7 @@ export function ChatPage() {
     if (wasNearBottom) {
       scrollToBottomNextRef.current = true;
     }
-  }, [loadConversations]);
+  }, [loadConversations, showArchivedFailures]);
 
   const handleReadEvent = useCallback((event: ReadEvent) => {
     const currentUser = userRef.current;
@@ -1959,11 +2032,17 @@ export function ChatPage() {
       );
       const plan = planActiveSync(newest, newestMessage, serverLast);
       if (plan.kind === "resync") {
+        let archived: CachedOutbox[] = [];
         if (user) {
-          await deleteMessagesFrom(user.username, target.key, plan.fromSeq);
+          archived = await deleteMessagesFrom(
+            user.username,
+            target.key,
+            plan.fromSeq,
+          );
         }
         setMessages((previous) => previous.filter((message) =>
           !isAcceptedSeq(message.seq) || message.seq < plan.fromSeq));
+        showArchivedFailures(target, archived);
         resyncTailRef.current(target, plan.fromSeq - 1);
         return;
       }
@@ -2033,6 +2112,7 @@ export function ChatPage() {
     isCurrentConversation,
     loadInitialMessages,
     loseGroupAccess,
+    showArchivedFailures,
     user,
   ]);
 
@@ -2253,6 +2333,7 @@ export function ChatPage() {
   async function deliverMessage(message: DisplayMessage, target: ActiveTarget) {
     const version = conversationVersionRef.current;
     const isCurrent = () => isCurrentConversation(target.key, version);
+    inFlightSends.add(message.client_message_id);
     try {
       const raw = target.kind === "direct"
         ? (await api.sendMessage(
@@ -2341,6 +2422,8 @@ export function ChatPage() {
             : item));
         setSendError(describeError(error));
       }
+    } finally {
+      inFlightSends.delete(message.client_message_id);
     }
   }
 

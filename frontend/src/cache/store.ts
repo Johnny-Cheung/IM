@@ -357,14 +357,22 @@ async function runRead<T>(
 async function runWrite(
   operation: (db: IDBDatabase) => Promise<void>,
 ): Promise<void> {
+  await runWriteResult(undefined, operation);
+}
+
+async function runWriteResult<T>(
+  fallback: T,
+  operation: (db: IDBDatabase) => Promise<T>,
+): Promise<T> {
   if (shouldSkipCache()) {
-    return;
+    return fallback;
   }
   try {
     const db = await openCacheDB();
-    await operation(db);
+    return await operation(db);
   } catch (error) {
     disableCache("write", error);
+    return fallback;
   }
 }
 
@@ -765,29 +773,85 @@ export async function writeMessages(
   });
 }
 
+// A confirmed message of our own that a rollback drops is gone from the server
+// with its dropped tail; keep it in the outbox as failed so it stays visible
+// and can only be retried with its original client id.
+function archivedOwnMessage(
+  user: string,
+  conversation: string,
+  record: CachedMessageRecord,
+): CachedOutbox | null {
+  const message = record.message;
+  if (
+    message.client_message_id === ""
+    || message.sender.username.toLocaleLowerCase() !== user.toLocaleLowerCase()
+  ) {
+    return null;
+  }
+  const entry: CachedOutbox = "group_id" in message
+    ? {
+      user,
+      conversation,
+      client_message_id: message.client_message_id,
+      body: message.body,
+      kind: "group",
+      group_id: message.group_id,
+      created_at: message.created_at,
+      status: "failed",
+    }
+    : {
+      user,
+      conversation,
+      client_message_id: message.client_message_id,
+      body: message.body,
+      kind: "direct",
+      recipient: message.recipient,
+      created_at: message.created_at,
+      status: "failed",
+    };
+  return isValidOutboxRecord(entry) ? entry : null;
+}
+
 // Drops the local tail from fromSeq on (rollback resync) and lowers the local
-// watermark so the next pull starts at the server's position.
+// watermark so the next pull starts at the server's position. Returns the own
+// confirmed messages archived into the outbox as failed by the same
+// transaction.
 export async function deleteMessagesFrom(
   user: string,
   conversation: string,
   fromSeq: number,
-): Promise<void> {
+): Promise<CachedOutbox[]> {
   if (!Number.isInteger(fromSeq) || fromSeq < 1) {
-    return;
+    return [];
   }
-  await runWrite(async (db) => {
-    await runTransaction(
+  return runWriteResult<CachedOutbox[]>([], async (db) =>
+    runTransaction(
       db,
-      [MESSAGES_STORE, META_STORE],
+      [MESSAGES_STORE, META_STORE, OUTBOX_STORE],
       "readwrite",
       async (transaction) => {
         const store = transaction.objectStore(MESSAGES_STORE);
+        const outboxStore = transaction.objectStore(OUTBOX_STORE);
         const index = store.index(MESSAGES_SEQ_INDEX);
-        const keys = await requestToPromise(
-          index.getAllKeys(conversationSeqRange(user, conversation, fromSeq)),
-        );
-        for (const key of keys) {
-          await requestToPromise(store.delete(key));
+        const range = conversationSeqRange(user, conversation, fromSeq);
+        // Values and keys come from the same range so a corrupt record is still
+        // dropped by its primary key while only valid own messages are archived.
+        const [records, keys] = await Promise.all([
+          requestToPromise(index.getAll(range)),
+          requestToPromise(index.getAllKeys(range)),
+        ]);
+        const archived: CachedOutbox[] = [];
+        for (let position = 0; position < keys.length; position += 1) {
+          await requestToPromise(store.delete(keys[position]));
+          const record = records[position];
+          if (record === undefined || !isValidMessageRecord(record)) {
+            continue;
+          }
+          const entry = archivedOwnMessage(user, conversation, record);
+          if (entry !== null) {
+            await requestToPromise(outboxStore.put(entry));
+            archived.push(entry);
+          }
         }
 
         const metaStore = transaction.objectStore(META_STORE);
@@ -795,12 +859,12 @@ export async function deleteMessagesFrom(
           await readValue(metaStore, syncKey(user)),
         );
         if (state === null) {
-          return;
+          return archived;
         }
         const keepSeq = fromSeq - 1;
         const current = state.localSeq[conversation] ?? 0;
         if (current <= keepSeq) {
-          return;
+          return archived;
         }
         const localSeq = { ...state.localSeq };
         if (keepSeq > 0) {
@@ -814,9 +878,9 @@ export async function deleteMessagesFrom(
             syncKey(user),
           ),
         );
+        return archived;
       },
-    );
-  });
+    ));
 }
 
 // The outbox keeps locally pending or failed messages across reloads so a

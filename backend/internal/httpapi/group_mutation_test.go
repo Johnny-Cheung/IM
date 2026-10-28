@@ -36,6 +36,56 @@ func fastGroupRepair(t *testing.T) {
 	})
 }
 
+type snapshotOrderStore struct {
+	*fakeStore
+	projector              *fakeGroupProjector
+	snapshotBeforeMutation bool
+}
+
+func (s *snapshotOrderStore) ListGroupMemberIDs(
+	ctx context.Context,
+	groupID uint64,
+) ([]uint64, error) {
+	s.projector.mu.Lock()
+	begun := s.projector.begins > 0
+	s.projector.mu.Unlock()
+	if !begun {
+		s.snapshotBeforeMutation = true
+	}
+	return s.fakeStore.ListGroupMemberIDs(ctx, groupID)
+}
+
+func TestInviteSnapshotsMembersUnderGroupWriteLock(t *testing.T) {
+	dataStore := inviteTestStore(t)
+	// The concurrent invite already added member 3; only 4 is new to this one.
+	dataStore.groupMemberIDSequence = [][]uint64{{1, 2, 3}, {1, 2, 3, 4}}
+	dataStore.inviteGroupBaseline = 60
+	projector := &fakeGroupProjector{lastSeq: 55}
+	tracker := newFakeGroupReadTracker()
+	wrapped := &snapshotOrderStore{fakeStore: dataStore, projector: projector}
+	router := testRouter(
+		wrapped,
+		WithGroupReadTracker(tracker),
+		WithGroupProjector(projector),
+		WithGroupSequenceReader(projector),
+	)
+
+	recorder := doJSON(t, router, http.MethodPost, "/api/groups/7/members", map[string]any{
+		"usernames": []string{"bob"},
+	}, authTestCookie())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if wrapped.snapshotBeforeMutation {
+		t.Fatal("pre-invite member snapshot was read before the group write lock")
+	}
+	for _, baseline := range tracker.snapBaselines() {
+		if baseline.groupID == 7 && baseline.userID == 3 {
+			t.Fatalf("concurrently invited member was re-seeded: %#v", baseline)
+		}
+	}
+}
+
 func TestInviteReadsWatermarkAfterMutation(t *testing.T) {
 	dataStore := inviteTestStore(t)
 	dataStore.groupMemberIDSequence = [][]uint64{{1, 2}, {1, 2, 3}}

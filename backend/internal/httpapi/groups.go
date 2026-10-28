@@ -242,17 +242,20 @@ func (a *API) inviteGroupMembers(c *gin.Context) {
 		a.writeGroupError(c, store.ErrGroupNotFound)
 		return
 	}
-	existingIDs, existingErr := a.store.ListGroupMemberIDs(ctx, groupID)
-	if existingErr != nil {
-		log.Printf("list group members before invite: %v", existingErr)
-	}
-
 	mutation, err := a.beginGroupMutation(ctx, groupID)
 	if err != nil {
 		a.writeGroupError(c, err)
 		return
 	}
 	defer mutation.finish()
+
+	// Read the pre-invite snapshot under the group write lock: an invite that
+	// committed before this one must already appear here, otherwise its members
+	// would be re-seeded below with this invite's higher baseline.
+	existingIDs, existingErr := a.store.ListGroupMemberIDs(ctx, groupID)
+	if existingErr != nil {
+		log.Printf("list group members before invite: %v", existingErr)
+	}
 
 	baselineFloor := uint64(0)
 	if a.groupSequenceReader != nil {
@@ -497,8 +500,10 @@ func (a *API) listGroupMessages(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
 		return
 	}
-	afterSeq, err := parseAfterSeq(c.Query("after_seq"))
-	if err != nil || (beforeSeq > 0 && afterSeq > 0) {
+	afterRaw := c.Query("after_seq")
+	afterSeq, err := parseAfterSeq(afterRaw)
+	hasAfter := afterRaw != ""
+	if err != nil || (beforeSeq > 0 && hasAfter) {
 		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
 		return
 	}
@@ -518,7 +523,7 @@ func (a *API) listGroupMessages(c *gin.Context) {
 			log.Printf("check group membership: %v", memberErr)
 		} else if member {
 			var hot messaging.GroupConversationPage
-			if afterSeq > 0 {
+			if hasAfter {
 				hot, err = a.groupReader.ReadGroupAfter(
 					c.Request.Context(), current.ID, groupID, afterSeq, limit,
 				)
@@ -541,7 +546,7 @@ func (a *API) listGroupMessages(c *gin.Context) {
 	}
 
 	if !servedFromRedis {
-		if afterSeq > 0 {
+		if hasAfter {
 			page, err = a.store.ListGroupMessagesAfter(
 				c.Request.Context(),
 				current.ID,
@@ -563,7 +568,7 @@ func (a *API) listGroupMessages(c *gin.Context) {
 			return
 		}
 		if hotAvailable {
-			page = mergeGroupMessagePages(page, hotPage, beforeSeq > 0 || afterSeq == 0, limit)
+			page = mergeGroupMessagePages(page, hotPage, !hasAfter, limit)
 		}
 	}
 
@@ -627,16 +632,37 @@ func (a *API) sendGroupMessage(c *gin.Context) {
 	}
 	response := toGroupMessageResponse(message)
 	if created {
-		if memberIDs, err := a.store.ListGroupMemberIDs(
-			c.Request.Context(), groupID,
-		); err != nil {
-			log.Printf("list group message recipients: %v", err)
-		} else {
+		memberIDs := a.groupMessageRecipients(c.Request.Context(), groupID)
+		if len(memberIDs) > 0 {
 			a.PublishGroupMessage(memberIDs, response)
-			a.scheduleGroupImplicitRead(groupID, current.ID, message.Seq, memberIDs)
 		}
+		// The recipients only feed the group.read broadcast; the flush still
+		// advances the sender and focused viewers when the list is empty.
+		a.scheduleGroupImplicitRead(groupID, current.ID, message.Seq, memberIDs)
 	}
 	c.JSON(status, sendGroupMessageResponse{Message: response})
+}
+
+// groupMessageRecipients prefers MySQL and falls back to the Redis member set,
+// which the group acceptance path already required to exist. A MySQL blip must
+// not suppress delivery of an accepted message.
+func (a *API) groupMessageRecipients(ctx context.Context, groupID uint64) []uint64 {
+	memberIDs, err := a.store.ListGroupMemberIDs(ctx, groupID)
+	if err == nil {
+		return memberIDs
+	}
+	log.Printf("list group message recipients group=%d: %v", groupID, err)
+	if a.groupReads == nil {
+		return nil
+	}
+	fallbackCtx, cancel := groupCommitContext(ctx)
+	defer cancel()
+	memberIDs, err = a.groupReads.MemberIDs(fallbackCtx, groupID)
+	if err != nil {
+		log.Printf("list group message recipients from redis group=%d: %v", groupID, err)
+		return nil
+	}
+	return memberIDs
 }
 
 // publishGroupReadFromRedis broadcasts a group read signal from the Redis

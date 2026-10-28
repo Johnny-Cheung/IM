@@ -87,6 +87,43 @@ type SeqBackfillResult struct {
 	MemoryAfter              string
 }
 
+// writeMaxHSetScript raises a hash field only when the new value is greater,
+// or rewrites it when the stored value exceeds the counter (an impossible seq
+// that must be clamped). It is used once seq:ready exists, so all values are in
+// the same unit.
+var writeMaxHSetScript = redis.NewScript(`
+local current = tonumber(redis.call('HGET', KEYS[1], ARGV[1]) or '0')
+local next = tonumber(ARGV[2])
+local counter = tonumber(ARGV[3])
+if next > current or current > counter then
+  redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+  return 1
+end
+return 0
+`)
+
+// writeMaxZAddScript mirrors writeMaxHSetScript for group read ZSETs.
+var writeMaxZAddScript = redis.NewScript(`
+local current = tonumber(redis.call('ZSCORE', KEYS[1], ARGV[1]) or '0')
+local next = tonumber(ARGV[2])
+local counter = tonumber(ARGV[3])
+if next > current or current > counter then
+  redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+  return 1
+end
+return 0
+`)
+
+// SeqBackfillLockTTL bounds a backfill lock. It matches the backfill command's
+// own 30-minute deadline.
+const SeqBackfillLockTTL = 30 * time.Minute
+
+// BackfillLockKey exposes the Redis key a running seq backfill holds so the
+// server and the command can agree on it.
+func BackfillLockKey(keyspace Keyspace) string {
+	return keyspace.backfillLockKey()
+}
+
 // SeqBackfill performs the one-off switch to per-conversation seq. The caller
 // must run the MySQL migrations and stop the backend first. It is idempotent
 // and never lowers a counter.
@@ -140,14 +177,11 @@ func (b *SeqBackfill) Run(ctx context.Context) (SeqBackfillResult, error) {
 	if err := b.rebuildRedis(ctx, &result); err != nil {
 		return result, err
 	}
-	switched, err := b.switched(ctx)
+	ready, err := b.sequenceReady(ctx)
 	if err != nil {
 		return result, err
 	}
-	if err := b.client.Set(ctx, b.keyspace.sequenceConvertingKey(), "1", 0).Err(); err != nil {
-		return result, fmt.Errorf("mark conversion started: %w", err)
-	}
-	if err := b.convertReadPositions(ctx, &result, switched); err != nil {
+	if err := b.convertReadPositions(ctx, &result, ready); err != nil {
 		return result, err
 	}
 	if err := b.verify(ctx, &result); err != nil {
@@ -156,22 +190,16 @@ func (b *SeqBackfill) Run(ctx context.Context) (SeqBackfillResult, error) {
 	if err := b.client.Set(ctx, b.keyspace.sequenceReadyKey(), "1", 0).Err(); err != nil {
 		return result, fmt.Errorf("mark sequence ready: %w", err)
 	}
-	if err := b.client.Del(ctx, b.keyspace.sequenceConvertingKey()).Err(); err != nil {
-		return result, fmt.Errorf("clear conversion marker: %w", err)
-	}
 	result.MemoryAfter = redisUsedMemory(ctx, b.client)
 	return result, nil
 }
 
-// switched reports whether an earlier run already started converting read
-// watermarks. Backend is stopped while this runs, so a first run can only see
-// legacy global message IDs in Redis.
-func (b *SeqBackfill) switched(ctx context.Context) (bool, error) {
-	count, err := b.client.Exists(
-		ctx,
-		b.keyspace.sequenceReadyKey(),
-		b.keyspace.sequenceConvertingKey(),
-	).Result()
+// sequenceReady reports whether a completed backfill already swore that every
+// Redis watermark is in seq units. It is the only global proof: a partial run
+// leaves no marker behind, so its remaining watermarks are still legacy global
+// message IDs and must be converted again.
+func (b *SeqBackfill) sequenceReady(ctx context.Context) (bool, error) {
+	count, err := b.client.Exists(ctx, b.keyspace.sequenceReadyKey()).Result()
 	if err != nil {
 		return false, fmt.Errorf("read conversion state: %w", err)
 	}
@@ -536,13 +564,14 @@ func scanKeys(
 	}
 }
 
-// convertReadPositions turns the old global-ID watermarks into seq without
-// lowering a position that is already stored in seq units, including
-// watermarks that only exist in Redis.
+// convertReadPositions turns the old global-ID watermarks into seq. When
+// seq:ready is absent every Redis watermark is legacy, so it is converted;
+// when it is present Redis already holds seq and is only clamped to the
+// counter. The durable last_read_seq is always a floor.
 func (b *SeqBackfill) convertReadPositions(
 	ctx context.Context,
 	result *SeqBackfillResult,
-	switched bool,
+	ready bool,
 ) error {
 	now := time.Now().UTC()
 	handledDirect := make(map[[2]uint64]struct{})
@@ -576,7 +605,7 @@ func (b *SeqBackfill) convertReadPositions(
 			}
 			seq, err := b.readSeq(
 				ctx, row.LastReadSeq, row.LastReadMessageID, redisPosition, counter,
-				switched,
+				ready,
 				func(ctx context.Context, position uint64) (uint64, error) {
 					return b.store.DirectSeqAtOrBefore(ctx, low, high, position)
 				},
@@ -589,12 +618,9 @@ func (b *SeqBackfill) convertReadPositions(
 				row.LastReadMessageID == 0 && redisPosition == 0 {
 				continue
 			}
-			if err := b.client.HSet(
-				ctx,
-				b.keyspace.directReadKey(row.UserID),
-				strconv.FormatUint(row.PeerID, 10),
-				strconv.FormatUint(seq, 10),
-			).Err(); err != nil {
+			if err := b.writeDirectReadSeq(
+				ctx, ready, row.UserID, row.PeerID, seq, counter,
+			); err != nil {
 				return fmt.Errorf("write conversation read position: %w", err)
 			}
 			if seq > 0 {
@@ -636,7 +662,7 @@ func (b *SeqBackfill) convertReadPositions(
 			}
 			seq, err := b.readSeq(
 				ctx, row.LastReadSeq, row.LastReadMessageID, redisPosition, counter,
-				switched,
+				ready,
 				func(ctx context.Context, position uint64) (uint64, error) {
 					return b.store.GroupSeqAtOrBefore(ctx, row.GroupID, position)
 				},
@@ -649,11 +675,9 @@ func (b *SeqBackfill) convertReadPositions(
 				row.LastReadMessageID == 0 && redisPosition == 0 {
 				continue
 			}
-			if err := b.client.ZAdd(
-				ctx,
-				b.keyspace.groupReadKey(row.GroupID),
-				redis.Z{Score: float64(seq), Member: strconv.FormatUint(row.UserID, 10)},
-			).Err(); err != nil {
+			if err := b.writeGroupReadSeq(
+				ctx, ready, row.GroupID, row.UserID, seq, counter,
+			); err != nil {
 				return fmt.Errorf("write group read position: %w", err)
 			}
 			if seq > 0 {
@@ -667,85 +691,102 @@ func (b *SeqBackfill) convertReadPositions(
 		}
 	}
 
-	if err := b.convertRedisOnlyReadPositions(ctx, handledDirect, handledGroup, now, result, switched); err != nil {
+	if err := b.convertRedisOnlyReadPositions(ctx, handledDirect, handledGroup, now, result, ready); err != nil {
 		return err
 	}
 	return nil
 }
 
 // readSeq resolves a durable read row plus its Redis watermark into seq units.
-// A set last_read_seq is the post-switch truth; otherwise both stored values
-// are legacy global message IDs and are converted. Values are never lowered.
+// The durable last_read_seq is a floor. A legacy last_read_message_id is a
+// global ID and is converted. Redis is seq only when seq:ready proves a
+// completed conversion; otherwise it is a legacy global ID and is converted.
 func (b *SeqBackfill) readSeq(
 	ctx context.Context,
 	lastReadSeq, lastReadMessageID, redisPosition, counter uint64,
-	switched bool,
+	ready bool,
 	convert func(context.Context, uint64) (uint64, error),
 ) (uint64, error) {
-	if lastReadSeq > 0 {
-		seq := lastReadSeq
-		if redisPosition == 0 {
-			return seq, nil
+	seq := lastReadSeq
+	if lastReadMessageID > 0 {
+		converted, err := convert(ctx, lastReadMessageID)
+		if err != nil {
+			return 0, err
 		}
-		redisSeq, err := b.redisPositionSeq(
-			ctx, redisPosition, counter, switched, convert,
-		)
+		if converted > seq {
+			seq = converted
+		}
+	}
+	if redisPosition > 0 {
+		redisSeq, err := b.redisPositionSeq(ctx, redisPosition, counter, ready, convert)
 		if err != nil {
 			return 0, err
 		}
 		if redisSeq > seq {
 			seq = redisSeq
 		}
-		return seq, nil
 	}
-	if lastReadMessageID > 0 {
-		// Pre-switch row: both stored values are global message IDs.
-		seq, err := convert(ctx, lastReadMessageID)
-		if err != nil {
-			return 0, err
-		}
-		if redisPosition > 0 {
-			redisSeq, err := b.redisPositionSeq(
-				ctx, redisPosition, counter, switched, convert,
-			)
-			if err != nil {
-				return 0, err
-			}
-			if redisSeq > seq {
-				seq = redisSeq
-			}
-		}
-		return seq, nil
-	}
-	return b.redisOnlyReadSeq(ctx, redisPosition, counter, switched, convert)
+	return seq, nil
 }
 
-// redisPositionSeq interprets a Redis watermark: after the switch started it
-// is already a seq (a seq can never exceed the counter); before that it can
-// only be a legacy global message ID.
+// redisPositionSeq interprets a Redis watermark. Only seq:ready proves the
+// whole model is in seq units; without it the value is a legacy global message
+// ID and must be converted. A crash-window conversion can only lower a seq
+// value, which keeps unread conservative, so conversion is always safe.
 func (b *SeqBackfill) redisPositionSeq(
 	ctx context.Context,
 	position, counter uint64,
-	switched bool,
+	ready bool,
 	convert func(context.Context, uint64) (uint64, error),
 ) (uint64, error) {
 	if position == 0 {
 		return 0, nil
 	}
-	if switched && position <= counter {
-		return position, nil
+	if !ready {
+		return convert(ctx, position)
 	}
-	return convert(ctx, position)
+	if position > counter {
+		return counter, nil
+	}
+	return position, nil
 }
 
-// redisOnlyReadSeq interprets a watermark that has no durable row.
-func (b *SeqBackfill) redisOnlyReadSeq(
+// writeDirectReadSeq writes a seq watermark. Once seq:ready exists the stored
+// value is comparable, so the write never lowers it; before that the stored
+// value is a global ID and must be replaced by the converted seq.
+func (b *SeqBackfill) writeDirectReadSeq(
 	ctx context.Context,
-	position, counter uint64,
-	switched bool,
-	convert func(context.Context, uint64) (uint64, error),
-) (uint64, error) {
-	return b.redisPositionSeq(ctx, position, counter, switched, convert)
+	ready bool,
+	userID, peerID, seq, counter uint64,
+) error {
+	key := b.keyspace.directReadKey(userID)
+	field := strconv.FormatUint(peerID, 10)
+	value := strconv.FormatUint(seq, 10)
+	if !ready {
+		return b.client.HSet(ctx, key, field, value).Err()
+	}
+	counterValue := strconv.FormatUint(counter, 10)
+	return writeMaxHSetScript.Run(
+		ctx, b.client, []string{key}, field, value, counterValue,
+	).Err()
+}
+
+// writeGroupReadSeq mirrors writeDirectReadSeq for the group ZSET.
+func (b *SeqBackfill) writeGroupReadSeq(
+	ctx context.Context,
+	ready bool,
+	groupID, userID, seq, counter uint64,
+) error {
+	key := b.keyspace.groupReadKey(groupID)
+	member := strconv.FormatUint(userID, 10)
+	value := strconv.FormatUint(seq, 10)
+	if !ready {
+		return b.client.ZAdd(ctx, key, redis.Z{Score: float64(seq), Member: member}).Err()
+	}
+	counterValue := strconv.FormatUint(counter, 10)
+	return writeMaxZAddScript.Run(
+		ctx, b.client, []string{key}, member, value, counterValue,
+	).Err()
 }
 
 // convertRedisOnlyReadPositions converts watermarks whose pair has no durable
@@ -755,7 +796,7 @@ func (b *SeqBackfill) convertRedisOnlyReadPositions(
 	handledDirect, handledGroup map[[2]uint64]struct{},
 	now time.Time,
 	result *SeqBackfillResult,
-	switched bool,
+	ready bool,
 ) error {
 	prefix := b.keyspace.prefixOrDefault()
 	keys, err := scanKeys(ctx, b.client, prefix+"dm:read:*")
@@ -790,8 +831,8 @@ func (b *SeqBackfill) convertRedisOnlyReadPositions(
 			if err != nil {
 				return err
 			}
-			seq, err := b.redisOnlyReadSeq(
-				ctx, position, counter, switched,
+			seq, err := b.redisPositionSeq(
+				ctx, position, counter, ready,
 				func(ctx context.Context, position uint64) (uint64, error) {
 					return b.store.DirectSeqAtOrBefore(ctx, low, high, position)
 				},
@@ -799,10 +840,7 @@ func (b *SeqBackfill) convertRedisOnlyReadPositions(
 			if err != nil {
 				return fmt.Errorf("convert conversation read position: %w", err)
 			}
-			if err := b.client.HSet(
-				ctx, b.keyspace.directReadKey(userID), field,
-				strconv.FormatUint(seq, 10),
-			).Err(); err != nil {
+			if err := b.writeDirectReadSeq(ctx, ready, userID, peerID, seq, counter); err != nil {
 				return fmt.Errorf("write conversation read position: %w", err)
 			}
 			if seq > 0 {
@@ -854,8 +892,8 @@ func (b *SeqBackfill) convertRedisOnlyReadPositions(
 					return err
 				}
 			}
-			seq, err := b.redisOnlyReadSeq(
-				ctx, position, counter, switched,
+			seq, err := b.redisPositionSeq(
+				ctx, position, counter, ready,
 				func(ctx context.Context, position uint64) (uint64, error) {
 					return b.store.GroupSeqAtOrBefore(ctx, groupID, position)
 				},
@@ -863,11 +901,7 @@ func (b *SeqBackfill) convertRedisOnlyReadPositions(
 			if err != nil {
 				return fmt.Errorf("convert group read position: %w", err)
 			}
-			if err := b.client.ZAdd(
-				ctx,
-				b.keyspace.groupReadKey(groupID),
-				redis.Z{Score: float64(seq), Member: member},
-			).Err(); err != nil {
+			if err := b.writeGroupReadSeq(ctx, ready, groupID, userID, seq, counter); err != nil {
 				return fmt.Errorf("write group read position: %w", err)
 			}
 			if seq > 0 {

@@ -337,6 +337,28 @@ func TestListGroupMessages(t *testing.T) {
 	}
 }
 
+func TestListGroupMessagesAfterZeroStartsAtBeginning(t *testing.T) {
+	dataStore := authenticatedChatStore()
+	dataStore.groupMessageAfterPage = store.GroupMessagePage{}
+	router := testRouter(dataStore)
+
+	recorder := doJSON(
+		t, router, http.MethodGet,
+		"/api/groups/7/messages?after_seq=0&limit=10", nil, authTestCookie(),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s",
+			recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if dataStore.groupMessageAfterCall.afterSeq != 0 ||
+		dataStore.groupMessageAfterCall.limit != 10 {
+		t.Fatalf("after-seq call = %#v", dataStore.groupMessageAfterCall)
+	}
+	if dataStore.groupMessageCall.limit != 0 {
+		t.Fatalf("before-seq path was used: %#v", dataStore.groupMessageCall)
+	}
+}
+
 func TestSendGroupMessage(t *testing.T) {
 	now := time.Now().UTC()
 	dataStore := authenticatedChatStore()

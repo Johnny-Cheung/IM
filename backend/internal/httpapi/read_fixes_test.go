@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -45,6 +46,98 @@ func TestImplicitGroupReadAdvancesEverySender(t *testing.T) {
 				call, call.userID)
 		}
 	}
+}
+
+func TestSendGroupMessageFallsBackToRedisRecipients(t *testing.T) {
+	alice := store.User{ID: 1, Username: "alice", Nickname: "Alice"}
+	bob := store.User{ID: 2, Username: "bob", Nickname: "Bob"}
+	dataStore := &fakeStore{
+		sessionByTokenHash:     chatSessions(alice, bob),
+		groupMemberIDsErr:      errors.New("mysql: connection reset"),
+		createdGroupMessageNew: true,
+		createdGroupMessage: store.GroupMessage{
+			ID: 12, Seq: 12, GroupID: 7, SenderID: 1,
+			Sender:          store.PublicUser{Username: "alice", Nickname: "Alice"},
+			ClientMessageID: "group-client-1",
+			Body:            "hello",
+			CreatedAt:       time.Now().UTC(),
+		},
+	}
+	tracker := newFakeGroupReadTracker()
+	tracker.memberIDs = []uint64{1, 2}
+	api, router, baseURL := startChatServer(t, dataStore, WithGroupReadTracker(tracker))
+	api.Start()
+	t.Cleanup(api.Stop)
+	conn := dialChatSocket(t, baseURL, "bob")
+	waitFor(t, func() bool { return api.hub.activeCount(2) == 1 })
+
+	recorder := doJSON(t, router, http.MethodPost, "/api/groups/7/messages", map[string]string{
+		"body":              "hello",
+		"client_message_id": "group-client-1",
+	}, testCookie("alice"))
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	event := readWSEventType(t, conn, "group.message.created")
+	message, ok := event["message"].(map[string]any)
+	if !ok || message["seq"] != float64(12) {
+		t.Fatalf("event = %#v", event)
+	}
+	waitFor(t, func() bool {
+		for _, advance := range tracker.snapAdvances() {
+			if advance.groupID == 7 && advance.userID == 1 && advance.throughSeq == 12 {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func TestImplicitReadFlushReportsRetryableFailures(t *testing.T) {
+	direct := newFakeDirectReadTracker()
+	api := New(&fakeStore{}, WithDirectReadTracker(direct))
+	directBatch := implicitReadBatch{
+		direct: true, senderID: 1, recipientID: 2, throughSeq: 5,
+	}
+	direct.advanceErr = errors.New("redis: connection reset")
+	if ok := api.flushDirectImplicitRead(context.Background(), &directBatch); ok {
+		t.Fatal("direct flush reported success after a Redis error")
+	}
+	direct.advanceErr = nil
+	if ok := api.flushDirectImplicitRead(context.Background(), &directBatch); !ok {
+		t.Fatal("direct flush reported failure without an error")
+	}
+
+	group := newFakeGroupReadTracker()
+	groupAPI := New(&fakeStore{}, WithGroupReadTracker(group))
+	groupBatch := implicitReadBatch{groupID: 7, senderID: 1, throughSeq: 5}
+	group.advanceErr = errors.New("redis: connection reset")
+	if ok := groupAPI.flushGroupImplicitRead(context.Background(), &groupBatch); ok {
+		t.Fatal("group flush reported success after a Redis error")
+	}
+	group.advanceErr = messaging.ErrGroupDissolved
+	if ok := groupAPI.flushGroupImplicitRead(context.Background(), &groupBatch); !ok {
+		t.Fatal("a dissolved group must retire the batch")
+	}
+}
+
+func TestImplicitReadRequeuesFailedAdvance(t *testing.T) {
+	var attempts atomic.Int32
+	tracker := newFakeGroupReadTracker()
+	tracker.advanceFn = func(_, userID, throughSeq uint64) (messaging.GroupReadAdvance, error) {
+		if attempts.Add(1) == 1 {
+			return messaging.GroupReadAdvance{}, errors.New("redis: connection reset")
+		}
+		return messaging.GroupReadAdvance{
+			UserID: userID, LastReadSeq: throughSeq, Advanced: true,
+		}, nil
+	}
+	api := New(&fakeStore{}, WithGroupReadTracker(tracker))
+	api.Start()
+	t.Cleanup(api.Stop)
+
+	api.scheduleGroupImplicitRead(7, 1, 10, []uint64{1})
+	waitFor(t, func() bool { return attempts.Load() >= 2 })
 }
 
 func TestImplicitReadStopBoundsDrain(t *testing.T) {

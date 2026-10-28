@@ -165,6 +165,24 @@ func TestRedisMessageReaderHasMoreUsesRangeBoundaries(t *testing.T) {
 	}
 }
 
+func TestRedisMessageReaderAfterZeroStartsAtFirstSeq(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	defer client.Close()
+	ctx := context.Background()
+
+	seedDirectMessages(t, client, 1, 2, 5)
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	page, err := reader.ReadConversationAfter(ctx, 2, 1, 0, 2)
+	if err != nil {
+		t.Fatalf("ReadConversationAfter(0) error = %v", err)
+	}
+	if !page.Complete || !page.Page.HasMore || len(page.Page.Messages) != 2 ||
+		page.Page.Messages[0].Seq != 1 || page.Page.Messages[1].Seq != 2 {
+		t.Fatalf("page = %#v, want seqs 1 and 2 with more", page)
+	}
+}
+
 func TestRedisMessageReaderIsolatesConversations(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})

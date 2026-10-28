@@ -44,23 +44,25 @@ func (r *GroupMessageReader) ReadGroup(
 	groupID, beforeSeq uint64,
 	limit int,
 ) (GroupConversationPage, error) {
-	return r.read(ctx, groupID, beforeSeq, 0, limit)
+	return r.read(ctx, groupID, false, beforeSeq, 0, limit)
 }
 
 // ReadGroupAfter returns group messages with a seq greater than afterSeq,
-// oldest first.
+// oldest first. afterSeq zero starts at seq 1.
 func (r *GroupMessageReader) ReadGroupAfter(
 	ctx context.Context,
 	_ uint64,
 	groupID, afterSeq uint64,
 	limit int,
 ) (GroupConversationPage, error) {
-	return r.read(ctx, groupID, 0, afterSeq, limit)
+	return r.read(ctx, groupID, true, 0, afterSeq, limit)
 }
 
 func (r *GroupMessageReader) read(
 	ctx context.Context,
-	groupID, beforeSeq, afterSeq uint64,
+	groupID uint64,
+	afterMode bool,
+	beforeSeq, afterSeq uint64,
 	limit int,
 ) (GroupConversationPage, error) {
 	if r == nil || r.client == nil {
@@ -88,7 +90,7 @@ func (r *GroupMessageReader) read(
 	var low, high uint64
 	var hasMore bool
 	switch {
-	case afterSeq > 0:
+	case afterMode:
 		low = afterSeq
 		high = counter
 		if afterSeq+uint64(limit) < high {
@@ -158,7 +160,7 @@ func (r *GroupMessageReader) read(
 	}
 	sort.Slice(messages, func(i, j int) bool { return messages[i].Seq < messages[j].Seq })
 	if len(messages) > limit {
-		if afterSeq > 0 {
+		if afterMode {
 			messages = messages[:limit]
 		} else {
 			messages = messages[len(messages)-limit:]

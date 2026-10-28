@@ -29,7 +29,21 @@ TEST_COUNT=0
 pass() { TEST_COUNT=$((TEST_COUNT+1)); printf 'PASS %s\n' "$1"; }
 sleep() { :; }
 journalctl() { :; }
-ss() { printf 'State Recv-Q Send-Q LocalAddress PeerAddress\n'; }
+TEST_PORTS=""
+TEST_PROCESSES=""
+ss() {
+  printf 'State Recv-Q Send-Q LocalAddress PeerAddress\n'
+  local port
+  for port in ${TEST_PORTS}; do
+    printf 'LISTEN 0 128 0.0.0.0:%s 0.0.0.0:*\n' "${port}"
+  done
+}
+pgrep() {
+  local pid
+  for pid in ${TEST_PROCESSES}; do
+    printf '%s\n' "${pid}"
+  done
+}
 prepare_backend_config() {
   if [ "${VERIFY_MODE}" = "1" ]; then
     mkdir -p "${INFRA_CONFIG_DIR}"
@@ -107,6 +121,18 @@ touch "${TEST_DIR}/active"
 if backfill_seq >/dev/null 2>&1; then exit 1; fi
 rm -f "${TEST_DIR}/active"
 pass 'seq backfill refuses to run while the backend is active'
+TEST_PORTS="${PORT}"
+if backfill_seq >/dev/null 2>&1; then exit 1; fi
+TEST_PORTS=""
+pass 'seq backfill refuses while the backend port is listening'
+TEST_PROCESSES=4242
+if backfill_seq >/dev/null 2>&1; then exit 1; fi
+TEST_PROCESSES=""
+pass 'seq backfill refuses while an im-server process is running'
+TEST_PROCESSES="$$"
+backfill_seq >/dev/null
+TEST_PROCESSES=""
+pass 'seq backfill ignores its own process'
 INFRA_REDIS_URL_FILE="${TEST_DIR}/missing-redis-url"
 VERIFY_MODE=0
 if backfill_seq >/dev/null 2>&1; then exit 1; fi

@@ -200,8 +200,10 @@ export function missingSeqs(
 
 export type GapPullPlan = { afterSeq: number; targetSeq: number };
 
-// A seq already marked missing is never retried; the pull resumes after the
-// highest skipped seq so the server keeps making progress.
+// A seq already marked missing is never retried. The server's after cursor is
+// exclusive and 0 is its "no cursor" sentinel, so resume at the last seq before
+// the first hole; the range start would collide with the sentinel and fetch the
+// newest page instead of the hole.
 export function planGapPull(
   afterSeq: number,
   targetSeq: number,
@@ -213,14 +215,7 @@ export function planGapPull(
   if (unfilled.length === 0) {
     return null;
   }
-  const first = unfilled[0];
-  let cursor = Number.isInteger(afterSeq) && afterSeq > 0 ? afterSeq : 0;
-  for (const seq of knownMissing) {
-    if (seq > cursor && seq < first) {
-      cursor = seq;
-    }
-  }
-  return { afterSeq: cursor, targetSeq };
+  return { afterSeq: Math.max(unfilled[0] - 1, 0), targetSeq };
 }
 
 export function nextUnread(
@@ -271,6 +266,16 @@ export function lostOutboxEntries<T extends { client_message_id: string }>(
   confirmedClientIDs: ReadonlySet<string>,
 ): T[] {
   return entries.filter((entry) => !confirmedClientIDs.has(entry.client_message_id));
+}
+
+// A stored outbox row is still sending only while a request for its client id
+// is in flight in this document; one left behind by a reload must surface as
+// failed so it stays visible and retryable.
+export function outboxDisplayStatus(
+  stored: "sending" | "failed",
+  inFlight: boolean,
+): "sending" | "failed" {
+  return stored === "sending" && inFlight ? "sending" : "failed";
 }
 
 export class MissingSeqTracker {

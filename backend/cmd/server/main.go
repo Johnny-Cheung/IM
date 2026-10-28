@@ -119,6 +119,17 @@ func run(options serverOptions) error {
 		if err != nil {
 			return fmt.Errorf("seed message ID: %w", err)
 		}
+		backfillLocked, err := infraManager.Redis().Exists(
+			startupCtx, messaging.BackfillLockKey(keyspace),
+		).Result()
+		if err != nil {
+			return fmt.Errorf("check seq backfill lock: %w", err)
+		}
+		if backfillLocked > 0 {
+			return fmt.Errorf(
+				"seq backfill is in progress; wait for it to finish before starting the backend",
+			)
+		}
 		readyChecker := messaging.NewDirectReadTracker(
 			infraManager.Redis(),
 			messaging.DirectReadTrackerOptions{Keyspace: keyspace},
@@ -221,13 +232,16 @@ func run(options serverOptions) error {
 		if err != nil {
 			return fmt.Errorf("calibrate conversation counters: %w", err)
 		}
+		calibratedAt := time.Now().UTC()
 		gate.Open()
 		log.Printf("conversation counters calibrated conversations=%d", calibrated)
 		seqWatcher = messaging.NewSeqWatcher(infraManager.Redis(), messaging.SeqWatcherOptions{
-			Keyspace:     keyspace,
-			Gate:         gate,
-			Calibrator:   calibrator,
-			InitialRunID: runIDBeforeCalibration,
+			Keyspace:             keyspace,
+			Gate:                 gate,
+			Calibrator:           calibrator,
+			InitialRunID:         runIDBeforeCalibration,
+			InitialCalibratedAt:  calibratedAt,
+			InitialConversations: calibrated,
 		})
 
 		workerContext, cancelWorkers = context.WithCancel(context.Background())

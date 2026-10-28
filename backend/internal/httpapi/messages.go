@@ -142,6 +142,18 @@ func (a *API) buildConversations(
 				if !ok {
 					continue
 				}
+				// The counter snapshot above and this preview read are separate
+				// calls: a message accepted in between must not leave last_seq
+				// behind last_message.seq, or clients treat the list as a
+				// server-side rollback and drop it.
+				newest := message.Seq
+				if current := conversations[index].LastMessage; current != nil && current.Seq > newest {
+					newest = current.Seq
+				}
+				if newest > conversations[index].LastSeq {
+					conversations[index].UnreadCount += int(newest - conversations[index].LastSeq)
+					conversations[index].LastSeq = newest
+				}
 				if conversations[index].LastMessage == nil || message.Seq > conversations[index].LastMessage.Seq {
 					messageCopy := message
 					conversations[index].LastMessage = &messageCopy
@@ -403,8 +415,10 @@ func (a *API) listMessages(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
 		return
 	}
-	afterSeq, err := parseAfterSeq(c.Query("after_seq"))
-	if err != nil || (beforeSeq > 0 && afterSeq > 0) {
+	afterRaw := c.Query("after_seq")
+	afterSeq, err := parseAfterSeq(afterRaw)
+	hasAfter := afterRaw != ""
+	if err != nil || (beforeSeq > 0 && hasAfter) {
 		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
 		return
 	}
@@ -420,7 +434,7 @@ func (a *API) listMessages(c *gin.Context) {
 	hotAvailable := false
 	if a.directReader != nil {
 		var hot messaging.ConversationPage
-		if afterSeq > 0 {
+		if hasAfter {
 			hot, err = a.directReader.ReadConversationAfter(
 				c.Request.Context(),
 				current.ID,
@@ -450,7 +464,7 @@ func (a *API) listMessages(c *gin.Context) {
 	}
 
 	if !servedFromRedis {
-		if afterSeq > 0 {
+		if hasAfter {
 			page, err = a.store.ListMessagesAfter(
 				c.Request.Context(),
 				current.ID,
@@ -473,7 +487,7 @@ func (a *API) listMessages(c *gin.Context) {
 			return
 		}
 		if hotAvailable {
-			page = mergeMessagePages(page, hotPage, beforeSeq > 0 || afterSeq == 0, limit)
+			page = mergeMessagePages(page, hotPage, !hasAfter, limit)
 		}
 	}
 

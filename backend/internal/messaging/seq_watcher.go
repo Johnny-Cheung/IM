@@ -75,17 +75,25 @@ type SeqWatcherOptions struct {
 	// is set the first check compares against it instead of skipping, so a
 	// restart during startup is still detected.
 	InitialRunID string
-	Interval     time.Duration
-	Backoff      time.Duration
-	MaxBackoff   time.Duration
+	// InitialCalibratedAt and InitialConversations carry the startup
+	// calibration into the status so /ops/infra is meaningful before the
+	// watcher's first runtime recalibration.
+	InitialCalibratedAt  time.Time
+	InitialConversations int
+	Interval             time.Duration
+	Backoff              time.Duration
+	MaxBackoff           time.Duration
 }
 
 // SeqWatcherStatus is the diagnostics surface for /ops/infra.
 type SeqWatcherStatus struct {
-	Ready            bool
-	LastCalibratedAt time.Time
-	Conversations    int
-	LastError        string
+	Ready            bool      `json:"ready"`
+	RunID            string    `json:"run_id,omitempty"`
+	Calibrating      bool      `json:"calibrating"`
+	WaitingSeqReady  bool      `json:"waiting_seq_ready"`
+	LastCalibratedAt time.Time `json:"last_calibrated_at,omitempty"`
+	Conversations    int       `json:"conversations"`
+	LastError        string    `json:"last_error,omitempty"`
 }
 
 // SeqWatcher polls run_id and seq:ready, closing the gate and recalibrating
@@ -104,6 +112,7 @@ type SeqWatcher struct {
 	mu               sync.Mutex
 	initialized      bool
 	lastRunID        string
+	calibrating      bool
 	waitingReady     bool
 	lastCalibratedAt time.Time
 	conversations    int
@@ -128,17 +137,19 @@ func NewSeqWatcher(
 		runIDs = redisRunIDSource{client: client}
 	}
 	return &SeqWatcher{
-		client:      client,
-		keyspace:    options.Keyspace,
-		gate:        options.Gate,
-		calibrator:  options.Calibrator,
-		runIDs:      runIDs,
-		interval:    options.Interval,
-		backoff:     options.Backoff,
-		maxBackoff:  options.MaxBackoff,
-		notify:      make(chan struct{}, 1),
-		initialized: options.InitialRunID != "",
-		lastRunID:   options.InitialRunID,
+		client:           client,
+		keyspace:         options.Keyspace,
+		gate:             options.Gate,
+		calibrator:       options.Calibrator,
+		runIDs:           runIDs,
+		interval:         options.Interval,
+		backoff:          options.Backoff,
+		maxBackoff:       options.MaxBackoff,
+		notify:           make(chan struct{}, 1),
+		initialized:      options.InitialRunID != "",
+		lastRunID:        options.InitialRunID,
+		lastCalibratedAt: options.InitialCalibratedAt,
+		conversations:    options.InitialConversations,
 	}
 }
 
@@ -186,6 +197,9 @@ func (w *SeqWatcher) Status() SeqWatcherStatus {
 	defer w.mu.Unlock()
 	return SeqWatcherStatus{
 		Ready:            w.gate.IsReady(),
+		RunID:            w.lastRunID,
+		Calibrating:      w.calibrating,
+		WaitingSeqReady:  w.waitingReady,
 		LastCalibratedAt: w.lastCalibratedAt,
 		Conversations:    w.conversations,
 		LastError:        w.lastError,
@@ -223,6 +237,14 @@ func (w *SeqWatcher) check(ctx context.Context) {
 
 func (w *SeqWatcher) recalibrate(ctx context.Context) {
 	w.gate.Close()
+	w.mu.Lock()
+	w.calibrating = true
+	w.mu.Unlock()
+	defer func() {
+		w.mu.Lock()
+		w.calibrating = false
+		w.mu.Unlock()
+	}()
 	backoff := w.backoff
 	for {
 		conversations, err := w.calibrator.Calibrate(ctx)

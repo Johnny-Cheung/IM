@@ -200,11 +200,9 @@ func (r *implicitRead) flushDue() {
 
 func (r *implicitRead) flushBatch(ctx context.Context, batch *implicitReadBatch) bool {
 	if batch.direct {
-		r.api.flushDirectImplicitRead(ctx, batch)
-	} else {
-		r.api.flushGroupImplicitRead(ctx, batch)
+		return r.api.flushDirectImplicitRead(ctx, batch)
 	}
-	return ctx.Err() == nil
+	return r.api.flushGroupImplicitRead(ctx, batch)
 }
 
 // requeue puts unflushed batches back so a slow or failing Redis call retries
@@ -328,10 +326,14 @@ func (a *API) scheduleGroupImplicitRead(
 	})
 }
 
-func (a *API) flushDirectImplicitRead(ctx context.Context, batch *implicitReadBatch) {
+// flushDirectImplicitRead reports whether the batch can be retired. A Redis or
+// gate failure returns false so the caller retries instead of losing the
+// readers' positions.
+func (a *API) flushDirectImplicitRead(ctx context.Context, batch *implicitReadBatch) bool {
 	if a.directReads == nil {
-		return
+		return true
 	}
+	ok := true
 	now := time.Now().UTC()
 
 	type advancedRead struct{ readerID, peerID, position uint64 }
@@ -341,6 +343,7 @@ func (a *API) flushDirectImplicitRead(ctx context.Context, batch *implicitReadBa
 			ctx, batch.recipientID, batch.senderID, batch.throughSeq, now,
 		)
 		if err != nil {
+			ok = false
 			log.Printf("implicit direct read recipient=%d peer=%d: %v",
 				batch.recipientID, batch.senderID, err)
 		} else if result.Advanced {
@@ -356,6 +359,7 @@ func (a *API) flushDirectImplicitRead(ctx context.Context, batch *implicitReadBa
 		ctx, batch.senderID, batch.recipientID, batch.throughSeq, now,
 	)
 	if err != nil {
+		ok = false
 		log.Printf("implicit direct read sender=%d peer=%d: %v",
 			batch.senderID, batch.recipientID, err)
 	} else if result.Advanced {
@@ -373,12 +377,17 @@ func (a *API) flushDirectImplicitRead(ctx context.Context, batch *implicitReadBa
 		}
 		a.PublishRead(item.readerID, item.peerID, readerName, peerName, item.position)
 	}
+	return ok
 }
 
-func (a *API) flushGroupImplicitRead(ctx context.Context, batch *implicitReadBatch) {
+// flushGroupImplicitRead reports whether the batch can be retired. A dissolved
+// group or a removed member is terminal; any other Redis or gate failure is
+// retried.
+func (a *API) flushGroupImplicitRead(ctx context.Context, batch *implicitReadBatch) bool {
 	if a.groupReads == nil {
-		return
+		return true
 	}
+	ok := true
 	now := time.Now().UTC()
 	advanced := make(map[uint64]struct{}, 4)
 
@@ -389,6 +398,7 @@ func (a *API) flushGroupImplicitRead(ctx context.Context, batch *implicitReadBat
 		)
 		if err != nil {
 			if !groupGoneError(err) {
+				ok = false
 				log.Printf("implicit group read group=%d viewers=%v: %v",
 					batch.groupID, viewers, err)
 			}
@@ -408,6 +418,7 @@ func (a *API) flushGroupImplicitRead(ctx context.Context, batch *implicitReadBat
 		)
 		if err != nil {
 			if !groupGoneError(err) {
+				ok = false
 				log.Printf("implicit group read sender=%d group=%d: %v",
 					batch.senderID, batch.groupID, err)
 			}
@@ -420,7 +431,7 @@ func (a *API) flushGroupImplicitRead(ctx context.Context, batch *implicitReadBat
 	}
 
 	if len(advanced) == 0 {
-		return
+		return ok
 	}
 	// The sender's own advance is not a read by somebody else, so it must not
 	// suppress the signal the sender needs for its receipt: exclude only the
@@ -432,9 +443,10 @@ func (a *API) flushGroupImplicitRead(ctx context.Context, batch *implicitReadBat
 		}
 	}
 	if len(excluded) == 0 {
-		return
+		return ok
 	}
 	a.publishGroupRead(batch.memberIDs, batch.groupID, excluded)
+	return ok
 }
 
 // groupGoneError marks the expected race where the group was dissolved or the

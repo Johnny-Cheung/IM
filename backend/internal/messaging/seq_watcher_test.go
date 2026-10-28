@@ -47,18 +47,31 @@ type fakeCalibrator struct {
 	failures         int
 	conversations    int
 	closedAtCallTime []bool
+
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
 }
 
 func (f *fakeCalibrator) Calibrate(context.Context) (int, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls++
 	f.closedAtCallTime = append(f.closedAtCallTime, f.gate != nil && !f.gate.IsReady())
-	if f.failures > 0 {
+	failures := f.failures
+	if failures > 0 {
 		f.failures--
+	}
+	conversations := f.conversations
+	started, release := f.started, f.release
+	f.mu.Unlock()
+	if failures > 0 {
 		return 0, errors.New("mysql unavailable")
 	}
-	return f.conversations, nil
+	if started != nil {
+		f.once.Do(func() { close(started) })
+		<-release
+	}
+	return conversations, nil
 }
 
 func (f *fakeCalibrator) callCount() int {
@@ -228,6 +241,40 @@ func TestSeqWatcherRecalibratesOnRunIDChange(t *testing.T) {
 	if !status.Ready || status.Conversations != 3 || status.LastCalibratedAt.IsZero() {
 		t.Fatalf("status = %#v", status)
 	}
+	if status.RunID != "run-b" || status.Calibrating || status.WaitingSeqReady {
+		t.Fatalf("status = %#v, want run-b and no calibration flags", status)
+	}
+}
+
+func TestSeqWatcherReportsCalibrating(t *testing.T) {
+	client, _, runIDs, calibrator, _, watcher := newWatcherTest(t)
+	seedSequenceReady(t, client)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	calibrator.mu.Lock()
+	calibrator.started = started
+	calibrator.release = release
+	calibrator.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runIDs.set("run-b")
+		watcher.check(context.Background())
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("calibration did not start")
+	}
+	if status := watcher.Status(); !status.Calibrating || status.Ready {
+		t.Fatalf("status during calibration = %#v", status)
+	}
+	close(release)
+	<-done
+	if status := watcher.Status(); status.Calibrating || !status.Ready {
+		t.Fatalf("status after calibration = %#v", status)
+	}
 }
 
 func TestSeqWatcherKeepsGateClosedWhenReadyIsMissing(t *testing.T) {
@@ -247,6 +294,9 @@ func TestSeqWatcherKeepsGateClosedWhenReadyIsMissing(t *testing.T) {
 	}
 	if watcher.Status().Ready {
 		t.Fatal("status ready while seq:ready is missing")
+	}
+	if status := watcher.Status(); !status.WaitingSeqReady || status.Calibrating {
+		t.Fatalf("status while waiting for seq:ready = %#v", status)
 	}
 
 	watcher.check(ctx)

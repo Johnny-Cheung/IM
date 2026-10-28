@@ -290,6 +290,18 @@ backfill_seq() {
     echo "stop the backend before running the seq backfill" >&2
     return 1
   fi
+  local listeners
+  listeners="$(ss -lnt | awk '{print $4}')"
+  if grep -q ":${PORT}\$" <<<"${listeners}"; then
+    echo "port ${PORT} is in use; stop any backend listening on it before the seq backfill" >&2
+    return 1
+  fi
+  local running
+  running="$(pgrep -f "${APP_ROOT}/bin/im-server" | grep -vx "$$" || true)"
+  if [ -n "${running}" ]; then
+    echo "an im-server process is running for ${APP_ROOT}; stop it before the seq backfill" >&2
+    return 1
+  fi
   local -a env_args=()
   local line
   while IFS= read -r line; do

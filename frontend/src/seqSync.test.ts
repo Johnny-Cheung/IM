@@ -8,6 +8,7 @@ import {
   MissingSeqTracker,
   missingSeqs,
   nextUnread,
+  outboxDisplayStatus,
   planActiveSync,
   planGapPull,
   planIncoming,
@@ -195,18 +196,32 @@ describe("gap filling", () => {
     const present = new Set([1, 2, 4, 5]);
     const tracker = new MissingSeqTracker();
     const first = planGapPull(0, 5, present, tracker.pending("direct:bob"));
-    expect(first).toEqual({ afterSeq: 0, targetSeq: 5 });
+    expect(first).toEqual({ afterSeq: 2, targetSeq: 5 });
 
     tracker.mark("direct:bob", [3]);
     expect(tracker.has("direct:bob", 3)).toBe(true);
     expect(planGapPull(0, 5, present, tracker.pending("direct:bob"))).toBeNull();
   });
 
-  it("resumes after the skipped seq when another gap remains", () => {
+  it("resumes at the last seq before the hole for the exclusive cursor", () => {
+    // A 120-message cache with a hole at 10..12 must ask for after_seq=9; the
+    // range start 0 is the endpoint's "no cursor" sentinel and would return the
+    // newest page instead.
+    const present = new Set(
+      Array.from({ length: 120 }, (_, index) => index + 1)
+        .filter((seq) => seq < 10 || seq > 12),
+    );
+    expect(planGapPull(0, 120, present))
+      .toEqual({ afterSeq: 9, targetSeq: 120 });
+    // A hole that starts at seq 1 still has to fall back to the sentinel.
+    expect(planGapPull(0, 3, [2, 3])).toEqual({ afterSeq: 0, targetSeq: 3 });
+  });
+
+  it("resumes before the next gap once a skipped seq is marked", () => {
     const present = new Set([1, 2, 4, 6]);
     const missing = new Set([3]);
     expect(planGapPull(0, 6, present, missing))
-      .toEqual({ afterSeq: 3, targetSeq: 6 });
+      .toEqual({ afterSeq: 4, targetSeq: 6 });
   });
 
   it("clears a conversation's missing seqs", () => {
@@ -266,5 +281,13 @@ describe("outbox reconciliation", () => {
     ];
     expect(lostOutboxEntries(entries, new Set(["a"])))
       .toEqual([{ client_message_id: "b" }]);
+  });
+
+  it("shows a stored sending row as sending only while its send is in flight", () => {
+    expect(outboxDisplayStatus("sending", true)).toBe("sending");
+    // A reload leaves the row behind with no request in this document.
+    expect(outboxDisplayStatus("sending", false)).toBe("failed");
+    expect(outboxDisplayStatus("failed", true)).toBe("failed");
+    expect(outboxDisplayStatus("failed", false)).toBe("failed");
   });
 });

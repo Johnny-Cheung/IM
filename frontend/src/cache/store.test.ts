@@ -653,6 +653,62 @@ describe("seq storage", () => {
     expect(await readConversationSeq("alice", conversation)).toBe(2);
   });
 
+  it("archives own messages dropped by a rollback as failed outbox entries", async () => {
+    const conversation = "direct:bob";
+    await writeMessages("alice", conversation, [
+      directMessage(10, { seq: 1 }),
+      directMessage(20, { seq: 2 }),
+      directMessage(30, { seq: 3, sender: bob, recipient: alice }),
+      directMessage(40, {
+        seq: 4,
+        body: "lost",
+        client_message_id: "client-lost",
+        created_at: "2026-10-26T00:04:00Z",
+      }),
+    ]);
+
+    const archived = await deleteMessagesFrom("alice", conversation, 3);
+
+    // Only the own confirmed message is retryable; the peer one is just dropped.
+    expect(archived).toEqual([{
+      user: "alice",
+      conversation,
+      client_message_id: "client-lost",
+      body: "lost",
+      kind: "direct",
+      recipient: bob,
+      created_at: "2026-10-26T00:04:00Z",
+      status: "failed",
+    }]);
+    expect(await readOutbox("alice", conversation)).toEqual(archived);
+    expect((await readMessages("alice", conversation)).map((message) => message.seq))
+      .toEqual([1, 2]);
+    expect(await readConversationSeq("alice", conversation)).toBe(2);
+  });
+
+  it("keeps the group id when archiving a dropped group message", async () => {
+    const conversation = "group:9";
+    await writeMessages("alice", conversation, [
+      groupMessage(9, 10, { seq: 1 }),
+      groupMessage(9, 20, { seq: 2, body: "lost group" }),
+    ]);
+
+    const archived = await deleteMessagesFrom("alice", conversation, 2);
+
+    expect(archived).toHaveLength(1);
+    expect(archived[0]).toMatchObject({
+      user: "alice",
+      conversation,
+      kind: "group",
+      group_id: 9,
+      body: "lost group",
+      client_message_id: "group-client-9-20",
+      status: "failed",
+    });
+    expect(archived[0].recipient).toBeUndefined();
+    expect(await readOutbox("alice", conversation)).toEqual(archived);
+  });
+
   it("keeps the newest 200 messages per conversation by seq", async () => {
     const conversation = "direct:bob";
     const messages = Array.from({ length: 250 }, (_, index) =>
@@ -751,7 +807,7 @@ describe("degraded mode", () => {
       writeMessages("alice", "direct:bob", [directMessage(1)]),
     ).resolves.toBeUndefined();
     await expect(deleteMessagesFrom("alice", "direct:bob", 2))
-      .resolves.toBeUndefined();
+      .resolves.toEqual([]);
     await expect(writeOutbox(outboxEntry())).resolves.toBeUndefined();
     await expect(deleteOutbox("alice", "direct:bob", "client-outbox"))
       .resolves.toBeUndefined();

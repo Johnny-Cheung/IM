@@ -487,6 +487,57 @@ func TestListConversationsUsesHotLastMessage(t *testing.T) {
 	}
 }
 
+func TestListConversationsRaisesLastSeqToHotMessage(t *testing.T) {
+	now := time.Now().UTC()
+	dataStore := authenticatedFriendStore()
+	dataStore.conversations = []store.Conversation{{
+		UserID:   2,
+		User:     store.PublicUser{Username: "bob", Nickname: "Bob"},
+		IsFriend: true,
+	}}
+	reader := &directReaderStub{lastMessages: map[uint64]store.Message{
+		2: {
+			ID:              11,
+			Seq:             5,
+			SenderID:        2,
+			RecipientID:     1,
+			ClientMessageID: "client-00000011",
+			Body:            "accepted after the counter snapshot",
+			CreatedAt:       now,
+		},
+	}}
+	tracker := newFakeDirectReadTracker()
+	tracker.states = map[uint64]messaging.DirectConversationState{
+		2: {LastSeq: 4, ReadSeq: 3, Unread: 1},
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	New(dataStore, WithDirectMessageReader(reader), WithDirectReadTracker(tracker)).Register(router)
+
+	recorder := doJSON(t, router, http.MethodGet, "/api/conversations", nil, authTestCookie())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var response conversationListResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Conversations) != 1 {
+		t.Fatalf("conversations = %#v", response.Conversations)
+	}
+	conversation := response.Conversations[0]
+	if conversation.LastMessage == nil || conversation.LastMessage.Seq != 5 {
+		t.Fatalf("last message = %#v", conversation.LastMessage)
+	}
+	if conversation.LastSeq != 5 {
+		t.Fatalf("last_seq = %d, want the hot message seq 5", conversation.LastSeq)
+	}
+	if conversation.UnreadCount != 2 {
+		t.Fatalf("unread = %d, want 2", conversation.UnreadCount)
+	}
+}
+
 func TestListMessages(t *testing.T) {
 	now := time.Now().UTC()
 	dataStore := authenticatedChatStore()
@@ -599,6 +650,28 @@ func TestListMessagesAfter(t *testing.T) {
 	if !response.HasMore || len(response.Messages) != 1 ||
 		response.Messages[0].Seq != 12 || response.Messages[0].Body != "after cursor" {
 		t.Fatalf("response = %#v", response)
+	}
+}
+
+func TestListMessagesAfterZeroStartsAtBeginning(t *testing.T) {
+	dataStore := authenticatedChatStore()
+	dataStore.messageAfterPage = store.MessagePage{HasMore: false}
+	router := testRouter(dataStore)
+
+	recorder := doJSON(
+		t, router, http.MethodGet,
+		"/api/conversations/bob/messages?after_seq=0&limit=10",
+		nil, authTestCookie(),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if dataStore.listMessagesAfterCall.afterSeq != 0 ||
+		dataStore.listMessagesAfterCall.limit != 10 {
+		t.Fatalf("after-seq call = %#v", dataStore.listMessagesAfterCall)
+	}
+	if dataStore.listMessagesCall.limit != 0 {
+		t.Fatalf("before-seq path was used: %#v", dataStore.listMessagesCall)
 	}
 }
 

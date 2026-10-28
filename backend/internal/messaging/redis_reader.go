@@ -53,17 +53,17 @@ func (r *RedisMessageReader) ReadConversation(
 	userID, otherID, beforeSeq uint64,
 	limit int,
 ) (ConversationPage, error) {
-	return r.read(ctx, userID, otherID, beforeSeq, 0, limit)
+	return r.read(ctx, userID, otherID, false, beforeSeq, 0, limit)
 }
 
 // ReadConversationAfter returns messages with a seq greater than afterSeq,
-// oldest first.
+// oldest first. afterSeq zero starts at seq 1.
 func (r *RedisMessageReader) ReadConversationAfter(
 	ctx context.Context,
 	userID, otherID, afterSeq uint64,
 	limit int,
 ) (ConversationPage, error) {
-	return r.read(ctx, userID, otherID, 0, afterSeq, limit)
+	return r.read(ctx, userID, otherID, true, 0, afterSeq, limit)
 }
 
 // FeedPage is one page of the user's direct-message feed.
@@ -259,7 +259,9 @@ func ReadGroupSequenceCounters(
 
 func (r *RedisMessageReader) read(
 	ctx context.Context,
-	userID, otherID, beforeSeq, afterSeq uint64,
+	userID, otherID uint64,
+	afterMode bool,
+	beforeSeq, afterSeq uint64,
 	limit int,
 ) (ConversationPage, error) {
 	if r == nil || r.client == nil {
@@ -287,7 +289,7 @@ func (r *RedisMessageReader) read(
 	var low, high uint64
 	var hasMore bool
 	switch {
-	case afterSeq > 0:
+	case afterMode:
 		low = afterSeq
 		high = counter
 		if afterSeq+uint64(limit) < high {
@@ -357,7 +359,7 @@ func (r *RedisMessageReader) read(
 	}
 	sort.Slice(messages, func(i, j int) bool { return messages[i].Seq < messages[j].Seq })
 	if len(messages) > limit {
-		if afterSeq > 0 {
+		if afterMode {
 			messages = messages[:limit]
 		} else {
 			messages = messages[len(messages)-limit:]

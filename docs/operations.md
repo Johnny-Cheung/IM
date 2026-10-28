@@ -47,7 +47,7 @@ sha256sum -c SHA256SUMS         # Linux
 | --- | --- |
 | `/health` | HTTP 进程可响应即返回 200；不检查 MySQL。 |
 | `/ready` | 2 秒内成功 ping MySQL 时返回 200（`database=ok`）；否则返回 503（`database=unavailable`）。它仍然只检查 MySQL，不反映消息号闸门。 |
-| `/ops/infra` | 基础设施连通性和 v1.8.1 的 seq 就绪/校准状态（`seq:ready`、校准中、run_id）。切换后用它判断接纳是否可用。 |
+| `/ops/infra` | 基础设施连通性和 v1.8.1 的 seq 就绪/校准状态。`seq` 段包含 `ready`、`calibrating`、`waiting_seq_ready`、`run_id`、`last_calibrated_at`、`conversations`、`last_error`。切换后用它判断接纳是否可用。 |
 
 ```bash
 /opt/IM-Rebuild/imctl health
@@ -152,12 +152,12 @@ grep -q 'backfill-group-read' "$PRE" \
 
 1. 备份，并在 Redis 容器内记录只读诊断：`INFO memory`、`INFO server` 的 `run_id`，以及 `dm:conv:*`、`group:{G}:inbox`、`index:epoch` 的键数量。不要手工删除正式键。
 2. 确认持久化队列已排空：`/opt/IM-Rebuild/imctl queue-status`。非 0 时等待 relay 和 consumer 消费后重试。
-3. 停后端：`/opt/IM-Rebuild/imctl backend-stop`。`backfill-seq` 会拒绝在后端 active 时执行。
+3. 停后端：`/opt/IM-Rebuild/imctl backend-stop`。`backfill-seq` 会拒绝在 systemd 单元 active、端口被占用、或存在本目录 `bin/im-server` 进程时执行，也会拒绝在另一个回填持有 Redis `backfill:lock` 时启动。
 4. 校验新包并替换 `bin/`、`web/`、`RELEASE`（步骤同“发布切换”第 2 步）。
-5. 执行回填：`/opt/IM-Rebuild/imctl backfill-seq`（验证实例为 `/opt/IM-Rebuild/imctl --verify backfill-seq`）。命令先执行迁移，再填充 MySQL 的会话列与 `seq`、重建 Redis 计数器/`dm:pair`/群 inbox、换算水位、校验，全部通过后写入 `seq:ready`（正式 `im:v12:seq:ready`，验证 `im:v13-verify:seq:ready`）；失败时不写标记。
+5. 执行回填：`/opt/IM-Rebuild/imctl backfill-seq`（验证实例为 `/opt/IM-Rebuild/imctl --verify backfill-seq`）。命令先执行迁移，再填充 MySQL 的会话列与 `seq`、重建 Redis 计数器/`dm:pair`/群 inbox、换算水位、校验，全部通过后写入 `seq:ready`（正式 `im:v12:seq:ready`，验证 `im:v13-verify:seq:ready`）；失败时不写 `seq:ready`。回填期间持有 `backfill:lock`（30 分钟 TTL），后端在锁存在时拒绝启动。重跑时只有 `seq:ready` 能证明 Redis 水位已是 `seq`：缺少它就把所有 Redis 水位按旧全局消息号重新换算，MySQL 的 `last_read_seq` 作为下限；已存在 `seq:ready` 时保留 `seq` 值并截断到计数器。崩溃残留的锁最多阻塞启动 30 分钟，可用 `SCAN` 确认后 `UNLINK` 该键。
 6. 启动：`/opt/IM-Rebuild/imctl backend-start`。缺少 `seq:ready` 时后端拒绝启动。
 7. 启动后验证：
-   - `/ready` 200（仍只查 MySQL），并观察 `/ops/infra` 的 seq 就绪与校准状态；校准完成前发送、`focus`、未读、`read-stats` 返回 503，历史读取正常。
+   - `/ready` 200（仍只查 MySQL），并观察 `/ops/infra` 的 `seq` 段：`calibrating:true`（或 `run_id` 与切换前记录的不同）表示 Redis 重启后正在重新校准，等待即可；`ready:false` 且 `waiting_seq_ready:true` 表示 `seq:ready` 丢失，需要停止后端并重新执行 `backfill-seq`。校准完成前发送、`focus`、未读、`read-stats` 返回 503，历史读取正常。
    - `imctl health`、`imctl status`、`imctl logs backend` 无 `seq:ready`、校准或唯一索引错误。
    - `imctl queue-status` 在回归后重新排空；`infractl status` 观察 Redis 内存变化（新的 `dm:seq`/`dm:pair` 取代两个方向的 `dm:conv`，容量治理留到 v1.9）。
    - 用独立验证账号回归**正式切换后的 8198**（必须显式设置 `BASE_URL`；不设置时 smoke 默认打 8199 canary）：`BASE_URL=http://10.12.75.191:8198 node scripts/smoke.mjs`、`BASE_URL=http://10.12.75.191:8198 node scripts/browser-smoke.mjs`、`BASE_URL=http://10.12.75.191:8198 node scripts/cache-smoke.mjs`；在开发机上执行时用 `http://127.0.0.1:8198`。每个会话 `seq` 从 1 连续、重复发送返回同一 `seq`、未读等于 `last_seq - read_seq`、三个旧已读接口 404。本轮 manifest 必须用数据库 `im` 清理。

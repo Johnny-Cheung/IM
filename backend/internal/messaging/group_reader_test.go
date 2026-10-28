@@ -45,6 +45,26 @@ func TestGroupMessageReaderReturnsNewestHotMessages(t *testing.T) {
 	}
 }
 
+func TestGroupMessageReaderAfterZeroStartsAtFirstSeq(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	defer client.Close()
+	ctx := context.Background()
+
+	seedGroupMessages(t, client, 9, map[uint64]uint64{1: 1, 2: 2, 3: 3})
+	setGroupSequence(t, client, 9, 3)
+
+	reader := NewGroupMessageReader(client, defaultKeyspace)
+	page, err := reader.ReadGroupAfter(ctx, 1, 9, 0, 2)
+	if err != nil {
+		t.Fatalf("ReadGroupAfter(0) error = %v", err)
+	}
+	if !page.Complete || !page.Page.HasMore || len(page.Page.Messages) != 2 ||
+		page.Page.Messages[0].Seq != 1 || page.Page.Messages[1].Seq != 2 {
+		t.Fatalf("page = %#v, want seqs 1 and 2 with more", page)
+	}
+}
+
 func TestGroupMessageReaderMissingEntityForcesFallback(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})

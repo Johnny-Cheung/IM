@@ -135,10 +135,10 @@ func (k Keyspace) sequenceReadyKey() string {
 	return k.prefixOrDefault() + "seq:ready"
 }
 
-// sequenceConvertingKey marks that a seq backfill has started converting read
-// watermarks. Watermarks seen while it exists may already be in seq units.
-func (k Keyspace) sequenceConvertingKey() string {
-	return k.prefixOrDefault() + "seq:converting"
+// backfillLockKey is held while a seq backfill runs. The backend refuses to
+// start while it exists, and a second backfill refuses to acquire it.
+func (k Keyspace) backfillLockKey() string {
+	return k.prefixOrDefault() + "backfill:lock"
 }
 
 // indexEpochKey records the highest message ID that is not guaranteed to be
