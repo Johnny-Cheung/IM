@@ -13,8 +13,39 @@ const directSelector = (key) => `.conversation-item[data-username="${name(key)}"
 const directOf = (conversationList, username) => conversationList.conversations.find((item) => item.type === "direct" && item.user.username === username);
 const conversationsOf = (who) => run.request(who, "GET", "/api/conversations");
 // a's unread from c: the browser opens b, so only c's message stays unread.
+// The browser owns a's session, so ask through the page instead of HTTP.
 async function unreadFromC() {
-  return directOf(await conversationsOf("a"), name("c"))?.unread_count ?? 0;
+  return tab.evaluate(`(async () => {
+    const response = await fetch('/api/conversations', { credentials: 'include' });
+    const data = await response.json();
+    const item = data.conversations.find((conversation) =>
+      conversation.type === "direct" &&
+      conversation.user.username.toLowerCase() === ${JSON.stringify(name("c"))}.toLowerCase());
+    return item?.unread_count ?? 0;
+  })()`);
+}
+
+// Offline variant: read the locally cached sidebar value, since no request can
+// reach the server while the network is disabled.
+async function cachedUnreadFromC() {
+  return tab.evaluate(`(async () => {
+    const db = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("im-cache");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const rows = await new Promise((resolve) => {
+      const transaction = db.transaction(["conversations"], "readonly");
+      const request = transaction.objectStore("conversations").getAll();
+      transaction.oncomplete = () => resolve(request.result ?? []);
+    });
+    db.close();
+    const row = rows.find((entry) =>
+      entry.user === ${JSON.stringify(name("a"))} &&
+      entry.conversation?.type === "direct" &&
+      entry.conversation.user.username.toLowerCase() === ${JSON.stringify(name("c"))}.toLowerCase());
+    return row?.conversation?.unread_count ?? 0;
+  })()`);
 }
 const same = (first, second) => String(first).toLocaleLowerCase() === String(second).toLocaleLowerCase();
 
@@ -276,8 +307,8 @@ async function main() {
       await tab.waitFor(`document.querySelector('#message-list').innerText.includes(${JSON.stringify(fromC)})`);
       run.check("another cached conversation opens offline", true);
       run.check(
-        "offline reading leaves the unread on the server",
-        await unreadFromC() === 1,
+        "offline reading leaves the cached unread untouched",
+        await cachedUnreadFromC() === 1,
       );
       run.check("offline reading sends no read request", reads.paths.length === 0);
     } finally {

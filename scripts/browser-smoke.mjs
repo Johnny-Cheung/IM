@@ -13,6 +13,7 @@ const memberSelector = (id) => `.conversation-item[data-group-id="${id}"]`;
 const directSelector = (key) => `.conversation-item[data-username="${name(key)}"]`;
 const textAt = (selector) => `document.querySelector(${JSON.stringify(selector)})?.textContent`;
 const conversationsOf = (who) => run.request(who, "GET", "/api/conversations");
+const directOf = (list, name) => list.conversations.find((item) => item.type === "direct" && item.user.username === name);
 const browserConversations = () => tab.evaluate("fetch('/api/conversations', { credentials: 'same-origin' }).then((response) => response.json())");
 const groupOf = (conversationList, id) => conversationList.conversations.find((item) => item.type === "group" && item.group.id === id);
 const same = (first, second) => String(first).toLocaleLowerCase() === String(second).toLocaleLowerCase();
@@ -404,7 +405,7 @@ async function main() {
   await scenario("a skipped push is backfilled with after_seq", async () => {
     await tab.select(directSelector("b"), `/chat/${name("b")}`);
     await tab.waitFor("document.querySelectorAll('#message-list .message-row').length > 0");
-    const startSeq = directOf(await conversationsOf("a"), name("b")).last_seq;
+    const startSeq = directOf(await conversationsOf("b"), name("a")).last_seq;
     await tab.waitFor(`(() => {
       const rows = [...document.querySelectorAll('#message-list .message-row')];
       return Math.max(0, ...rows.map((row) => Number(row.dataset.seq) || 0)) === ${startSeq};

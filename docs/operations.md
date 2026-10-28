@@ -118,7 +118,7 @@ curl -fsS http://127.0.0.1:8198/ready
 
 新二进制启动时会自动执行迁移。切换只替换应用文件，不停止 MySQL、不恢复数据库；迁移只向前执行，应用回滚时不要回滚或覆盖 MySQL 数据。v1.8.1 改变了 Redis 键和已读单位，不能只按本节替换文件，必须按下一节执行排空队列和 `backfill-seq`。
 
-## v1.8.1 切换步骤与回滚（待执行）
+## v1.8.1 切换步骤与回滚（8199 已验证，8198 待切换）
 
 v1.8.1 把全局消息号改为“会话内连续消息号 `seq`”：私聊两个方向合并成 `dm:pair`，会话计数器为 `dm:seq`/`group:{G}:seq`，已读水位改用 `seq`，三个旧 HTTP 已读接口删除，就绪标记统一为 `seq:ready`。以下步骤尚未执行，执行后把结果补在本节。
 
@@ -148,6 +148,19 @@ grep -q 'backfill-group-read' "$PRE" \
 - 保留 `imctl.pre-v1.8.1` 是因为新脚本删除了 `backfill-read`/`backfill-group-read`，回滚只能由旧脚本发起。该副本只生成一次；重复执行上面的块不会把已安装的新脚本复制覆盖它。
 - 新包用 `scripts/build-release.sh v1.8.1 <目录>` 构建；脚本接受两段式和三段式版本号。
 
+### 8199 隔离验证结果（2026-10-28）
+
+- 发布包 `v1.8.1`，提交 `8ecd45d`；canary 切换前备份 `/opt/IM-Rebuild/canary-v07/backup-v17-20261028T143510Z`。
+- 验证命名空间 `im:v13-verify` 先清空（1340 个旧键），验证库 `im_v07_verify` 为空库。
+- 空库回填：写入 `seq:ready`，各计数为 0，内存 2.07M → 2.07M。
+- 冒烟：API 114 项、浏览器 56 项、缓存 29 项全部通过（含 `seq` 连续、重复发送同号、并发无空洞、`after_seq` 补缺口、旧已读接口 404/405、`read-stats` 带 `message_id`、群回执实时更新、离线和重连）。
+- 数据一致性：146 条私聊、213 条群消息、11 个私聊会话、7 个群；每个会话 `COUNT(*) = MAX(seq)`，无未编号行，MySQL 水位都不大于会话最大 `seq`；持久化队列 0，读事件 Stream 0。
+- 回填幂等：在已有数据上停后端重跑两次，会话计数、`dm:pair`、水位指纹完全不变（唯一变化是旧读事件 Stream 被删除后由后端重建）。
+- 校准：把 `dm:seq:426:427` 从 44 改成 1 后重启，启动校准抬回 44；`/ops/infra` 的 `seq.conversations=18`、`calibrating=false`。
+- 就绪标记丢失：删除 `im:v13-verify:seq:ready` 后 8 秒内发送返回 503 `message_service_unavailable`、会话列表返回 503 `read_model_not_ready`；停后端重跑 `backfill-seq` 并启动后恢复。
+- 清理：按 11 份 manifest 删除 45 个测试账号和 16 个测试群；验证库行数回到 0；验证命名空间只保留 `seq:ready`、`index:epoch` 和三个空 Stream。
+- 遗留：清理脚本没有覆盖按用户/消息 ID 命名的 `messages:*`、`dedup:*`、`group-dedup:*`、`friends:*`；本次在验证命名空间手工按前缀清除（DB 已空，仅该隔离命名空间）。正式环境同类清理留到 v1.9 容量治理，执行前需单独确认。
+
 ### 切换顺序
 
 1. 备份，并在 Redis 容器内记录只读诊断：`INFO memory`、`INFO server` 的 `run_id`，以及 `dm:conv:*`、`group:{G}:inbox`、`index:epoch` 的键数量。不要手工删除正式键。
@@ -160,7 +173,7 @@ grep -q 'backfill-group-read' "$PRE" \
    - `/ready` 200（仍只查 MySQL），并观察 `/ops/infra` 的 `seq` 段：`calibrating:true`（或 `run_id` 与切换前记录的不同）表示 Redis 重启后正在重新校准，等待即可；`ready:false` 且 `waiting_seq_ready:true` 表示 `seq:ready` 丢失，需要停止后端并重新执行 `backfill-seq`。校准完成前发送、`focus`、未读、`read-stats` 返回 503，历史读取正常。
    - `imctl health`、`imctl status`、`imctl logs backend` 无 `seq:ready`、校准或唯一索引错误。
    - `imctl queue-status` 在回归后重新排空；`infractl status` 观察 Redis 内存变化（新的 `dm:seq`/`dm:pair` 取代两个方向的 `dm:conv`，容量治理留到 v1.9）。
-   - 用独立验证账号回归**正式切换后的 8198**（必须显式设置 `BASE_URL`；不设置时 smoke 默认打 8199 canary）：`BASE_URL=http://10.12.75.191:8198 node scripts/smoke.mjs`、`BASE_URL=http://10.12.75.191:8198 node scripts/browser-smoke.mjs`、`BASE_URL=http://10.12.75.191:8198 node scripts/cache-smoke.mjs`；在开发机上执行时用 `http://127.0.0.1:8198`。每个会话 `seq` 从 1 连续、重复发送返回同一 `seq`、未读等于 `last_seq - read_seq`、三个旧已读接口 404。本轮 manifest 必须用数据库 `im` 清理。
+   - 用独立验证账号回归**正式切换后的 8198**（必须显式设置 `BASE_URL`；不设置时 smoke 默认打 8199 canary）：`BASE_URL=http://10.12.75.191:8198 node scripts/smoke.mjs`、`BASE_URL=http://10.12.75.191:8198 node scripts/browser-smoke.mjs`、`BASE_URL=http://10.12.75.191:8198 node scripts/cache-smoke.mjs`；在开发机上执行时用 `http://127.0.0.1:8198`。每个会话 `seq` 从 1 连续、重复发送返回同一 `seq`、未读等于 `last_seq - read_seq`、三个旧已读接口返回 404 或 405。本轮 manifest 必须用数据库 `im` 清理。
    - 已读人数核对：`read-stats` 用 `seq` 查询，响应里的 `message_id` 与该 `seq` 的全局消息号一致。
    - 实测统计（消息数、群数、水位、内存、队列）执行后补写，不预先填写。
 
@@ -206,7 +219,7 @@ grep -q 'backfill-group-read' "$PRE" \
 - [ ] 客户端缺口恢复：浏览器 smoke 已用合成跳号帧覆盖；人工再用真实弱网或切后台验证一次补拉日志。
 - [ ] 服务端回退：在验证命名空间把会话计数器改小，客户端应丢弃本地多出的尾部并按服务端重新同步。
 - [ ] 校准期间 503：改小计数器后重启，确认发送/未读/`focus`/`read-stats` 先 503，校准完成后恢复。
-- [ ] 旧三个 HTTP 已读接口均返回 404，浏览器前台收消息不发任何已读 HTTP 请求。
+- [ ] 旧三个 HTTP 已读接口均返回 404 或 405，浏览器前台收消息不发任何已读 HTTP 请求。
 - [ ] 群已读人数：`read-stats` 的 `message_id` 与本地该 `seq` 的全局号一致，`all_read`/分母在踢人后正确。
 
 ## 回滚应用文件
@@ -394,7 +407,7 @@ bash deploy/infractl_test.sh
 
 API 和浏览器脚本使用 Node 26；浏览器脚本默认使用 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`，可通过 `CHROME_PATH` 指定本机 Chrome。通过 `BASE_URL` 指定其他已确认的验证地址。容量脚本会创建 101 个独立账号并验证 100 人边界，仅用于隔离验证库。性能基线脚本串行采样发送、会话列表、历史和 WebSocket `focus`，只输出 p50/p95/max，不设阈值，也不做压力测试。
 
-v1.8.1 起 smoke 断言会话内 `seq`：每个会话从 1 连续、私聊两个方向共用一个编号、重复发送返回同一 `seq`、并发发送无重复无空洞、`after_seq` 补拉缺口、未读等于 `last_seq - read_seq`、`read-stats` 用 `seq` 并返回 `message_id`、三个旧 HTTP 已读接口返回 404。浏览器 smoke 用已安装的 WebSocket 包装层丢弃真实推送并合成一帧跳号消息，验证客户端按 `after_seq` 补拉后恢复。缓存 smoke 覆盖 v1.7 缓存升级清理、缓存消息携带 `seq`、未读按服务端计数和重连补读。掉电丢尾重发无法在 smoke 中复现，见“v1.8.1 切换步骤与回滚”的人工验证清单。
+v1.8.1 起 smoke 断言会话内 `seq`：每个会话从 1 连续、私聊两个方向共用一个编号、重复发送返回同一 `seq`、并发发送无重复无空洞、`after_seq` 补拉缺口、未读等于 `last_seq - read_seq`、`read-stats` 用 `seq` 并返回 `message_id`、三个旧 HTTP 已读接口返回 404 或 405。浏览器 smoke 用已安装的 WebSocket 包装层丢弃真实推送并合成一帧跳号消息，验证客户端按 `after_seq` 补拉后恢复。缓存 smoke 覆盖 v1.7 缓存升级清理、缓存消息携带 `seq`、未读按服务端计数和重连补读。掉电丢尾重发无法在 smoke 中复现，见“v1.8.1 切换步骤与回滚”的人工验证清单。
 
 脚本随机生成本轮账号和密码，密码只在进程内存中使用。完成后打印独立报告目录，`manifest.json` 只记录服务地址、本轮账号名、群 ID 和检查数；失败截图不包含登录表单。脚本退出非零表示检查未通过；账号清理需按本轮清单执行，不使用宽泛用户名通配符，不操作 `demo_*`。正式发布后的少量写入检查也必须使用本轮独立账号并按清单清理，不重置演示账号或它们的未读位置。
 

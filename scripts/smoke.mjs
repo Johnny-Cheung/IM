@@ -147,8 +147,8 @@ async function main() {
 
   // Bounded and rewinding HTTP reads are gone: focus always advances to the
   // conversation counter, so only the latest position can be recorded.
-  await run.expectStatus("legacy conversation read endpoint is gone", "b", "POST", `${directPath("a")}/read`, 404);
-  await run.expectStatus("legacy batch read endpoint is gone", "b", "POST", "/api/read", 404, { reads: [] });
+  await run.expectGone("legacy conversation read endpoint is gone", "b", "POST", `${directPath("a")}/read`);
+  await run.expectGone("legacy batch read endpoint is gone", "b", "POST", "/api/read", { reads: [] });
 
   await run.expectError("group needs members", "a", "POST", "/api/groups", { name: "empty", member_usernames: [] }, 400, "invalid_members");
   await run.expectError("group needs valid name", "a", "POST", "/api/groups", { name: "群".repeat(31), member_usernames: [run.users.get("b").username] }, 400, "invalid_group_name");
@@ -225,7 +225,7 @@ async function main() {
   run.check("concurrent group sends reuse no seq and leave no gap", contiguous(groupConcurrentSeqs, 37));
   const groupGap = await run.request("b", "GET", `/api/groups/${id}/messages?limit=50&after_seq=36`);
   run.check("group after_seq backfills a gap", contiguous(seqsOf(groupGap.messages), 37) && groupGap.messages.length === 12);
-  await run.expectStatus("legacy group read endpoint is gone", "b", "POST", `/api/groups/${id}/read`, 404);
+  await run.expectGone("legacy group read endpoint is gone", "b", "POST", `/api/groups/${id}/read`);
   await run.expectError("conflicting group cursors rejected", "a", "GET", `/api/groups/${id}/messages?before_seq=10&after_seq=1`, undefined, 400, "invalid_request");
   await run.request("a", "DELETE", `/api/groups/${id}/members/${run.users.get("c").username}`);
   await run.expectError("kicked member loses history", "c", "GET", `/api/groups/${id}/messages`, undefined, 404, "group_not_found");

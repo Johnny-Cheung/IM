@@ -71,6 +71,17 @@ export class TestRun {
     return response.payload;
   }
 
+  // expectGone accepts 404 (no route) and 405 (path exists for another
+  // method); either way the endpoint no longer performs the operation.
+  async expectGone(name, user, method, path, body) {
+    const response = await this.send(user, method, path, body);
+    assert.ok(
+      response.status === 404 || response.status === 405,
+      `${name}: got HTTP ${response.status}`,
+    );
+    this.check(name, true);
+  }
+
   async expectError(name, user, method, path, body, status, code) {
     await assert.rejects(
       () => this.request(user, method, path, body),
