@@ -2,9 +2,12 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
+
+	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
 )
 
 const (
@@ -385,8 +388,10 @@ func (a *API) flushGroupImplicitRead(ctx context.Context, batch *implicitReadBat
 			ctx, batch.groupID, viewers, batch.throughID, now,
 		)
 		if err != nil {
-			log.Printf("implicit group read group=%d viewers=%v: %v",
-				batch.groupID, viewers, err)
+			if !groupGoneError(err) {
+				log.Printf("implicit group read group=%d viewers=%v: %v",
+					batch.groupID, viewers, err)
+			}
 		} else {
 			for _, advance := range advances {
 				logGroupReadStreamError(advance, batch.groupID)
@@ -402,8 +407,10 @@ func (a *API) flushGroupImplicitRead(ctx context.Context, batch *implicitReadBat
 			ctx, batch.groupID, batch.senderID, batch.throughID, now,
 		)
 		if err != nil {
-			log.Printf("implicit group read sender=%d group=%d: %v",
-				batch.senderID, batch.groupID, err)
+			if !groupGoneError(err) {
+				log.Printf("implicit group read sender=%d group=%d: %v",
+					batch.senderID, batch.groupID, err)
+			}
 		} else {
 			logGroupReadStreamError(advance, batch.groupID)
 			if advance.Advanced {
@@ -428,4 +435,10 @@ func (a *API) flushGroupImplicitRead(ctx context.Context, batch *implicitReadBat
 		return
 	}
 	a.publishGroupRead(batch.memberIDs, batch.groupID, excluded)
+}
+
+// groupGoneError marks the expected race where the group was dissolved or the
+// member removed between delivery and the asynchronous advance.
+func groupGoneError(err error) bool {
+	return errors.Is(err, messaging.ErrGroupDissolved) || errors.Is(err, messaging.ErrGroupNotMember)
 }
