@@ -373,3 +373,33 @@ func TestGroupReadBackfillRequiresDependencies(t *testing.T) {
 		t.Fatalf("backfill error = nil, want service unavailable")
 	}
 }
+
+func TestGroupReadBackfillRaisesStaleLowerRedisPositions(t *testing.T) {
+	dataStore := &fakeGroupReadBackfillStore{
+		projections: []store.GroupMembershipProjection{
+			{GroupID: 1, MemberIDs: []uint64{1, 2}},
+		},
+		messages: []store.GroupMessageIndex{
+			{GroupID: 1, MessageID: 10},
+			{GroupID: 1, MessageID: 30},
+		},
+		members: []store.GroupMemberRead{
+			{GroupID: 1, UserID: 1, LastReadMessageID: 10},
+			{GroupID: 1, UserID: 2, LastReadMessageID: 30},
+		},
+	}
+	backfill, client := newGroupReadBackfillTest(t, dataStore, 10)
+	ctx := context.Background()
+	if err := client.ZAdd(ctx, defaultKeyspace.groupReadKey(1), redis.Z{
+		Score: 5, Member: "2",
+	}).Err(); err != nil {
+		t.Fatalf("seed stale position: %v", err)
+	}
+
+	if _, err := backfill.Run(ctx); err != nil {
+		t.Fatalf("backfill with a stale lower position: %v", err)
+	}
+	if got := client.ZScore(ctx, defaultKeyspace.groupReadKey(1), "2").Val(); got != 30 {
+		t.Fatalf("stale position = %v, want it raised to 30", got)
+	}
+}

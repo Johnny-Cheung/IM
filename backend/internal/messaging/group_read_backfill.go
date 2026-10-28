@@ -257,6 +257,11 @@ func (b *GroupReadBackfill) reconcileReadPositions(
 		if err := tracker.ReconcileGroup(ctx, groupID, positions); err != nil {
 			return fmt.Errorf("reconcile group %d reads: %w", groupID, err)
 		}
+		for userID, position := range positions {
+			if err := tracker.SetMemberBaseline(ctx, groupID, userID, position); err != nil {
+				return fmt.Errorf("raise group %d member %d read: %w", groupID, userID, err)
+			}
+		}
 		result.ReadPositionsIndexed += len(positions)
 	}
 
