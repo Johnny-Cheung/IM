@@ -108,22 +108,39 @@ func (a *API) createGroup(c *gin.Context) {
 		a.writeGroupError(c, err)
 		return
 	}
-	if memberIDs, err := a.store.ListGroupMemberIDs(
-		c.Request.Context(), detail.Group.ID,
-	); err != nil {
-		log.Printf("list created group members: %v", err)
-	} else {
-		if a.groupProjector != nil {
-			if err := a.groupProjector.Replace(c.Request.Context(), detail.Group.ID, memberIDs, false); err != nil {
-				log.Printf("project created group %d: %v", detail.Group.ID, err)
+
+	syncCtx, cancel := groupCommitContext(c.Request.Context())
+	defer cancel()
+	createdIDs, listErr := a.store.ListGroupMemberIDs(syncCtx, detail.Group.ID)
+	if listErr != nil {
+		log.Printf("list created group members: %v", listErr)
+		createdIDs = append([]uint64{current.ID}, memberIDs...)
+	}
+	if a.groupReads != nil {
+		for _, memberID := range createdIDs {
+			if err := a.groupReads.SeedMember(
+				syncCtx, detail.Group.ID, memberID, 0,
+			); err != nil {
+				log.Printf("seed created group %d member %d read: %v",
+					detail.Group.ID, memberID, err)
+				a.groupRepairs.schedule(detail.Group.ID)
+				break
 			}
 		}
-		a.PublishGroupChanged(
-			excludeUserID(memberIDs, current.ID),
-			detail.Group.ID,
-			"added",
-		)
 	}
+	if a.groupProjector != nil {
+		if err := a.groupProjector.Replace(
+			syncCtx, detail.Group.ID, createdIDs, false,
+		); err != nil {
+			log.Printf("project created group %d: %v", detail.Group.ID, err)
+			a.groupRepairs.schedule(detail.Group.ID)
+		}
+	}
+	a.PublishGroupChanged(
+		excludeUserID(createdIDs, current.ID),
+		detail.Group.ID,
+		"added",
+	)
 	c.JSON(http.StatusCreated, toGroupDetailResponse(detail))
 }
 
@@ -210,53 +227,104 @@ func (a *API) inviteGroupMembers(c *gin.Context) {
 		return
 	}
 
-	existingIDs, existingErr := a.store.ListGroupMemberIDs(c.Request.Context(), groupID)
-	if err := a.store.InviteGroupMembers(
-		c.Request.Context(),
-		groupID,
-		current.ID,
-		memberIDs,
-		time.Now().UTC(),
-	); err != nil {
-		a.writeGroupError(c, err)
-		return
+	ctx := c.Request.Context()
+	existingIDs, existingErr := a.store.ListGroupMemberIDs(ctx, groupID)
+	if existingErr != nil {
+		log.Printf("list group members before invite: %v", existingErr)
 	}
-	detail, err := a.store.GetGroup(c.Request.Context(), current.ID, groupID)
+
+	mutation, err := a.beginGroupMutation(ctx, groupID)
 	if err != nil {
 		a.writeGroupError(c, err)
 		return
 	}
-	if allIDs, err := a.store.ListGroupMemberIDs(
-		c.Request.Context(), groupID,
-	); err != nil {
-		log.Printf("list invited group members: %v", err)
-	} else if existingErr != nil {
-		if a.groupProjector != nil {
-			if err := a.groupProjector.Replace(c.Request.Context(), groupID, allIDs, false); err != nil {
-				log.Printf("project invited group %d: %v", groupID, err)
-			}
+	defer mutation.finish()
+
+	baselineFloor := uint64(0)
+	if a.groupWatermarkReader != nil {
+		// Read after BeginMutation: a send racing with the invite is already
+		// rejected, so it cannot slip below the new members' baseline.
+		accepted, err := a.groupWatermarkReader.LastAcceptedID(ctx, groupID)
+		if err != nil {
+			log.Printf("read group accepted watermark for invite: %v", err)
+			mutation.abort()
+			a.writeGroupError(c, messaging.ErrMessageServiceUnavailable)
+			return
 		}
-		a.PublishGroupChanged(allIDs, groupID, "members_changed")
-	} else {
-		if a.groupProjector != nil {
-			if err := a.groupProjector.Replace(c.Request.Context(), groupID, allIDs, false); err != nil {
-				log.Printf("project invited group %d: %v", groupID, err)
-			}
-		}
+		baselineFloor = accepted
+	}
+
+	baseline, err := a.store.InviteGroupMembersWithBaseline(
+		ctx,
+		groupID,
+		current.ID,
+		memberIDs,
+		time.Now().UTC(),
+		baselineFloor,
+	)
+	if err != nil {
+		mutation.abort()
+		a.writeGroupError(c, err)
+		return
+	}
+
+	syncCtx, cancel := groupCommitContext(ctx)
+	defer cancel()
+
+	detail, detailErr := a.store.GetGroup(syncCtx, current.ID, groupID)
+	allIDs, listErr := a.store.ListGroupMemberIDs(syncCtx, groupID)
+	if listErr != nil {
+		log.Printf("list invited group members: %v", listErr)
+		allIDs = nil
+	}
+
+	seedIDs := make([]uint64, 0, len(memberIDs))
+	if allIDs != nil && existingErr == nil {
 		existing := userIDSet(existingIDs)
-		newMemberIDs := make([]uint64, 0, len(allIDs))
 		for _, memberID := range allIDs {
 			if _, ok := existing[memberID]; !ok {
-				newMemberIDs = append(newMemberIDs, memberID)
+				seedIDs = append(seedIDs, memberID)
 			}
 		}
-		if len(newMemberIDs) > 0 {
-			a.advanceGroupJoinBaseline(c.Request.Context(), groupID, newMemberIDs)
-			a.PublishGroupChanged(newMemberIDs, groupID, "added")
+	}
+	var seedErr error
+	if a.groupReads != nil {
+		for _, memberID := range seedIDs {
+			if err := a.groupReads.SeedMember(
+				syncCtx, groupID, memberID, baseline,
+			); err != nil {
+				log.Printf("seed invited group %d member %d read: %v",
+					groupID, memberID, err)
+				seedErr = messaging.ErrMessageServiceUnavailable
+				break
+			}
+		}
+		if seedErr != nil || (allIDs != nil && existingErr != nil) {
+			// The repair loop seeds missing positions from MySQL, which also
+			// covers a retry whose baseline was already consumed.
+			mutation.queueRepair()
+		}
+	}
+	mutation.project(syncCtx, allIDs, false)
+
+	if existingErr == nil {
+		if len(seedIDs) > 0 {
+			a.PublishGroupChanged(seedIDs, groupID, "added")
 		}
 		if len(existingIDs) > 0 {
 			a.PublishGroupChanged(existingIDs, groupID, "members_changed")
 		}
+	} else {
+		a.PublishGroupChanged(memberIDs, groupID, "added")
+	}
+
+	if detailErr != nil {
+		a.writeGroupError(c, detailErr)
+		return
+	}
+	if seedErr != nil {
+		a.writeGroupError(c, seedErr)
+		return
 	}
 	c.JSON(http.StatusOK, toGroupDetailResponse(detail))
 }
@@ -276,41 +344,47 @@ func (a *API) kickGroupMember(c *gin.Context) {
 		return
 	}
 
-	mutationBegun := false
-	if a.groupProjector != nil {
-		if err := a.groupProjector.BeginMutation(c.Request.Context(), groupID); err != nil {
-			a.writeGroupError(c, err)
-			return
-		}
-		mutationBegun = true
-	}
-	if err := a.store.KickGroupMember(
-		c.Request.Context(), current.ID, groupID, target.ID,
-	); err != nil {
-		if mutationBegun {
-			_ = a.groupProjector.EndMutation(c.Request.Context(), groupID)
-		}
-		a.writeGroupError(c, err)
-		return
-	}
-	detail, err := a.store.GetGroup(c.Request.Context(), current.ID, groupID)
+	mutation, err := a.beginGroupMutation(c.Request.Context(), groupID)
 	if err != nil {
 		a.writeGroupError(c, err)
 		return
 	}
-	if remainingIDs, err := a.store.ListGroupMemberIDs(
-		c.Request.Context(), groupID,
+	defer mutation.finish()
+	if err := a.store.KickGroupMember(
+		c.Request.Context(), current.ID, groupID, target.ID,
 	); err != nil {
-		log.Printf("list group members after kick: %v", err)
-	} else {
-		if mutationBegun && a.groupProjector != nil {
-			if err := a.groupProjector.Replace(c.Request.Context(), groupID, remainingIDs, false); err != nil {
-				log.Printf("project group %d after membership change: %v", groupID, err)
-			}
+		mutation.abort()
+		a.writeGroupError(c, err)
+		return
+	}
+
+	syncCtx, cancel := groupCommitContext(c.Request.Context())
+	defer cancel()
+	detail, detailErr := a.store.GetGroup(syncCtx, current.ID, groupID)
+	remainingIDs, remainingErr := a.store.ListGroupMemberIDs(syncCtx, groupID)
+	if remainingErr != nil {
+		log.Printf("list group members after kick: %v", remainingErr)
+		remainingIDs = nil
+	}
+	if a.groupReads != nil {
+		if err := a.groupReads.RemoveMember(
+			syncCtx, groupID, target.ID,
+		); err != nil {
+			log.Printf("remove kicked group %d member %d read: %v",
+				groupID, target.ID, err)
 		}
+	}
+	// The member-set rewrite also prunes the kicked member's read position and
+	// is retried in the background when it fails.
+	mutation.project(syncCtx, remainingIDs, false)
+	if remainingIDs != nil {
 		a.PublishGroupChanged(remainingIDs, groupID, "members_changed")
 	}
 	a.PublishGroupChanged([]uint64{target.ID}, groupID, "removed")
+	if detailErr != nil {
+		a.writeGroupError(c, detailErr)
+		return
+	}
 	c.JSON(http.StatusOK, toGroupDetailResponse(detail))
 }
 
@@ -325,46 +399,50 @@ func (a *API) leaveGroup(c *gin.Context) {
 		return
 	}
 
-	mutationBegun := false
-	if a.groupProjector != nil {
-		if err := a.groupProjector.BeginMutation(c.Request.Context(), groupID); err != nil {
-			a.writeGroupError(c, err)
-			return
-		}
-		mutationBegun = true
+	mutation, err := a.beginGroupMutation(c.Request.Context(), groupID)
+	if err != nil {
+		a.writeGroupError(c, err)
+		return
 	}
+	defer mutation.finish()
 	memberIDs, memberErr := a.store.ListGroupMemberIDs(c.Request.Context(), groupID)
 	dissolved, err := a.store.LeaveGroup(
 		c.Request.Context(), current.ID, groupID, time.Now().UTC(),
 	)
 	if err != nil {
-		if mutationBegun {
-			_ = a.groupProjector.EndMutation(c.Request.Context(), groupID)
-		}
+		mutation.abort()
 		a.writeGroupError(c, err)
 		return
 	}
+
+	syncCtx, cancel := groupCommitContext(c.Request.Context())
+	defer cancel()
 	if dissolved {
 		if memberErr != nil || len(memberIDs) == 0 {
 			memberIDs = []uint64{current.ID}
 		}
-		if mutationBegun && a.groupProjector != nil {
-			if err := a.groupProjector.Replace(c.Request.Context(), groupID, memberIDs, true); err != nil {
-				log.Printf("project dissolved group %d: %v", groupID, err)
-			}
-		}
+		mutation.project(syncCtx, memberIDs, true)
 		a.PublishGroupChanged(memberIDs, groupID, "dissolved")
-	} else if remainingIDs, err := a.store.ListGroupMemberIDs(
-		c.Request.Context(), groupID,
-	); err != nil {
-		log.Printf("list group members after leave: %v", err)
 	} else {
-		if mutationBegun && a.groupProjector != nil {
-			if err := a.groupProjector.Replace(c.Request.Context(), groupID, remainingIDs, false); err != nil {
-				log.Printf("project group %d after membership change: %v", groupID, err)
+		remainingIDs, remainingErr := a.store.ListGroupMemberIDs(syncCtx, groupID)
+		if remainingErr != nil {
+			log.Printf("list group members after leave: %v", remainingErr)
+			remainingIDs = nil
+		}
+		if a.groupReads != nil {
+			if err := a.groupReads.RemoveMember(
+				syncCtx, groupID, current.ID,
+			); err != nil {
+				log.Printf("remove left group %d member %d read: %v",
+					groupID, current.ID, err)
 			}
 		}
-		a.PublishGroupChanged(remainingIDs, groupID, "members_changed")
+		// The member-set rewrite also prunes the leaver's read position and is
+		// retried in the background when it fails.
+		mutation.project(syncCtx, remainingIDs, false)
+		if remainingIDs != nil {
+			a.PublishGroupChanged(remainingIDs, groupID, "members_changed")
+		}
 	}
 	c.JSON(http.StatusOK, leaveGroupResponse{Dissolved: dissolved})
 }
@@ -521,6 +599,7 @@ func (a *API) sendGroupMessage(c *gin.Context) {
 			log.Printf("list group message recipients: %v", err)
 		} else {
 			a.PublishGroupMessage(memberIDs, response)
+			a.scheduleGroupImplicitRead(groupID, current.ID, message.ID, memberIDs)
 		}
 	}
 	c.JSON(status, sendGroupMessageResponse{Message: response})
@@ -541,39 +620,154 @@ func (a *API) markGroupRead(c *gin.Context) {
 	if !ok {
 		return
 	}
-	lastReadMessageID, advanced, err := a.markGroupReadThrough(
+	if a.groupReads != nil {
+		if !a.ensureGroupReadModelReady(c) {
+			return
+		}
+		result, err := a.groupReads.AdvanceRead(
+			c.Request.Context(),
+			groupID,
+			current.ID,
+			throughID,
+			time.Now().UTC(),
+		)
+		if err != nil {
+			a.writeGroupError(c, err)
+			return
+		}
+		if result.Advanced {
+			logGroupReadStreamError(result, groupID)
+			if memberIDs, err := a.store.ListGroupMemberIDs(
+				c.Request.Context(), groupID,
+			); err != nil {
+				log.Printf("list group read broadcast members: %v", err)
+			} else {
+				a.publishGroupRead(memberIDs, groupID, map[uint64]struct{}{
+					current.ID: {},
+				})
+			}
+		}
+		c.JSON(http.StatusOK, readStateResponse{
+			LastReadMessageID: result.LastReadMessageID,
+		})
+		return
+	}
+
+	lastReadMessageID, _, err := a.markGroupReadThrough(
 		c.Request.Context(), current.ID, groupID, throughID,
 	)
 	if err != nil {
 		a.writeGroupError(c, err)
 		return
 	}
-	_ = advanced
 	c.JSON(http.StatusOK, readStateResponse{LastReadMessageID: lastReadMessageID})
 }
 
-func (a *API) advanceGroupJoinBaseline(ctx context.Context, groupID uint64, memberIDs []uint64) {
-	if a.groupWatermarkReader == nil {
+func (a *API) ensureGroupReadModelReady(c *gin.Context) bool {
+	if a.groupReads == nil {
+		writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂时不可用")
+		return false
+	}
+	ready, err := a.groupReads.ReadModelReady(c.Request.Context())
+	if err != nil {
+		log.Printf("check group read model: %v", err)
+		writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂时不可用")
+		return false
+	}
+	if !ready {
+		writeError(c, http.StatusServiceUnavailable, "read_model_not_ready", "已读服务尚未就绪")
+		return false
+	}
+	return true
+}
+
+type groupReadStatsResponse struct {
+	MessageID   uint64 `json:"message_id"`
+	ReadCount   int    `json:"read_count"`
+	MemberCount int    `json:"member_count"`
+	AllRead     bool   `json:"all_read"`
+}
+
+func (a *API) groupReadStats(c *gin.Context) {
+	current, ok := currentUser(c)
+	if !ok {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
 		return
 	}
-	accepted, err := a.groupWatermarkReader.LastAcceptedID(ctx, groupID)
-	if err != nil || accepted == 0 {
-		if err != nil {
-			log.Printf("read group accepted watermark for join: %v", err)
-		}
-		return
-	}
-	advancer, ok := a.store.(interface {
-		AdvanceGroupReadThrough(context.Context, uint64, uint64, uint64) (uint64, bool, error)
-	})
+	groupID, ok := parseGroupID(c)
 	if !ok {
 		return
 	}
-	for _, memberID := range memberIDs {
-		if _, _, err := advancer.AdvanceGroupReadThrough(ctx, memberID, groupID, accepted); err != nil {
-			log.Printf("advance group join baseline for %d/%d: %v", groupID, memberID, err)
+	messageID, err := parseReadStatsMessageID(c.Query("message_id"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_request", "已读消息参数不正确")
+		return
+	}
+	if !a.ensureGroupReadModelReady(c) {
+		return
+	}
+
+	ctx := c.Request.Context()
+	// Check membership before the message lookup: a non-member must get the
+	// same answer whether or not the message exists.
+	stats, err := a.groupReads.ReadStats(ctx, groupID, current.ID, messageID)
+	if err != nil {
+		a.writeGroupError(c, err)
+		return
+	}
+
+	senderID, found, err := a.groupReads.MessageSender(ctx, groupID, messageID)
+	if err != nil {
+		log.Printf("load group message sender group=%d message=%d: %v",
+			groupID, messageID, err)
+		writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂时不可用")
+		return
+	}
+	if !found {
+		senderID, found, err = a.store.GroupMessageSender(ctx, groupID, messageID)
+		if err != nil {
+			log.Printf("load persisted group message sender group=%d message=%d: %v",
+				groupID, messageID, err)
+			writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
+			return
+		}
+		if !found {
+			writeError(c, http.StatusNotFound, "message_not_found", "消息不存在")
+			return
 		}
 	}
+	if senderID != current.ID {
+		writeError(c, http.StatusForbidden, "not_your_message", "只能查看自己消息的已读情况")
+		return
+	}
+
+	c.JSON(http.StatusOK, groupReadStatsResponse{
+		MessageID:   messageID,
+		ReadCount:   stats.ReadCount,
+		MemberCount: stats.MemberCount,
+		AllRead:     stats.AllRead,
+	})
+}
+
+func parseReadStatsMessageID(raw string) (uint64, error) {
+	if raw == "" {
+		return 0, errors.New("missing message id")
+	}
+	value, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || value == 0 {
+		return 0, errors.New("invalid message id")
+	}
+	return value, nil
+}
+
+// logGroupReadStreamError surfaces a lost MySQL persistence event; the Redis
+// position is still authoritative, so the advance itself is kept.
+func logGroupReadStreamError(advance messaging.GroupReadAdvance, groupID uint64) {
+	if !advance.StreamError {
+		return
+	}
+	log.Printf("group read stream append failed group=%d user=%d position=%d; MySQL persistence is delayed",
+		groupID, advance.UserID, advance.LastReadMessageID)
 }
 
 func (a *API) markGroupReadThrough(
@@ -647,6 +841,8 @@ func (a *API) writeGroupError(c *gin.Context, err error) {
 		writeError(c, http.StatusServiceUnavailable, "message_id_exhausted", "消息服务暂时不可用")
 	case errors.Is(err, messaging.ErrMessageServiceUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂时不可用")
+	case errors.Is(err, messaging.ErrGroupNotMember), errors.Is(err, messaging.ErrGroupDissolved):
+		writeError(c, http.StatusNotFound, "group_not_found", "群聊不存在或你不在群中")
 	case errors.Is(err, store.ErrGroupNotFound):
 		writeError(c, http.StatusNotFound, "group_not_found", "群聊不存在或你不在群中")
 	case errors.Is(err, store.ErrNotGroupOwner):

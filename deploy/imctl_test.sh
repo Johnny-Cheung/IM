@@ -12,7 +12,7 @@ UNIT=im-test
 PORT=8199
 VERIFY_MODE=0
 mkdir -p "${APP_ROOT}/bin" "${APP_ROOT}/web"
-printf '#!/bin/sh\nexit 0\n' > "${APP_ROOT}/bin/im-server"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexit 0\n' "${TEST_DIR}/server-args" > "${APP_ROOT}/bin/im-server"
 chmod +x "${APP_ROOT}/bin/im-server"
 printf 'test page' > "${APP_ROOT}/web/index.html"
 printf 'version: test\n' > "${APP_ROOT}/RELEASE"
@@ -91,6 +91,16 @@ if health >/dev/null 2>&1; then exit 1; fi
 pass 'health rejects transport failures'
 TEST_NETWORK=0
 TEST_READY=200
+: > "${TEST_DIR}/server-args"
+backfill_group_read >/dev/null
+test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-backfill-group-read -backfill-batch 1000 '
+pass 'group read backfill runs the backend with the group read flag'
+INFRA_REDIS_URL_FILE="${TEST_DIR}/missing-redis-url"
+VERIFY_MODE=0
+if backfill_group_read >/dev/null 2>&1; then exit 1; fi
+VERIFY_MODE=1
+INFRA_REDIS_URL_FILE="${INFRA_CONFIG_DIR}/redis-url"
+pass 'group read backfill requires Redis configuration'
 if grep -q 'IM_REDIS_URL_FILE' "${SCRIPT_DIR}/imctl" \
   && grep -q 'IM_REDIS_PASSWORD_FILE' "${SCRIPT_DIR}/imctl" \
   && grep -q 'IM_RABBITMQ_URL_FILE' "${SCRIPT_DIR}/imctl" \

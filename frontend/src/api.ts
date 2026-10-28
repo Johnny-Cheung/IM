@@ -126,20 +126,11 @@ export type SendGroupMessageResponse = {
   message: GroupMessage;
 };
 
-export type ReadUpdate = {
-  username: string;
-  through_id: number;
-};
-
-export type ReadUpdateResult = {
-  username: string;
-  last_read_message_id: number;
-  advanced: boolean;
-  error?: string;
-};
-
-export type ReadBatchResponse = {
-  reads: ReadUpdateResult[];
+export type GroupReadStats = {
+  message_id: number;
+  read_count: number;
+  member_count: number;
+  all_read: boolean;
 };
 
 export type ConversationListResponse = {
@@ -369,18 +360,6 @@ export const api = {
     );
   },
 
-  markConversationRead: (username: string, throughID: number) =>
-    request<{ last_read_message_id: number }>(
-      `/api/conversations/${encodeURIComponent(username)}/read?through_id=${throughID}`,
-      { method: "POST" },
-    ),
-
-  markReadBatch: (reads: ReadUpdate[]) =>
-    request<ReadBatchResponse>("/api/read", {
-      method: "POST",
-      body: JSON.stringify({ reads }),
-    }),
-
   sendMessage: (username: string, body: string, clientMessageID: string) =>
     request<SendMessageResponse>(
       `/api/conversations/${encodeURIComponent(username)}/messages`,
@@ -448,10 +427,9 @@ export const api = {
     );
   },
 
-  markGroupRead: (groupID: number, throughID: number) =>
-    request<{ last_read_message_id: number }>(
-      `/api/groups/${groupID}/read?through_id=${throughID}`,
-      { method: "POST" },
+  groupReadStats: (groupID: number, messageID: number) =>
+    request<GroupReadStats>(
+      `/api/groups/${groupID}/read-stats?message_id=${messageID}`,
     ),
 
   sendGroupMessage: (groupID: number, body: string, clientMessageID: string) =>

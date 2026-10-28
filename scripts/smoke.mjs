@@ -1,13 +1,25 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { TestRun } from "./lib/test-client.mjs";
+import { delay, TestRun } from "./lib/test-client.mjs";
 
 const run = new TestRun("api-smoke");
 const groupOf = (list, id) => list.conversations.find((item) => item.type === "group" && item.group.id === id);
 const directOf = (list, name) => list.conversations.find((item) => item.type === "direct" && item.user.username === name);
 const list = (who) => run.request(who, "GET", "/api/conversations");
+const bootstrapOf = (who) => run.request(who, "POST", "/api/bootstrap", {});
 const sendGroup = (who, id, body, key = randomUUID()) => run.request(who, "POST", `/api/groups/${id}/messages`, { body, client_message_id: key });
 const directPath = (who) => `/api/conversations/${run.users.get(who).username}`;
+const readStats = (who, id, messageID) => run.request(who, "GET", `/api/groups/${id}/read-stats?message_id=${messageID}`);
+const groupReadThrough = (who, id, throughID) => run.request(who, "POST", `/api/groups/${id}/read?through_id=${throughID}`);
+
+async function until(condition, message, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await condition()) return;
+    await delay(100);
+  }
+  throw new Error(message);
+}
 
 async function main() {
   console.log(`API smoke ${run.id}: ${run.base}`);
@@ -23,10 +35,12 @@ async function main() {
     run.check(`asset ${asset}`, (await fetch(run.base + asset, { signal: AbortSignal.timeout(10000) })).status === 200);
   }
   await run.expectError("anonymous conversations rejected", null, "GET", "/api/conversations", undefined, 401, "unauthenticated");
-  for (const key of ["a", "b", "c", "d"]) await run.register(key);
+  for (const key of ["a", "b", "c", "d", "e", "f", "g"]) await run.register(key);
   await run.befriend("a", "b");
   await run.befriend("a", "c");
   await run.befriend("b", "c");
+  await run.befriend("e", "f");
+  await run.befriend("e", "g");
   const friends = await run.request("a", "GET", "/api/friends");
   run.check("accepted friends listed", friends.friends.length === 2);
   const accepted = await run.request("b", "GET", "/api/friend-requests");
@@ -106,7 +120,9 @@ async function main() {
   const groupFirst = await sendGroup("a", id, "入群前的历史", messageKey);
   const repeated = await sendGroup("a", id, "入群前的历史", messageKey);
   run.check("group retry is idempotent", groupFirst.message.id === repeated.message.id);
-  run.check("group sender has no own unread", groupOf(await list("a"), id).unread_count === 0);
+  // v1.7 advances the sender's own position asynchronously after accept.
+  await until(async () => groupOf(await list("a"), id)?.unread_count === 0, "group sender unread did not settle");
+  run.check("group sender has no own unread", true);
   run.check("group receiver unread increments", groupOf(await list("b"), id).unread_count === 1);
   await run.request("b", "POST", `/api/groups/${id}/read`);
   run.check("group read persists", groupOf(await list("b"), id).unread_count === 0);
@@ -151,6 +167,71 @@ async function main() {
   run.check("owner leaving dissolves group", dissolved.dissolved);
   run.check("dissolved group removed", !groupOf(await list("b"), id));
   await run.expectError("dissolved history denied", "b", "GET", `/api/groups/${id}/messages`, undefined, 404, "group_not_found");
+
+  const statsGroup = await run.group("e", "已读验证群", ["f", "g"]);
+  const statsPath = `/api/groups/${statsGroup}/read-stats`;
+  const readFirst = await sendGroup("e", statsGroup, "已读第一条");
+  await until(async () => groupOf(await list("e"), statsGroup)?.unread_count === 0, "sender unread did not settle");
+  run.check("group sender never carries own unread", true);
+  const peerF = groupOf(await list("f"), statsGroup);
+  const peerG = groupOf(await list("g"), statsGroup);
+  run.check(
+    "group unread matches for peers",
+    peerF.unread_count === 1 && peerG.unread_count === 1,
+  );
+  run.check(
+    "bootstrap group unread matches conversations",
+    groupOf(await bootstrapOf("f"), statsGroup).unread_count === peerF.unread_count,
+  );
+  run.check(
+    "group sender has no own unread in bootstrap",
+    groupOf(await bootstrapOf("e"), statsGroup).unread_count === 0,
+  );
+  const ownStats = await readStats("e", statsGroup, readFirst.message.id);
+  run.check(
+    "read-stats starts at zero",
+    ownStats.message_id === readFirst.message.id
+      && ownStats.read_count === 0 && ownStats.member_count === 2 && ownStats.all_read === false,
+  );
+  await run.expectError("read-stats needs a message id", "e", "GET", statsPath, undefined, 400, "invalid_request");
+  await run.expectError("read-stats rejects zero message id", "e", "GET", `${statsPath}?message_id=0`, undefined, 400, "invalid_request");
+  await run.expectError("read-stats rejects malformed message id", "e", "GET", `${statsPath}?message_id=abc`, undefined, 400, "invalid_request");
+  await run.expectError("outsider cannot read stats or probe messages", "d", "GET", `${statsPath}?message_id=${readFirst.message.id}`, undefined, 404, "group_not_found");
+  await groupReadThrough("f", statsGroup, readFirst.message.id);
+  const oneReader = await readStats("e", statsGroup, readFirst.message.id);
+  run.check(
+    "read-stats counts a partial reader",
+    oneReader.read_count === 1 && oneReader.member_count === 2 && oneReader.all_read === false,
+  );
+  await groupReadThrough("g", statsGroup, readFirst.message.id);
+  const everyone = await readStats("e", statsGroup, readFirst.message.id);
+  run.check(
+    "read-stats reports all read",
+    everyone.read_count === 2 && everyone.member_count === 2 && everyone.all_read === true,
+  );
+  const otherMessage = await sendGroup("g", statsGroup, "他人的消息");
+  await run.expectError("read-stats rejects another member's message", "e", "GET", `${statsPath}?message_id=${otherMessage.message.id}`, undefined, 403, "not_your_message");
+  const readSecond = await sendGroup("e", statsGroup, "已读第二条");
+  await until(async () => groupOf(await list("e"), statsGroup)?.unread_count === 0, "sender unread did not settle for the second message");
+  await groupReadThrough("g", statsGroup, readSecond.message.id);
+  const beforeKick = await readStats("e", statsGroup, readSecond.message.id);
+  run.check(
+    "read-stats tracks the newer message",
+    beforeKick.read_count === 1 && beforeKick.member_count === 2 && beforeKick.all_read === false,
+  );
+  await run.request("e", "DELETE", `/api/groups/${statsGroup}/members/${run.users.get("f").username}`);
+  const afterKick = await readStats("e", statsGroup, readSecond.message.id);
+  run.check(
+    "kicking a non-reader shrinks the denominator",
+    afterKick.read_count === 1 && afterKick.member_count === 1 && afterKick.all_read === true,
+  );
+  await run.request("g", "POST", `/api/groups/${statsGroup}/leave`);
+  await run.expectError("former member cannot read stats", "g", "GET", `${statsPath}?message_id=${otherMessage.message.id}`, undefined, 404, "group_not_found");
+  const alone = await readStats("e", statsGroup, readSecond.message.id);
+  run.check(
+    "alone in the group has no denominator",
+    alone.read_count === 0 && alone.member_count === 0 && alone.all_read === false,
+  );
 }
 
 try { await main(); } catch (error) { console.error(`FAIL ${error.message}`); process.exitCode = 1; } finally { await run.finish(); }

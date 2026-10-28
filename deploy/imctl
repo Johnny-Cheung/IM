@@ -257,6 +257,22 @@ backfill_read() {
     -backfill-batch "${BACKFILL_BATCH:-1000}"
 }
 
+backfill_group_read() {
+  prepare_backend_config
+  if ! infra_ready; then
+    echo "group read backfill requires Redis configuration" >&2
+    return 1
+  fi
+  local -a env_args=()
+  local line
+  while IFS= read -r line; do
+    env_args+=("${line}")
+  done < <(backend_env_args)
+  /usr/bin/env "${env_args[@]}" \
+    "${APP_ROOT}/bin/im-server" -backfill-group-read \
+    -backfill-batch "${BACKFILL_BATCH:-1000}"
+}
+
 backend_start() {
   if systemctl is-active --quiet "${UNIT}"; then
     echo "backend is already running on port ${PORT}"
@@ -501,6 +517,7 @@ main() {
     backend-start) backend_start ;;
     backend-stop) backend_stop ;;
     backfill-read) backfill_read ;;
+    backfill-group-read) backfill_group_read ;;
     health) health ;;
     status) status ;;
     backup) backup ;;
@@ -512,7 +529,7 @@ main() {
     runtime-stop) runtime_stop ;;
     verify-host) verify_host ;;
     logs) logs "${2:-backend}" "${3:-80}" ;;
-    *) echo "Usage: $0 [--verify] {start|stop|restart|backend-start|backend-stop|backfill-read|health|status|backup|restore-check <backup>|mysql-start|mysql-stop|mysql-status|runtime-start|runtime-stop|verify-host|logs [backend|mysql|runtime] [lines]}" >&2; return 2 ;;
+    *) echo "Usage: $0 [--verify] {start|stop|restart|backend-start|backend-stop|backfill-read|backfill-group-read|health|status|backup|restore-check <backup>|mysql-start|mysql-stop|mysql-status|runtime-start|runtime-stop|verify-host|logs [backend|mysql|runtime] [lines]}" >&2; return 2 ;;
   esac
 }
 

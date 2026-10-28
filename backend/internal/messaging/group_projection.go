@@ -17,6 +17,13 @@ end
 for index = 2, #ARGV do
   redis.call('SADD', KEYS[1], ARGV[index])
 end
+if ARGV[1] ~= '1' then
+  for _, member in ipairs(redis.call('ZRANGE', KEYS[4], 0, -1)) do
+    if redis.call('SISMEMBER', KEYS[1], member) == 0 then
+      redis.call('ZREM', KEYS[4], member)
+    end
+  end
+end
 redis.call('DEL', KEYS[3])
 return 1
 `)
@@ -64,6 +71,7 @@ func (p *GroupProjection) Replace(
 		p.keyspace.groupMembersKey(groupID),
 		p.keyspace.groupDissolvedKey(groupID),
 		p.keyspace.groupSyncRequiredKey(groupID),
+		p.keyspace.groupReadKey(groupID),
 	}, args...).Err()
 }
 

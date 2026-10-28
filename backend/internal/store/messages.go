@@ -96,6 +96,27 @@ func (s *Store) ListConversationBasics(
 	return conversations, err
 }
 
+// HasDirectConversation reports whether the two users have exchanged a
+// message. The pair may no longer be friends.
+func (s *Store) HasDirectConversation(
+	ctx context.Context,
+	userID, peerID uint64,
+) (bool, error) {
+	var found int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS(
+		   SELECT 1 FROM messages
+		   WHERE (sender_id = ? AND recipient_id = ?)
+		      OR (sender_id = ? AND recipient_id = ?)
+		 )`,
+		userID, peerID, peerID, userID,
+	).Scan(&found)
+	if err != nil {
+		return false, fmt.Errorf("check direct conversation: %w", err)
+	}
+	return found == 1, nil
+}
+
 // ListConversations returns all friends plus users with existing messages,
 // newest conversations first and friends without messages by nickname.
 func (s *Store) ListConversations(ctx context.Context, userID uint64) ([]Conversation, error) {

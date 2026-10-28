@@ -42,6 +42,8 @@ type fakeStore struct {
 
 	relationship       store.Relationship
 	relationshipErr    error
+	hasConversation    bool
+	hasConversationErr error
 	friends            []store.PublicUser
 	friendsErr         error
 	friendRequests     store.FriendRequests
@@ -111,10 +113,12 @@ type fakeStore struct {
 		now       time.Time
 	}
 
-	groupConversations    []store.GroupConversation
-	groupConversationsErr error
-	groupMember           bool
-	groupMessageCall      struct {
+	groupConversations                 []store.GroupConversation
+	groupConversationsErr              error
+	groupConversationsWithoutUnread    []store.GroupConversation
+	groupConversationsWithoutUnreadErr error
+	groupMember                        bool
+	groupMessageCall                   struct {
 		userID   uint64
 		groupID  uint64
 		beforeID uint64
@@ -133,16 +137,22 @@ type fakeStore struct {
 	renameGroupErr  error
 	inviteGroupErr  error
 	inviteGroupCall struct {
-		groupID   uint64
-		inviterID uint64
-		memberIDs []uint64
-		now       time.Time
+		groupID       uint64
+		inviterID     uint64
+		memberIDs     []uint64
+		now           time.Time
+		baselineFloor uint64
 	}
+	inviteGroupBaseline    uint64
 	kickGroupErr           error
 	leaveGroupDissolved    bool
 	leaveGroupErr          error
 	groupMemberIDs         []uint64
 	groupMemberIDsErr      error
+	groupMemberIDSequence  [][]uint64
+	groupMemberIDCalls     int
+	groupProjections       []store.GroupMembershipProjection
+	groupProjectionsErr    error
 	groupMessagePage       store.GroupMessagePage
 	groupMessagePageErr    error
 	groupMessageAfterPage  store.GroupMessagePage
@@ -157,10 +167,14 @@ type fakeStore struct {
 		body            string
 		now             time.Time
 	}
-	markGroupReadThrough  uint64
-	markGroupReadResult   uint64
-	markGroupReadAdvanced bool
-	markGroupReadErr      error
+	markGroupReadThrough    uint64
+	markGroupReadResult     uint64
+	markGroupReadAdvanced   bool
+	markGroupReadErr        error
+	groupMessageSender      uint64
+	groupMessageSenderFound bool
+	groupMessageSenderErr   error
+	sessionByTokenHash      map[string]store.SessionUser
 
 	createdSession struct {
 		userID    uint64
@@ -236,6 +250,14 @@ func (f *fakeStore) GetRelationship(
 	uint64,
 ) (store.Relationship, error) {
 	return f.relationship, f.relationshipErr
+}
+
+func (f *fakeStore) HasDirectConversation(
+	context.Context,
+	uint64,
+	uint64,
+) (bool, error) {
+	return f.hasConversation, f.hasConversationErr
 }
 
 func (f *fakeStore) ListFriends(context.Context, uint64) ([]store.PublicUser, error) {
@@ -373,6 +395,19 @@ func (f *fakeStore) ListGroupConversations(
 	return f.groupConversations, f.groupConversationsErr
 }
 
+func (f *fakeStore) ListGroupConversationsWithoutUnread(
+	context.Context,
+	uint64,
+) ([]store.GroupConversation, error) {
+	if f.groupConversationsWithoutUnreadErr != nil {
+		return nil, f.groupConversationsWithoutUnreadErr
+	}
+	if f.groupConversationsWithoutUnread != nil {
+		return f.groupConversationsWithoutUnread, nil
+	}
+	return f.groupConversations, f.groupConversationsErr
+}
+
 func (f *fakeStore) GetGroup(context.Context, uint64, uint64) (store.GroupDetail, error) {
 	return f.groupDetail, f.groupDetailErr
 }
@@ -381,17 +416,19 @@ func (f *fakeStore) RenameGroup(context.Context, uint64, uint64, string) error {
 	return f.renameGroupErr
 }
 
-func (f *fakeStore) InviteGroupMembers(
+func (f *fakeStore) InviteGroupMembersWithBaseline(
 	_ context.Context,
 	groupID, inviterID uint64,
 	memberIDs []uint64,
 	now time.Time,
-) error {
+	baselineFloor uint64,
+) (uint64, error) {
 	f.inviteGroupCall.groupID = groupID
 	f.inviteGroupCall.inviterID = inviterID
 	f.inviteGroupCall.memberIDs = memberIDs
 	f.inviteGroupCall.now = now
-	return f.inviteGroupErr
+	f.inviteGroupCall.baselineFloor = baselineFloor
+	return f.inviteGroupBaseline, f.inviteGroupErr
 }
 
 func (f *fakeStore) KickGroupMember(context.Context, uint64, uint64, uint64) error {
@@ -403,7 +440,24 @@ func (f *fakeStore) LeaveGroup(context.Context, uint64, uint64, time.Time) (bool
 }
 
 func (f *fakeStore) ListGroupMemberIDs(context.Context, uint64) ([]uint64, error) {
-	return f.groupMemberIDs, f.groupMemberIDsErr
+	if f.groupMemberIDsErr != nil {
+		return nil, f.groupMemberIDsErr
+	}
+	if len(f.groupMemberIDSequence) > 0 {
+		index := f.groupMemberIDCalls
+		f.groupMemberIDCalls++
+		if index >= len(f.groupMemberIDSequence) {
+			index = len(f.groupMemberIDSequence) - 1
+		}
+		return f.groupMemberIDSequence[index], nil
+	}
+	return f.groupMemberIDs, nil
+}
+
+func (f *fakeStore) ListGroupMembershipProjections(
+	context.Context,
+) ([]store.GroupMembershipProjection, error) {
+	return f.groupProjections, f.groupProjectionsErr
 }
 
 func (f *fakeStore) ListPublicUsersByIDs(
@@ -474,6 +528,14 @@ func (f *fakeStore) MarkGroupRead(_ context.Context, _, _, throughID uint64) (ui
 	return f.markGroupReadResult, f.markGroupReadAdvanced, f.markGroupReadErr
 }
 
+func (f *fakeStore) GroupMessageSender(
+	context.Context,
+	uint64,
+	uint64,
+) (uint64, bool, error) {
+	return f.groupMessageSender, f.groupMessageSenderFound, f.groupMessageSenderErr
+}
+
 func (f *fakeStore) CreateSession(
 	_ context.Context,
 	userID uint64,
@@ -487,9 +549,16 @@ func (f *fakeStore) CreateSession(
 	return f.createSessionErr
 }
 
-func (f *fakeStore) GetSessionWithUser(context.Context, []byte) (store.SessionUser, error) {
+func (f *fakeStore) GetSessionWithUser(_ context.Context, tokenHash []byte) (store.SessionUser, error) {
 	if f.sessionErr != nil {
 		return store.SessionUser{}, f.sessionErr
+	}
+	if f.sessionByTokenHash != nil {
+		session, ok := f.sessionByTokenHash[string(tokenHash)]
+		if !ok {
+			return store.SessionUser{}, store.ErrSessionNotFound
+		}
+		return session, nil
 	}
 	return f.session, nil
 }

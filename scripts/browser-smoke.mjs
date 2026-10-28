@@ -12,6 +12,65 @@ const name = (key) => run.users.get(key).username;
 const memberSelector = (id) => `.conversation-item[data-group-id="${id}"]`;
 const directSelector = (key) => `.conversation-item[data-username="${name(key)}"]`;
 const textAt = (selector) => `document.querySelector(${JSON.stringify(selector)})?.textContent`;
+const conversationsOf = (who) => run.request(who, "GET", "/api/conversations");
+const groupOf = (conversationList, id) => conversationList.conversations.find((item) => item.type === "group" && item.group.id === id);
+const same = (first, second) => String(first).toLocaleLowerCase() === String(second).toLocaleLowerCase();
+const focusTarget = (frames, kind, value) => frames.some((frame) =>
+  frame.type === "focus" && frame.kind === kind
+    && (kind === "direct" ? same(frame.username, value) : frame.group_id === value));
+
+function trackReadRequests() {
+  const paths = [];
+  const off = tab.on("Network.requestWillBeSent", ({ request }) => {
+    try {
+      const url = new URL(request.url);
+      if (url.origin === run.base && (url.pathname === "/api/read" || url.pathname.endsWith("/read"))) {
+        paths.push(url.pathname);
+      }
+    } catch {
+      // Ignore non-URL requests.
+    }
+  });
+  return { paths, off };
+}
+
+function trackFocusFrames() {
+  const frames = [];
+  const off = tab.on("Network.webSocketFrameSent", ({ response }) => {
+    try {
+      const frame = JSON.parse(response.payloadData);
+      if (frame?.type === "focus" || frame?.type === "blur") frames.push(frame);
+    } catch {
+      // Ignore non-JSON frames.
+    }
+  });
+  return { frames, off };
+}
+
+async function waitUntil(condition, message, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await condition()) return;
+    await delay(100);
+  }
+  throw new Error(message);
+}
+
+async function hidePage() {
+  await tab.evaluate("Object.defineProperty(document, 'visibilityState', {configurable:true, get:()=>window.__imHidden ? 'hidden' : 'visible'}); window.__imHidden=true; document.dispatchEvent(new Event('visibilitychange'))");
+}
+
+async function showPage() {
+  await tab.evaluate("window.__imHidden=false; document.dispatchEvent(new Event('visibilitychange'))");
+}
+
+// Reads the receipt rendered under the own message whose body is given.
+const receiptOf = (body) => `(() => {
+  const row = [...document.querySelectorAll('#message-list .message-row')]
+    .find((el) => el.innerText.includes(${JSON.stringify(body)}));
+  const state = row?.querySelector('.message-meta > span.read-state');
+  return state ? { text: state.textContent, read: state.dataset.readCount, members: state.dataset.memberCount, all: state.classList.contains('read-state--read') } : null;
+})()`;
 
 async function scenario(title, action) {
   try {
@@ -42,53 +101,6 @@ async function offline() {
 async function online() {
   await tab.send("Network.emulateNetworkConditions", { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
   await tab.evaluate("window.dispatchEvent(new Event('online'))");
-}
-
-function readPositionOf(request) {
-  const query = Number(new URL(request.url).searchParams.get("through_id"));
-  if (Number.isFinite(query) && query > 0) {
-    return query;
-  }
-  try {
-    const body = JSON.parse(request.postData ?? "");
-    const reads = Array.isArray(body?.reads) ? body.reads : [];
-    return reads.reduce(
-      (latest, item) => Math.max(latest, Number(item?.through_id) || 0),
-      0,
-    );
-  } catch {
-    return 0;
-  }
-}
-
-async function readWhileHiding(pattern, send, unreadSelector) {
-  await delay(400);
-  let resolveRead;
-  const paused = new Promise((resolve) => { resolveRead = resolve; });
-  const offRead = tab.on("Fetch.requestPaused", resolveRead);
-  await tab.send("Fetch.enable", { patterns: [{ urlPattern: pattern, requestStage: "Request" }] });
-  try {
-    const sent = await send("前台已看到");
-    const read = await Promise.race([paused, delay(5000).then(() => { throw new Error("read request was not intercepted"); })]);
-    const readPosition = readPositionOf(read.request);
-    await tab.evaluate("Object.defineProperty(document, 'visibilityState', {configurable:true, get:()=>window.__imHidden ? 'hidden' : 'visible'}); window.__imHidden=true; document.dispatchEvent(new Event('visibilitychange'))");
-    await send("后台未读");
-    await tab.waitFor(`document.querySelector(${JSON.stringify(unreadSelector)})?.textContent === '1'`);
-    let resolveCompleted;
-    const completed = new Promise((resolve) => { resolveCompleted = resolve; });
-    const offCompleted = tab.on("Network.loadingFinished", (event) => { if (event.requestId === read.networkId) resolveCompleted(); });
-    try {
-      await tab.send("Fetch.continueRequest", { requestId: read.requestId });
-      await Promise.race([completed, delay(5000).then(() => { throw new Error("read request did not finish"); })]);
-      await delay(250);
-      run.check(`in-flight read preserves background unread (${unreadSelector})`, await tab.evaluate(`document.querySelector(${JSON.stringify(unreadSelector)})?.textContent === '1'`));
-      run.check("read request captures viewed message position", readPosition >= sent.message.id);
-    } finally { offCompleted(); }
-  } finally {
-    offRead();
-    await tab.send("Fetch.disable");
-    await tab.evaluate("window.__imHidden=false; document.dispatchEvent(new Event('visibilitychange'))");
-  }
 }
 
 async function main() {
@@ -234,14 +246,39 @@ async function main() {
     await tab.waitFor(`document.querySelector('#message-list')?.innerText.includes(${JSON.stringify(firstBody)})`);
     await tab.waitFor(`!document.querySelector('#conversation-list ${memberSelector(live)} .unread-badge')`);
     run.check("opening group clears unread", true);
-    run.check("group has no read receipt", !await tab.evaluate("!!document.querySelector('#message-list .read-state')"));
-    await readWhileHiding(
-      `*/api/groups/${live}/read*`,
-      (body) => run.request("b", "POST", `/api/groups/${live}/messages`, { body, client_message_id: randomUUID() }),
-      `#conversation-list ${memberSelector(live)} .unread-badge`,
-    );
-    await tab.waitFor(`!document.querySelector('#conversation-list ${memberSelector(live)} .unread-badge')`);
-    run.check("returning to foreground clears unread", true);
+    run.check("other members' messages have no read receipt", !await tab.evaluate("!!document.querySelector('#message-list .read-state')"));
+    const unreadSelector = `#conversation-list ${memberSelector(live)} .unread-badge`;
+    const reads = trackReadRequests();
+    const focus = trackFocusFrames();
+    try {
+      await run.request("b", "POST", `/api/groups/${live}/messages`, { body: "前台已看到", client_message_id: randomUUID() });
+      await tab.waitFor("document.querySelector('#message-list')?.innerText.includes('前台已看到')");
+      await delay(600);
+      run.check("foreground group message leaves no unread", !await tab.evaluate(`!!document.querySelector(${JSON.stringify(unreadSelector)})`));
+      run.check("foreground viewing sends no read request", reads.paths.length === 0);
+
+      const hiddenAt = focus.frames.length;
+      await hidePage();
+      await waitUntil(() => focus.frames.slice(hiddenAt).some((frame) => frame.type === "blur"), "hiding the page did not send blur");
+      await delay(150);
+      await run.request("b", "POST", `/api/groups/${live}/messages`, { body: "后台未读", client_message_id: randomUUID() });
+      await tab.waitFor(`document.querySelector(${JSON.stringify(unreadSelector)})?.textContent === '1'`);
+      await delay(400);
+      run.check("hidden tab leaves the background message unread", await tab.evaluate(`document.querySelector(${JSON.stringify(unreadSelector)})?.textContent === '1'`));
+      run.check("hidden tab sends no read request", reads.paths.length === 0);
+      run.check("hidden unread is kept on the server", groupOf(await conversationsOf("a"), live)?.unread_count === 1);
+
+      const shownAt = focus.frames.length;
+      await showPage();
+      await tab.waitFor(`!document.querySelector(${JSON.stringify(unreadSelector)})`);
+      await waitUntil(() => focusTarget(focus.frames.slice(shownAt), "group", live), "returning to foreground did not focus the group");
+      await waitUntil(async () => groupOf(await conversationsOf("a"), live)?.unread_count === 0, "server unread did not clear after refocus");
+      run.check("returning to foreground catches up the unread", true);
+      run.check("foreground catch-up uses focus instead of read requests", reads.paths.length === 0);
+    } finally {
+      reads.off();
+      focus.off();
+    }
     for (let index = 0; index < 32; index += 1) await run.request("b", "POST", `/api/groups/${live}/messages`, { body: `历史 ${index}`, client_message_id: randomUUID() });
     // Wait until every real-time message has reached the client before
     // dropping the cache; a late WebSocket write would otherwise restore a
@@ -296,69 +333,79 @@ async function main() {
     await tab.viewport(1280, 900);
   });
 
-  await scenario("private read in flight cannot consume unseen messages", async () => {
-    await tab.select(directSelector("b"), `/chat/${name("b")}`);
-    const unread = `#conversation-list ${directSelector("b")} .unread-badge`;
-    await readWhileHiding(
-      "*/api/read*",
-      (body) => run.request("b", "POST", `/api/conversations/${name("a")}/messages`, { body, client_message_id: randomUUID() }),
-      unread,
-    );
-    await tab.waitFor(`!document.querySelector(${JSON.stringify(unread)})`);
-    run.check("private foreground restoration clears unread", true);
-
-    await tab.setValue("#message-input", "回执测试");
-    await tab.click("#send-message");
-    await tab.waitFor(`(() => {
-      const row = [...document.querySelectorAll('#message-list .message-row')]
-        .find((el) => el.innerText.includes('回执测试'));
-      return !!row && row.dataset.status === 'sent' && Number(row.dataset.messageId) > 0;
-    })()`, 5000);
-    await run.request("b", "POST", `/api/conversations/${name("a")}/read`);
-    await tab.waitFor(`(() => {
-      const row = [...document.querySelectorAll('#message-list .message-row')]
-        .find((el) => el.innerText.includes('回执测试'));
-      return row?.querySelector('.read-state')?.textContent === '已读';
-    })()`, 5000);
-    run.check("sender sees the peer read receipt", true);
-
-    // Let the in-conversation read flush, then verify that switching away
-    // sends the previous conversation's position.
-    await delay(1500);
-    const switchReads = [];
-    const offSwitchRead = tab.on("Network.requestWillBeSent", ({ request }) => {
-      if (new URL(request.url).pathname !== "/api/read") return;
-      try {
-        const body = JSON.parse(request.postData ?? "{}");
-        if (Array.isArray(body.reads)) switchReads.push(...body.reads);
-      } catch {
-        // Ignore malformed requests.
-      }
-    });
+  await scenario("private foreground reading uses focus with receipts", async () => {
+    const reads = trackReadRequests();
+    const focus = trackFocusFrames();
     try {
+      await tab.select(directSelector("b"), `/chat/${name("b")}`);
+      await waitUntil(() => focusTarget(focus.frames, "direct", name("b")), "opening a private chat did not focus it");
+      const unread = `#conversation-list ${directSelector("b")} .unread-badge`;
+      await run.request("b", "POST", `/api/conversations/${name("a")}/messages`, { body: "私聊前台观看", client_message_id: randomUUID() });
+      await tab.waitFor("document.querySelector('#message-list')?.innerText.includes('私聊前台观看')");
+      await delay(600);
+      run.check("foreground private message leaves no unread", !await tab.evaluate(`!!document.querySelector(${JSON.stringify(unread)})`));
+      run.check("private foreground sends no read request", reads.paths.length === 0);
+
+      await tab.setValue("#message-input", "回执测试");
+      await tab.click("#send-message");
+      await tab.waitFor(`(() => {
+        const row = [...document.querySelectorAll('#message-list .message-row')]
+          .find((el) => el.innerText.includes('回执测试'));
+        return !!row && row.dataset.status === 'sent' && Number(row.dataset.messageId) > 0;
+      })()`, 5000);
+      await run.request("b", "POST", `/api/conversations/${name("a")}/read`);
+      await tab.waitFor(`(() => {
+        const row = [...document.querySelectorAll('#message-list .message-row')]
+          .find((el) => el.innerText.includes('回执测试'));
+        return row?.querySelector('.read-state')?.textContent === '已读';
+      })()`, 5000);
+      run.check("sender sees the peer read receipt", true);
+
+      const before = focus.frames.length;
       await tab.select(directSelector("c"), `/chat/${name("c")}`);
-      const expected = name("b").toLocaleLowerCase();
-      const deadline = Date.now() + 3000;
-      while (
-        Date.now() < deadline
-        && !switchReads.some(
-          (item) => String(item.username).toLocaleLowerCase() === expected,
-        )
-      ) {
-        await delay(100);
-      }
-      run.check(
-        "switching conversations flushes the previous read",
-        switchReads.some(
-          (item) => String(item.username).toLocaleLowerCase() === expected,
-        ),
-      );
+      await waitUntil(() => focusTarget(focus.frames.slice(before), "direct", name("c")), "switching chats did not focus the new chat");
+      run.check("switching conversations focuses the new chat", true);
+      run.check("switching conversations sends no read request", reads.paths.length === 0);
     } finally {
-      offSwitchRead();
+      reads.off();
+      focus.off();
     }
 
     await tab.select(memberSelector(live), `/chat/group/${live}`);
     await tab.waitFor("document.querySelectorAll('#message-list .message-row').length > 0");
+  });
+
+  await scenario("group receipts, reader changes and sender switching", async () => {
+    const reads = trackReadRequests();
+    try {
+      await tab.select(memberSelector(live), `/chat/group/${live}`);
+      await tab.waitFor("document.querySelectorAll('#message-list .message-row').length > 0");
+      await tab.setValue("#message-input", "群回执验证");
+      await tab.click("#send-message");
+      await tab.waitFor(`(${receiptOf("群回执验证")})?.text === '已读 0/2'`, 5000);
+      const initial = await tab.evaluate(receiptOf("群回执验证"));
+      run.check("group receipt starts at zero", initial.read === "0" && initial.members === "2" && !initial.all);
+
+      await run.request("b", "POST", `/api/groups/${live}/read`);
+      await tab.waitFor(`(${receiptOf("群回执验证")})?.text === '已读 1/2'`, 5000);
+      run.check("group receipt follows a reader in real time", true);
+
+      await run.request("b", "DELETE", `/api/groups/${live}/members/${name("c")}`);
+      await tab.waitFor(`(${receiptOf("群回执验证")})?.text === '全部已读'`, 5000);
+      const shrunk = await tab.evaluate(receiptOf("群回执验证"));
+      run.check("kicking a non-reader shrinks the denominator", shrunk.read === "1" && shrunk.members === "1" && shrunk.all);
+      run.check("group receipts never send read requests", reads.paths.length === 0);
+
+      await tab.setValue("#message-input", "发完就切走");
+      await tab.click("#send-message");
+      await tab.select(directSelector("c"), `/chat/${name("c")}`);
+      await waitUntil(async () => groupOf(await conversationsOf("a"), live)?.unread_count === 0, "sender still has unread after switching away");
+      run.check("sending then switching away leaves no sender unread", true);
+      await tab.waitFor(`!document.querySelector('#conversation-list ${memberSelector(live)} .unread-badge')`);
+      run.check("sender sidebar shows no own unread", true);
+    } finally {
+      reads.off();
+    }
   });
 
   await scenario("same-session new window replaces old chat connection", async () => {

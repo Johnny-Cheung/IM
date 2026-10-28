@@ -22,29 +22,30 @@ import {
   type GroupConversation,
   type GroupDetail,
   type GroupMessage,
+  type GroupReadStats,
   type PublicUser,
-  type ReadUpdateResult,
 } from "../api";
 import {
   readConversations,
   readFriends,
   readMessages,
-  readPendingReads,
   readSyncState,
   removeMessages,
   writeConversations,
   writeFriends,
   writeMessages,
-  writePendingReads,
 } from "../cache";
 import type { CachedMessage } from "../cache";
+import { BLUR_FRAME, focusFrame, parseFocusAck, type FocusAck, type FocusTarget } from "../focus";
+import { groupReceiptLabel, lastOwnSentMessageID as findLastOwnSentMessageID } from "../groupReceipt";
 import {
-  deserializePendingReads,
-  enqueueRead,
-  serializePendingReads,
-  splitPendingReads,
-  type PendingRead,
-} from "../readQueue";
+  Debouncer,
+  READ_STATS_DEBOUNCE_MS,
+  ReadStatsGate,
+  parseGroupReadEvent,
+  parseGroupReadStats,
+  type GroupReadEvent,
+} from "../readStats";
 import { Brand } from "../components/Brand";
 import { useAuth } from "../auth";
 
@@ -54,10 +55,6 @@ const MAX_GROUP_NAME_LENGTH = 30;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY = 1000;
 const RECONNECT_MAX_DELAY = 10000;
-const READ_FLUSH_MS = 1000;
-const READ_SWITCH_FLUSH_MS = 300;
-const READ_RETRY_MS = 5000;
-const READ_BATCH_LIMIT = 50;
 const WS_CLOSE_REPLACED = 4001;
 const WS_CLOSE_SESSION = 4002;
 
@@ -82,6 +79,12 @@ type GroupChangedEvent = {
   action: string;
 };
 
+type GroupReceipt = {
+  groupID: number;
+  messageID: number;
+  stats: GroupReadStats;
+};
+
 type ScrollPosition = {
   height: number;
   top: number;
@@ -89,23 +92,6 @@ type ScrollPosition = {
 
 function sameUsername(left: string, right: string): boolean {
   return left.toLocaleLowerCase() === right.toLocaleLowerCase();
-}
-
-function usernameKey(value: string): string {
-  return value.toLocaleLowerCase();
-}
-
-function maxMessageID(items: DisplayMessage[]): number {
-  return items.reduce((latest, message) => Math.max(latest, message.id), 0);
-}
-
-function isPermanentReadError(error: unknown): boolean {
-  return error instanceof ApiError
-    && error.status >= 400
-    && error.status < 500
-    && error.status !== 401
-    && error.status !== 408
-    && error.status !== 429;
 }
 
 const messageTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
@@ -527,6 +513,7 @@ export function ChatPage() {
   const [groupDetail, setGroupDetail] = useState<GroupDetail | null>(null);
   const [groupDetailLoading, setGroupDetailLoading] = useState(false);
   const [groupDetailError, setGroupDetailError] = useState<string | null>(null);
+  const [groupReceipt, setGroupReceipt] = useState<GroupReceipt | null>(null);
   const [groupInfoOpen, setGroupInfoOpen] = useState(false);
   const [groupNameDraft, setGroupNameDraft] = useState("");
   const [groupActionError, setGroupActionError] = useState<string | null>(null);
@@ -562,16 +549,9 @@ export function ChatPage() {
   const reconnectAttemptRef = useRef(0);
   const connectRef = useRef<() => void>(() => {});
   const syncingRef = useRef(false);
-  const pendingReadsRef = useRef<Map<string, PendingRead>>(new Map());
-  const readFlushTimerRef = useRef<number | null>(null);
-  const readFlushRef = useRef<() => void>(() => {});
-  const readFlushingRef = useRef(false);
-  const readPersistTimerRef = useRef<number | null>(null);
-  const previousReadTargetRef = useRef<ActiveTarget | null>(null);
-  const pendingReadsLoadedForRef = useRef("");
-  const pendingReadsLoadingForRef = useRef("");
-  const pendingReadsMergedRef = useRef(false);
-  const conversationMaxRef = useRef<Map<string, number>>(new Map());
+  const groupReceiptTargetRef = useRef<{ groupID: number; messageID: number } | null>(null);
+  const readStatsGateRef = useRef(new ReadStatsGate());
+  const readStatsDebouncerRef = useRef(new Debouncer(READ_STATS_DEBOUNCE_MS));
   const nearBottomRef = useRef(true);
   const scrollToBottomNextRef = useRef(false);
   const pendingOlderScrollRef = useRef<ScrollPosition | null>(null);
@@ -659,40 +639,7 @@ export function ChatPage() {
     navigate("/", { replace: true });
   }, [navigate]);
 
-  const persistPendingReads = useCallback((immediate = false) => {
-    const currentUser = userRef.current;
-    if (!currentUser || loggingOutRef.current || !pendingReadsMergedRef.current) {
-      return;
-    }
-    if (readPersistTimerRef.current !== null) {
-      window.clearTimeout(readPersistTimerRef.current);
-      readPersistTimerRef.current = null;
-    }
-    const write = () => {
-      void writePendingReads(
-        currentUser.username,
-        serializePendingReads(pendingReadsRef.current),
-      );
-    };
-    if (immediate) {
-      write();
-      return;
-    }
-    readPersistTimerRef.current = window.setTimeout(() => {
-      readPersistTimerRef.current = null;
-      write();
-    }, 300);
-  }, []);
-
-  const enqueuePendingRead = useCallback((target: ActiveTarget, throughID: number) => {
-    if (!enqueueRead(pendingReadsRef.current, target, throughID)) {
-      return false;
-    }
-    persistPendingReads();
-    return true;
-  }, [persistPendingReads]);
-
-  const clearLocalUnread = useCallback((target: ActiveTarget, throughID: number) => {
+  const clearLocalUnread = useCallback((target: FocusTarget, throughID: number) => {
     setConversations((previous) => previous.map((conversation) => {
       if (target.kind === "direct") {
         return conversation.type === "direct"
@@ -709,229 +656,75 @@ export function ChatPage() {
     }));
   }, []);
 
-  const scheduleReadFlush = useCallback((delay: number, replace = false) => {
-    if (readFlushTimerRef.current !== null) {
-      if (!replace) {
-        return;
-      }
-      window.clearTimeout(readFlushTimerRef.current);
-      readFlushTimerRef.current = null;
+  const syncFocus = useCallback(() => {
+    const socket = websocketRef.current;
+    if (socket === null || socket.readyState !== WebSocket.OPEN) {
+      return;
     }
-    readFlushTimerRef.current = window.setTimeout(() => {
-      readFlushTimerRef.current = null;
-      readFlushRef.current();
-    }, delay);
+    const target = activeTargetRef.current;
+    const frame = target !== null && pageVisibleRef.current
+      ? focusFrame(target)
+      : BLUR_FRAME;
+    socket.send(JSON.stringify(frame));
   }, []);
 
-  const flushPendingReads = useCallback(async (updateLocal = true) => {
-    if (offlineRef.current || readFlushingRef.current) {
+  const handleFocusAck = useCallback((ack: FocusAck) => {
+    if (!ack.ok) {
       return;
     }
-    const queue = pendingReadsRef.current;
-    if (queue.size === 0) {
+    clearLocalUnread(ack.target, ack.lastReadMessageID);
+  }, [clearLocalUnread]);
+
+  const fetchGroupReadStats = useCallback(async () => {
+    const target = groupReceiptTargetRef.current;
+    if (target === null || offlineRef.current) {
       return;
     }
-    if (readFlushTimerRef.current !== null) {
-      window.clearTimeout(readFlushTimerRef.current);
-      readFlushTimerRef.current = null;
-    }
-
-    readFlushingRef.current = true;
-    const items = [...queue.values()];
-    queue.clear();
-    const retry: PendingRead[] = [];
-    let sessionEnded = false;
-
+    const token = readStatsGateRef.current.begin(
+      target.groupID,
+      target.messageID,
+    );
     try {
-      const { direct, groups } = splitPendingReads(items);
-      for (let start = 0; start < direct.length; start += READ_BATCH_LIMIT) {
-        const chunk = direct.slice(start, start + READ_BATCH_LIMIT);
-        try {
-          const response = await api.markReadBatch(chunk.map((item) => ({
-            username: item.username,
-            through_id: item.throughID,
-          })));
-          const results = new Map<string, ReadUpdateResult>(
-            response.reads.map((result) => [usernameKey(result.username), result]),
-          );
-          for (const item of chunk) {
-            const result = results.get(usernameKey(item.username));
-            if (result === undefined) {
-              retry.push(item);
-              continue;
-            }
-            if (result.error !== undefined && result.error !== "") {
-              if (result.error === "message_service_unavailable") {
-                retry.push(item);
-              }
-              continue;
-            }
-            if (updateLocal) {
-              clearLocalUnread(item, result.last_read_message_id);
-            }
-          }
-        } catch (error) {
-          if (handleSessionError(error)) {
-            sessionEnded = true;
-            break;
-          }
-          if (isPermanentReadError(error)) {
-            continue;
-          }
-          retry.push(...chunk);
-        }
-      }
-
-      if (!sessionEnded) {
-        for (const item of groups) {
-          try {
-            const result = await api.markGroupRead(item.groupID, item.throughID);
-            if (updateLocal) {
-              clearLocalUnread(item, result.last_read_message_id);
-            }
-          } catch (error) {
-            if (handleSessionError(error)) {
-              sessionEnded = true;
-              break;
-            }
-            if (isPermanentReadError(error)) {
-              continue;
-            }
-            retry.push(item);
-          }
-        }
-      }
-    } finally {
-      readFlushingRef.current = false;
-      if (sessionEnded) {
-        pendingReadsRef.current.clear();
-        persistPendingReads(true);
+      const stats = parseGroupReadStats(
+        await api.groupReadStats(target.groupID, target.messageID),
+      );
+      if (
+        stats === null
+        || !readStatsGateRef.current.accepts(
+          token,
+          target.groupID,
+          target.messageID,
+        )
+      ) {
         return;
       }
-      for (const item of retry) {
-        const existing = pendingReadsRef.current.get(item.key);
-        if (existing === undefined || existing.throughID < item.throughID) {
-          pendingReadsRef.current.set(item.key, item);
-        }
-      }
-      persistPendingReads();
-      if (pendingReadsRef.current.size > 0 && !offlineRef.current) {
-        scheduleReadFlush(retry.length > 0 ? READ_RETRY_MS : READ_FLUSH_MS);
-      }
+      setGroupReceipt({
+        groupID: target.groupID,
+        messageID: stats.message_id,
+        stats,
+      });
+    } catch (error) {
+      // Keep the last good value; the next trigger retries.
+      handleSessionError(error);
     }
-  }, [
-    clearLocalUnread,
-    handleSessionError,
-    persistPendingReads,
-    scheduleReadFlush,
-  ]);
+  }, [handleSessionError]);
 
-  useEffect(() => {
-    readFlushRef.current = () => {
-      void flushPendingReads();
-    };
-  }, [flushPendingReads]);
-
-  useEffect(() => {
-    if (!user) {
+  const handleGroupRead = useCallback((event: GroupReadEvent) => {
+    const target = activeTargetRef.current;
+    if (target?.kind !== "group" || target.groupID !== event.groupID) {
       return;
     }
-    const username = user.username;
-    if (
-      pendingReadsLoadedForRef.current === username
-      || pendingReadsLoadingForRef.current === username
-    ) {
+    if (groupReceiptTargetRef.current === null) {
       return;
     }
-    if (pendingReadsLoadedForRef.current !== "") {
-      pendingReadsRef.current.clear();
-      conversationMaxRef.current.clear();
-      pendingReadsMergedRef.current = false;
-      pendingReadsLoadedForRef.current = "";
-      if (readFlushTimerRef.current !== null) {
-        window.clearTimeout(readFlushTimerRef.current);
-        readFlushTimerRef.current = null;
-      }
-    }
-    pendingReadsLoadingForRef.current = username;
-    let cancelled = false;
-    void (async () => {
-      const stored = await readPendingReads(username);
-      if (cancelled) {
-        return;
-      }
-      for (const [key, item] of deserializePendingReads(stored)) {
-        const existing = pendingReadsRef.current.get(key);
-        if (existing === undefined || existing.throughID < item.throughID) {
-          pendingReadsRef.current.set(key, item);
-        }
-      }
-      pendingReadsLoadingForRef.current = "";
-      pendingReadsLoadedForRef.current = username;
-      pendingReadsMergedRef.current = true;
-      persistPendingReads(true);
-      if (!offlineRef.current && pendingReadsRef.current.size > 0) {
-        scheduleReadFlush(0, true);
-      }
-    })();
-    return () => {
-      cancelled = true;
-      if (pendingReadsLoadingForRef.current === username) {
-        pendingReadsLoadingForRef.current = "";
-      }
-    };
-  }, [persistPendingReads, scheduleReadFlush, user]);
-
-  useEffect(() => {
-    if (offline) {
-      return;
-    }
-    if (pendingReadsRef.current.size > 0) {
-      scheduleReadFlush(0, true);
-    }
-  }, [offline, scheduleReadFlush]);
-
-  useEffect(() => {
-    const onVisibilityChange = () => {
-      if (document.visibilityState !== "hidden") {
-        return;
-      }
-      persistPendingReads(true);
-      void flushPendingReads();
-    };
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => {
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-    };
-  }, [flushPendingReads, persistPendingReads]);
+    readStatsDebouncerRef.current.schedule(() => {
+      void fetchGroupReadStats();
+    });
+  }, [fetchGroupReadStats]);
 
   useEffect(() => () => {
-    if (readFlushTimerRef.current !== null) {
-      window.clearTimeout(readFlushTimerRef.current);
-      readFlushTimerRef.current = null;
-    }
-    if (readPersistTimerRef.current !== null) {
-      window.clearTimeout(readPersistTimerRef.current);
-      readPersistTimerRef.current = null;
-    }
-    if (loggingOutRef.current) {
-      return;
-    }
-    persistPendingReads(true);
-    void flushPendingReads(false);
-  }, [flushPendingReads, persistPendingReads]);
-
-  useEffect(() => {
-    const previous = previousReadTargetRef.current;
-    if (previous !== null && previous.key !== activeKey) {
-      const throughID = conversationMaxRef.current.get(previous.key) ?? 0;
-      if (throughID > 0) {
-        enqueuePendingRead(previous, throughID);
-        scheduleReadFlush(READ_SWITCH_FLUSH_MS, true);
-      }
-    }
-    previousReadTargetRef.current = activeTargetRef.current;
-  }, [activeKey, enqueuePendingRead, scheduleReadFlush]);
+    readStatsDebouncerRef.current.cancel();
+  }, []);
 
   const loadConversations = useCallback(async (initial = false) => {
     const requestID = ++conversationRequestRef.current;
@@ -1271,52 +1064,45 @@ export function ChatPage() {
     && messagesKey === activeKey;
   const peerLastReadMessageID = activeDirect?.peer_last_read_message_id ?? 0;
   const lastOwnSentMessageID = useMemo(() => {
-    if (!user || !messagesBelongToActive || activeTarget?.kind !== "direct") {
+    if (!user || !messagesBelongToActive) {
       return 0;
     }
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index];
-      if (isGroupMessage(message)) {
-        continue;
-      }
-      if (sameUsername(message.sender.username, user.username) && message.status === "sent") {
-        return message.id;
-      }
-    }
-    return 0;
-  }, [activeKey, messages, messagesBelongToActive, user]);
+    return findLastOwnSentMessageID(messages, user.username);
+  }, [messages, messagesBelongToActive, user]);
 
   useEffect(() => {
-    const target = activeTargetRef.current;
-    if (!target || !messagesBelongToActive) {
-      return;
-    }
-    if (messagesLoading || messages.length === 0) {
-      return;
-    }
-    if (!pageVisible || connectionStatus === "replaced") {
-      return;
-    }
-    const throughID = maxMessageID(messages);
-    if (throughID === 0) {
-      return;
-    }
-    conversationMaxRef.current.set(target.key, throughID);
-    clearLocalUnread(target, throughID);
-    if (enqueuePendingRead(target, throughID) && !offlineRef.current) {
-      scheduleReadFlush(READ_FLUSH_MS);
+    syncFocus();
+  }, [activeKey, syncFocus]);
+
+  useEffect(() => {
+    syncFocus();
+  }, [pageVisible, syncFocus]);
+
+  useEffect(() => {
+    readStatsDebouncerRef.current.cancel();
+    readStatsGateRef.current.reset();
+    const target = activeGroupID > 0 && messagesBelongToActive
+      && lastOwnSentMessageID > 0
+      ? { groupID: activeGroupID, messageID: lastOwnSentMessageID }
+      : null;
+    groupReceiptTargetRef.current = target;
+    setGroupReceipt(null);
+    if (target !== null) {
+      void fetchGroupReadStats();
     }
   }, [
-    activeKey,
-    clearLocalUnread,
-    connectionStatus,
-    enqueuePendingRead,
-    messages,
+    activeGroupID,
+    fetchGroupReadStats,
+    lastOwnSentMessageID,
     messagesBelongToActive,
-    messagesLoading,
-    pageVisible,
-    scheduleReadFlush,
   ]);
+
+  useEffect(() => {
+    if (!pageVisible) {
+      return;
+    }
+    void fetchGroupReadStats();
+  }, [fetchGroupReadStats, pageVisible]);
 
   const loadOlderMessages = useCallback(async () => {
     const target = activeTargetRef.current;
@@ -1491,7 +1277,7 @@ export function ChatPage() {
       return;
     }
     if (sameUsername(event.reader, currentUser.username)) {
-      // The batch response already cleared local unread; do not refetch the
+      // The focus ack already cleared local unread; do not refetch the
       // whole conversation list for our own read echo.
       setConversations((previous) => previous.map((conversation) =>
         conversation.type === "direct"
@@ -1529,8 +1315,9 @@ export function ChatPage() {
       && activeTargetRef.current.groupID === event.groupID
     ) {
       void loadGroupDetail(event.groupID);
+      void fetchGroupReadStats();
     }
-  }, [loadConversations, loadGroupDetail, loseGroupAccess]);
+  }, [fetchGroupReadStats, loadConversations, loadGroupDetail, loseGroupAccess]);
 
   const scheduleReconnect = useCallback(() => {
     if (!mountedRef.current || replacedRef.current) {
@@ -1668,6 +1455,8 @@ export function ChatPage() {
       const target = activeTargetRef.current;
       const skipInitialSync = skipInitialSocketSyncRef.current;
       skipInitialSocketSyncRef.current = false;
+      syncFocus();
+      void fetchGroupReadStats();
       if (target && !skipInitialSync) {
         if (target.kind === "group") {
           void loadGroupDetail(target.groupID);
@@ -1697,6 +1486,16 @@ export function ChatPage() {
           const groupEvent = parseGroupChangedEvent(data);
           if (groupEvent) {
             handleGroupChanged(groupEvent);
+          }
+        } else if (data?.type === "focus.ack") {
+          const ack = parseFocusAck(data);
+          if (ack) {
+            handleFocusAck(ack);
+          }
+        } else if (data?.type === "group.read") {
+          const readEvent = parseGroupReadEvent(data);
+          if (readEvent) {
+            handleGroupRead(readEvent);
           }
         }
       } catch {
@@ -1731,7 +1530,10 @@ export function ChatPage() {
       socket.close();
     };
   }, [
+    fetchGroupReadStats,
+    handleFocusAck,
     handleGroupChanged,
+    handleGroupRead,
     handleIncomingGroupMessage,
     handleIncomingMessage,
     handleReadEvent,
@@ -1741,6 +1543,7 @@ export function ChatPage() {
     navigate,
     scheduleReconnect,
     syncActiveMessages,
+    syncFocus,
   ]);
 
   useEffect(() => {
@@ -2513,6 +2316,22 @@ export function ChatPage() {
                                     && message.id === lastOwnSentMessageID && (
                                       <span className={`read-state${peerLastReadMessageID >= message.id ? " read-state--read" : ""}`}>
                                         {peerLastReadMessageID >= message.id ? "已读" : "未读"}
+                                      </span>
+                                    )}
+                                  {mine
+                                    && groupMessage
+                                    && message.status === "sent"
+                                    && message.id > 0
+                                    && message.id === lastOwnSentMessageID
+                                    && groupReceipt?.groupID === message.group_id
+                                    && groupReceipt.messageID === message.id
+                                    && groupReceipt.stats.member_count > 0 && (
+                                      <span
+                                        className={`read-state${groupReceipt.stats.all_read ? " read-state--read" : ""}`}
+                                        data-member-count={groupReceipt.stats.member_count}
+                                        data-read-count={groupReceipt.stats.read_count}
+                                      >
+                                        {groupReceiptLabel(groupReceipt.stats)}
                                       </span>
                                     )}
                                 </div>

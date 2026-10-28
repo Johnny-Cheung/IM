@@ -78,6 +78,7 @@ type syncMessagePageResponse struct {
 
 var errMessageServiceUnavailable = errors.New("message service unavailable")
 var errReadModelNotReady = errors.New("direct read model not ready")
+var errGroupReadModelNotReady = errors.New("group read model not ready")
 
 type sendMessageRequest struct {
 	Body            string `json:"body"`
@@ -122,7 +123,7 @@ func (a *API) listConversations(c *gin.Context) {
 	conversations, err := a.buildConversations(c.Request.Context(), current)
 	if err != nil {
 		switch {
-		case errors.Is(err, errReadModelNotReady):
+		case errors.Is(err, errReadModelNotReady), errors.Is(err, errGroupReadModelNotReady):
 			writeError(c, http.StatusServiceUnavailable, "read_model_not_ready", "已读服务尚未就绪")
 		case errors.Is(err, messaging.ErrMessageServiceUnavailable):
 			writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂时不可用")
@@ -171,9 +172,15 @@ func (a *API) buildConversations(
 			}
 		}
 	}
-	groups, err := a.store.ListGroupConversations(ctx, current.ID)
+	groupConversations, err := a.listGroupConversations(ctx, current.ID)
 	if err != nil {
 		return nil, fmt.Errorf("list group conversations: %w", err)
+	}
+	groups := groupConversations
+	if a.groupReads != nil {
+		if err := a.applyGroupReadState(ctx, current.ID, groups); err != nil {
+			return nil, fmt.Errorf("apply group read state: %w", err)
+		}
 	}
 
 	response := conversationListResponse{
@@ -264,6 +271,60 @@ func (a *API) applyDirectReadState(
 		peerID := conversations[index].UserID
 		conversations[index].UnreadCount = unread[peerID]
 		conversations[index].PeerLastReadMessageID = peerPositions[peerID]
+	}
+	return nil
+}
+
+func (a *API) listGroupConversations(
+	ctx context.Context,
+	userID uint64,
+) ([]store.GroupConversation, error) {
+	if a.groupReads == nil {
+		return a.store.ListGroupConversations(ctx, userID)
+	}
+	return a.store.ListGroupConversationsWithoutUnread(ctx, userID)
+}
+
+// applyGroupReadState fills unread counts from the Redis read model. It never
+// consults MySQL for read state.
+func (a *API) applyGroupReadState(
+	ctx context.Context,
+	userID uint64,
+	conversations []store.GroupConversation,
+) error {
+	ready, err := a.groupReads.ReadModelReady(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: %v", messaging.ErrMessageServiceUnavailable, err)
+	}
+	if !ready {
+		return errGroupReadModelNotReady
+	}
+	if len(conversations) == 0 {
+		return nil
+	}
+
+	groupIDs := make([]uint64, 0, len(conversations))
+	seen := make(map[uint64]struct{}, len(conversations))
+	for _, conversation := range conversations {
+		if conversation.Group.ID == 0 {
+			continue
+		}
+		if _, ok := seen[conversation.Group.ID]; ok {
+			continue
+		}
+		seen[conversation.Group.ID] = struct{}{}
+		groupIDs = append(groupIDs, conversation.Group.ID)
+	}
+	if len(groupIDs) == 0 {
+		return nil
+	}
+
+	unread, err := a.groupReads.UnreadCounts(ctx, userID, groupIDs)
+	if err != nil {
+		return fmt.Errorf("%w: %v", messaging.ErrMessageServiceUnavailable, err)
+	}
+	for index := range conversations {
+		conversations[index].UnreadCount = unread[conversations[index].Group.ID]
 	}
 	return nil
 }
@@ -628,6 +689,13 @@ func (a *API) sendMessage(c *gin.Context) {
 	response := toMessageResponse(message, current, other)
 	if created {
 		a.PublishMessage(current.ID, target.ID, response)
+		a.scheduleDirectImplicitRead(
+			current.ID,
+			target.ID,
+			current.Username,
+			target.Username,
+			message.ID,
+		)
 	}
 
 	status := http.StatusOK

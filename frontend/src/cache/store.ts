@@ -1,5 +1,4 @@
 import type { Conversation, PublicUser, User } from "../api";
-import type { SerializedPendingReads } from "../readQueue";
 import {
   CONVERSATIONS_STORE,
   FRIENDS_STORE,
@@ -41,10 +40,6 @@ let warned = false;
 
 function syncKey(user: string): string {
   return `${user}:sync`;
-}
-
-function pendingReadsKey(user: string): string {
-  return `${user}:pending-read`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -340,36 +335,6 @@ export async function setActiveUser(user: User): Promise<void> {
         transaction.objectStore(META_STORE).put(
           { username: user.username, nickname: user.nickname },
           ACTIVE_USER_KEY,
-        ),
-      );
-    });
-  });
-}
-
-export async function readPendingReads(user: string): Promise<unknown> {
-  return runRead<unknown>(
-    {},
-    async (db) =>
-      runTransaction(db, [META_STORE], "readonly", async (transaction) => {
-        const value = await readValue(
-          transaction.objectStore(META_STORE),
-          pendingReadsKey(user),
-        );
-        return value ?? {};
-      }),
-  );
-}
-
-export async function writePendingReads(
-  user: string,
-  reads: SerializedPendingReads,
-): Promise<void> {
-  await runWrite(async (db) => {
-    await runTransaction(db, [META_STORE], "readwrite", async (transaction) => {
-      await requestToPromise(
-        transaction.objectStore(META_STORE).put(
-          reads,
-          pendingReadsKey(user),
         ),
       );
     });
@@ -797,7 +762,8 @@ export async function clearUser(user: string): Promise<void> {
 
         await requestToPromise(friendsStore.delete([user]));
         await requestToPromise(metaStore.delete(syncKey(user)));
-        await requestToPromise(metaStore.delete(pendingReadsKey(user)));
+        // v1.6 wrote its pending read positions here; drop the leftover key.
+        await requestToPromise(metaStore.delete(`${user}:pending-read`));
       },
     );
   });

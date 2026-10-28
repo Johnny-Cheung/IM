@@ -10,6 +10,46 @@ let tab;
 let failures = 0;
 const name = (key) => run.users.get(key).username;
 const directSelector = (key) => `.conversation-item[data-username="${name(key)}"]`;
+const directOf = (conversationList, username) => conversationList.conversations.find((item) => item.type === "direct" && item.user.username === username);
+const conversationsOf = (who) => run.request(who, "GET", "/api/conversations");
+const same = (first, second) => String(first).toLocaleLowerCase() === String(second).toLocaleLowerCase();
+
+function trackReadRequests() {
+  const paths = [];
+  const off = tab.on("Network.requestWillBeSent", ({ request }) => {
+    try {
+      const url = new URL(request.url);
+      if (url.origin === run.base && (url.pathname === "/api/read" || url.pathname.endsWith("/read"))) {
+        paths.push(url.pathname);
+      }
+    } catch {
+      // Ignore non-URL requests.
+    }
+  });
+  return { paths, off };
+}
+
+function trackFocusFrames() {
+  const frames = [];
+  const off = tab.on("Network.webSocketFrameSent", ({ response }) => {
+    try {
+      const frame = JSON.parse(response.payloadData);
+      if (frame?.type === "focus" || frame?.type === "blur") frames.push(frame);
+    } catch {
+      // Ignore non-JSON frames.
+    }
+  });
+  return { frames, off };
+}
+
+async function waitUntil(condition, message, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await condition()) return;
+    await delay(100);
+  }
+  throw new Error(message);
+}
 
 async function scenario(title, action) {
   try {
@@ -56,6 +96,31 @@ async function cacheState(user) {
   })()`);
 }
 
+async function metaKeys() {
+  return tab.evaluate(`(async () => {
+    const known = await indexedDB.databases();
+    if (!known.some((database) => database.name === "im-cache")) {
+      return [];
+    }
+    const db = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("im-cache");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    if (!db.objectStoreNames.contains("meta")) {
+      db.close();
+      return [];
+    }
+    const keys = await new Promise((resolve) => {
+      const transaction = db.transaction(["meta"], "readonly");
+      const request = transaction.objectStore("meta").getAllKeys();
+      transaction.oncomplete = () => resolve(request.result ?? []);
+    });
+    db.close();
+    return keys.map(String);
+  })()`);
+}
+
 async function main() {
   console.log(`Cache smoke ${run.id}: ${run.base}`);
   for (const key of ["a", "b", "c"]) await run.register(key);
@@ -66,6 +131,9 @@ async function main() {
   tab = await browser.tab(run.base);
   await tab.login(name("a"), run.password);
   await tab.waitFor("!!document.querySelector('#conversation-list .conversation-item')");
+  await delay(300);
+  const loginKeys = await metaKeys();
+  run.check("fresh login has no pending read queue", !loginKeys.includes(`${name("a")}:pending-read`));
 
   const fromB = `缓存测试 B→A ${run.id}`;
   const fromC = `仅 A 与 C ${run.id}`;
@@ -109,12 +177,12 @@ async function main() {
     run.check("bootstrap is the first-screen request", requests[0] === "/api/bootstrap");
     run.check("cold start does not refetch friends", !requests.includes("/api/friends"));
     run.check(
-      "conversation list is only refreshed after the read receipt",
-      (() => {
-        const firstConversations = requests.indexOf("/api/conversations");
-        const firstRead = requests.indexOf("/api/read");
-        return firstConversations === -1 || (firstRead !== -1 && firstConversations > firstRead);
-      })(),
+      "cold start sends no read request",
+      !requests.some((path) => path === "/api/read" || path.endsWith("/read")),
+    );
+    run.check(
+      "cold start does not refetch conversations",
+      !requests.includes("/api/conversations"),
     );
     run.check(
       "cold start does not refetch the open conversation",
@@ -123,38 +191,37 @@ async function main() {
   });
 
   await scenario("offline mode stays readable and disables sending", async () => {
-    await setOffline(true);
-    await tab.waitFor("!!document.querySelector('#offline-banner')", 5000);
-    run.check(
-      "cached messages stay visible offline",
-      await tab.evaluate(`document.querySelector('#message-list').innerText.includes(${JSON.stringify(fromB)})`),
-    );
-    run.check(
-      "composer is disabled offline",
-      await tab.evaluate("document.querySelector('#message-input').disabled"),
-    );
-    await tab.evaluate(`document.querySelector('#conversation-list ${directSelector("c")}').click()`);
-    await tab.waitFor(`location.pathname === "/chat/${name("c")}"`);
-    await tab.waitFor(`document.querySelector('#message-list').innerText.includes(${JSON.stringify(fromC)})`);
-    run.check("another cached conversation opens offline", true);
+    const reads = trackReadRequests();
+    try {
+      const before = directOf(await conversationsOf("a"), name("c"));
+      run.check("cached conversation starts unread", before?.unread_count === 1);
+      await setOffline(true);
+      await tab.waitFor("!!document.querySelector('#offline-banner')", 5000);
+      run.check(
+        "cached messages stay visible offline",
+        await tab.evaluate(`document.querySelector('#message-list').innerText.includes(${JSON.stringify(fromB)})`),
+      );
+      run.check(
+        "composer is disabled offline",
+        await tab.evaluate("document.querySelector('#message-input').disabled"),
+      );
+      await tab.evaluate(`document.querySelector('#conversation-list ${directSelector("c")}').click()`);
+      await tab.waitFor(`location.pathname === "/chat/${name("c")}"`);
+      await tab.waitFor(`document.querySelector('#message-list').innerText.includes(${JSON.stringify(fromC)})`);
+      run.check("another cached conversation opens offline", true);
+      run.check(
+        "offline reading leaves the unread on the server",
+        directOf(await conversationsOf("a"), name("c"))?.unread_count === 1,
+      );
+      run.check("offline reading sends no read request", reads.paths.length === 0);
+    } finally {
+      reads.off();
+    }
   });
 
-  await scenario("reconnecting restores the live connection", async () => {
-    const flushedReads = [];
-    const offReads = tab.on("Network.requestWillBeSent", ({ request }) => {
-      try {
-        const url = new URL(request.url);
-        if (url.origin !== run.base || url.pathname !== "/api/read") {
-          return;
-        }
-        const body = JSON.parse(request.postData ?? "{}");
-        if (Array.isArray(body.reads)) {
-          flushedReads.push(...body.reads);
-        }
-      } catch {
-        // Ignore malformed or unrelated requests.
-      }
-    });
+  await scenario("reconnecting restores the live connection and refocuses", async () => {
+    const reads = trackReadRequests();
+    const focus = trackFocusFrames();
     try {
       await setOffline(false);
       await tab.evaluate("window.dispatchEvent(new Event('online'))");
@@ -162,24 +229,21 @@ async function main() {
       await tab.waitFor("!!document.querySelector('.connection-state--open')", 10000);
       run.check("composer becomes editable again", !await tab.evaluate("document.querySelector('#message-input').disabled"));
 
-      const expected = name("c").toLocaleLowerCase();
-      const deadline = Date.now() + 5000;
-      while (
-        Date.now() < deadline
-        && !flushedReads.some(
-          (item) => String(item.username).toLocaleLowerCase() === expected,
-        )
-      ) {
-        await delay(100);
-      }
-      run.check(
-        "offline read is queued and flushed on reconnect",
-        flushedReads.some(
-          (item) => String(item.username).toLocaleLowerCase() === expected,
-        ),
+      await waitUntil(
+        () => focus.frames.some((frame) => frame.type === "focus" && frame.kind === "direct" && same(frame.username, name("c"))),
+        "reconnect did not refocus the cached conversation",
       );
+      await waitUntil(
+        async () => directOf(await conversationsOf("a"), name("c"))?.unread_count === 0,
+        "reconnect did not clear the unread on the server",
+      );
+      run.check("reconnect clears the offline read on the server", true);
+      run.check("reconnect sends no read request", reads.paths.length === 0);
+      const keys = await metaKeys();
+      run.check("reconnect leaves no pending read queue", !keys.includes(`${name("a")}:pending-read`));
     } finally {
-      offReads();
+      reads.off();
+      focus.off();
     }
   });
 

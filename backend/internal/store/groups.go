@@ -43,6 +43,7 @@ type GroupMember struct {
 type GroupMembershipProjection struct {
 	GroupID   uint64
 	MemberIDs []uint64
+	Positions map[uint64]uint64
 	Dissolved bool
 }
 
@@ -151,6 +152,23 @@ func (s *Store) ListGroupConversations(
 	ctx context.Context,
 	userID uint64,
 ) ([]GroupConversation, error) {
+	return s.listGroupConversations(ctx, userID, true)
+}
+
+// ListGroupConversationsWithoutUnread returns the same groups with unread left
+// at zero and without running an unread query.
+func (s *Store) ListGroupConversationsWithoutUnread(
+	ctx context.Context,
+	userID uint64,
+) ([]GroupConversation, error) {
+	return s.listGroupConversations(ctx, userID, false)
+}
+
+func (s *Store) listGroupConversations(
+	ctx context.Context,
+	userID uint64,
+	includeUnread bool,
+) ([]GroupConversation, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT g.id, g.name, g.owner_id, owner.username, owner.nickname, g.created_at,
 		        (SELECT COUNT(*) FROM group_members count_member
@@ -248,37 +266,39 @@ func (s *Store) ListGroupConversations(
 		return nil, fmt.Errorf("close latest group messages: %w", err)
 	}
 
-	unreadRows, err := s.db.QueryContext(ctx,
-		`SELECT gm.group_id, COUNT(*)
-		 FROM group_messages gm
-		 JOIN group_members member
-		   ON member.group_id = gm.group_id AND member.user_id = ?
-		 JOIN chat_groups g ON g.id = gm.group_id AND g.dissolved_at IS NULL
-		 WHERE gm.server_message_id > member.last_read_message_id
-		   AND gm.sender_id <> ?
-		 GROUP BY gm.group_id`,
-		userID, userID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("list group unread counts: %w", err)
-	}
-	for unreadRows.Next() {
-		var groupID uint64
-		var unread int64
-		if err := unreadRows.Scan(&groupID, &unread); err != nil {
+	if includeUnread {
+		unreadRows, err := s.db.QueryContext(ctx,
+			`SELECT gm.group_id, COUNT(*)
+			 FROM group_messages gm
+			 JOIN group_members member
+			   ON member.group_id = gm.group_id AND member.user_id = ?
+			 JOIN chat_groups g ON g.id = gm.group_id AND g.dissolved_at IS NULL
+			 WHERE gm.server_message_id > member.last_read_message_id
+			   AND gm.sender_id <> ?
+			 GROUP BY gm.group_id`,
+			userID, userID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("list group unread counts: %w", err)
+		}
+		for unreadRows.Next() {
+			var groupID uint64
+			var unread int64
+			if err := unreadRows.Scan(&groupID, &unread); err != nil {
+				_ = unreadRows.Close()
+				return nil, fmt.Errorf("scan group unread count: %w", err)
+			}
+			if index, ok := indexByGroupID[groupID]; ok {
+				conversations[index].UnreadCount = int(unread)
+			}
+		}
+		if err := unreadRows.Err(); err != nil {
 			_ = unreadRows.Close()
-			return nil, fmt.Errorf("scan group unread count: %w", err)
+			return nil, fmt.Errorf("iterate group unread counts: %w", err)
 		}
-		if index, ok := indexByGroupID[groupID]; ok {
-			conversations[index].UnreadCount = int(unread)
+		if err := unreadRows.Close(); err != nil {
+			return nil, fmt.Errorf("close group unread counts: %w", err)
 		}
-	}
-	if err := unreadRows.Err(); err != nil {
-		_ = unreadRows.Close()
-		return nil, fmt.Errorf("iterate group unread counts: %w", err)
-	}
-	if err := unreadRows.Close(); err != nil {
-		return nil, fmt.Errorf("close group unread counts: %w", err)
 	}
 
 	sort.SliceStable(conversations, func(i, j int) bool {
@@ -401,111 +421,6 @@ func (s *Store) RenameGroup(
 		}
 		return nil
 	})
-}
-
-// InviteGroupMembers adds the inviter's friends to the group. The whole
-// invitation is rejected when any non-member is not the inviter's friend or
-// the group would exceed its member limit.
-func (s *Store) InviteGroupMembers(
-	ctx context.Context,
-	groupID, inviterID uint64,
-	memberIDs []uint64,
-	now time.Time,
-) error {
-	members, err := normalizeGroupMemberIDs(inviterID, memberIDs)
-	if err != nil {
-		return err
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin invite group members transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if _, err := lockActiveGroup(ctx, tx, groupID); err != nil {
-		return err
-	}
-
-	var isMember int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?)`,
-		groupID, inviterID,
-	).Scan(&isMember); err != nil {
-		return fmt.Errorf("check group inviter: %w", err)
-	}
-	if isMember == 0 {
-		return ErrGroupNotFound
-	}
-
-	memberRows, err := tx.QueryContext(ctx,
-		`SELECT user_id FROM group_members WHERE group_id = ? ORDER BY user_id FOR UPDATE`,
-		groupID,
-	)
-	if err != nil {
-		return fmt.Errorf("lock group members: %w", err)
-	}
-	existing := make(map[uint64]struct{})
-	for memberRows.Next() {
-		var memberID uint64
-		if err := memberRows.Scan(&memberID); err != nil {
-			_ = memberRows.Close()
-			return fmt.Errorf("scan locked group member: %w", err)
-		}
-		existing[memberID] = struct{}{}
-	}
-	if err := memberRows.Err(); err != nil {
-		_ = memberRows.Close()
-		return fmt.Errorf("iterate locked group members: %w", err)
-	}
-	if err := memberRows.Close(); err != nil {
-		return fmt.Errorf("close locked group members: %w", err)
-	}
-
-	newMembers := make([]uint64, 0, len(members))
-	for _, memberID := range members {
-		if _, ok := existing[memberID]; ok {
-			continue
-		}
-		newMembers = append(newMembers, memberID)
-	}
-	if len(newMembers) == 0 {
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit empty group invite: %w", err)
-		}
-		return nil
-	}
-	if len(existing)+len(newMembers) > maxGroupMembers {
-		return ErrGroupFull
-	}
-	for _, memberID := range newMembers {
-		if err := requireFriendship(ctx, tx, inviterID, memberID); err != nil {
-			return err
-		}
-	}
-
-	var latestMessageID uint64
-	if err := tx.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(server_message_id), 0) FROM group_messages WHERE group_id = ?`,
-		groupID,
-	).Scan(&latestMessageID); err != nil {
-		return fmt.Errorf("find latest group message: %w", err)
-	}
-	for _, memberID := range newMembers {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO group_members
-			   (group_id, user_id, joined_at, last_read_message_id)
-			 VALUES (?, ?, ?, ?)`,
-			groupID, memberID, now, latestMessageID,
-		); err != nil {
-			return fmt.Errorf("insert invited group member: %w", err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit group invite: %w", err)
-	}
-	return nil
 }
 
 // KickGroupMember removes a member when the user is the group owner.
@@ -635,7 +550,7 @@ func (s *Store) ListGroupMemberIDs(ctx context.Context, groupID uint64) ([]uint6
 // rows for rebuilding the Redis group projection.
 func (s *Store) ListGroupMembershipProjections(ctx context.Context) ([]GroupMembershipProjection, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT g.id, g.dissolved_at, member.user_id
+		`SELECT g.id, g.dissolved_at, member.user_id, member.last_read_message_id
 		 FROM chat_groups g
 		 LEFT JOIN group_members member ON member.group_id = g.id
 		 ORDER BY g.id, member.user_id`,
@@ -650,8 +565,8 @@ func (s *Store) ListGroupMembershipProjections(ctx context.Context) ([]GroupMemb
 	for rows.Next() {
 		var groupID uint64
 		var dissolvedAt sql.NullTime
-		var memberID sql.NullInt64
-		if err := rows.Scan(&groupID, &dissolvedAt, &memberID); err != nil {
+		var memberID, lastReadMessageID sql.NullInt64
+		if err := rows.Scan(&groupID, &dissolvedAt, &memberID, &lastReadMessageID); err != nil {
 			return nil, fmt.Errorf("scan group membership projection: %w", err)
 		}
 		index, ok := indexByGroupID[groupID]
@@ -664,7 +579,16 @@ func (s *Store) ListGroupMembershipProjections(ctx context.Context) ([]GroupMemb
 			})
 		}
 		if memberID.Valid {
-			projections[index].MemberIDs = append(projections[index].MemberIDs, uint64(memberID.Int64))
+			member := uint64(memberID.Int64)
+			projections[index].MemberIDs = append(projections[index].MemberIDs, member)
+			if projections[index].Positions == nil {
+				projections[index].Positions = make(map[uint64]uint64)
+			}
+			if lastReadMessageID.Valid && lastReadMessageID.Int64 > 0 {
+				projections[index].Positions[member] = uint64(lastReadMessageID.Int64)
+			} else {
+				projections[index].Positions[member] = 0
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {

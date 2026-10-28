@@ -157,3 +157,15 @@ func (k Keyspace) groupMessageKey(messageID uint64) string {
 func (k Keyspace) groupMessageStreamKey() string {
 	return k.prefixOrDefault() + "group-messages:stream"
 }
+
+func (k Keyspace) groupReadKey(groupID uint64) string {
+	return fmt.Sprintf("%sgroup:%d:read", k.prefixOrDefault(), groupID)
+}
+
+func (k Keyspace) groupReadStreamKey() string {
+	return k.prefixOrDefault() + "group-read:stream"
+}
+
+func (k Keyspace) groupReadReadyKey() string {
+	return k.prefixOrDefault() + "group-read:ready"
+}

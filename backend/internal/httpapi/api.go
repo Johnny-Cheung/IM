@@ -48,6 +48,7 @@ type Store interface {
 		revokedAt time.Time,
 	) error
 	GetRelationship(ctx context.Context, viewerID, targetID uint64) (store.Relationship, error)
+	HasDirectConversation(ctx context.Context, userID, peerID uint64) (bool, error)
 	ListFriends(ctx context.Context, userID uint64) ([]store.PublicUser, error)
 	ListFriendRequests(ctx context.Context, userID uint64) (store.FriendRequests, error)
 	CreateFriendRequest(
@@ -101,17 +102,23 @@ type Store interface {
 		ctx context.Context,
 		userID uint64,
 	) ([]store.GroupConversation, error)
+	ListGroupConversationsWithoutUnread(
+		ctx context.Context,
+		userID uint64,
+	) ([]store.GroupConversation, error)
 	GetGroup(ctx context.Context, userID, groupID uint64) (store.GroupDetail, error)
 	RenameGroup(ctx context.Context, ownerID, groupID uint64, name string) error
-	InviteGroupMembers(
+	InviteGroupMembersWithBaseline(
 		ctx context.Context,
 		groupID, inviterID uint64,
 		memberIDs []uint64,
 		now time.Time,
-	) error
+		baselineFloor uint64,
+	) (uint64, error)
 	KickGroupMember(ctx context.Context, ownerID, groupID, targetID uint64) error
 	LeaveGroup(ctx context.Context, userID, groupID uint64, now time.Time) (bool, error)
 	ListGroupMemberIDs(ctx context.Context, groupID uint64) ([]uint64, error)
+	ListGroupMembershipProjections(ctx context.Context) ([]store.GroupMembershipProjection, error)
 	IsGroupMember(ctx context.Context, userID, groupID uint64) (bool, error)
 	ListGroupMessages(
 		ctx context.Context,
@@ -129,6 +136,10 @@ type Store interface {
 		clientMessageID, body string,
 		now time.Time,
 	) (store.GroupMessage, bool, error)
+	GroupMessageSender(
+		ctx context.Context,
+		groupID, messageID uint64,
+	) (uint64, bool, error)
 	MarkGroupRead(ctx context.Context, userID, groupID, throughID uint64) (uint64, bool, error)
 }
 
@@ -157,6 +168,22 @@ type DirectReadTracker interface {
 	ReadPositions(context.Context, uint64) (map[uint64]uint64, error)
 	PeerReadPositions(context.Context, uint64, []uint64) (map[uint64]uint64, error)
 	UnreadCounts(context.Context, uint64, []uint64, map[uint64]uint64) (map[uint64]int, error)
+	ReadModelReady(context.Context) (bool, error)
+}
+
+// GroupReadTracker owns group read positions in Redis.
+type GroupReadTracker interface {
+	AdvanceRead(
+		context.Context, uint64, uint64, uint64, time.Time,
+	) (messaging.GroupReadAdvance, error)
+	AdvanceReadMany(
+		context.Context, uint64, []uint64, uint64, time.Time,
+	) ([]messaging.GroupReadAdvance, error)
+	UnreadCounts(context.Context, uint64, []uint64) (map[uint64]int, error)
+	ReadStats(context.Context, uint64, uint64, uint64) (messaging.GroupReadStats, error)
+	MessageSender(context.Context, uint64, uint64) (uint64, bool, error)
+	SeedMember(context.Context, uint64, uint64, uint64) error
+	RemoveMember(context.Context, uint64, uint64) error
 	ReadModelReady(context.Context) (bool, error)
 }
 
@@ -195,6 +222,9 @@ type API struct {
 	groupReader          GroupMessageReader
 	groupWatermarkReader GroupAcceptedWatermarkReader
 	groupProjector       GroupProjector
+	groupReads           GroupReadTracker
+	implicitReads        *implicitRead
+	groupRepairs         *groupRepair
 }
 
 type Option func(*API)
@@ -247,12 +277,37 @@ func WithGroupProjector(projector GroupProjector) Option {
 	}
 }
 
+func WithGroupReadTracker(tracker GroupReadTracker) Option {
+	return func(api *API) {
+		api.groupReads = tracker
+	}
+}
+
 func New(dataStore Store, options ...Option) *API {
 	api := &API{store: dataStore, hub: NewHub()}
 	for _, option := range options {
 		option(api)
 	}
+	api.implicitReads = newImplicitRead(api)
+	api.groupRepairs = &groupRepair{
+		api:     api,
+		pending: make(map[uint64]*groupRepairEntry),
+		wake:    make(chan struct{}, 1),
+		stopCh:  make(chan struct{}),
+	}
 	return api
+}
+
+// Start begins the background implicit-read flush loop and projection repair.
+func (a *API) Start() {
+	a.groupRepairs.start()
+	a.implicitReads.start()
+}
+
+// Stop drains the implicit-read flush loop and the projection repair loop.
+func (a *API) Stop() {
+	a.groupRepairs.stop()
+	a.implicitReads.stop()
 }
 
 // Register mounts authentication and current-user routes under /api.
@@ -291,6 +346,7 @@ func (a *API) Register(router *gin.Engine) {
 	authed.GET("/groups/:id/messages", a.listGroupMessages)
 	authed.POST("/groups/:id/messages", a.sendGroupMessage)
 	authed.POST("/groups/:id/read", a.markGroupRead)
+	authed.GET("/groups/:id/read-stats", a.groupReadStats)
 	authed.GET("/ws", a.websocket)
 }
 

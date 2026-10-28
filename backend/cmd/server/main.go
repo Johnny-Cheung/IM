@@ -28,10 +28,11 @@ const (
 )
 
 type serverOptions struct {
-	addr          string
-	webDir        string
-	backfillRead  bool
-	backfillBatch int
+	addr              string
+	webDir            string
+	backfillRead      bool
+	backfillGroupRead bool
+	backfillBatch     int
 }
 
 func main() {
@@ -39,11 +40,18 @@ func main() {
 	flag.StringVar(&options.addr, "addr", defaultAddr, "HTTP server address")
 	flag.StringVar(&options.webDir, "web-dir", "", "directory containing the frontend build")
 	flag.BoolVar(&options.backfillRead, "backfill-read", false, "backfill the direct read model and exit")
+	flag.BoolVar(&options.backfillGroupRead, "backfill-group-read", false, "backfill the group read model and exit")
 	flag.IntVar(&options.backfillBatch, "backfill-batch", 1000, "rows per backfill batch")
 	flag.Parse()
 
 	if options.backfillRead {
 		if err := runBackfill(options); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if options.backfillGroupRead {
+		if err := runGroupBackfill(options); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -108,6 +116,7 @@ func run(options serverOptions) error {
 	var groupAcceptor *messaging.GroupRedisAcceptor
 	var groupReader *messaging.GroupMessageReader
 	var groupProjector *messaging.GroupProjection
+	var groupReadTracker *messaging.GroupReadTracker
 	var workerContext context.Context
 	var cancelWorkers context.CancelFunc
 	var workers sync.WaitGroup
@@ -158,6 +167,20 @@ func run(options serverOptions) error {
 		}
 
 		if infraConfig.GroupMessagingEnabled {
+			groupReadTracker = messaging.NewGroupReadTracker(
+				infraManager.Redis(),
+				messaging.GroupReadTrackerOptions{Keyspace: keyspace},
+			)
+			ready, err := groupReadTracker.ReadModelReady(startupCtx)
+			if err != nil {
+				return fmt.Errorf("check group read model: %w", err)
+			}
+			if !ready {
+				return fmt.Errorf(
+					"group read model is not ready; stop the backend and run `imctl backfill-group-read`",
+				)
+			}
+
 			groupProjector = messaging.NewGroupProjection(infraManager.Redis(), keyspace)
 			storedGroups, err := dataStore.ListGroupMembershipProjections(startupCtx)
 			if err != nil {
@@ -173,6 +196,15 @@ func run(options serverOptions) error {
 			}
 			if err := groupProjector.Rebuild(startupCtx, projections); err != nil {
 				return fmt.Errorf("rebuild group projection: %w", err)
+			}
+			for _, group := range storedGroups {
+				if err := groupReadTracker.ReconcileGroup(
+					startupCtx, group.GroupID, group.Positions,
+				); err != nil {
+					return fmt.Errorf(
+						"reconcile group %d read model: %w", group.GroupID, err,
+					)
+				}
 			}
 			groupAcceptor = messaging.NewGroupRedisAcceptor(
 				infraManager.Redis(),
@@ -223,7 +255,10 @@ func run(options serverOptions) error {
 			groupConsumer := messaging.NewGroupMessageConsumer(
 				infraConfig.RabbitMQ, infra.DialRabbit, dataStore, namespace,
 			)
-			workers.Add(2)
+			groupReadPersister := messaging.NewGroupReadPersister(
+				infraManager.Redis(), keyspace, namespace, dataStore,
+			)
+			workers.Add(3)
 			go func() {
 				defer workers.Done()
 				if err := groupRelay.Run(workerContext); err != nil && workerContext.Err() == nil {
@@ -234,6 +269,12 @@ func run(options serverOptions) error {
 				defer workers.Done()
 				if err := groupConsumer.Run(workerContext); err != nil && workerContext.Err() == nil {
 					log.Printf("group message consumer stopped: %v", err)
+				}
+			}()
+			go func() {
+				defer workers.Done()
+				if err := groupReadPersister.Run(workerContext); err != nil && workerContext.Err() == nil {
+					log.Printf("group read persister stopped: %v", err)
 				}
 			}()
 			log.Printf("group message pipeline enabled namespace=%s", namespace.Base())
@@ -249,7 +290,7 @@ func run(options serverOptions) error {
 	if infraManager != nil {
 		registerInfraStatus(router, infraManager)
 	}
-	apiOptions := make([]httpapi.Option, 0, 2)
+	apiOptions := make([]httpapi.Option, 0, 8)
 	if directAcceptor != nil {
 		apiOptions = append(apiOptions, httpapi.WithDirectMessageAcceptor(directAcceptor))
 	}
@@ -274,7 +315,13 @@ func run(options serverOptions) error {
 			httpapi.WithGroupAcceptedWatermarkReader(groupProjector),
 		)
 	}
-	httpapi.New(dataStore, apiOptions...).Register(router)
+	if groupReadTracker != nil {
+		apiOptions = append(apiOptions, httpapi.WithGroupReadTracker(groupReadTracker))
+	}
+	api := httpapi.New(dataStore, apiOptions...)
+	api.Register(router)
+	api.Start()
+	defer api.Stop()
 
 	server := &http.Server{Addr: options.addr, Handler: router}
 	serverErrors := make(chan error, 1)
