@@ -124,11 +124,13 @@ type fakeStore struct {
 		beforeID uint64
 		limit    int
 	}
-	usersByKey      map[string]store.User
-	groupDetail     store.GroupDetail
-	groupDetailErr  error
-	createGroupErr  error
-	createGroupCall struct {
+	usersByKey          map[string]store.User
+	groupDetail         store.GroupDetail
+	groupDetailErr      error
+	groupDetailErrAfter int
+	groupDetailCalls    int
+	createGroupErr      error
+	createGroupCall     struct {
 		ownerID   uint64
 		name      string
 		memberIDs []uint64
@@ -409,7 +411,11 @@ func (f *fakeStore) ListGroupConversationsWithoutUnread(
 }
 
 func (f *fakeStore) GetGroup(context.Context, uint64, uint64) (store.GroupDetail, error) {
-	return f.groupDetail, f.groupDetailErr
+	f.groupDetailCalls++
+	if f.groupDetailErr != nil && f.groupDetailCalls > f.groupDetailErrAfter {
+		return store.GroupDetail{}, f.groupDetailErr
+	}
+	return f.groupDetail, nil
 }
 
 func (f *fakeStore) RenameGroup(context.Context, uint64, uint64, string) error {

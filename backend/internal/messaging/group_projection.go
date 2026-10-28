@@ -84,13 +84,6 @@ func (p *GroupProjection) BeginMutation(ctx context.Context, groupID uint64) err
 	return p.client.Set(ctx, p.keyspace.groupSyncRequiredKey(groupID), "1", 0).Err()
 }
 
-func (p *GroupProjection) EndMutation(ctx context.Context, groupID uint64) error {
-	if p == nil || p.client == nil {
-		return ErrMessageServiceUnavailable
-	}
-	return p.client.Del(ctx, p.keyspace.groupSyncRequiredKey(groupID)).Err()
-}
-
 func (p *GroupProjection) IsMember(ctx context.Context, groupID, userID uint64) (bool, error) {
 	if p == nil || p.client == nil {
 		return false, ErrMessageServiceUnavailable

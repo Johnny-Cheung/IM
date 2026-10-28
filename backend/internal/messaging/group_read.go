@@ -35,6 +35,13 @@ end
 redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
 return 1
 `)
+	groupReadRaiseMember = redis.NewScript(`
+local current = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if not current or tonumber(current) < tonumber(ARGV[2]) then
+  redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+end
+return 1
+`)
 	groupReadRemoveMember = redis.NewScript(`
 redis.call('ZREM', KEYS[1], ARGV[1])
 return 1
@@ -429,6 +436,49 @@ func (t *GroupReadTracker) SeedMember(
 		strconv.FormatUint(userID, 10),
 		strconv.FormatUint(position, 10),
 	).Err()
+}
+
+// SetMemberBaseline raises a member's read position to the join baseline,
+// never lowering an existing position.
+func (t *GroupReadTracker) SetMemberBaseline(
+	ctx context.Context,
+	groupID, userID, position uint64,
+) error {
+	if t == nil || t.client == nil {
+		return ErrMessageServiceUnavailable
+	}
+	return groupReadRaiseMember.Run(
+		ctx,
+		t.client,
+		[]string{t.keyspace.groupReadKey(groupID)},
+		strconv.FormatUint(userID, 10),
+		strconv.FormatUint(position, 10),
+	).Err()
+}
+
+// MemberIDs returns the group member set maintained in Redis.
+func (t *GroupReadTracker) MemberIDs(
+	ctx context.Context,
+	groupID uint64,
+) ([]uint64, error) {
+	if t == nil || t.client == nil {
+		return nil, ErrMessageServiceUnavailable
+	}
+	values, err := t.client.SMembers(
+		ctx, t.keyspace.groupMembersKey(groupID),
+	).Result()
+	if err != nil {
+		return nil, err
+	}
+	memberIDs := make([]uint64, 0, len(values))
+	for _, value := range values {
+		memberID, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || memberID == 0 {
+			continue
+		}
+		memberIDs = append(memberIDs, memberID)
+	}
+	return memberIDs, nil
 }
 
 // RemoveMember drops a member's read position.

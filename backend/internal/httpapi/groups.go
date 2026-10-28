@@ -109,6 +109,8 @@ func (a *API) createGroup(c *gin.Context) {
 		return
 	}
 
+	release := a.groupWrites.acquire(detail.Group.ID)
+	defer release()
 	syncCtx, cancel := groupCommitContext(c.Request.Context())
 	defer cancel()
 	createdIDs, listErr := a.store.ListGroupMemberIDs(syncCtx, detail.Group.ID)
@@ -228,6 +230,17 @@ func (a *API) inviteGroupMembers(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+	member, err := a.store.IsGroupMember(ctx, current.ID, groupID)
+	if err != nil {
+		a.writeGroupError(c, err)
+		return
+	}
+	if !member {
+		// Authorize before BeginMutation so a non-member cannot fail-close the
+		// group by reaching the sync flag.
+		a.writeGroupError(c, store.ErrGroupNotFound)
+		return
+	}
 	existingIDs, existingErr := a.store.ListGroupMemberIDs(ctx, groupID)
 	if existingErr != nil {
 		log.Printf("list group members before invite: %v", existingErr)
@@ -247,7 +260,6 @@ func (a *API) inviteGroupMembers(c *gin.Context) {
 		accepted, err := a.groupWatermarkReader.LastAcceptedID(ctx, groupID)
 		if err != nil {
 			log.Printf("read group accepted watermark for invite: %v", err)
-			mutation.abort()
 			a.writeGroupError(c, messaging.ErrMessageServiceUnavailable)
 			return
 		}
@@ -263,7 +275,6 @@ func (a *API) inviteGroupMembers(c *gin.Context) {
 		baselineFloor,
 	)
 	if err != nil {
-		mutation.abort()
 		a.writeGroupError(c, err)
 		return
 	}
@@ -290,7 +301,7 @@ func (a *API) inviteGroupMembers(c *gin.Context) {
 	var seedErr error
 	if a.groupReads != nil {
 		for _, memberID := range seedIDs {
-			if err := a.groupReads.SeedMember(
+			if err := a.groupReads.SetMemberBaseline(
 				syncCtx, groupID, memberID, baseline,
 			); err != nil {
 				log.Printf("seed invited group %d member %d read: %v",
@@ -300,8 +311,8 @@ func (a *API) inviteGroupMembers(c *gin.Context) {
 			}
 		}
 		if seedErr != nil || (allIDs != nil && existingErr != nil) {
-			// The repair loop seeds missing positions from MySQL, which also
-			// covers a retry whose baseline was already consumed.
+			// The repair loop sets positions from MySQL, which also covers a
+			// retry whose baseline was already consumed.
 			mutation.queueRepair()
 		}
 	}
@@ -344,6 +355,18 @@ func (a *API) kickGroupMember(c *gin.Context) {
 		return
 	}
 
+	detail, err := a.store.GetGroup(c.Request.Context(), current.ID, groupID)
+	if err != nil {
+		a.writeGroupError(c, err)
+		return
+	}
+	if !detail.IsOwner {
+		// Authorize before BeginMutation so a non-owner cannot fail-close the
+		// group by reaching the sync flag.
+		a.writeGroupError(c, store.ErrNotGroupOwner)
+		return
+	}
+
 	mutation, err := a.beginGroupMutation(c.Request.Context(), groupID)
 	if err != nil {
 		a.writeGroupError(c, err)
@@ -353,7 +376,6 @@ func (a *API) kickGroupMember(c *gin.Context) {
 	if err := a.store.KickGroupMember(
 		c.Request.Context(), current.ID, groupID, target.ID,
 	); err != nil {
-		mutation.abort()
 		a.writeGroupError(c, err)
 		return
 	}
@@ -399,6 +421,18 @@ func (a *API) leaveGroup(c *gin.Context) {
 		return
 	}
 
+	member, err := a.store.IsGroupMember(c.Request.Context(), current.ID, groupID)
+	if err != nil {
+		a.writeGroupError(c, err)
+		return
+	}
+	if !member {
+		// Authorize before BeginMutation so a non-member cannot fail-close the
+		// group by reaching the sync flag.
+		a.writeGroupError(c, store.ErrGroupNotFound)
+		return
+	}
+
 	mutation, err := a.beginGroupMutation(c.Request.Context(), groupID)
 	if err != nil {
 		a.writeGroupError(c, err)
@@ -410,7 +444,6 @@ func (a *API) leaveGroup(c *gin.Context) {
 		c.Request.Context(), current.ID, groupID, time.Now().UTC(),
 	)
 	if err != nil {
-		mutation.abort()
 		a.writeGroupError(c, err)
 		return
 	}
@@ -637,15 +670,9 @@ func (a *API) markGroupRead(c *gin.Context) {
 		}
 		if result.Advanced {
 			logGroupReadStreamError(result, groupID)
-			if memberIDs, err := a.store.ListGroupMemberIDs(
-				c.Request.Context(), groupID,
-			); err != nil {
-				log.Printf("list group read broadcast members: %v", err)
-			} else {
-				a.publishGroupRead(memberIDs, groupID, map[uint64]struct{}{
-					current.ID: {},
-				})
-			}
+			a.publishGroupReadFromRedis(c.Request.Context(), groupID, map[uint64]struct{}{
+				current.ID: {},
+			})
 		}
 		c.JSON(http.StatusOK, readStateResponse{
 			LastReadMessageID: result.LastReadMessageID,
@@ -661,6 +688,24 @@ func (a *API) markGroupRead(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, readStateResponse{LastReadMessageID: lastReadMessageID})
+}
+
+// publishGroupReadFromRedis broadcasts a group read signal from the Redis
+// member set, keeping the read path off MySQL.
+func (a *API) publishGroupReadFromRedis(
+	ctx context.Context,
+	groupID uint64,
+	excluded map[uint64]struct{},
+) {
+	if a.groupReads == nil {
+		return
+	}
+	memberIDs, err := a.groupReads.MemberIDs(ctx, groupID)
+	if err != nil {
+		log.Printf("list group read broadcast members group=%d: %v", groupID, err)
+		return
+	}
+	a.publishGroupRead(memberIDs, groupID, excluded)
 }
 
 func (a *API) ensureGroupReadModelReady(c *gin.Context) bool {

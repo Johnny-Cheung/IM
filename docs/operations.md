@@ -279,7 +279,7 @@ API 和浏览器脚本使用 Node 26；浏览器脚本默认使用 `/Application
 
 脚本随机生成本轮账号和密码，密码只在进程内存中使用。完成后打印独立报告目录，`manifest.json` 只记录服务地址、本轮账号名、群 ID 和检查数；失败截图不包含登录表单。脚本退出非零表示检查未通过；账号清理需按本轮清单执行，不使用宽泛用户名通配符，不操作 `demo_*`。正式发布后的少量写入检查也必须使用本轮独立账号并按清单清理，不重置演示账号或它们的未读位置。
 
-清理脚本先生成 SQL，不直接连接数据库；它只接受已登记的随机测试账号名，并核对清单服务端口与所选数据库一致：
+清理脚本先生成 SQL 和同名的 `*.redis.sh`，不直接连接数据库；它只接受已登记的随机测试账号名和群 ID，并核对清单服务端口与所选数据库一致：
 
 ```bash
 node scripts/cleanup-test-data.mjs im_v07_verify /tmp/im-cleanup.sql /path/to/manifest.json
@@ -290,9 +290,10 @@ node scripts/cleanup-test-data.mjs im_v07_verify /tmp/im-cleanup.sql /path/to/ma
 
 ```bash
 bash -c 'source /opt/IM-Rebuild/imctl; mysql_command mysql < /opt/IM-Rebuild/canary-v07/reports/cleanup.sql'
+bash /opt/IM-Rebuild/canary-v07/reports/cleanup.redis.sh
 ```
 
-SQL 仅按明确用户名删除，表名包含固定数据库前缀，删除账号会级联清理这些账号的测试关系、消息和群；不会按用户名通配符清理，也不会修改真实账号或演示账号。
+SQL 仅按明确用户名删除，表名包含固定数据库前缀，删除账号会级联清理这些账号的测试关系、消息和群；不会按用户名通配符清理，也不会修改真实账号或演示账号。`*.redis.sh` 只删除清单中群 ID 对应的验证命名空间键（成员集合、已读位置、inbox、水位、消息实体及两个 Stream 中的群事件），不影响其他群或正式数据。
 
 ## 凭据和演示数据
 

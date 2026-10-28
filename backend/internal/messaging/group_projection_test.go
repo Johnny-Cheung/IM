@@ -29,9 +29,6 @@ func TestGroupProjectionLifecycle(t *testing.T) {
 	if _, err := projection.IsMember(ctx, 9, 2); err != ErrMessageServiceUnavailable {
 		t.Fatalf("IsMember() during mutation error = %v, want service unavailable", err)
 	}
-	if err := projection.EndMutation(ctx, 9); err != nil {
-		t.Fatalf("EndMutation() error = %v", err)
-	}
 	if err := projection.Replace(ctx, 9, []uint64{1}, true); err != nil {
 		t.Fatalf("Replace(dissolved) error = %v", err)
 	}

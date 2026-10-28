@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -78,6 +80,43 @@ func TestImplicitReadStopBoundsDrain(t *testing.T) {
 	if elapsed := time.Since(begin); elapsed > time.Second {
 		t.Fatalf("Stop blocked for %v with 4 due batches", elapsed)
 	}
+}
+
+func TestImplicitReadRequeuesAfterSlowBatch(t *testing.T) {
+	previous := implicitReadDrainTimeout
+	implicitReadDrainTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { implicitReadDrainTimeout = previous })
+
+	var stalled atomic.Bool
+	var mu sync.Mutex
+	succeeded := make(map[uint64]bool)
+	tracker := newFakeGroupReadTracker()
+	tracker.advanceCtxFn = func(
+		ctx context.Context, groupID, userID, throughID uint64,
+	) (messaging.GroupReadAdvance, error) {
+		if stalled.CompareAndSwap(false, true) {
+			<-ctx.Done()
+			return messaging.GroupReadAdvance{}, ctx.Err()
+		}
+		mu.Lock()
+		succeeded[groupID] = true
+		mu.Unlock()
+		return messaging.GroupReadAdvance{
+			UserID: userID, LastReadMessageID: throughID, Advanced: true,
+		}, nil
+	}
+	api := New(&fakeStore{}, WithGroupReadTracker(tracker))
+	api.Start()
+	t.Cleanup(api.Stop)
+	for groupID := uint64(1); groupID <= 3; groupID++ {
+		api.scheduleGroupImplicitRead(groupID, 1, 10, []uint64{1})
+	}
+
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return succeeded[1] && succeeded[2] && succeeded[3] && stalled.Load()
+	})
 }
 
 func TestMarkGroupReadLogsStreamFailure(t *testing.T) {

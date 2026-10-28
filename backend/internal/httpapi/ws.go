@@ -491,13 +491,9 @@ func (a *API) handleGroupFocus(client *wsClient, groupID uint64) {
 	client.setFocus(wsFocus{kind: wsFocusKindGroup, groupID: groupID})
 	logGroupReadStreamError(result, groupID)
 	if result.Advanced {
-		if memberIDs, err := a.store.ListGroupMemberIDs(ctx, groupID); err != nil {
-			log.Printf("websocket focus group members group=%d: %v", groupID, err)
-		} else {
-			a.publishGroupRead(memberIDs, groupID, map[uint64]struct{}{
-				client.userID: {},
-			})
-		}
+		a.publishGroupReadFromRedis(ctx, groupID, map[uint64]struct{}{
+			client.userID: {},
+		})
 	}
 	a.sendFocusAck(client, wsFocusAckEvent{
 		Kind:              wsFocusKindGroup,

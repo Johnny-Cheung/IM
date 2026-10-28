@@ -197,6 +197,45 @@ func (r *groupRepair) repairDue() {
 	}
 }
 
+// groupWrites serializes Redis projection writes per group. A repair builds
+// its Replace argument from a MySQL snapshot, so without this a snapshot read
+// before a concurrent membership commit could be published after it and clear
+// sync_required on stale membership.
+type groupWrites struct {
+	mu   sync.Mutex
+	byID map[uint64]*groupWrite
+}
+
+type groupWrite struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (w *groupWrites) acquire(groupID uint64) func() {
+	w.mu.Lock()
+	if w.byID == nil {
+		w.byID = make(map[uint64]*groupWrite)
+	}
+	entry, ok := w.byID[groupID]
+	if !ok {
+		entry = &groupWrite{}
+		w.byID[groupID] = entry
+	}
+	entry.refs++
+	w.mu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		w.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(w.byID, groupID)
+		}
+		w.mu.Unlock()
+	}
+}
+
 func groupRepairDelay(attempts int) time.Duration {
 	delay := groupRepairBaseDelay
 	for index := 1; index < attempts && delay < groupRepairMaxDelay; index++ {
@@ -214,6 +253,8 @@ func (a *API) repairGroupProjection(groupID uint64) error {
 	if a.groupProjector == nil {
 		return nil
 	}
+	release := a.groupWrites.acquire(groupID)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), groupProjectionTimeout)
 	defer cancel()
 	projections, err := a.store.ListGroupMembershipProjections(ctx)
@@ -233,7 +274,7 @@ func (a *API) repairGroupProjection(groupID uint64) error {
 			return nil
 		}
 		for userID, position := range projection.Positions {
-			if err := a.groupReads.SeedMember(ctx, groupID, userID, position); err != nil {
+			if err := a.groupReads.SetMemberBaseline(ctx, groupID, userID, position); err != nil {
 				return err
 			}
 		}
@@ -250,8 +291,8 @@ type groupMutation struct {
 	groupID uint64
 	begun   bool
 	synced  bool
-	aborted bool
 	queued  bool
+	release func()
 }
 
 func (m *groupMutation) queueRepair() {
@@ -267,26 +308,14 @@ func (a *API) beginGroupMutation(ctx context.Context, groupID uint64) (*groupMut
 	if a.groupProjector == nil {
 		return mutation, nil
 	}
+	mutation.release = a.groupWrites.acquire(groupID)
 	if err := a.groupProjector.BeginMutation(ctx, groupID); err != nil {
+		mutation.release()
+		mutation.release = nil
 		return nil, err
 	}
 	mutation.begun = true
 	return mutation, nil
-}
-
-// abort clears the flag before the MySQL mutation commits.
-func (m *groupMutation) abort() {
-	if !m.begun || m.synced {
-		return
-	}
-	ctx, cancel := groupCommitContext(context.Background())
-	defer cancel()
-	if err := m.api.groupProjector.EndMutation(ctx, m.groupID); err != nil {
-		log.Printf("clear group %d sync flag: %v", m.groupID, err)
-		m.queueRepair()
-		return
-	}
-	m.aborted = true
 }
 
 // project refreshes the Redis projection from the committed MySQL state. A
@@ -310,9 +339,15 @@ func (m *groupMutation) project(ctx context.Context, memberIDs []uint64, dissolv
 	m.synced = true
 }
 
-// finish queues a repair when a committed mutation left the projection stale.
+// finish releases the group write lock. A mutation that never published a
+// projection leaves sync_required set and queues a repair: a MySQL commit error
+// can be ambiguous (the commit may have landed), so only a fresh snapshot may
+// clear the flag.
 func (m *groupMutation) finish() {
-	if !m.begun || m.synced || m.aborted {
+	if m.release != nil {
+		defer m.release()
+	}
+	if !m.begun || m.synced {
 		return
 	}
 	m.queueRepair()

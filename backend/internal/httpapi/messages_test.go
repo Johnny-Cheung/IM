@@ -18,6 +18,9 @@ import (
 func authenticatedChatStore() *fakeStore {
 	dataStore := authenticatedFriendStore()
 	dataStore.user = store.User{ID: 2, Username: "bob", Nickname: "Bob"}
+	// Group mutation handlers authorize membership before setting the sync flag;
+	// tests that exercise a non-member set this back to false.
+	dataStore.groupMember = true
 	return dataStore
 }
 

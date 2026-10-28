@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/alicebob/miniredis/v2"
+	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -83,7 +86,9 @@ func TestKickGetGroupFailureStillProjects(t *testing.T) {
 	dataStore.usersByKey = map[string]store.User{
 		"bob": {ID: 2, Username: "bob", Nickname: "Bob"},
 	}
+	dataStore.groupDetail = groupTestDetail(time.Now().UTC())
 	dataStore.groupDetailErr = store.ErrGroupNotFound
+	dataStore.groupDetailErrAfter = 1
 	dataStore.groupMemberIDs = []uint64{1}
 	projector := &fakeGroupProjector{}
 	router := testRouter(
@@ -137,7 +142,7 @@ func TestGroupRepairSeedsMissingReadPositions(t *testing.T) {
 		Positions: map[uint64]uint64{1: 0, 2: 0, 3: 60},
 	}}
 	tracker := newFakeGroupReadTracker()
-	tracker.setSeedErr(messaging.ErrMessageServiceUnavailable)
+	tracker.setBaselineErr(messaging.ErrMessageServiceUnavailable)
 	projector := &fakeGroupProjector{watermark: 55}
 	api, router, _ := startChatServer(
 		t,
@@ -155,11 +160,11 @@ func TestGroupRepairSeedsMissingReadPositions(t *testing.T) {
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	tracker.setSeedErr(nil)
+	tracker.setBaselineErr(nil)
 
 	waitFor(t, func() bool {
-		for _, seed := range tracker.snapSeeds() {
-			if seed.groupID == 7 && seed.userID == 3 && seed.position == 60 {
+		for _, baseline := range tracker.snapBaselines() {
+			if baseline.groupID == 7 && baseline.userID == 3 && baseline.position == 60 {
 				return true
 			}
 		}
@@ -266,6 +271,206 @@ func TestCreateGroupReplaceFailureIsRepaired(t *testing.T) {
 	}
 }
 
+type gatedProjectionStore struct {
+	*fakeStore
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *gatedProjectionStore) ListGroupMembershipProjections(
+	ctx context.Context,
+) ([]store.GroupMembershipProjection, error) {
+	s.once.Do(func() { close(s.started) })
+	<-s.release
+	return s.fakeStore.ListGroupMembershipProjections(ctx)
+}
+
+func TestGroupRepairSerializesWithMembershipMutation(t *testing.T) {
+	now := time.Now().UTC()
+	dataStore := authenticatedChatStore()
+	dataStore.usersByKey = map[string]store.User{
+		"bob": {ID: 2, Username: "bob", Nickname: "Bob"},
+	}
+	dataStore.groupDetail = groupTestDetail(now)
+	dataStore.groupMemberIDs = []uint64{1}
+	dataStore.groupProjections = []store.GroupMembershipProjection{{
+		GroupID:   7,
+		MemberIDs: []uint64{1, 2},
+		Positions: map[uint64]uint64{1: 0, 2: 0},
+	}}
+	gated := &gatedProjectionStore{
+		fakeStore: dataStore,
+		started:   make(chan struct{}),
+		release:   make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	releaseGated := func() { releaseOnce.Do(func() { close(gated.release) }) }
+	projector := &fakeGroupProjector{}
+	gin.SetMode(gin.TestMode)
+	api := New(gated, WithGroupProjector(projector),
+		WithGroupReadTracker(newFakeGroupReadTracker()))
+	router := gin.New()
+	api.Register(router)
+	api.Start()
+	t.Cleanup(api.Stop)
+	t.Cleanup(releaseGated)
+
+	repairDone := make(chan error, 1)
+	go func() { repairDone <- api.repairGroupProjection(7) }()
+	select {
+	case <-gated.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("repair did not start")
+	}
+
+	response := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response <- doJSON(
+			t, router, http.MethodDelete, "/api/groups/7/members/bob", nil, authTestCookie(),
+		)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	projector.mu.Lock()
+	begins := projector.begins
+	projector.mu.Unlock()
+	if begins != 0 {
+		t.Fatal("membership mutation started while repair held the MySQL snapshot")
+	}
+
+	releaseGated()
+	if err := <-repairDone; err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	recorder := <-response
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	projector.mu.Lock()
+	defer projector.mu.Unlock()
+	if len(projector.lastMembers) != 1 || projector.lastMembers[0] != 1 {
+		t.Fatalf("final projection = %#v, want the committed kick to win", projector.lastMembers)
+	}
+}
+
+func TestFailedGroupMutationKeepsSyncFlagUntilRepair(t *testing.T) {
+	fastGroupRepair(t)
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := context.Background()
+	prefix := messaging.DefaultNamespace().RedisPrefix()
+	keyspace := messaging.NewKeyspace(messaging.DefaultNamespace())
+	if err := client.SAdd(ctx, prefix+"group:7:members", "1", "2").Err(); err != nil {
+		t.Fatalf("seed members: %v", err)
+	}
+	tracker := messaging.NewGroupReadTracker(
+		client, messaging.GroupReadTrackerOptions{Keyspace: keyspace},
+	)
+	projector := &flakyGroupProjector{
+		inner:   messaging.NewGroupProjection(client, keyspace),
+		gate:    make(chan struct{}),
+		started: make(chan struct{}),
+	}
+	var gateOnce sync.Once
+	releaseGate := func() { gateOnce.Do(func() { close(projector.gate) }) }
+	dataStore := authenticatedChatStore()
+	dataStore.usersByKey = map[string]store.User{
+		"bob": {ID: 2, Username: "bob", Nickname: "Bob"},
+	}
+	dataStore.groupDetail = groupTestDetail(time.Now().UTC())
+	dataStore.groupMemberIDs = []uint64{1}
+	dataStore.kickGroupErr = errors.New("commit group kick: invalid connection")
+	dataStore.groupProjections = []store.GroupMembershipProjection{{
+		GroupID:   7,
+		MemberIDs: []uint64{1},
+		Positions: map[uint64]uint64{1: 0},
+	}}
+	api, router, _ := startChatServer(
+		t, dataStore, WithGroupReadTracker(tracker), WithGroupProjector(projector),
+	)
+	api.Start()
+	t.Cleanup(api.Stop)
+	t.Cleanup(releaseGate)
+
+	recorder := doJSON(
+		t, router, http.MethodDelete, "/api/groups/7/members/bob", nil, authTestCookie(),
+	)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	// The commit may have landed even though the store returned an error, so the
+	// gate must stay closed until a fresh snapshot is published.
+	if exists, err := client.Exists(ctx, prefix+"group:7:sync_required").Result(); err != nil || exists != 1 {
+		t.Fatalf("sync flag = %d, %v; want fail-closed", exists, err)
+	}
+	select {
+	case <-projector.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("repair did not start")
+	}
+	releaseGate()
+	waitFor(t, func() bool {
+		exists, err := client.Exists(ctx, prefix+"group:7:sync_required").Result()
+		return err == nil && exists == 0
+	})
+	if member, err := client.SIsMember(ctx, prefix+"group:7:members", "2").Result(); err != nil || member {
+		t.Fatalf("kicked member still projected: %v, %v", member, err)
+	}
+}
+
+func TestInviteRejectsNonMemberBeforeBeginMutation(t *testing.T) {
+	dataStore := authenticatedChatStore()
+	dataStore.groupMember = false
+	dataStore.usersByKey = map[string]store.User{
+		"bob": {ID: 2, Username: "bob", Nickname: "Bob"},
+	}
+	projector := &fakeGroupProjector{}
+	router := testRouter(
+		dataStore,
+		WithGroupReadTracker(newFakeGroupReadTracker()),
+		WithGroupProjector(projector),
+		WithGroupAcceptedWatermarkReader(projector),
+	)
+
+	recorder := doJSON(t, router, http.MethodPost, "/api/groups/7/members", map[string]any{
+		"usernames": []string{"bob"},
+	}, authTestCookie())
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if projector.begins != 0 {
+		t.Fatalf("non-member opened the group sync gate (%#v)", projector)
+	}
+}
+
+func TestKickRejectsNonOwnerBeforeBeginMutation(t *testing.T) {
+	now := time.Now().UTC()
+	dataStore := authenticatedChatStore()
+	dataStore.usersByKey = map[string]store.User{
+		"bob": {ID: 2, Username: "bob", Nickname: "Bob"},
+	}
+	detail := groupTestDetail(now)
+	detail.IsOwner = false
+	dataStore.groupDetail = detail
+	projector := &fakeGroupProjector{}
+	router := testRouter(
+		dataStore,
+		WithGroupReadTracker(newFakeGroupReadTracker()),
+		WithGroupProjector(projector),
+	)
+
+	recorder := doJSON(
+		t, router, http.MethodDelete, "/api/groups/7/members/bob", nil, authTestCookie(),
+	)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if projector.begins != 0 {
+		t.Fatalf("non-owner opened the group sync gate (%#v)", projector)
+	}
+}
+
 type flakyGroupProjector struct {
 	inner        *messaging.GroupProjection
 	failReplaces atomic.Int32
@@ -291,10 +496,6 @@ func (p *flakyGroupProjector) Replace(
 
 func (p *flakyGroupProjector) BeginMutation(ctx context.Context, groupID uint64) error {
 	return p.inner.BeginMutation(ctx, groupID)
-}
-
-func (p *flakyGroupProjector) EndMutation(ctx context.Context, groupID uint64) error {
-	return p.inner.EndMutation(ctx, groupID)
 }
 
 func TestGroupRepairClearsSyncRequiredOnRealRedis(t *testing.T) {

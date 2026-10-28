@@ -183,7 +183,9 @@ type GroupReadTracker interface {
 	ReadStats(context.Context, uint64, uint64, uint64) (messaging.GroupReadStats, error)
 	MessageSender(context.Context, uint64, uint64) (uint64, bool, error)
 	SeedMember(context.Context, uint64, uint64, uint64) error
+	SetMemberBaseline(context.Context, uint64, uint64, uint64) error
 	RemoveMember(context.Context, uint64, uint64) error
+	MemberIDs(context.Context, uint64) ([]uint64, error)
 	ReadModelReady(context.Context) (bool, error)
 }
 
@@ -207,7 +209,6 @@ type GroupAcceptedWatermarkReader interface {
 type GroupProjector interface {
 	Replace(context.Context, uint64, []uint64, bool) error
 	BeginMutation(context.Context, uint64) error
-	EndMutation(context.Context, uint64) error
 }
 
 // API registers the versioned JSON endpoints.
@@ -225,6 +226,7 @@ type API struct {
 	groupReads           GroupReadTracker
 	implicitReads        *implicitRead
 	groupRepairs         *groupRepair
+	groupWrites          groupWrites
 }
 
 type Option func(*API)

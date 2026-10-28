@@ -10,11 +10,13 @@ import (
 const (
 	implicitReadWindow     = 100 * time.Millisecond
 	implicitReadMaxPending = 256
+	implicitReadMaxRetries = 3
 	implicitReadTimeout    = 5 * time.Second
 )
 
-// implicitReadDrainTimeout bounds one flush pass. Every batch in the pass
-// shares it, so shutdown cannot block for timeout times the backlog.
+// implicitReadDrainTimeout bounds one flush pass; batches left over are
+// requeued, so a slow Redis call cannot lose them. Shutdown cancels the drain
+// context instead of waiting for this deadline.
 var implicitReadDrainTimeout = implicitReadTimeout
 
 type implicitReadKey struct {
@@ -34,6 +36,7 @@ type implicitReadBatch struct {
 	throughID         uint64
 	memberIDs         []uint64
 	queuedAt          time.Time
+	attempts          int
 }
 
 // implicitRead merges delivered messages per conversation and advances the
@@ -174,20 +177,72 @@ func (r *implicitRead) flushDue() {
 
 	ctx, cancel := context.WithTimeout(r.drainCtx, implicitReadDrainTimeout)
 	defer cancel()
-	for _, batch := range due {
-		if ctx.Err() != nil {
-			return
-		}
+	for index, batch := range due {
 		select {
 		case <-r.stopCh:
 			return
 		default:
 		}
-		if batch.direct {
-			r.api.flushDirectImplicitRead(ctx, batch)
+		if ctx.Err() != nil {
+			r.requeue(due[index:])
+			return
+		}
+		if !r.flushBatch(ctx, batch) {
+			// One stalled Redis call must not discard the batches behind it.
+			r.requeue(due[index:])
+			return
+		}
+	}
+}
+
+func (r *implicitRead) flushBatch(ctx context.Context, batch *implicitReadBatch) bool {
+	if batch.direct {
+		r.api.flushDirectImplicitRead(ctx, batch)
+	} else {
+		r.api.flushGroupImplicitRead(ctx, batch)
+	}
+	return ctx.Err() == nil
+}
+
+// requeue puts unflushed batches back so a slow or failing Redis call retries
+// instead of silently losing the readers' positions.
+func (r *implicitRead) requeue(batches []*implicitReadBatch) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopped {
+		return
+	}
+	for _, batch := range batches {
+		batch.attempts++
+		if batch.attempts > implicitReadMaxRetries {
+			log.Printf("implicit read dropped after %d attempts: direct=%t group=%d through=%d",
+				batch.attempts, batch.direct, batch.groupID, batch.throughID)
 			continue
 		}
-		r.api.flushGroupImplicitRead(ctx, batch)
+		batch.queuedAt = time.Now()
+		existing, ok := r.pending[batch.key]
+		if ok {
+			if batch.throughID > existing.throughID {
+				existing.throughID = batch.throughID
+			}
+			if batch.senderUsername != "" {
+				existing.senderUsername = batch.senderUsername
+				existing.recipientUsername = batch.recipientUsername
+			}
+			if len(batch.memberIDs) > 0 {
+				existing.memberIDs = batch.memberIDs
+			}
+			if batch.attempts > existing.attempts {
+				existing.attempts = batch.attempts
+			}
+			continue
+		}
+		if len(r.pending) >= implicitReadMaxPending {
+			log.Printf("implicit read queue full, dropping: direct=%t group=%d through=%d",
+				batch.direct, batch.groupID, batch.throughID)
+			continue
+		}
+		r.pending[batch.key] = batch
 	}
 }
 
@@ -217,6 +272,8 @@ func (r *implicitRead) enqueue(batch implicitReadBatch) {
 	}
 	if len(r.pending) >= implicitReadMaxPending {
 		r.mu.Unlock()
+		log.Printf("implicit read queue full, dropping: direct=%t group=%d through=%d",
+			batch.direct, batch.groupID, batch.throughID)
 		return
 	}
 	batch.queuedAt = time.Now()
@@ -358,5 +415,17 @@ func (a *API) flushGroupImplicitRead(ctx context.Context, batch *implicitReadBat
 	if len(advanced) == 0 {
 		return
 	}
-	a.publishGroupRead(batch.memberIDs, batch.groupID, advanced)
+	// The sender's own advance is not a read by somebody else, so it must not
+	// suppress the signal the sender needs for its receipt: exclude only the
+	// readers that are not the batch sender.
+	excluded := make(map[uint64]struct{}, len(advanced))
+	for userID := range advanced {
+		if userID != batch.senderID {
+			excluded[userID] = struct{}{}
+		}
+	}
+	if len(excluded) == 0 {
+		return
+	}
+	a.publishGroupRead(batch.memberIDs, batch.groupID, excluded)
 }

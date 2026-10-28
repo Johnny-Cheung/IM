@@ -128,6 +128,12 @@ function conversationKey(conversation: Conversation): string {
     : groupKey(conversation.group.id);
 }
 
+function focusTargetKey(target: FocusTarget): string {
+  return target.kind === "direct"
+    ? directKey(target.username)
+    : groupKey(target.groupID);
+}
+
 function isGroupMessage(message: DisplayMessage): message is GroupDisplayMessage {
   return "group_id" in message;
 }
@@ -558,6 +564,10 @@ export function ChatPage() {
   const messagesRequestRef = useRef(0);
   const conversationVersionRef = useRef(0);
   const conversationRequestRef = useRef(0);
+  const conversationsInFlightRef = useRef(0);
+  const conversationsRefetchRef = useRef(false);
+  const conversationsRefetchDirtyRef = useRef(false);
+  const pendingFocusReadsRef = useRef<Map<string, FocusTarget>>(new Map());
   const groupDetailRequestRef = useRef(0);
   const friendsRequestRef = useRef(0);
 
@@ -662,18 +672,21 @@ export function ChatPage() {
       return;
     }
     const target = activeTargetRef.current;
-    const frame = target !== null && pageVisibleRef.current
-      ? focusFrame(target)
-      : BLUR_FRAME;
+    const visible = pageVisibleRef.current;
+    if (visible) {
+      // Replay conversations read while the socket was down; the server
+      // advances each one, then the current focus stays last.
+      const currentKey = target === null ? "" : focusTargetKey(target);
+      for (const [key, pending] of pendingFocusReadsRef.current) {
+        if (key !== currentKey) {
+          socket.send(JSON.stringify(focusFrame(pending)));
+        }
+      }
+      pendingFocusReadsRef.current.clear();
+    }
+    const frame = target !== null && visible ? focusFrame(target) : BLUR_FRAME;
     socket.send(JSON.stringify(frame));
   }, []);
-
-  const handleFocusAck = useCallback((ack: FocusAck) => {
-    if (!ack.ok) {
-      return;
-    }
-    clearLocalUnread(ack.target, ack.lastReadMessageID);
-  }, [clearLocalUnread]);
 
   const fetchGroupReadStats = useCallback(async () => {
     const target = groupReceiptTargetRef.current;
@@ -728,6 +741,7 @@ export function ChatPage() {
 
   const loadConversations = useCallback(async (initial = false) => {
     const requestID = ++conversationRequestRef.current;
+    conversationsInFlightRef.current += 1;
     if (initial) {
       setConversationsLoading(true);
     }
@@ -736,18 +750,51 @@ export function ChatPage() {
       if (requestID !== conversationRequestRef.current) {
         return;
       }
-      setConversations(sortConversations(response.conversations));
+      const pendingReads = pendingFocusReadsRef.current;
+      setConversations(sortConversations(response.conversations.map((conversation) =>
+        pendingReads.has(conversationKey(conversation))
+          ? { ...conversation, unread_count: 0 }
+          : conversation)));
       setConversationsError(null);
     } catch (error) {
       if (!handleSessionError(error) && requestID === conversationRequestRef.current) {
         setConversationsError(describeError(error));
       }
     } finally {
+      conversationsInFlightRef.current -= 1;
       if (requestID === conversationRequestRef.current) {
         setConversationsLoading(false);
       }
     }
   }, [handleSessionError]);
+
+  const handleFocusAck = useCallback((ack: FocusAck) => {
+    if (!ack.ok) {
+      return;
+    }
+    clearLocalUnread(ack.target, ack.lastReadMessageID);
+    pendingFocusReadsRef.current.delete(focusTargetKey(ack.target));
+    if (conversationsInFlightRef.current === 0) {
+      return;
+    }
+    // A list response snapshotted before this ack can still overwrite the
+    // unread it just cleared; refetch until the last ack is reflected.
+    if (conversationsRefetchRef.current) {
+      conversationsRefetchDirtyRef.current = true;
+      return;
+    }
+    const refresh = () => {
+      conversationsRefetchRef.current = true;
+      void loadConversations(false).finally(() => {
+        conversationsRefetchRef.current = false;
+        if (conversationsRefetchDirtyRef.current) {
+          conversationsRefetchDirtyRef.current = false;
+          refresh();
+        }
+      });
+    };
+    refresh();
+  }, [clearLocalUnread, loadConversations]);
 
   const loadFriends = useCallback(async () => {
     if (offline) {
@@ -1071,8 +1118,17 @@ export function ChatPage() {
   }, [messages, messagesBelongToActive, user]);
 
   useEffect(() => {
+    const target = activeTargetRef.current;
+    const socket = websocketRef.current;
+    if (target !== null && (socket === null || socket.readyState !== WebSocket.OPEN)) {
+      // Opening a conversation is a read even without a socket; remember it so
+      // the reconnect can focus it and let the server catch the position up.
+      pendingFocusReadsRef.current.set(focusTargetKey(target), target);
+      clearLocalUnread(target, Number.MAX_SAFE_INTEGER);
+      return;
+    }
     syncFocus();
-  }, [activeKey, syncFocus]);
+  }, [activeKey, clearLocalUnread, syncFocus]);
 
   useEffect(() => {
     syncFocus();
@@ -1666,6 +1722,9 @@ export function ChatPage() {
       } else {
         void loadConversations(false);
       }
+      // Sending means the sender has read up to this message. The server's echo
+      // only arrives over the socket, so clear locally when it is down.
+      clearLocalUnread(target, sent.id);
     } catch (error) {
       if (handleSessionError(error)) {
         return;

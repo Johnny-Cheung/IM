@@ -557,6 +557,47 @@ func TestGroupReadTrackerSeedRemoveAndReconcile(t *testing.T) {
 	}
 }
 
+func TestGroupReadTrackerSetMemberBaselineRaisesOnly(t *testing.T) {
+	client := newGroupReadTestClient(t)
+	ctx := context.Background()
+	seedGroupReadState(t, client, 9, []uint64{1, 2}, nil, map[uint64]uint64{1: 100})
+	tracker := newGroupReadTracker(t, client)
+
+	if err := tracker.SetMemberBaseline(ctx, 9, 1, 150); err != nil {
+		t.Fatalf("raise baseline: %v", err)
+	}
+	if got := client.ZScore(ctx, defaultKeyspace.groupReadKey(9), "1").Val(); got != 150 {
+		t.Fatalf("raised position = %v, want 150", got)
+	}
+	if err := tracker.SetMemberBaseline(ctx, 9, 1, 90); err != nil {
+		t.Fatalf("lower baseline: %v", err)
+	}
+	if got := client.ZScore(ctx, defaultKeyspace.groupReadKey(9), "1").Val(); got != 150 {
+		t.Fatalf("lowered position = %v, want unchanged 150", got)
+	}
+	if err := tracker.SetMemberBaseline(ctx, 9, 2, 60); err != nil {
+		t.Fatalf("seed missing member: %v", err)
+	}
+	if got := client.ZScore(ctx, defaultKeyspace.groupReadKey(9), "2").Val(); got != 60 {
+		t.Fatalf("new member position = %v, want 60", got)
+	}
+}
+
+func TestGroupReadTrackerMemberIDs(t *testing.T) {
+	client := newGroupReadTestClient(t)
+	ctx := context.Background()
+	seedGroupReadState(t, client, 9, []uint64{1, 2, 3}, nil, nil)
+	tracker := newGroupReadTracker(t, client)
+
+	got, err := tracker.MemberIDs(ctx, 9)
+	if err != nil {
+		t.Fatalf("member ids: %v", err)
+	}
+	if len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+		t.Fatalf("member ids = %#v", got)
+	}
+}
+
 func TestGroupReadTrackerReadModelReady(t *testing.T) {
 	client := newGroupReadTestClient(t)
 	ctx := context.Background()
