@@ -13,6 +13,7 @@ const memberSelector = (id) => `.conversation-item[data-group-id="${id}"]`;
 const directSelector = (key) => `.conversation-item[data-username="${name(key)}"]`;
 const textAt = (selector) => `document.querySelector(${JSON.stringify(selector)})?.textContent`;
 const conversationsOf = (who) => run.request(who, "GET", "/api/conversations");
+const browserConversations = () => tab.evaluate("fetch('/api/conversations', { credentials: 'same-origin' }).then((response) => response.json())");
 const groupOf = (conversationList, id) => conversationList.conversations.find((item) => item.type === "group" && item.group.id === id);
 const same = (first, second) => String(first).toLocaleLowerCase() === String(second).toLocaleLowerCase();
 const focusTarget = (frames, kind, value) => frames.some((frame) =>
@@ -266,16 +267,17 @@ async function main() {
       await delay(400);
       run.check("hidden tab leaves the background message unread", await tab.evaluate(`document.querySelector(${JSON.stringify(unreadSelector)})?.textContent === '1'`));
       run.check("hidden tab sends no read request", reads.paths.length === 0);
-      run.check("hidden unread is kept on the server", groupOf(await conversationsOf("a"), live)?.unread_count === 1);
+      run.check("hidden unread is kept on the server", groupOf(await browserConversations(), live)?.unread_count === 1);
 
       const shownAt = focus.frames.length;
       await showPage();
       await tab.waitFor(`!document.querySelector(${JSON.stringify(unreadSelector)})`);
       await waitUntil(() => focusTarget(focus.frames.slice(shownAt), "group", live), "returning to foreground did not focus the group");
-      await waitUntil(async () => groupOf(await conversationsOf("a"), live)?.unread_count === 0, "server unread did not clear after refocus");
+      await waitUntil(async () => groupOf(await browserConversations(), live)?.unread_count === 0, "server unread did not clear after refocus");
       run.check("returning to foreground catches up the unread", true);
       run.check("foreground catch-up uses focus instead of read requests", reads.paths.length === 0);
     } finally {
+      await showPage();
       reads.off();
       focus.off();
     }
@@ -399,7 +401,7 @@ async function main() {
       await tab.setValue("#message-input", "发完就切走");
       await tab.click("#send-message");
       await tab.select(directSelector("c"), `/chat/${name("c")}`);
-      await waitUntil(async () => groupOf(await conversationsOf("a"), live)?.unread_count === 0, "sender still has unread after switching away");
+      await waitUntil(async () => groupOf(await browserConversations(), live)?.unread_count === 0, "sender still has unread after switching away");
       run.check("sending then switching away leaves no sender unread", true);
       await tab.waitFor(`!document.querySelector('#conversation-list ${memberSelector(live)} .unread-badge')`);
       run.check("sender sidebar shows no own unread", true);
@@ -409,6 +411,8 @@ async function main() {
   });
 
   await scenario("same-session new window replaces old chat connection", async () => {
+    await tab.select(directSelector("b"), `/chat/${name("b")}`);
+    await tab.waitFor("document.querySelectorAll('#message-list .message-row').length > 0");
     const replacement = await browser.tab(run.base);
     const { cookies } = await tab.send("Network.getCookies", { urls: [run.base] });
     const cookie = cookies.find((item) => item.name === "im_session");

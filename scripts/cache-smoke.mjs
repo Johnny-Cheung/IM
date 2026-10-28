@@ -12,6 +12,10 @@ const name = (key) => run.users.get(key).username;
 const directSelector = (key) => `.conversation-item[data-username="${name(key)}"]`;
 const directOf = (conversationList, username) => conversationList.conversations.find((item) => item.type === "direct" && item.user.username === username);
 const conversationsOf = (who) => run.request(who, "GET", "/api/conversations");
+async function unreadOfA() {
+  const item = directOf(await conversationsOf("c"), name("a"));
+  return (item?.last_message?.id ?? 0) > (item?.peer_last_read_message_id ?? 0) ? 1 : 0;
+}
 const same = (first, second) => String(first).toLocaleLowerCase() === String(second).toLocaleLowerCase();
 
 function trackReadRequests() {
@@ -193,8 +197,7 @@ async function main() {
   await scenario("offline mode stays readable and disables sending", async () => {
     const reads = trackReadRequests();
     try {
-      const before = directOf(await conversationsOf("a"), name("c"));
-      run.check("cached conversation starts unread", before?.unread_count === 1);
+      run.check("cached conversation starts unread", await unreadOfA() === 1);
       await setOffline(true);
       await tab.waitFor("!!document.querySelector('#offline-banner')", 5000);
       run.check(
@@ -211,7 +214,7 @@ async function main() {
       run.check("another cached conversation opens offline", true);
       run.check(
         "offline reading leaves the unread on the server",
-        directOf(await conversationsOf("a"), name("c"))?.unread_count === 1,
+        await unreadOfA() === 1,
       );
       run.check("offline reading sends no read request", reads.paths.length === 0);
     } finally {
@@ -234,7 +237,7 @@ async function main() {
         "reconnect did not refocus the cached conversation",
       );
       await waitUntil(
-        async () => directOf(await conversationsOf("a"), name("c"))?.unread_count === 0,
+        async () => await unreadOfA() === 0,
         "reconnect did not clear the unread on the server",
       );
       run.check("reconnect clears the offline read on the server", true);
