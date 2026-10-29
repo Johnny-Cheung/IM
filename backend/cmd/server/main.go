@@ -21,6 +21,7 @@ import (
 	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -29,17 +30,20 @@ const (
 )
 
 type serverOptions struct {
-	addr          string
-	webDir        string
-	backfillSeq   bool
-	backfillBatch int
-	dlqList       bool
-	dlqReplay     bool
-	dlqDiscard    bool
-	dlqKind       string
-	dlqID         uint64
-	dlqLimit      int
-	dlqYes        bool
+	addr                string
+	webDir              string
+	backfillSeq         bool
+	backfillBatch       int
+	rebuildRedis        bool
+	rebuildBatch        int
+	rebuildQueueTimeout time.Duration
+	dlqList             bool
+	dlqReplay           bool
+	dlqDiscard          bool
+	dlqKind             string
+	dlqID               uint64
+	dlqLimit            int
+	dlqYes              bool
 }
 
 func main() {
@@ -48,6 +52,9 @@ func main() {
 	flag.StringVar(&options.webDir, "web-dir", "", "directory containing the frontend build")
 	flag.BoolVar(&options.backfillSeq, "backfill-seq", false, "number conversation history and write seq:ready, then exit")
 	flag.IntVar(&options.backfillBatch, "backfill-batch", 1000, "rows per backfill batch")
+	flag.BoolVar(&options.rebuildRedis, "rebuild-redis", false, "rebuild the Redis messaging projection from MySQL, then exit")
+	flag.IntVar(&options.rebuildBatch, "rebuild-batch", defaultRedisRebuildBatch, "rows per rebuild batch")
+	flag.DurationVar(&options.rebuildQueueTimeout, "rebuild-queue-timeout", defaultRedisRebuildQueueTimeout, "how long the rebuild waits for the persist queues to drain")
 	flag.BoolVar(&options.dlqList, "dlq-list", false, "list dead letters and exit")
 	flag.BoolVar(&options.dlqReplay, "dlq-replay", false, "replay dead letters to the main exchange and exit")
 	flag.BoolVar(&options.dlqDiscard, "dlq-discard", false, "discard dead letters and exit")
@@ -57,6 +64,9 @@ func main() {
 	flag.BoolVar(&options.dlqYes, "dlq-yes", false, "confirm discard or replay of every dead letter")
 	flag.Parse()
 
+	if err := validateCommandModes(options); err != nil {
+		log.Fatal(err)
+	}
 	if options.dlqList || options.dlqReplay || options.dlqDiscard {
 		if err := runDeadLetterAdmin(options); err != nil {
 			log.Fatal(err)
@@ -69,9 +79,39 @@ func main() {
 		}
 		return
 	}
+	if options.rebuildRedis {
+		if err := runRedisRebuild(options); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if err := run(options); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// validateCommandModes rejects one-shot command flags selected together.
+func validateCommandModes(options serverOptions) error {
+	selected := make([]string, 0, 5)
+	if options.backfillSeq {
+		selected = append(selected, "-backfill-seq")
+	}
+	if options.rebuildRedis {
+		selected = append(selected, "-rebuild-redis")
+	}
+	if options.dlqList {
+		selected = append(selected, "-dlq-list")
+	}
+	if options.dlqReplay {
+		selected = append(selected, "-dlq-replay")
+	}
+	if options.dlqDiscard {
+		selected = append(selected, "-dlq-discard")
+	}
+	if len(selected) > 1 {
+		return fmt.Errorf("%s cannot be combined", strings.Join(selected, ", "))
+	}
+	return nil
 }
 
 func run(options serverOptions) error {
@@ -140,16 +180,8 @@ func run(options serverOptions) error {
 		if err != nil {
 			return fmt.Errorf("seed message ID: %w", err)
 		}
-		backfillLocked, err := infraManager.Redis().Exists(
-			startupCtx, messaging.BackfillLockKey(keyspace),
-		).Result()
-		if err != nil {
-			return fmt.Errorf("check seq backfill lock: %w", err)
-		}
-		if backfillLocked > 0 {
-			return fmt.Errorf(
-				"seq backfill is in progress; wait for it to finish before starting the backend",
-			)
+		if err := checkMaintenanceLocks(startupCtx, infraManager.Redis(), keyspace); err != nil {
+			return err
 		}
 		readyChecker := messaging.NewDirectReadTracker(
 			infraManager.Redis(),
@@ -340,10 +372,21 @@ func run(options serverOptions) error {
 			log.Printf("group message pipeline enabled namespace=%s", namespace.Base())
 		}
 
+		// The audit repair path writes the same Redis projection as the rebuild,
+		// so reverse inconsistency is repaired in place instead of only reported.
+		projectionWriter := messaging.NewProjectionWriter(
+			infraManager.Redis(),
+			keyspace,
+			messaging.ProjectionWriteOptions{},
+		)
 		reconciler := messaging.NewReconciler(
 			infraManager.Redis(),
 			dataStore,
-			messaging.ReconcileOptions{Keyspace: keyspace, Gate: gate},
+			messaging.ReconcileOptions{
+				Keyspace: keyspace,
+				Gate:     gate,
+				Repair:   projectionWriter,
+			},
 		)
 		workers.Add(1)
 		go func() {
@@ -542,6 +585,39 @@ func (a notifyingGroupAcceptor) Accept(
 	result, err := a.inner.Accept(ctx, request)
 	notifySeqWatcher(a.watcher, err)
 	return result, err
+}
+
+// checkMaintenanceLocks refuses startup while a one-shot maintenance command
+// holds its lock; serving a half-rebuilt namespace is worse than being down.
+func checkMaintenanceLocks(
+	ctx context.Context,
+	client redis.UniversalClient,
+	keyspace messaging.Keyspace,
+) error {
+	backfillLock := messaging.BackfillLockKey(keyspace)
+	backfilling, err := client.Exists(ctx, backfillLock).Result()
+	if err != nil {
+		return fmt.Errorf("check seq backfill lock: %w", err)
+	}
+	if backfilling > 0 {
+		return fmt.Errorf(
+			"seq backfill is in progress (lock %s); wait for it to finish before starting the backend",
+			backfillLock,
+		)
+	}
+	rebuildLock := messaging.RebuildLockKey(keyspace)
+	rebuilding, err := client.Exists(ctx, rebuildLock).Result()
+	if err != nil {
+		return fmt.Errorf("check Redis rebuild lock: %w", err)
+	}
+	if rebuilding > 0 {
+		return fmt.Errorf(
+			"Redis rebuild is in progress (lock %s); wait for it to finish, or confirm no "+
+				"rebuild is running and delete the lock, before starting the backend",
+			rebuildLock,
+		)
+	}
+	return nil
 }
 
 func newRouter(webDir string, ready func(context.Context) error) (*gin.Engine, error) {

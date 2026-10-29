@@ -32,14 +32,25 @@ type fakeReconcileStore struct {
 	persistErrs   map[uint64]error
 	statsErr      error
 	seqsErr       error
+	rangeErr      error
 
-	persisted       []store.Message
-	persistedGroups []store.GroupMessage
-	attempts        int
-	statsCalls      int
-	detailCalls     int
-	directSeqCalls  []fakeSeqCall
-	groupSeqCalls   []fakeSeqCall
+	directMessages    map[[2]uint64][]store.Message
+	groupMessages     map[uint64][]store.GroupMessage
+	userIDs           []uint64
+	userPeers         map[uint64][]uint64
+	conversationReads []store.ConversationReadState
+	groupReads        []store.GroupMemberReadState
+
+	persisted        []store.Message
+	persistedGroups  []store.GroupMessage
+	attempts         int
+	statsCalls       int
+	detailCalls      int
+	rangeCalls       int
+	directRangeCount int
+	userCountCalls   []uint64
+	directSeqCalls   []fakeSeqCall
+	groupSeqCalls    []fakeSeqCall
 
 	firstCall  chan struct{}
 	signalOnce sync.Once
@@ -47,10 +58,13 @@ type fakeReconcileStore struct {
 
 func newFakeReconcileStore() *fakeReconcileStore {
 	return &fakeReconcileStore{
-		directSeqs:  make(map[[2]uint64][]uint64),
-		groupSeqs:   make(map[uint64][]uint64),
-		persistErrs: make(map[uint64]error),
-		firstCall:   make(chan struct{}),
+		directSeqs:     make(map[[2]uint64][]uint64),
+		groupSeqs:      make(map[uint64][]uint64),
+		persistErrs:    make(map[uint64]error),
+		directMessages: make(map[[2]uint64][]store.Message),
+		groupMessages:  make(map[uint64][]store.GroupMessage),
+		userPeers:      make(map[uint64][]uint64),
+		firstCall:      make(chan struct{}),
 	}
 }
 
@@ -257,12 +271,226 @@ func (f *fakeReconcileStore) addGroupLocked(groupID, seq uint64) {
 	f.groups = append(f.groups, store.GroupSeqStat{GroupID: groupID, Count: 1, MaxSeq: seq})
 }
 
+func (f *fakeReconcileStore) ListMessagesBySeqRange(
+	_ context.Context,
+	lowID, highID, afterSeq uint64,
+	limit int,
+) ([]store.Message, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rangeCalls++
+	f.directRangeCount++
+	if f.rangeErr != nil {
+		return nil, f.rangeErr
+	}
+	if f.seqsErr != nil {
+		return nil, f.seqsErr
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	messages := append([]store.Message(nil), f.directMessages[[2]uint64{lowID, highID}]...)
+	sort.Slice(messages, func(i, j int) bool { return messages[i].Seq < messages[j].Seq })
+	result := make([]store.Message, 0, limit)
+	for _, message := range messages {
+		if message.Seq <= afterSeq {
+			continue
+		}
+		result = append(result, message)
+		if len(result) == limit {
+			break
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeReconcileStore) ListGroupMessagesBySeqRange(
+	_ context.Context,
+	groupID, afterSeq uint64,
+	limit int,
+) ([]store.GroupMessage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rangeCalls++
+	if f.rangeErr != nil {
+		return nil, f.rangeErr
+	}
+	if f.seqsErr != nil {
+		return nil, f.seqsErr
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	messages := append([]store.GroupMessage(nil), f.groupMessages[groupID]...)
+	sort.Slice(messages, func(i, j int) bool { return messages[i].Seq < messages[j].Seq })
+	result := make([]store.GroupMessage, 0, limit)
+	for _, message := range messages {
+		if message.Seq <= afterSeq {
+			continue
+		}
+		result = append(result, message)
+		if len(result) == limit {
+			break
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeReconcileStore) CountMessagesInvolvingUser(
+	_ context.Context,
+	userID uint64,
+) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.userCountCalls = append(f.userCountCalls, userID)
+	if f.seqsErr != nil {
+		return 0, f.seqsErr
+	}
+	var count uint64
+	for _, messages := range f.directMessages {
+		for _, message := range messages {
+			if message.SenderID == userID || message.RecipientID == userID {
+				count++
+			}
+		}
+	}
+	return count, nil
+}
+
+func (f *fakeReconcileStore) ListUserIDs(
+	_ context.Context,
+	afterID uint64,
+	limit int,
+) ([]uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rangeCalls++
+	if f.seqsErr != nil {
+		return nil, f.seqsErr
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	ids := append([]uint64(nil), f.userIDs...)
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	result := make([]uint64, 0, limit)
+	for _, id := range ids {
+		if id <= afterID {
+			continue
+		}
+		result = append(result, id)
+		if len(result) == limit {
+			break
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeReconcileStore) ListConversationReadStates(
+	_ context.Context,
+	afterUserID, afterPeerID uint64,
+	limit int,
+) ([]store.ConversationReadState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rangeCalls++
+	if f.seqsErr != nil {
+		return nil, f.seqsErr
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows := append([]store.ConversationReadState(nil), f.conversationReads...)
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].UserID != rows[j].UserID {
+			return rows[i].UserID < rows[j].UserID
+		}
+		return rows[i].PeerID < rows[j].PeerID
+	})
+	result := make([]store.ConversationReadState, 0, limit)
+	for _, row := range rows {
+		if row.UserID < afterUserID || (row.UserID == afterUserID && row.PeerID <= afterPeerID) {
+			continue
+		}
+		result = append(result, row)
+		if len(result) == limit {
+			break
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeReconcileStore) ListGroupMemberReadStates(
+	_ context.Context,
+	afterGroupID, afterUserID uint64,
+	limit int,
+) ([]store.GroupMemberReadState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rangeCalls++
+	if f.seqsErr != nil {
+		return nil, f.seqsErr
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows := append([]store.GroupMemberReadState(nil), f.groupReads...)
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].GroupID != rows[j].GroupID {
+			return rows[i].GroupID < rows[j].GroupID
+		}
+		return rows[i].UserID < rows[j].UserID
+	})
+	result := make([]store.GroupMemberReadState, 0, limit)
+	for _, row := range rows {
+		if row.GroupID < afterGroupID || (row.GroupID == afterGroupID && row.UserID <= afterUserID) {
+			continue
+		}
+		result = append(result, row)
+		if len(result) == limit {
+			break
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeReconcileStore) ListConversationBasics(
+	_ context.Context,
+	userID uint64,
+) ([]store.Conversation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rangeCalls++
+	if f.seqsErr != nil {
+		return nil, f.seqsErr
+	}
+	peers := append([]uint64(nil), f.userPeers[userID]...)
+	sort.Slice(peers, func(i, j int) bool { return peers[i] < peers[j] })
+	conversations := make([]store.Conversation, 0, len(peers))
+	for _, peer := range peers {
+		conversations = append(conversations, store.Conversation{UserID: peer})
+	}
+	return conversations, nil
+}
+
 func (f *fakeReconcileStore) snapshot() ([]store.Message, []store.GroupMessage, int, int, int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]store.Message(nil), f.persisted...),
 		append([]store.GroupMessage(nil), f.persistedGroups...),
 		f.attempts, f.statsCalls, f.detailCalls
+}
+
+func (f *fakeReconcileStore) directRangeCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.directRangeCount
+}
+
+func (f *fakeReconcileStore) userCountCallsSnapshot() []uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]uint64(nil), f.userCountCalls...)
 }
 
 func newReconcileTestClient(t *testing.T) (redis.UniversalClient, *miniredis.Miniredis) {
@@ -378,6 +606,11 @@ func TestReconcilerHealthyData(t *testing.T) {
 	client, _ := newReconcileTestClient(t)
 	setDirectSequence(t, client, 1, 2, 3)
 	setGroupSequence(t, client, 7, 2)
+	seedReconcileDirectIndex(t, client, 1, 2, 101, 1)
+	seedReconcileDirectIndex(t, client, 1, 2, 102, 2)
+	seedReconcileDirectIndex(t, client, 1, 2, 103, 3)
+	seedReconcileGroupIndex(t, client, 7, 201, 1)
+	seedReconcileGroupIndex(t, client, 7, 202, 2)
 	fakeStore := newFakeReconcileStore()
 	fakeStore.conversations = []store.ConversationSeqStat{{LowID: 1, HighID: 2, Count: 3, MaxSeq: 3}}
 	fakeStore.groups = []store.GroupSeqStat{{GroupID: 7, Count: 2, MaxSeq: 2}}

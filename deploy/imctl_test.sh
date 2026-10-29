@@ -174,17 +174,69 @@ VERIFY_MODE=1
 INFRA_SECRETS="${INFRA_ROOT}/secrets"
 INFRA_REDIS_URL_FILE="${INFRA_CONFIG_DIR}/redis-url"
 pass 'seq backfill requires Redis configuration'
+# The rebuild drains both persist queues and regenerates Redis, so it needs
+# MySQL and RabbitMQ as well, plus the same stopped-backend guards.
+: > "${TEST_DIR}/server-args"
+: > "${TEST_DIR}/server-env"
+unset REBUILD_BATCH REBUILD_QUEUE_TIMEOUT || true
+output="$(rebuild_redis)"
+test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-rebuild-redis '
+test "$(cat "${TEST_DIR}/server-env")" = 'im:v13-verify 1 true'
+grep -q 'Redis rebuild finished' <<<"${output}"
+pass 'redis rebuild runs the backend with the rebuild flag in the verify namespace'
+: > "${TEST_DIR}/server-args"
+REBUILD_BATCH=250 REBUILD_QUEUE_TIMEOUT=5m rebuild_redis >/dev/null
+test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-rebuild-redis -rebuild-batch 250 -rebuild-queue-timeout 5m '
+pass 'redis rebuild maps the batch and queue timeout overrides'
+touch "${TEST_DIR}/active"
+if rebuild_redis >/dev/null 2>&1; then exit 1; fi
+rm -f "${TEST_DIR}/active"
+pass 'redis rebuild refuses to run while the backend is active'
+TEST_PORTS="${PORT}"
+if rebuild_redis >/dev/null 2>&1; then exit 1; fi
+TEST_PORTS=""
+pass 'redis rebuild refuses while the backend port is listening'
+TEST_PROCESSES=4242
+if rebuild_redis >/dev/null 2>&1; then exit 1; fi
+TEST_PROCESSES=""
+pass 'redis rebuild refuses while an im-server process is running'
+TEST_PROCESSES="$$"
+rebuild_redis >/dev/null
+TEST_PROCESSES=""
+pass 'redis rebuild ignores its own process'
+rebuild_config_backup="${INFRA_CONFIG_DIR}"
+INFRA_CONFIG_DIR="${TEST_DIR}/rebuild-missing-config"
+INFRA_REDIS_URL_FILE="${INFRA_CONFIG_DIR}/redis-url"
+INFRA_REDIS_PASSWORD_FILE="${INFRA_CONFIG_DIR}/redis-password"
+INFRA_RABBITMQ_URL_FILE="${INFRA_CONFIG_DIR}/rabbitmq-url"
+INFRA_RABBITMQ_PASSWORD_FILE="${INFRA_CONFIG_DIR}/rabbitmq-password"
+INFRA_SECRETS="${TEST_DIR}/missing-infra-secrets"
+if rebuild_redis >/dev/null 2>&1; then exit 1; fi
+pass 'redis rebuild requires Redis configuration'
+INFRA_SECRETS="${TEST_DIR}/redis-only-secrets"
+mkdir -p "${INFRA_SECRETS}"
+printf 'redis-only\n' > "${INFRA_SECRETS}/redis-password"
+if rebuild_redis >/dev/null 2>&1; then exit 1; fi
+pass 'redis rebuild requires RabbitMQ configuration'
+INFRA_CONFIG_DIR="${rebuild_config_backup}"
+INFRA_REDIS_URL_FILE="${INFRA_CONFIG_DIR}/redis-url"
+INFRA_REDIS_PASSWORD_FILE="${INFRA_CONFIG_DIR}/redis-password"
+INFRA_RABBITMQ_URL_FILE="${INFRA_CONFIG_DIR}/rabbitmq-url"
+INFRA_RABBITMQ_PASSWORD_FILE="${INFRA_CONFIG_DIR}/rabbitmq-password"
+INFRA_SECRETS="${INFRA_ROOT}/secrets"
+if main rebuild-read >/dev/null 2>&1; then exit 1; fi
 if main backfill-read >/dev/null 2>&1; then exit 1; fi
 if main backfill-group-read >/dev/null 2>&1; then exit 1; fi
 pass 'removed read backfill subcommands are rejected'
 usage="$(main unknown-command 2>&1 || true)"
-if ! grep -q 'backfill-seq' <<<"${usage}" || ! grep -q 'queue-status' <<<"${usage}" \
+if ! grep -q 'backfill-seq' <<<"${usage}" || ! grep -q 'rebuild-redis' <<<"${usage}" \
+  || ! grep -q 'queue-status' <<<"${usage}" \
   || ! grep -q 'dlq-list' <<<"${usage}" || ! grep -q 'dlq-replay' <<<"${usage}" \
   || ! grep -q 'dlq-discard' <<<"${usage}"; then
-  echo 'FAIL usage does not list backfill-seq, queue-status and the dlq commands'
+  echo 'FAIL usage does not list backfill-seq, rebuild-redis, queue-status and the dlq commands'
   exit 1
 fi
-pass 'usage lists the seq backfill, the queue drain check and the dlq commands'
+pass 'usage lists the seq backfill, redis rebuild, queue drain check and the dlq commands'
 DI() {
   case "$*" in
     *list_queues*)

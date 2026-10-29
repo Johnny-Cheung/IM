@@ -37,6 +37,29 @@ type ReconcileStore interface {
 	ListGroupSeqs(ctx context.Context, groupID, upTo, afterSeq uint64, limit int) ([]uint64, error)
 	PersistMessage(ctx context.Context, message store.Message) (bool, error)
 	PersistGroupMessage(ctx context.Context, message store.GroupMessage) (bool, error)
+	// Reverse-direction queries: MySQL rows missing from Redis and the read
+	// watermarks that back them.
+	ListMessagesBySeqRange(ctx context.Context, lowID, highID, afterSeq uint64, limit int) ([]store.Message, error)
+	ListGroupMessagesBySeqRange(ctx context.Context, groupID, afterSeq uint64, limit int) ([]store.GroupMessage, error)
+	CountMessagesInvolvingUser(ctx context.Context, userID uint64) (uint64, error)
+	ListUserIDs(ctx context.Context, afterID uint64, limit int) ([]uint64, error)
+	ListConversationReadStates(ctx context.Context, afterUserID, afterPeerID uint64, limit int) ([]store.ConversationReadState, error)
+	ListGroupMemberReadStates(ctx context.Context, afterGroupID, afterUserID uint64, limit int) ([]store.GroupMemberReadState, error)
+	// ListConversationBasics enumerates the peers a user has messages with,
+	// which is how the feed audit finds the rows to restore.
+	ListConversationBasics(ctx context.Context, userID uint64) ([]store.Conversation, error)
+}
+
+// ProjectionRepairer restores Redis read-model entries from durable rows. The
+// reconciler only adds: it never deletes an index member, overwrites an
+// existing entity or lowers a counter.
+type ProjectionRepairer interface {
+	WriteDirectBatch(context.Context, []store.Message) (int, error)
+	WriteGroupBatch(context.Context, []store.GroupMessage) (int, error)
+	RaiseDirectReadWatermarks(context.Context, []store.ConversationReadState) (int, error)
+	RaiseGroupReadWatermarks(context.Context, []store.GroupMemberReadState) (int, error)
+	RaiseDirectCounter(ctx context.Context, lowID, highID, seq uint64) error
+	RaiseGroupCounter(ctx context.Context, groupID, seq uint64) error
 }
 
 // ReconcileOptions configures the background reconciler. Zero values select the
@@ -56,6 +79,31 @@ type ReconcileOptions struct {
 	Now       func() time.Time
 	// LogEvery bounds how often the same unresolved item is logged. Default 1h.
 	LogEvery time.Duration
+
+	// Repair writes Redis projections back from MySQL. Nil disables reverse
+	// repair: defects are still detected and counted, never written.
+	Repair ProjectionRepairer
+	// RepairLimit bounds Redis messages repaired per run. Default 200.
+	RepairLimit int
+	// RepairPerConversation bounds messages repaired for one conversation per
+	// run. Default 50.
+	RepairPerConversation int
+	// NeedsRebuildMessages flags a conversation whose estimated Redis gap
+	// exceeds this. Default 200.
+	NeedsRebuildMessages int
+	// NeedsRebuildRatio flags a conversation whose gap also exceeds this share
+	// of its MySQL count, gated by RepairMinMessages. Default 0.2.
+	NeedsRebuildRatio float64
+	// RepairMinMessages is the absolute floor for the ratio rule. Default 20.
+	RepairMinMessages int
+	// DeepAuditInterval between entity and feed samples. Default 1h.
+	DeepAuditInterval time.Duration
+	// DeepAuditBoundary is how many oldest and newest messages of each audited
+	// conversation are compared. Default 2.
+	DeepAuditBoundary int
+	// DeepAuditUsers is how many users are sampled for feed parity per audit.
+	// Default 50.
+	DeepAuditUsers int
 }
 
 // ReconcileResult is what one reconciliation run did.
@@ -70,6 +118,19 @@ type ReconcileResult struct {
 	// remainder is retried on the next run.
 	Deferred uint64
 	Duration time.Duration
+	// CountersRaised counts Redis conversation counters raised from MySQL.
+	CountersRaised uint64
+	// RedisMissing counts Redis-side defects detected: missing counters, index
+	// members, entities, feed entries and read watermarks.
+	RedisMissing uint64
+	// RedisRepaired counts Redis items written back: messages and counters.
+	RedisRepaired uint64
+	// WatermarksRaised counts read positions moved to the MySQL value.
+	WatermarksRaised uint64
+	// FeedRepairs counts dm:feed entries restored by the deep audit.
+	FeedRepairs uint64
+	// NeedsRebuild counts conversations and users flagged this run.
+	NeedsRebuild uint64
 }
 
 // ReconcileStatus is a snapshot of the reconciler for /ops/infra.
@@ -85,6 +146,14 @@ type ReconcileStatus struct {
 	TotalRepaired     uint64    `json:"total_repaired"`
 	LastError         string    `json:"last_error,omitempty"`
 	LastResultSummary string    `json:"last_result_summary,omitempty"`
+	// Reverse-direction repair counters.
+	RedisMissing     uint64    `json:"redis_missing"`
+	RedisRepaired    uint64    `json:"redis_repaired"`
+	WatermarksRaised uint64    `json:"watermarks_raised"`
+	FeedRepairs      uint64    `json:"feed_repairs"`
+	NeedsRebuild     uint64    `json:"needs_rebuild"`
+	LastDeepAuditAt  time.Time `json:"last_deep_audit_at,omitempty"`
+	DeepAuditError   string    `json:"deep_audit_error,omitempty"`
 }
 
 const (
@@ -104,6 +173,20 @@ const (
 	reconcileGatePollFloor             = time.Millisecond
 	reconcileGatePollCeiling           = time.Second
 	reconcileIncompleteEntityMsg       = "entity is incomplete"
+
+	defaultRepairLimit           = 200
+	defaultRepairPerConversation = 50
+	defaultNeedsRebuildMessages  = 200
+	defaultNeedsRebuildRatio     = 0.2
+	defaultRepairMinMessages     = 20
+	defaultDeepAuditInterval     = time.Hour
+	defaultDeepAuditBoundary     = 2
+	defaultDeepAuditUsers        = 50
+	reconcileDeepAuditPerRun     = 50
+	reconcileMaxReverseScan      = 5000
+	reconcileReadStatesPerRun    = 2000
+	reconcileFeedChecksPerUser   = 2000
+	reconcileFeedWriteBatch      = 50
 )
 
 // Reconciler compares Redis conversation counters with MySQL and repairs
@@ -120,6 +203,16 @@ type Reconciler struct {
 	maxDetail int
 	now       func() time.Time
 
+	repair                ProjectionRepairer
+	repairLimit           int
+	repairPerConversation int
+	needsRebuildMessages  int
+	needsRebuildRatio     float64
+	repairMinMessages     int
+	deepAuditInterval     time.Duration
+	deepAuditBoundary     int
+	deepAuditUsers        int
+
 	runMu sync.Mutex
 
 	mu                sync.Mutex
@@ -132,6 +225,14 @@ type Reconciler struct {
 	directStatsCursor [2]uint64
 	groupStatsCursor  uint64
 	missingSeqs       map[reconcileSeqCursorKey]uint64
+	reverseSeqs       map[reconcileSeqCursorKey]uint64
+	feedCursors       map[uint64]reconcileFeedCursor
+	directReadCursor  [2]uint64
+	groupReadCursor   [2]uint64
+	directDeepCursor  [2]uint64
+	groupDeepCursor   uint64
+	userDeepCursor    uint64
+	lastDeepAudit     time.Time
 }
 
 // NewReconciler builds a reconciler. Only the client and store are required.
@@ -158,19 +259,55 @@ func NewReconciler(
 	if options.LogEvery <= 0 {
 		options.LogEvery = defaultReconcileLogEvery
 	}
+	if options.RepairLimit <= 0 {
+		options.RepairLimit = defaultRepairLimit
+	}
+	if options.RepairPerConversation <= 0 {
+		options.RepairPerConversation = defaultRepairPerConversation
+	}
+	if options.NeedsRebuildMessages <= 0 {
+		options.NeedsRebuildMessages = defaultNeedsRebuildMessages
+	}
+	if options.NeedsRebuildRatio <= 0 {
+		options.NeedsRebuildRatio = defaultNeedsRebuildRatio
+	}
+	if options.RepairMinMessages <= 0 {
+		options.RepairMinMessages = defaultRepairMinMessages
+	}
+	if options.DeepAuditInterval <= 0 {
+		options.DeepAuditInterval = defaultDeepAuditInterval
+	}
+	if options.DeepAuditBoundary <= 0 {
+		options.DeepAuditBoundary = defaultDeepAuditBoundary
+	}
+	if options.DeepAuditUsers <= 0 {
+		options.DeepAuditUsers = defaultDeepAuditUsers
+	}
 	return &Reconciler{
-		client:      client,
-		store:       dataStore,
-		keyspace:    options.Keyspace,
-		gate:        options.Gate,
-		interval:    options.Interval,
-		minAge:      options.MinAge,
-		logEvery:    options.LogEvery,
-		batch:       options.Batch,
-		maxDetail:   options.MaxDetail,
-		now:         options.Now,
-		logged:      make(map[string]time.Time),
-		missingSeqs: make(map[reconcileSeqCursorKey]uint64),
+		client:                client,
+		store:                 dataStore,
+		keyspace:              options.Keyspace,
+		gate:                  options.Gate,
+		interval:              options.Interval,
+		minAge:                options.MinAge,
+		logEvery:              options.LogEvery,
+		batch:                 options.Batch,
+		maxDetail:             options.MaxDetail,
+		now:                   options.Now,
+		repair:                options.Repair,
+		repairLimit:           options.RepairLimit,
+		repairPerConversation: options.RepairPerConversation,
+		needsRebuildMessages:  options.NeedsRebuildMessages,
+		needsRebuildRatio:     options.NeedsRebuildRatio,
+		repairMinMessages:     options.RepairMinMessages,
+		deepAuditInterval:     options.DeepAuditInterval,
+		deepAuditBoundary:     options.DeepAuditBoundary,
+		deepAuditUsers:        options.DeepAuditUsers,
+		logged:                make(map[string]time.Time),
+		missingSeqs:           make(map[reconcileSeqCursorKey]uint64),
+		reverseSeqs:           make(map[reconcileSeqCursorKey]uint64),
+		feedCursors:           make(map[uint64]reconcileFeedCursor),
+		lastDeepAudit:         options.Now().UTC(),
 	}
 }
 
@@ -248,9 +385,12 @@ func (r *Reconciler) RunOnce(ctx context.Context) (ReconcileResult, error) {
 	suppressed := r.runSuppressed
 	r.mu.Unlock()
 	summary := fmt.Sprintf(
-		"scanned=%d mismatched=%d repaired=%d unresolved=%d in_flight=%d deferred=%d suppressed=%d",
+		"scanned=%d mismatched=%d repaired=%d unresolved=%d in_flight=%d deferred=%d "+
+			"redis_missing=%d redis_repaired=%d counters=%d watermarks=%d feed_repairs=%d needs_rebuild=%d suppressed=%d",
 		result.Scanned, result.Mismatched, result.Repaired, result.Unresolved,
-		result.InFlight, result.Deferred, suppressed,
+		result.InFlight, result.Deferred, result.RedisMissing, result.RedisRepaired,
+		result.CountersRaised, result.WatermarksRaised, result.FeedRepairs,
+		result.NeedsRebuild, suppressed,
 	)
 
 	r.mu.Lock()
@@ -263,6 +403,11 @@ func (r *Reconciler) RunOnce(ctx context.Context) (ReconcileResult, error) {
 	r.status.Unresolved = result.Unresolved
 	r.status.InFlight = result.InFlight
 	r.status.TotalRepaired += result.Repaired
+	r.status.RedisMissing = result.RedisMissing
+	r.status.RedisRepaired = result.RedisRepaired
+	r.status.WatermarksRaised = result.WatermarksRaised
+	r.status.FeedRepairs = result.FeedRepairs
+	r.status.NeedsRebuild = result.NeedsRebuild
 	r.status.LastResultSummary = summary
 	// A cancelled context is a shutdown, not a reconciliation failure.
 	if err == nil || ctx.Err() != nil {
@@ -272,7 +417,10 @@ func (r *Reconciler) RunOnce(ctx context.Context) (ReconcileResult, error) {
 	}
 	r.mu.Unlock()
 
-	if result.Mismatched > 0 || result.Repaired > 0 || result.Unresolved > 0 || suppressed > 0 {
+	if result.Mismatched > 0 || result.Repaired > 0 || result.Unresolved > 0 ||
+		result.RedisMissing > 0 || result.RedisRepaired > 0 ||
+		result.WatermarksRaised > 0 || result.FeedRepairs > 0 ||
+		result.NeedsRebuild > 0 || suppressed > 0 {
 		log.Printf("reconcile run: %s duration=%s", summary, duration)
 	}
 	return result, err
@@ -297,19 +445,36 @@ func (r *Reconciler) reconcile(
 	r.runLogs = 0
 	r.runSuppressed = 0
 	r.mu.Unlock()
+	budget := newReconcileRepairBudget(r.repairLimit)
 
 	seenPairs := make(map[[2]uint64]struct{})
-	if err := r.reconcileDirect(ctx, runAt, &result, seenPairs); err != nil {
+	if err := r.reconcileDirect(ctx, runAt, &result, seenPairs, budget); err != nil {
 		return result, err
 	}
 	seenGroups := make(map[uint64]struct{})
-	if err := r.reconcileGroups(ctx, runAt, &result, seenGroups); err != nil {
+	if err := r.reconcileGroups(ctx, runAt, &result, seenGroups, budget); err != nil {
+		return result, err
+	}
+	if err := r.reconcileReadWatermarks(ctx, runAt, &result); err != nil {
 		return result, err
 	}
 	if err := r.reconcileOrphanDirectCounters(ctx, runAt, &result, seenPairs); err != nil {
 		return result, err
 	}
-	return result, r.reconcileOrphanGroupCounters(ctx, runAt, &result, seenGroups)
+	if err := r.reconcileOrphanGroupCounters(ctx, runAt, &result, seenGroups); err != nil {
+		return result, err
+	}
+	if r.deepAuditDue(runAt) {
+		auditErr := r.deepAudit(ctx, runAt, &result, budget)
+		r.recordDeepAudit(runAt, auditErr)
+		if auditErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return result, ctxErr
+			}
+			log.Printf("reconcile deep audit: %v", auditErr)
+		}
+	}
+	return result, nil
 }
 
 type reconcileDirectSuspect struct {
@@ -327,8 +492,9 @@ func (r *Reconciler) reconcileDirect(
 	runAt time.Time,
 	result *ReconcileResult,
 	seen map[[2]uint64]struct{},
+	budget *reconcileRepairBudget,
 ) error {
-	suspects, err := r.scanDirectSuspects(ctx, result, seen)
+	suspects, err := r.scanDirectSuspects(ctx, runAt, result, seen, budget)
 	if err != nil {
 		return err
 	}
@@ -360,8 +526,10 @@ func (r *Reconciler) reconcileDirect(
 
 func (r *Reconciler) scanDirectSuspects(
 	ctx context.Context,
+	runAt time.Time,
 	result *ReconcileResult,
 	seen map[[2]uint64]struct{},
+	budget *reconcileRepairBudget,
 ) ([]reconcileDirectSuspect, error) {
 	afterLow, afterHigh := uint64(0), uint64(0)
 	var suspects []reconcileDirectSuspect
@@ -376,7 +544,7 @@ func (r *Reconciler) scanDirectSuspects(
 		if len(rows) == 0 {
 			return suspects, nil
 		}
-		counters, err := r.readDirectCounters(ctx, rows)
+		states, err := r.readDirectStates(ctx, rows)
 		if err != nil {
 			return nil, err
 		}
@@ -385,17 +553,22 @@ func (r *Reconciler) scanDirectSuspects(
 				continue
 			}
 			seen[[2]uint64{row.LowID, row.HighID}] = struct{}{}
-			counter := counters[[2]uint64{row.LowID, row.HighID}]
-			if counter == 0 {
+			state := states[[2]uint64{row.LowID, row.HighID}]
+			if state.counter == 0 {
+				// A conversation absent from Redis is a rebuild concern; the
+				// incremental path only repairs live conversations.
 				continue
 			}
 			result.Scanned++
-			if counter <= row.MaxSeq && row.Count == row.MaxSeq {
+			if err := r.checkDirectRedisGap(ctx, runAt, row, state, budget, result); err != nil {
+				return nil, err
+			}
+			if state.counter <= row.MaxSeq && row.Count == row.MaxSeq {
 				continue
 			}
 			result.Mismatched++
 			suspects = append(suspects, reconcileDirectSuspect{
-				lowID: row.LowID, highID: row.HighID, counter: counter,
+				lowID: row.LowID, highID: row.HighID, counter: state.counter,
 				count: row.Count, maxSeq: row.MaxSeq,
 			})
 		}
@@ -421,8 +594,9 @@ func (r *Reconciler) reconcileGroups(
 	runAt time.Time,
 	result *ReconcileResult,
 	seen map[uint64]struct{},
+	budget *reconcileRepairBudget,
 ) error {
-	suspects, err := r.scanGroupSuspects(ctx, result, seen)
+	suspects, err := r.scanGroupSuspects(ctx, runAt, result, seen, budget)
 	if err != nil {
 		return err
 	}
@@ -459,8 +633,10 @@ type reconcileGroupSuspect struct {
 
 func (r *Reconciler) scanGroupSuspects(
 	ctx context.Context,
+	runAt time.Time,
 	result *ReconcileResult,
 	seen map[uint64]struct{},
+	budget *reconcileRepairBudget,
 ) ([]reconcileGroupSuspect, error) {
 	afterGroupID := uint64(0)
 	var suspects []reconcileGroupSuspect
@@ -475,7 +651,7 @@ func (r *Reconciler) scanGroupSuspects(
 		if len(rows) == 0 {
 			return suspects, nil
 		}
-		counters, err := r.readGroupCounters(ctx, rows)
+		states, err := r.readGroupStates(ctx, rows)
 		if err != nil {
 			return nil, err
 		}
@@ -484,17 +660,20 @@ func (r *Reconciler) scanGroupSuspects(
 				continue
 			}
 			seen[row.GroupID] = struct{}{}
-			counter := counters[row.GroupID]
-			if counter == 0 {
+			state := states[row.GroupID]
+			if state.counter == 0 {
 				continue
 			}
 			result.Scanned++
-			if counter <= row.MaxSeq && row.Count == row.MaxSeq {
+			if err := r.checkGroupRedisGap(ctx, runAt, row, state, budget, result); err != nil {
+				return nil, err
+			}
+			if state.counter <= row.MaxSeq && row.Count == row.MaxSeq {
 				continue
 			}
 			result.Mismatched++
 			suspects = append(suspects, reconcileGroupSuspect{
-				groupID: row.GroupID, counter: counter,
+				groupID: row.GroupID, counter: state.counter,
 				count: row.Count, maxSeq: row.MaxSeq,
 			})
 		}
@@ -505,50 +684,72 @@ func (r *Reconciler) scanGroupSuspects(
 	}
 }
 
-func (r *Reconciler) readDirectCounters(
+// reconcileRedisState is one conversation's Redis counter and index size, read
+// in the same pipeline as the MySQL stats row.
+type reconcileRedisState struct {
+	counter uint64
+	index   uint64
+}
+
+func (r *Reconciler) readDirectStates(
 	ctx context.Context,
 	rows []store.ConversationSeqStat,
-) (map[[2]uint64]uint64, error) {
+) (map[[2]uint64]reconcileRedisState, error) {
 	pipe := r.client.Pipeline()
-	commands := make([]*redis.StringCmd, len(rows))
+	counters := make([]*redis.StringCmd, len(rows))
+	indexes := make([]*redis.IntCmd, len(rows))
 	for index, row := range rows {
-		commands[index] = pipe.Get(ctx, r.keyspace.directSequenceKey(row.LowID, row.HighID))
+		counters[index] = pipe.Get(ctx, r.keyspace.directSequenceKey(row.LowID, row.HighID))
+		indexes[index] = pipe.ZCard(ctx, r.keyspace.directPairKey(row.LowID, row.HighID))
 	}
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return nil, fmt.Errorf("read conversation seq counters: %w", err)
 	}
-	counters := make(map[[2]uint64]uint64, len(rows))
+	states := make(map[[2]uint64]reconcileRedisState, len(rows))
 	for index, row := range rows {
-		counter, err := reconcileCounterValue(commands[index])
+		counter, err := reconcileCounterValue(counters[index])
 		if err != nil {
 			return nil, fmt.Errorf("read conversation seq counter: %w", err)
 		}
-		counters[[2]uint64{row.LowID, row.HighID}] = counter
+		size, err := indexes[index].Result()
+		if err != nil {
+			return nil, fmt.Errorf("read conversation index size: %w", err)
+		}
+		states[[2]uint64{row.LowID, row.HighID}] = reconcileRedisState{
+			counter: counter,
+			index:   uint64(size),
+		}
 	}
-	return counters, nil
+	return states, nil
 }
 
-func (r *Reconciler) readGroupCounters(
+func (r *Reconciler) readGroupStates(
 	ctx context.Context,
 	rows []store.GroupSeqStat,
-) (map[uint64]uint64, error) {
+) (map[uint64]reconcileRedisState, error) {
 	pipe := r.client.Pipeline()
-	commands := make([]*redis.StringCmd, len(rows))
+	counters := make([]*redis.StringCmd, len(rows))
+	indexes := make([]*redis.IntCmd, len(rows))
 	for index, row := range rows {
-		commands[index] = pipe.Get(ctx, r.keyspace.groupSequenceKey(row.GroupID))
+		counters[index] = pipe.Get(ctx, r.keyspace.groupSequenceKey(row.GroupID))
+		indexes[index] = pipe.ZCard(ctx, r.keyspace.groupInboxKey(row.GroupID))
 	}
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return nil, fmt.Errorf("read group seq counters: %w", err)
 	}
-	counters := make(map[uint64]uint64, len(rows))
+	states := make(map[uint64]reconcileRedisState, len(rows))
 	for index, row := range rows {
-		counter, err := reconcileCounterValue(commands[index])
+		counter, err := reconcileCounterValue(counters[index])
 		if err != nil {
 			return nil, fmt.Errorf("read group seq counter: %w", err)
 		}
-		counters[row.GroupID] = counter
+		size, err := indexes[index].Result()
+		if err != nil {
+			return nil, fmt.Errorf("read group index size: %w", err)
+		}
+		states[row.GroupID] = reconcileRedisState{counter: counter, index: uint64(size)}
 	}
-	return counters, nil
+	return states, nil
 }
 
 func reconcileCounterValue(command *redis.StringCmd) (uint64, error) {
@@ -1237,6 +1438,11 @@ func (r *Reconciler) setGroupStatsCursor(cursor uint64) {
 // suppressed rather than evicted when either the per-run cap or the key map is
 // full, so a burst cannot break the per-item throttle.
 func (r *Reconciler) logUnresolved(runAt time.Time, key, reason string) {
+	r.logThrottled(runAt, "unresolved", key, reason)
+}
+
+// logThrottled logs one repair or unresolved item at most once per LogEvery.
+func (r *Reconciler) logThrottled(runAt time.Time, kind, key, reason string) {
 	r.mu.Lock()
 	if when, ok := r.logged[key]; ok && runAt.Sub(when) < r.logEvery {
 		r.mu.Unlock()
@@ -1258,7 +1464,7 @@ func (r *Reconciler) logUnresolved(runAt time.Time, key, reason string) {
 	r.runLogs++
 	r.logged[key] = runAt
 	r.mu.Unlock()
-	log.Printf("reconcile unresolved %s: %s", key, reason)
+	log.Printf("reconcile %s %s: %s", kind, key, reason)
 }
 
 // expireLoggedLocked drops only entries whose LogEvery window elapsed. Fresh
@@ -1269,6 +1475,1241 @@ func (r *Reconciler) expireLoggedLocked(now time.Time) {
 			delete(r.logged, key)
 		}
 	}
+}
+
+// reconcileRepairBudget bounds how many Redis messages one run writes across
+// the 5-minute repair pass and the deep audit.
+type reconcileRepairBudget struct {
+	limit int
+	used  int
+}
+
+func newReconcileRepairBudget(limit int) *reconcileRepairBudget {
+	return &reconcileRepairBudget{limit: limit}
+}
+
+func (b *reconcileRepairBudget) remaining() int {
+	if b == nil || b.used >= b.limit {
+		return 0
+	}
+	return b.limit - b.used
+}
+
+func (b *reconcileRepairBudget) spend(count int) {
+	if b == nil || count <= 0 {
+		return
+	}
+	b.used += count
+}
+
+// conversationNeedsRebuild applies the two automatic-repair caps: an absolute
+// gap and a ratio with an absolute floor, so a nearly empty conversation with
+// one missing message is still repaired.
+func (r *Reconciler) conversationNeedsRebuild(gap, count uint64) bool {
+	if gap == 0 {
+		return false
+	}
+	if gap > uint64(r.needsRebuildMessages) {
+		return true
+	}
+	return float64(gap) > r.needsRebuildRatio*float64(count) &&
+		gap >= uint64(r.repairMinMessages)
+}
+
+// checkDirectRedisGap compares one conversation against MySQL in the reverse
+// direction. It raises a lagging counter and repairs a small index gap; a gap
+// above the caps is reported as needing a rebuild instead.
+func (r *Reconciler) checkDirectRedisGap(
+	ctx context.Context,
+	runAt time.Time,
+	row store.ConversationSeqStat,
+	state reconcileRedisState,
+	budget *reconcileRepairBudget,
+	result *ReconcileResult,
+) error {
+	if state.counter < row.MaxSeq {
+		// A lagging counter would reissue seqs that MySQL already holds.
+		result.RedisMissing++
+		if r.repair != nil {
+			if err := r.repair.RaiseDirectCounter(ctx, row.LowID, row.HighID, row.MaxSeq); err != nil {
+				r.logThrottled(runAt, "repair-error",
+					fmt.Sprintf("direct:%d:%d:counter", row.LowID, row.HighID),
+					"raise counter: "+err.Error())
+			} else {
+				result.RedisRepaired++
+				result.CountersRaised++
+			}
+		}
+	}
+	if state.index >= row.Count {
+		return nil
+	}
+	gap := row.Count - state.index
+	result.RedisMissing += gap
+	if r.conversationNeedsRebuild(gap, row.Count) {
+		result.NeedsRebuild++
+		r.logThrottled(runAt, "needs-rebuild",
+			fmt.Sprintf("direct:%d:%d:index", row.LowID, row.HighID),
+			fmt.Sprintf("redis index gap %d of %d exceeds repair budget", gap, row.Count))
+		return nil
+	}
+	return r.repairDirectIndexGap(ctx, runAt, row, budget, result)
+}
+
+func (r *Reconciler) checkGroupRedisGap(
+	ctx context.Context,
+	runAt time.Time,
+	row store.GroupSeqStat,
+	state reconcileRedisState,
+	budget *reconcileRepairBudget,
+	result *ReconcileResult,
+) error {
+	if state.counter < row.MaxSeq {
+		result.RedisMissing++
+		if r.repair != nil {
+			if err := r.repair.RaiseGroupCounter(ctx, row.GroupID, row.MaxSeq); err != nil {
+				r.logThrottled(runAt, "repair-error",
+					fmt.Sprintf("group:%d:counter", row.GroupID),
+					"raise counter: "+err.Error())
+			} else {
+				result.RedisRepaired++
+				result.CountersRaised++
+			}
+		}
+	}
+	if state.index >= row.Count {
+		return nil
+	}
+	gap := row.Count - state.index
+	result.RedisMissing += gap
+	if r.conversationNeedsRebuild(gap, row.Count) {
+		result.NeedsRebuild++
+		r.logThrottled(runAt, "needs-rebuild",
+			fmt.Sprintf("group:%d:index", row.GroupID),
+			fmt.Sprintf("redis inbox gap %d of %d exceeds repair budget", gap, row.Count))
+		return nil
+	}
+	return r.repairGroupIndexGap(ctx, runAt, row, budget, result)
+}
+
+// repairDirectIndexGap finds messages absent from dm:pair (or carrying a stale
+// score) in ascending seq order and writes at most one conversation's share of
+// the per-run budget. The scan resumes from a cursor when it hits its own cap.
+func (r *Reconciler) repairDirectIndexGap(
+	ctx context.Context,
+	runAt time.Time,
+	row store.ConversationSeqStat,
+	budget *reconcileRepairBudget,
+	result *ReconcileResult,
+) error {
+	capacity := r.repairPerConversation
+	if r.repair != nil {
+		if remaining := budget.remaining(); remaining < capacity {
+			capacity = remaining
+		}
+	}
+	if capacity <= 0 {
+		return nil
+	}
+	key := reconcileSeqCursorKey{first: row.LowID, second: row.HighID}
+	afterSeq := r.reverseSeqStart(key)
+	missing := make([]store.Message, 0, capacity)
+	scanned := 0
+	completed := false
+	for len(missing) < capacity && scanned < reconcileMaxReverseScan {
+		pageSize := r.batch
+		if remaining := reconcileMaxReverseScan - scanned; pageSize > remaining {
+			pageSize = remaining
+		}
+		page, err := r.store.ListMessagesBySeqRange(ctx, row.LowID, row.HighID, afterSeq, pageSize)
+		if err != nil {
+			return fmt.Errorf("list messages by seq range: %w", err)
+		}
+		if len(page) == 0 {
+			completed = true
+			break
+		}
+		present, err := r.directIndexScores(ctx, row.LowID, row.HighID, page)
+		if err != nil {
+			return err
+		}
+		for index, message := range page {
+			afterSeq = message.Seq
+			if present[index] {
+				continue
+			}
+			missing = append(missing, message)
+			if len(missing) >= capacity {
+				break
+			}
+		}
+		scanned += len(page)
+		if len(page) < pageSize {
+			completed = true
+			break
+		}
+	}
+	if completed {
+		afterSeq = 0
+	}
+	r.setReverseSeqCursor(key, afterSeq, !completed)
+	return r.writeDirectRepairs(ctx, runAt, key, missing, budget, result, fmt.Sprintf("direct:%d:%d", row.LowID, row.HighID))
+}
+
+func (r *Reconciler) repairGroupIndexGap(
+	ctx context.Context,
+	runAt time.Time,
+	row store.GroupSeqStat,
+	budget *reconcileRepairBudget,
+	result *ReconcileResult,
+) error {
+	capacity := r.repairPerConversation
+	if r.repair != nil {
+		if remaining := budget.remaining(); remaining < capacity {
+			capacity = remaining
+		}
+	}
+	if capacity <= 0 {
+		return nil
+	}
+	key := reconcileSeqCursorKey{group: true, first: row.GroupID}
+	afterSeq := r.reverseSeqStart(key)
+	missing := make([]store.GroupMessage, 0, capacity)
+	scanned := 0
+	completed := false
+	for len(missing) < capacity && scanned < reconcileMaxReverseScan {
+		pageSize := r.batch
+		if remaining := reconcileMaxReverseScan - scanned; pageSize > remaining {
+			pageSize = remaining
+		}
+		page, err := r.store.ListGroupMessagesBySeqRange(ctx, row.GroupID, afterSeq, pageSize)
+		if err != nil {
+			return fmt.Errorf("list group messages by seq range: %w", err)
+		}
+		if len(page) == 0 {
+			completed = true
+			break
+		}
+		present, err := r.groupIndexScores(ctx, row.GroupID, page)
+		if err != nil {
+			return err
+		}
+		for index, message := range page {
+			afterSeq = message.Seq
+			if present[index] {
+				continue
+			}
+			missing = append(missing, message)
+			if len(missing) >= capacity {
+				break
+			}
+		}
+		scanned += len(page)
+		if len(page) < pageSize {
+			completed = true
+			break
+		}
+	}
+	if completed {
+		afterSeq = 0
+	}
+	r.setReverseSeqCursor(key, afterSeq, !completed)
+	return r.writeGroupRepairs(ctx, runAt, key, missing, budget, result, fmt.Sprintf("group:%d", row.GroupID))
+}
+
+func (r *Reconciler) directIndexScores(
+	ctx context.Context,
+	lowID, highID uint64,
+	messages []store.Message,
+) ([]bool, error) {
+	pipe := r.client.Pipeline()
+	key := r.keyspace.directPairKey(lowID, highID)
+	commands := make([]*redis.FloatCmd, len(messages))
+	for index, message := range messages {
+		commands[index] = pipe.ZScore(ctx, key, strconv.FormatUint(message.ID, 10))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read conversation index scores: %w", err)
+	}
+	present := make([]bool, len(messages))
+	for index, command := range commands {
+		score, err := command.Result()
+		if errors.Is(err, redis.Nil) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read conversation index score: %w", err)
+		}
+		present[index] = score == float64(messages[index].Seq)
+	}
+	return present, nil
+}
+
+func (r *Reconciler) groupIndexScores(
+	ctx context.Context,
+	groupID uint64,
+	messages []store.GroupMessage,
+) ([]bool, error) {
+	pipe := r.client.Pipeline()
+	key := r.keyspace.groupInboxKey(groupID)
+	commands := make([]*redis.FloatCmd, len(messages))
+	for index, message := range messages {
+		commands[index] = pipe.ZScore(ctx, key, strconv.FormatUint(message.ID, 10))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read group inbox scores: %w", err)
+	}
+	present := make([]bool, len(messages))
+	for index, command := range commands {
+		score, err := command.Result()
+		if errors.Is(err, redis.Nil) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read group inbox score: %w", err)
+		}
+		present[index] = score == float64(messages[index].Seq)
+	}
+	return present, nil
+}
+
+func (r *Reconciler) writeDirectRepairs(
+	ctx context.Context,
+	runAt time.Time,
+	cursorKey reconcileSeqCursorKey,
+	messages []store.Message,
+	budget *reconcileRepairBudget,
+	result *ReconcileResult,
+	key string,
+) error {
+	if len(messages) == 0 || r.repair == nil {
+		return nil
+	}
+	written, err := r.repair.WriteDirectBatch(ctx, messages)
+	if err != nil {
+		r.logThrottled(runAt, "repair-error", key+":index", "write missing messages: "+err.Error())
+		r.setReverseSeqCursor(cursorKey, 0, false)
+		return nil
+	}
+	result.RedisRepaired += uint64(written)
+	budget.spend(written)
+	return nil
+}
+
+func (r *Reconciler) writeGroupRepairs(
+	ctx context.Context,
+	runAt time.Time,
+	cursorKey reconcileSeqCursorKey,
+	messages []store.GroupMessage,
+	budget *reconcileRepairBudget,
+	result *ReconcileResult,
+	key string,
+) error {
+	if len(messages) == 0 || r.repair == nil {
+		return nil
+	}
+	written, err := r.repair.WriteGroupBatch(ctx, messages)
+	if err != nil {
+		r.logThrottled(runAt, "repair-error", key+":inbox", "write missing messages: "+err.Error())
+		r.setReverseSeqCursor(cursorKey, 0, false)
+		return nil
+	}
+	result.RedisRepaired += uint64(written)
+	budget.spend(written)
+	return nil
+}
+
+func (r *Reconciler) reverseSeqStart(key reconcileSeqCursorKey) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reverseSeqs[key]
+}
+
+func (r *Reconciler) setReverseSeqCursor(key reconcileSeqCursorKey, next uint64, truncated bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !truncated || next == 0 {
+		delete(r.reverseSeqs, key)
+		return
+	}
+	if _, exists := r.reverseSeqs[key]; !exists && len(r.reverseSeqs) >= reconcileLogKeyLimit {
+		// Bounded state: dropping the cursor only rescans from the start.
+		return
+	}
+	r.reverseSeqs[key] = next
+}
+
+// reconcileReadWatermarks compares both read watermarks with MySQL every run.
+// Redis may legitimately be newer because async persistence is still in
+// flight, so only an older Redis value is raised.
+func (r *Reconciler) reconcileReadWatermarks(
+	ctx context.Context,
+	runAt time.Time,
+	result *ReconcileResult,
+) error {
+	if err := r.reconcileDirectReadWatermarks(ctx, runAt, result); err != nil {
+		return err
+	}
+	return r.reconcileGroupReadWatermarks(ctx, runAt, result)
+}
+
+func (r *Reconciler) reconcileDirectReadWatermarks(
+	ctx context.Context,
+	runAt time.Time,
+	result *ReconcileResult,
+) error {
+	afterUser, afterPeer := r.directReadCursorState()
+	scanned := 0
+	var raised []store.ConversationReadState
+	for scanned < reconcileReadStatesPerRun {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rows, err := r.store.ListConversationReadStates(ctx, afterUser, afterPeer, r.batch)
+		if err != nil {
+			return fmt.Errorf("list conversation read states: %w", err)
+		}
+		if len(rows) == 0 {
+			afterUser, afterPeer = 0, 0
+			break
+		}
+		stale, err := r.staleDirectWatermarks(ctx, rows)
+		if err != nil {
+			return err
+		}
+		raised = append(raised, stale...)
+		last := rows[len(rows)-1]
+		afterUser, afterPeer = last.UserID, last.PeerID
+		scanned += len(rows)
+		if len(rows) < r.batch {
+			afterUser, afterPeer = 0, 0
+			break
+		}
+	}
+	r.setDirectReadCursor(afterUser, afterPeer)
+	return r.raiseDirectWatermarks(ctx, runAt, raised, result)
+}
+
+func (r *Reconciler) staleDirectWatermarks(
+	ctx context.Context,
+	rows []store.ConversationReadState,
+) ([]store.ConversationReadState, error) {
+	pipe := r.client.Pipeline()
+	commands := make([]*redis.StringCmd, len(rows))
+	for index, row := range rows {
+		commands[index] = pipe.HGet(
+			ctx,
+			r.keyspace.directReadKey(row.UserID),
+			strconv.FormatUint(row.PeerID, 10),
+		)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read direct read watermarks: %w", err)
+	}
+	var stale []store.ConversationReadState
+	for index, row := range rows {
+		current, err := reconcileCounterValue(commands[index])
+		if err != nil {
+			return nil, fmt.Errorf("read direct read watermark: %w", err)
+		}
+		if current >= row.LastReadSeq {
+			continue
+		}
+		stale = append(stale, row)
+	}
+	return stale, nil
+}
+
+func (r *Reconciler) raiseDirectWatermarks(
+	ctx context.Context,
+	runAt time.Time,
+	states []store.ConversationReadState,
+	result *ReconcileResult,
+) error {
+	if len(states) == 0 {
+		return nil
+	}
+	result.RedisMissing += uint64(len(states))
+	if r.repair == nil {
+		return nil
+	}
+	for _, chunk := range reconcileChunks(len(states), r.batch) {
+		raised, err := r.repair.RaiseDirectReadWatermarks(ctx, states[chunk[0]:chunk[1]])
+		if err != nil {
+			r.logThrottled(runAt, "repair-error", "direct:read", "raise watermarks: "+err.Error())
+			return nil
+		}
+		result.WatermarksRaised += uint64(raised)
+	}
+	return nil
+}
+
+func (r *Reconciler) reconcileGroupReadWatermarks(
+	ctx context.Context,
+	runAt time.Time,
+	result *ReconcileResult,
+) error {
+	afterGroup, afterUser := r.groupReadCursorState()
+	scanned := 0
+	var raised []store.GroupMemberReadState
+	for scanned < reconcileReadStatesPerRun {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rows, err := r.store.ListGroupMemberReadStates(ctx, afterGroup, afterUser, r.batch)
+		if err != nil {
+			return fmt.Errorf("list group member read states: %w", err)
+		}
+		if len(rows) == 0 {
+			afterGroup, afterUser = 0, 0
+			break
+		}
+		stale, err := r.staleGroupWatermarks(ctx, rows)
+		if err != nil {
+			return err
+		}
+		raised = append(raised, stale...)
+		last := rows[len(rows)-1]
+		afterGroup, afterUser = last.GroupID, last.UserID
+		scanned += len(rows)
+		if len(rows) < r.batch {
+			afterGroup, afterUser = 0, 0
+			break
+		}
+	}
+	r.setGroupReadCursor(afterGroup, afterUser)
+	return r.raiseGroupWatermarks(ctx, runAt, raised, result)
+}
+
+func (r *Reconciler) staleGroupWatermarks(
+	ctx context.Context,
+	rows []store.GroupMemberReadState,
+) ([]store.GroupMemberReadState, error) {
+	pipe := r.client.Pipeline()
+	commands := make([]*redis.FloatCmd, len(rows))
+	for index, row := range rows {
+		commands[index] = pipe.ZScore(
+			ctx,
+			r.keyspace.groupReadKey(row.GroupID),
+			strconv.FormatUint(row.UserID, 10),
+		)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read group read watermarks: %w", err)
+	}
+	var stale []store.GroupMemberReadState
+	for index, row := range rows {
+		score, err := commands[index].Result()
+		current := uint64(0)
+		if err == nil {
+			current = uint64(score)
+		} else if !errors.Is(err, redis.Nil) {
+			return nil, fmt.Errorf("read group read watermark: %w", err)
+		}
+		if current >= row.LastReadSeq {
+			continue
+		}
+		stale = append(stale, row)
+	}
+	return stale, nil
+}
+
+func (r *Reconciler) raiseGroupWatermarks(
+	ctx context.Context,
+	runAt time.Time,
+	states []store.GroupMemberReadState,
+	result *ReconcileResult,
+) error {
+	if len(states) == 0 {
+		return nil
+	}
+	result.RedisMissing += uint64(len(states))
+	if r.repair == nil {
+		return nil
+	}
+	for _, chunk := range reconcileChunks(len(states), r.batch) {
+		raised, err := r.repair.RaiseGroupReadWatermarks(ctx, states[chunk[0]:chunk[1]])
+		if err != nil {
+			r.logThrottled(runAt, "repair-error", "group:read", "raise watermarks: "+err.Error())
+			return nil
+		}
+		result.WatermarksRaised += uint64(raised)
+	}
+	return nil
+}
+
+// reconcileChunks splits n items into [start, end) batches of at most size.
+func reconcileChunks(n, size int) [][2]int {
+	if size <= 0 {
+		size = n
+	}
+	if n == 0 {
+		return nil
+	}
+	chunks := make([][2]int, 0, (n+size-1)/size)
+	for start := 0; start < n; start += size {
+		end := start + size
+		if end > n {
+			end = n
+		}
+		chunks = append(chunks, [2]int{start, end})
+	}
+	return chunks
+}
+
+func (r *Reconciler) directReadCursorState() (uint64, uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.directReadCursor[0], r.directReadCursor[1]
+}
+
+func (r *Reconciler) setDirectReadCursor(userID, peerID uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.directReadCursor = [2]uint64{userID, peerID}
+}
+
+func (r *Reconciler) groupReadCursorState() (uint64, uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.groupReadCursor[0], r.groupReadCursor[1]
+}
+
+func (r *Reconciler) setGroupReadCursor(groupID, userID uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.groupReadCursor = [2]uint64{groupID, userID}
+}
+
+func (r *Reconciler) directDeepCursorState() (uint64, uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.directDeepCursor[0], r.directDeepCursor[1]
+}
+
+func (r *Reconciler) setDirectDeepCursor(lowID, highID uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.directDeepCursor = [2]uint64{lowID, highID}
+}
+
+func (r *Reconciler) groupDeepCursorState() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.groupDeepCursor
+}
+
+func (r *Reconciler) setGroupDeepCursor(groupID uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.groupDeepCursor = groupID
+}
+
+func (r *Reconciler) userDeepCursorState() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.userDeepCursor
+}
+
+func (r *Reconciler) setUserDeepCursor(userID uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.userDeepCursor = userID
+}
+
+func (r *Reconciler) deepAuditDue(runAt time.Time) bool {
+	if r.deepAuditInterval <= 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastDeepAudit.IsZero() || runAt.Sub(r.lastDeepAudit) >= r.deepAuditInterval
+}
+
+func (r *Reconciler) recordDeepAudit(runAt time.Time, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastDeepAudit = runAt
+	r.status.LastDeepAuditAt = runAt
+	if err != nil {
+		r.status.DeepAuditError = err.Error()
+		return
+	}
+	r.status.DeepAuditError = ""
+}
+
+// deepAudit rotates through a bounded window of conversations and users and
+// compares sampled entities and feed sizes with MySQL. It never deletes or
+// overwrites existing data.
+func (r *Reconciler) deepAudit(
+	ctx context.Context,
+	runAt time.Time,
+	result *ReconcileResult,
+	budget *reconcileRepairBudget,
+) error {
+	if err := r.deepAuditDirectEntities(ctx, runAt, result, budget); err != nil {
+		return err
+	}
+	if err := r.deepAuditGroupEntities(ctx, runAt, result, budget); err != nil {
+		return err
+	}
+	return r.deepAuditFeeds(ctx, runAt, result, budget)
+}
+
+func (r *Reconciler) deepAuditDirectEntities(
+	ctx context.Context,
+	runAt time.Time,
+	result *ReconcileResult,
+	budget *reconcileRepairBudget,
+) error {
+	afterLow, afterHigh := r.directDeepCursorState()
+	rows, err := r.store.ListConversationSeqStats(ctx, afterLow, afterHigh, reconcileDeepAuditPerRun)
+	if err != nil {
+		return fmt.Errorf("list conversation seq stats for deep audit: %w", err)
+	}
+	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := r.auditDirectEntities(ctx, runAt, row, result, budget); err != nil {
+			return err
+		}
+	}
+	// Advance only after the page is done so an aborted audit retries it.
+	if len(rows) < reconcileDeepAuditPerRun {
+		r.setDirectDeepCursor(0, 0)
+	} else {
+		last := rows[len(rows)-1]
+		r.setDirectDeepCursor(last.LowID, last.HighID)
+	}
+	return nil
+}
+
+func (r *Reconciler) auditDirectEntities(
+	ctx context.Context,
+	runAt time.Time,
+	row store.ConversationSeqStat,
+	result *ReconcileResult,
+	budget *reconcileRepairBudget,
+) error {
+	samples, err := r.directBoundaryMessages(ctx, row)
+	if err != nil {
+		return err
+	}
+	if len(samples) == 0 {
+		return nil
+	}
+	pipe := r.client.Pipeline()
+	commands := make([]*redis.MapStringStringCmd, len(samples))
+	for index, message := range samples {
+		commands[index] = pipe.HGetAll(ctx, r.keyspace.messageKey(message.ID))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("read direct entities for deep audit: %w", err)
+	}
+	var missing []store.Message
+	diverged := false
+	for index, message := range samples {
+		fields, err := commands[index].Result()
+		if err != nil {
+			return fmt.Errorf("read direct entity for deep audit: %w", err)
+		}
+		if len(fields) == 0 {
+			missing = append(missing, message)
+			continue
+		}
+		if !directEntityMatches(message, fields) {
+			diverged = true
+		}
+	}
+	if diverged {
+		result.NeedsRebuild++
+		r.logThrottled(runAt, "needs-rebuild",
+			fmt.Sprintf("direct:%d:%d:entity", row.LowID, row.HighID),
+			"redis entity differs from MySQL")
+	}
+	return r.writeSampledDirectRepairs(ctx, runAt, missing, budget, result)
+}
+
+func (r *Reconciler) writeSampledDirectRepairs(
+	ctx context.Context,
+	runAt time.Time,
+	missing []store.Message,
+	budget *reconcileRepairBudget,
+	result *ReconcileResult,
+) error {
+	if len(missing) == 0 {
+		return nil
+	}
+	result.RedisMissing += uint64(len(missing))
+	if r.repair == nil {
+		return nil
+	}
+	for _, chunk := range reconcileChunks(len(missing), r.repairPerConversation) {
+		batch := missing[chunk[0]:chunk[1]]
+		if remaining := budget.remaining(); remaining < len(batch) {
+			batch = batch[:remaining]
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+		written, err := r.repair.WriteDirectBatch(ctx, batch)
+		if err != nil {
+			r.logThrottled(runAt, "repair-error", "deep:direct:entity", "write missing entity: "+err.Error())
+			return nil
+		}
+		result.RedisRepaired += uint64(written)
+		budget.spend(written)
+	}
+	return nil
+}
+
+func (r *Reconciler) deepAuditGroupEntities(
+	ctx context.Context,
+	runAt time.Time,
+	result *ReconcileResult,
+	budget *reconcileRepairBudget,
+) error {
+	afterGroupID := r.groupDeepCursorState()
+	rows, err := r.store.ListGroupSeqStats(ctx, afterGroupID, reconcileDeepAuditPerRun)
+	if err != nil {
+		return fmt.Errorf("list group seq stats for deep audit: %w", err)
+	}
+	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := r.auditGroupEntities(ctx, runAt, row, result, budget); err != nil {
+			return err
+		}
+	}
+	if len(rows) < reconcileDeepAuditPerRun {
+		r.setGroupDeepCursor(0)
+	} else {
+		r.setGroupDeepCursor(rows[len(rows)-1].GroupID)
+	}
+	return nil
+}
+
+func (r *Reconciler) auditGroupEntities(
+	ctx context.Context,
+	runAt time.Time,
+	row store.GroupSeqStat,
+	result *ReconcileResult,
+	budget *reconcileRepairBudget,
+) error {
+	samples, err := r.groupBoundaryMessages(ctx, row)
+	if err != nil {
+		return err
+	}
+	if len(samples) == 0 {
+		return nil
+	}
+	pipe := r.client.Pipeline()
+	commands := make([]*redis.MapStringStringCmd, len(samples))
+	for index, message := range samples {
+		commands[index] = pipe.HGetAll(ctx, r.keyspace.groupMessageKey(message.ID))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("read group entities for deep audit: %w", err)
+	}
+	var missing []store.GroupMessage
+	diverged := false
+	for index, message := range samples {
+		fields, err := commands[index].Result()
+		if err != nil {
+			return fmt.Errorf("read group entity for deep audit: %w", err)
+		}
+		if len(fields) == 0 {
+			missing = append(missing, message)
+			continue
+		}
+		if !groupEntityMatches(message, fields) {
+			diverged = true
+		}
+	}
+	if diverged {
+		result.NeedsRebuild++
+		r.logThrottled(runAt, "needs-rebuild",
+			fmt.Sprintf("group:%d:entity", row.GroupID),
+			"redis entity differs from MySQL")
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	result.RedisMissing += uint64(len(missing))
+	if r.repair == nil {
+		return nil
+	}
+	for _, chunk := range reconcileChunks(len(missing), r.repairPerConversation) {
+		batch := missing[chunk[0]:chunk[1]]
+		if remaining := budget.remaining(); remaining < len(batch) {
+			batch = batch[:remaining]
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+		written, err := r.repair.WriteGroupBatch(ctx, batch)
+		if err != nil {
+			r.logThrottled(runAt, "repair-error", "deep:group:entity", "write missing entity: "+err.Error())
+			return nil
+		}
+		result.RedisRepaired += uint64(written)
+		budget.spend(written)
+	}
+	return nil
+}
+
+// directBoundaryMessages samples the oldest and newest seqs of a conversation,
+// which is where a partial tail loss or a wiped prefix shows first.
+func (r *Reconciler) directBoundaryMessages(
+	ctx context.Context,
+	row store.ConversationSeqStat,
+) ([]store.Message, error) {
+	boundary := r.deepAuditBoundary
+	if boundary <= 0 {
+		return nil, nil
+	}
+	first, err := r.store.ListMessagesBySeqRange(ctx, row.LowID, row.HighID, 0, boundary)
+	if err != nil {
+		return nil, fmt.Errorf("sample oldest direct messages: %w", err)
+	}
+	if row.MaxSeq <= uint64(boundary) {
+		return first, nil
+	}
+	last, err := r.store.ListMessagesBySeqRange(
+		ctx, row.LowID, row.HighID, row.MaxSeq-uint64(boundary), boundary,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sample newest direct messages: %w", err)
+	}
+	return reconcileUniqueDirect(append(first, last...)), nil
+}
+
+func (r *Reconciler) groupBoundaryMessages(
+	ctx context.Context,
+	row store.GroupSeqStat,
+) ([]store.GroupMessage, error) {
+	boundary := r.deepAuditBoundary
+	if boundary <= 0 {
+		return nil, nil
+	}
+	first, err := r.store.ListGroupMessagesBySeqRange(ctx, row.GroupID, 0, boundary)
+	if err != nil {
+		return nil, fmt.Errorf("sample oldest group messages: %w", err)
+	}
+	if row.MaxSeq <= uint64(boundary) {
+		return first, nil
+	}
+	last, err := r.store.ListGroupMessagesBySeqRange(
+		ctx, row.GroupID, row.MaxSeq-uint64(boundary), boundary,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sample newest group messages: %w", err)
+	}
+	return reconcileUniqueGroup(append(first, last...)), nil
+}
+
+func reconcileUniqueDirect(messages []store.Message) []store.Message {
+	seen := make(map[uint64]struct{}, len(messages))
+	unique := make([]store.Message, 0, len(messages))
+	for _, message := range messages {
+		if _, ok := seen[message.ID]; ok {
+			continue
+		}
+		seen[message.ID] = struct{}{}
+		unique = append(unique, message)
+	}
+	return unique
+}
+
+func reconcileUniqueGroup(messages []store.GroupMessage) []store.GroupMessage {
+	seen := make(map[uint64]struct{}, len(messages))
+	unique := make([]store.GroupMessage, 0, len(messages))
+	for _, message := range messages {
+		if _, ok := seen[message.ID]; ok {
+			continue
+		}
+		seen[message.ID] = struct{}{}
+		unique = append(unique, message)
+	}
+	return unique
+}
+
+// directEntityMatches compares the immutable entity fields MySQL owns. A
+// mismatch is not repaired because the auditor never overwrites an entity.
+func directEntityMatches(message store.Message, fields map[string]string) bool {
+	id, err := reconcileEntityUint(fields, "id")
+	if err != nil || id != message.ID {
+		return false
+	}
+	seq, err := reconcileEntityUint(fields, "seq")
+	if err != nil || seq != message.Seq {
+		return false
+	}
+	senderID, err := reconcileEntityUint(fields, "sender_id")
+	if err != nil || senderID != message.SenderID {
+		return false
+	}
+	recipientID, err := reconcileEntityUint(fields, "recipient_id")
+	if err != nil || recipientID != message.RecipientID {
+		return false
+	}
+	createdAtMS, err := reconcileEntityInt64(fields, "created_at_ms")
+	if err != nil || createdAtMS != message.CreatedAt.UTC().Truncate(time.Millisecond).UnixMilli() {
+		return false
+	}
+	return strings.TrimSpace(fields["client_message_id"]) == message.ClientMessageID &&
+		fields["body"] == message.Body
+}
+
+func groupEntityMatches(message store.GroupMessage, fields map[string]string) bool {
+	id, err := reconcileEntityUint(fields, "id")
+	if err != nil || id != message.ID {
+		return false
+	}
+	seq, err := reconcileEntityUint(fields, "seq")
+	if err != nil || seq != message.Seq {
+		return false
+	}
+	groupID, err := reconcileEntityUint(fields, "group_id")
+	if err != nil || groupID != message.GroupID {
+		return false
+	}
+	senderID, err := reconcileEntityUint(fields, "sender_id")
+	if err != nil || senderID != message.SenderID {
+		return false
+	}
+	createdAtMS, err := reconcileEntityInt64(fields, "created_at_ms")
+	if err != nil || createdAtMS != message.CreatedAt.UTC().Truncate(time.Millisecond).UnixMilli() {
+		return false
+	}
+	// Sender nicknames are mutable snapshots; only require them to be present.
+	_, hasUsername := fields["sender_username"]
+	_, hasNickname := fields["sender_nickname"]
+	return hasUsername && hasNickname &&
+		strings.TrimSpace(fields["client_message_id"]) == message.ClientMessageID &&
+		fields["body"] == message.Body
+}
+
+func (r *Reconciler) deepAuditFeeds(
+	ctx context.Context,
+	runAt time.Time,
+	result *ReconcileResult,
+	budget *reconcileRepairBudget,
+) error {
+	cursor := r.userDeepCursorState()
+	ids, err := r.store.ListUserIDs(ctx, cursor, r.deepAuditUsers)
+	if err != nil {
+		return fmt.Errorf("list user IDs for deep audit: %w", err)
+	}
+	for _, userID := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := r.auditUserFeed(ctx, runAt, userID, result, budget); err != nil {
+			return err
+		}
+	}
+	if len(ids) < r.deepAuditUsers {
+		r.setUserDeepCursor(0)
+	} else {
+		r.setUserDeepCursor(ids[len(ids)-1])
+	}
+	return nil
+}
+
+func (r *Reconciler) auditUserFeed(
+	ctx context.Context,
+	runAt time.Time,
+	userID uint64,
+	result *ReconcileResult,
+	budget *reconcileRepairBudget,
+) error {
+	count, err := r.store.CountMessagesInvolvingUser(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("count messages involving user: %w", err)
+	}
+	if count == 0 {
+		return nil
+	}
+	key := r.keyspace.directFeedKey(userID)
+	card, err := r.client.ZCard(ctx, key).Result()
+	if err != nil {
+		return fmt.Errorf("read direct feed size: %w", err)
+	}
+	if card >= int64(count) {
+		return nil
+	}
+	gap := count - uint64(card)
+	result.RedisMissing += gap
+	if gap > uint64(r.repairPerConversation) {
+		result.NeedsRebuild++
+		r.logThrottled(runAt, "needs-rebuild",
+			fmt.Sprintf("user:%d:feed", userID),
+			fmt.Sprintf("direct feed gap %d exceeds repair budget", gap))
+		return nil
+	}
+	if r.repair == nil {
+		return nil
+	}
+	limit := int(gap)
+	if remaining := budget.remaining(); remaining < limit {
+		limit = remaining
+	}
+	if limit <= 0 {
+		return nil
+	}
+	missing, err := r.missingFeedMessages(ctx, userID, limit)
+	if err != nil {
+		return err
+	}
+	for _, chunk := range reconcileChunks(len(missing), reconcileFeedWriteBatch) {
+		batch := missing[chunk[0]:chunk[1]]
+		written, err := r.repair.WriteDirectBatch(ctx, batch)
+		if err != nil {
+			r.logThrottled(runAt, "repair-error", fmt.Sprintf("user:%d:feed", userID),
+				"write missing feed entries: "+err.Error())
+			r.setFeedCursor(userID, reconcileFeedCursor{}, false)
+			return nil
+		}
+		result.FeedRepairs += uint64(written)
+		budget.spend(written)
+	}
+	return nil
+}
+
+// reconcileFeedCursor resumes a capped feed scan at one conversation's seq.
+type reconcileFeedCursor struct {
+	peer uint64
+	seq  uint64
+}
+
+func (r *Reconciler) feedCursorStart(userID uint64) reconcileFeedCursor {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.feedCursors[userID]
+}
+
+func (r *Reconciler) setFeedCursor(userID uint64, cursor reconcileFeedCursor, keep bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !keep {
+		delete(r.feedCursors, userID)
+		return
+	}
+	if _, exists := r.feedCursors[userID]; !exists && len(r.feedCursors) >= reconcileLogKeyLimit {
+		return
+	}
+	r.feedCursors[userID] = cursor
+}
+
+// missingFeedMessages walks the user's conversations in MySQL and returns the
+// rows absent from dm:feed, resuming from the previous run's cursor when its
+// check budget was exhausted.
+func (r *Reconciler) missingFeedMessages(
+	ctx context.Context,
+	userID uint64,
+	limit int,
+) ([]store.Message, error) {
+	conversations, err := r.store.ListConversationBasics(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list user conversations: %w", err)
+	}
+	cursor := r.feedCursorStart(userID)
+	start := 0
+	if cursor.peer != 0 {
+		start = len(conversations)
+		for index, conversation := range conversations {
+			if conversation.UserID >= cursor.peer {
+				start = index
+				break
+			}
+		}
+	}
+	key := r.keyspace.directFeedKey(userID)
+	missing := make([]store.Message, 0, limit)
+	checks := 0
+	for index := start; index < len(conversations); index++ {
+		peerID := conversations[index].UserID
+		if peerID == 0 || peerID == userID {
+			continue
+		}
+		lowID, highID := sortedPair(userID, peerID)
+		afterSeq := uint64(0)
+		if peerID == cursor.peer {
+			afterSeq = cursor.seq
+		}
+		for len(missing) < limit && checks < reconcileFeedChecksPerUser {
+			pageSize := r.batch
+			if remaining := reconcileFeedChecksPerUser - checks; pageSize > remaining {
+				pageSize = remaining
+			}
+			page, err := r.store.ListMessagesBySeqRange(ctx, lowID, highID, afterSeq, pageSize)
+			if err != nil {
+				return nil, fmt.Errorf("list messages for feed audit: %w", err)
+			}
+			if len(page) == 0 {
+				break
+			}
+			present, err := r.feedMemberships(ctx, key, page)
+			if err != nil {
+				return nil, err
+			}
+			for pageIndex, message := range page {
+				if present[pageIndex] {
+					continue
+				}
+				missing = append(missing, message)
+				if len(missing) >= limit {
+					break
+				}
+			}
+			checks += len(page)
+			afterSeq = page[len(page)-1].Seq
+			if len(page) < pageSize {
+				break
+			}
+		}
+		if len(missing) >= limit {
+			// The detected gap is covered; a later audit finds anything left.
+			r.setFeedCursor(userID, reconcileFeedCursor{}, false)
+			return missing, nil
+		}
+		if checks >= reconcileFeedChecksPerUser {
+			r.setFeedCursor(userID, reconcileFeedCursor{peer: peerID, seq: afterSeq}, true)
+			return missing, nil
+		}
+	}
+	r.setFeedCursor(userID, reconcileFeedCursor{}, false)
+	return missing, nil
+}
+
+func (r *Reconciler) feedMemberships(
+	ctx context.Context,
+	key string,
+	messages []store.Message,
+) ([]bool, error) {
+	pipe := r.client.Pipeline()
+	commands := make([]*redis.FloatCmd, len(messages))
+	for index, message := range messages {
+		commands[index] = pipe.ZScore(ctx, key, strconv.FormatUint(message.ID, 10))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read direct feed scores: %w", err)
+	}
+	present := make([]bool, len(messages))
+	for index := range messages {
+		score, err := commands[index].Result()
+		if errors.Is(err, redis.Nil) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read direct feed score: %w", err)
+		}
+		present[index] = score == float64(messages[index].ID)
+	}
+	return present, nil
 }
 
 func reconcileWait(ctx context.Context, delay time.Duration) bool {

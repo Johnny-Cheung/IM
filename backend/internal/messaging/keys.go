@@ -141,6 +141,12 @@ func (k Keyspace) backfillLockKey() string {
 	return k.prefixOrDefault() + "backfill:lock"
 }
 
+// RebuildLockKey is held while a full Redis rebuild runs so the backend and the
+// seq backfill refuse to run concurrently with it.
+func RebuildLockKey(keyspace Keyspace) string {
+	return keyspace.prefixOrDefault() + "rebuild:lock"
+}
+
 // indexEpochKey records the highest message ID that is not guaranteed to be
 // present in the private feed index. It is a global-ID score floor for
 // dm:feed only and must never be used for conversation seq ranges.

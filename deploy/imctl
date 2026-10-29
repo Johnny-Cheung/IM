@@ -248,6 +248,28 @@ backend_stop() {
   fi
 }
 
+# One-shot maintenance commands rewrite shared state; a running backend would
+# serve a half-written namespace while they work.
+require_backend_stopped() {
+  local action="${1:?}"
+  if systemctl is-active --quiet "${UNIT}"; then
+    echo "stop the backend before running the ${action}" >&2
+    return 1
+  fi
+  local listeners
+  listeners="$(ss -lnt | awk '{print $4}')"
+  if grep -q ":${PORT}\$" <<<"${listeners}"; then
+    echo "port ${PORT} is in use; stop any backend listening on it before the ${action}" >&2
+    return 1
+  fi
+  local running
+  running="$(pgrep -f "${APP_ROOT}/bin/im-server" | grep -vx "$$" || true)"
+  if [ -n "${running}" ]; then
+    echo "an im-server process is running for ${APP_ROOT}; stop it before the ${action}" >&2
+    return 1
+  fi
+}
+
 infra_ready() {
   [ -s "${INFRA_REDIS_URL_FILE}" ] \
     && [ -s "${INFRA_REDIS_PASSWORD_FILE}" ] \
@@ -336,22 +358,7 @@ backfill_seq() {
     echo "seq backfill requires Redis configuration" >&2
     return 1
   fi
-  if systemctl is-active --quiet "${UNIT}"; then
-    echo "stop the backend before running the seq backfill" >&2
-    return 1
-  fi
-  local listeners
-  listeners="$(ss -lnt | awk '{print $4}')"
-  if grep -q ":${PORT}\$" <<<"${listeners}"; then
-    echo "port ${PORT} is in use; stop any backend listening on it before the seq backfill" >&2
-    return 1
-  fi
-  local running
-  running="$(pgrep -f "${APP_ROOT}/bin/im-server" | grep -vx "$$" || true)"
-  if [ -n "${running}" ]; then
-    echo "an im-server process is running for ${APP_ROOT}; stop it before the seq backfill" >&2
-    return 1
-  fi
+  require_backend_stopped "seq backfill" || return 1
   local -a env_args=()
   local line
   while IFS= read -r line; do
@@ -360,6 +367,40 @@ backfill_seq() {
   /usr/bin/env "${env_args[@]}" \
     "${APP_ROOT}/bin/im-server" -backfill-seq \
     -backfill-batch "${BACKFILL_BATCH:-1000}"
+}
+
+# A rebuild drains the persist queues and regenerates the whole Redis
+# namespace from MySQL, so it needs every backend dependency and a stopped
+# backend. Optional batch/queue-timeout overrides come from the environment.
+rebuild_redis() {
+  prepare_backend_config
+  if [ ! -s "${BACKEND_APP_SECRET}" ]; then
+    echo "redis rebuild requires MySQL configuration" >&2
+    return 1
+  fi
+  if [ ! -s "${INFRA_REDIS_URL_FILE}" ] || [ ! -s "${INFRA_REDIS_PASSWORD_FILE}" ]; then
+    echo "redis rebuild requires Redis configuration" >&2
+    return 1
+  fi
+  if ! rabbitmq_ready; then
+    echo "redis rebuild requires RabbitMQ configuration" >&2
+    return 1
+  fi
+  require_backend_stopped "redis rebuild" || return 1
+  local -a env_args=()
+  local line
+  while IFS= read -r line; do
+    env_args+=("${line}")
+  done < <(backend_env_args)
+  local -a server_args=("-rebuild-redis")
+  if [ -n "${REBUILD_BATCH:-}" ]; then
+    server_args+=(-rebuild-batch "${REBUILD_BATCH}")
+  fi
+  if [ -n "${REBUILD_QUEUE_TIMEOUT:-}" ]; then
+    server_args+=(-rebuild-queue-timeout "${REBUILD_QUEUE_TIMEOUT}")
+  fi
+  /usr/bin/env "${env_args[@]}" "${APP_ROOT}/bin/im-server" "${server_args[@]}"
+  echo "Redis rebuild finished; seq:ready is written for the selected namespace."
 }
 
 # Dead letter commands only need RabbitMQ configuration. They work against the
@@ -678,6 +719,7 @@ main() {
     backend-start) backend_start ;;
     backend-stop) backend_stop ;;
     backfill-seq) backfill_seq ;;
+    rebuild-redis) rebuild_redis ;;
     dlq-list) dlq_admin list "${@:2}" ;;
     dlq-replay) dlq_admin replay "${@:2}" ;;
     dlq-discard) dlq_admin discard "${@:2}" ;;
@@ -693,7 +735,7 @@ main() {
     runtime-stop) runtime_stop ;;
     verify-host) verify_host ;;
     logs) logs "${2:-backend}" "${3:-80}" ;;
-    *) echo "Usage: $0 [--verify] {start|stop|restart|backend-start|backend-stop|backfill-seq|dlq-list|dlq-replay|dlq-discard|queue-status|health|status|backup|restore-check <backup>|mysql-start|mysql-stop|mysql-status|runtime-start|runtime-stop|verify-host|logs [backend|mysql|runtime] [lines]}" >&2; return 2 ;;
+    *) echo "Usage: $0 [--verify] {start|stop|restart|backend-start|backend-stop|backfill-seq|rebuild-redis|dlq-list|dlq-replay|dlq-discard|queue-status|health|status|backup|restore-check <backup>|mysql-start|mysql-stop|mysql-status|runtime-start|runtime-stop|verify-host|logs [backend|mysql|runtime] [lines]}" >&2; return 2 ;;
   esac
 }
 
