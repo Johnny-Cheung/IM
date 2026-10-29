@@ -31,8 +31,8 @@ const (
 
 type serverOptions struct {
 	addr string
-	// addrSet records an explicit -addr. The one-shot maintenance commands
-	// default the stopped-backend check to the deployment port instead.
+	// addrSet records an explicit -addr. Without it the one-shot maintenance
+	// commands probe every listener this binary can be serving on.
 	addrSet             bool
 	webDir              string
 	backfillSeq         bool
@@ -202,7 +202,12 @@ func run(options serverOptions) error {
 			return fmt.Errorf("check conversation sequence readiness: %w", err)
 		}
 		if !ready {
-			return sequenceNotReadyError(startupCtx, infraManager.Redis(), keyspace)
+			return sequenceNotReadyError(
+				startupCtx,
+				infraManager.Redis(),
+				keyspace,
+				dataStore.CountUnnumberedMessages,
+			)
 		}
 
 		indexEpoch, err := messaging.EnsureIndexEpoch(
@@ -595,13 +600,23 @@ func (a notifyingGroupAcceptor) Accept(
 	return result, err
 }
 
+// unnumberedMessageCounter reports how many direct and group history rows still
+// have no conversation seq. It is a function so the startup hint can be tested
+// without MySQL.
+type unnumberedMessageCounter func(context.Context) (uint64, uint64, error)
+
 // sequenceNotReadyError explains how to make the namespace ready. A failed
-// rebuild leaves its pending marker; pointing the operator at a seq backfill
-// there would certify the half-built projection the rebuild must regenerate.
+// rebuild leaves its pending marker. Without one, MySQL decides: rows still
+// waiting to be numbered need the seq backfill, while a namespace with no
+// unnumbered rows lost its projection and must be rebuilt. A backfill only
+// numbers rows and writes counters, indexes and seq:ready; on a wiped namespace
+// it would certify a read model with no message entities, feeds, conversation
+// previews or dedup.
 func sequenceNotReadyError(
 	ctx context.Context,
 	client redis.UniversalClient,
 	keyspace messaging.Keyspace,
+	unnumbered unnumberedMessageCounter,
 ) error {
 	pendingKey := messaging.RebuildPendingKey(keyspace)
 	pending, err := client.Exists(ctx, pendingKey).Result()
@@ -615,8 +630,27 @@ func sequenceNotReadyError(
 			pendingKey,
 		)
 	}
+	if unnumbered == nil {
+		return fmt.Errorf(
+			"conversation sequence is not ready; cannot choose between " +
+				"`imctl backfill-seq` and `imctl rebuild-redis` without MySQL",
+		)
+	}
+	direct, group, err := unnumbered(ctx)
+	if err != nil {
+		return fmt.Errorf("count unnumbered messages: %w", err)
+	}
+	if direct == 0 && group == 0 {
+		return fmt.Errorf(
+			"conversation sequence is not ready and MySQL has no unnumbered messages; " +
+				"the Redis projection was lost, so stop the backend and run " +
+				"`imctl rebuild-redis`",
+		)
+	}
 	return fmt.Errorf(
-		"conversation sequence is not ready; stop the backend and run `imctl backfill-seq` first",
+		"conversation sequence is not ready; %d direct and %d group messages still "+
+			"need a sequence; stop the backend and run `imctl backfill-seq` first",
+		direct, group,
 	)
 }
 

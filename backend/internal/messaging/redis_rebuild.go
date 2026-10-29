@@ -27,22 +27,21 @@ var ErrRebuildMissingSeq = errors.New(
 	"messages without seq found; run backfill-seq before rebuilding Redis",
 )
 
-// RebuildLockTTL bounds the rebuild lock that the rebuild command holds.
-const RebuildLockTTL = 30 * time.Minute
-
 const (
 	defaultRebuildBatch  = 1000
 	rebuildScanCountHint = 500
 	rebuildEntitySamples = 8
-	// rebuildDedupSamples bounds the dedup records read back per message kind.
+	// rebuildDedupSamples bounds the dedup records read back at each end of the
+	// window.
 	rebuildDedupSamples = 8
 	// rebuildConvLastUsers bounds how many users' conversation previews are
 	// verified; the sample is the first users met in message ID order.
 	rebuildConvLastUsers = 64
-	// rebuildDedupExpiryMargin keeps records that may expire during the
-	// rebuild out of the dedup-count lower bound.
-	rebuildDedupExpiryMargin = time.Hour
-	rebuildCleanupTimeout    = 5 * time.Second
+	// rebuildDedupExpiryGrace keeps records that expire around the end of the
+	// rebuild out of the dedup-count lower bound. Every other record inside the
+	// window is required, however little TTL it has left.
+	rebuildDedupExpiryGrace = 30 * time.Second
+	rebuildCleanupTimeout   = 5 * time.Second
 )
 
 // RebuildStore is the durable source of a full Redis rebuild. *store.Store
@@ -72,6 +71,12 @@ type RedisRebuildOptions struct {
 	// DrainQueues must consume both persist queues to empty before the
 	// namespace is cleared. It is required.
 	DrainQueues func(ctx context.Context) (QueueDrainResult, error)
+	// BeforeClear runs after the drain and immediately before anything is
+	// destroyed, so the caller can re-check a precondition that refuses the
+	// destructive pass (in production: that the backend is still stopped). A
+	// non-nil error aborts the rebuild without touching a key. Production
+	// callers must set it; tests may leave it nil.
+	BeforeClear func(ctx context.Context) error
 }
 
 // RedisRebuildResult summarises one rebuild.
@@ -93,6 +98,52 @@ type rebuildDedupSample struct {
 	id          string
 	createdAtMS string
 	bodyHash    string
+	expiry      time.Time
+}
+
+// rebuildDedupSampleSet keeps a bounded sample at both ends of the dedup
+// window. The oldest samples are the ones a window or precision bug is most
+// likely to drop, so verifying only the newest records would miss it.
+type rebuildDedupSampleSet struct {
+	oldest []rebuildDedupSample
+	newest []rebuildDedupSample
+}
+
+func (s *rebuildDedupSampleSet) add(sample rebuildDedupSample) {
+	s.oldest = insertDedupSample(s.oldest, sample, true)
+	s.newest = insertDedupSample(s.newest, sample, false)
+}
+
+// insertDedupSample keeps either the smallest (keepOldest) or largest expiries
+// of a bounded, expiry-ordered set.
+func insertDedupSample(
+	samples []rebuildDedupSample,
+	sample rebuildDedupSample,
+	keepOldest bool,
+) []rebuildDedupSample {
+	index := sort.Search(len(samples), func(i int) bool {
+		return samples[i].expiry.After(sample.expiry)
+	})
+	if len(samples) >= rebuildDedupSamples {
+		if keepOldest && index >= rebuildDedupSamples {
+			return samples
+		}
+		if !keepOldest && index == 0 {
+			return samples
+		}
+	}
+	samples = append(samples, rebuildDedupSample{})
+	copy(samples[index+1:], samples[index:])
+	samples[index] = sample
+	if len(samples) > rebuildDedupSamples {
+		if keepOldest {
+			samples = samples[:rebuildDedupSamples]
+		} else {
+			copy(samples, samples[1:])
+			samples = samples[:rebuildDedupSamples]
+		}
+	}
+	return samples
 }
 
 // rebuildStats accumulates what the passes wrote so verification can compare it
@@ -103,10 +154,12 @@ type rebuildStats struct {
 	feedCounts     map[uint64]uint64
 	groupPositions map[uint64]map[uint64]uint64
 	dedupExpected  uint64
-	// dedupDurable excludes records whose TTL may run out before verification.
-	dedupDurable uint64
-	directDedups []rebuildDedupSample
-	groupDedups  []rebuildDedupSample
+	// dedupExpiries counts expected dedup records per absolute expiry second.
+	// Verification requires every record whose expiry is safely inside the
+	// window, so a record with a few minutes left is not silently skipped.
+	dedupExpiries map[int64]uint64
+	directDedups  rebuildDedupSampleSet
+	groupDedups   rebuildDedupSampleSet
 	// convLast holds, per sampled user, the newest message ID per peer.
 	convLast map[uint64]map[uint64]uint64
 	holes    uint64
@@ -118,6 +171,7 @@ func newRebuildStats() *rebuildStats {
 		maxSeqByGroup:  make(map[uint64]uint64),
 		feedCounts:     make(map[uint64]uint64),
 		groupPositions: make(map[uint64]map[uint64]uint64),
+		dedupExpiries:  make(map[int64]uint64),
 		convLast:       make(map[uint64]map[uint64]uint64),
 	}
 }
@@ -141,34 +195,32 @@ func (s *rebuildStats) noteConversationLast(userID, peerID, messageID uint64) {
 	}
 }
 
-func (s *rebuildStats) noteDirectDedup(sample rebuildDedupSample, ttl time.Duration) {
-	s.noteDedup(ttl)
-	s.directDedups = appendRollingDedup(s.directDedups, sample)
+func (s *rebuildStats) noteDirectDedup(sample rebuildDedupSample) {
+	s.noteDedup(sample.expiry)
+	s.directDedups.add(sample)
 }
 
-func (s *rebuildStats) noteGroupDedup(sample rebuildDedupSample, ttl time.Duration) {
-	s.noteDedup(ttl)
-	s.groupDedups = appendRollingDedup(s.groupDedups, sample)
+func (s *rebuildStats) noteGroupDedup(sample rebuildDedupSample) {
+	s.noteDedup(sample.expiry)
+	s.groupDedups.add(sample)
 }
 
-func (s *rebuildStats) noteDedup(ttl time.Duration) {
+func (s *rebuildStats) noteDedup(expiry time.Time) {
 	s.dedupExpected++
-	if ttl > rebuildDedupExpiryMargin {
-		s.dedupDurable++
-	}
+	s.dedupExpiries[expiry.Unix()]++
 }
 
-// appendRollingDedup keeps the newest samples, which have the longest TTL and
-// therefore survive the verification read.
-func appendRollingDedup(
-	samples []rebuildDedupSample,
-	sample rebuildDedupSample,
-) []rebuildDedupSample {
-	samples = append(samples, sample)
-	if len(samples) > rebuildDedupSamples {
-		samples = samples[len(samples)-rebuildDedupSamples:]
+// dedupAlive counts the noted records that cannot have expired at cutoff. The
+// whole expiry second must be past the cutoff so the bound stays conservative.
+func (s *rebuildStats) dedupAlive(cutoff time.Time) uint64 {
+	limit := cutoff.Unix()
+	alive := uint64(0)
+	for second, count := range s.dedupExpiries {
+		if second > limit {
+			alive += count
+		}
 	}
-	return samples
+	return alive
 }
 
 // RedisRebuilder regenerates the whole messaging namespace from MySQL. It must
@@ -249,6 +301,17 @@ func (r *RedisRebuilder) Run(ctx context.Context) (result RedisRebuildResult, er
 		drained.Direct, drained.Group, drained.DeadLettered,
 	)
 
+	// Last chance to refuse the destructive pass: the drain already took
+	// deliveries, but no key has been touched yet, so an error here leaves the
+	// namespace and the pending marker exactly as they were.
+	if r.options.BeforeClear != nil {
+		if err := r.options.BeforeClear(ctx); err != nil {
+			return result, fmt.Errorf(
+				"backend is still running; rebuild aborted before clearing: %w", err,
+			)
+		}
+	}
+
 	// Mark the rebuild as unfinished before anything is destroyed. The marker
 	// stays behind on every failure so an operator knows to re-run.
 	if err := r.client.Set(
@@ -320,8 +383,17 @@ func (r *RedisRebuilder) Run(ctx context.Context) (result RedisRebuildResult, er
 		return result, fmt.Errorf("mark sequence ready: %w", err)
 	}
 	readySet = true
-	if err := r.client.Del(ctx, RebuildPendingKey(keyspace)).Err(); err != nil {
-		return result, fmt.Errorf("clear rebuild pending marker: %w", err)
+	// The namespace is complete once seq:ready exists, so a failed marker
+	// delete must not report failure: that would leave an operator believing
+	// the rebuild did not commit while a stale marker blocks backfill-seq.
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), rebuildCleanupTimeout)
+	delErr := r.client.Del(cleanupCtx, RebuildPendingKey(keyspace)).Err()
+	cancel()
+	if delErr != nil {
+		r.logf(
+			"rebuild: namespace is ready but %s was not cleared: %v; delete it manually",
+			RebuildPendingKey(keyspace), delErr,
+		)
 	}
 
 	r.logf(
@@ -393,7 +465,8 @@ func (r *RedisRebuilder) rebuildDirectPass(
 					id:          strconv.FormatUint(message.ID, 10),
 					createdAtMS: strconv.FormatInt(createdAt.UnixMilli(), 10),
 					bodyHash:    hashMessageBody(message.Body),
-				}, ttl)
+					expiry:      now.Add(ttl),
+				})
 			}
 			pair := [2]uint64{}
 			pair[0], pair[1] = sortedPair(message.SenderID, message.RecipientID)
@@ -462,7 +535,8 @@ func (r *RedisRebuilder) rebuildGroupPass(
 					id:          strconv.FormatUint(message.ID, 10),
 					createdAtMS: strconv.FormatInt(createdAt.UnixMilli(), 10),
 					bodyHash:    hashMessageBody(message.Body),
-				}, ttl)
+					expiry:      now.Add(ttl),
+				})
 			}
 			if message.Seq > stats.maxSeqByGroup[message.GroupID] {
 				stats.maxSeqByGroup[message.GroupID] = message.Seq
@@ -959,7 +1033,7 @@ func (r *RedisRebuilder) verifyFeeds(ctx context.Context, stats *rebuildStats) e
 }
 
 // verifyDedup compares the rebuilt dedup layer with the messages the passes
-// found inside the dedup window, then reads back a bounded sample.
+// found inside the dedup window, then reads back both ends of the window.
 func (r *RedisRebuilder) verifyDedup(
 	ctx context.Context,
 	stats *rebuildStats,
@@ -986,28 +1060,35 @@ func (r *RedisRebuilder) verifyDedup(
 			}
 		}
 	}
-	// Records close to the end of their TTL may expire between the pass and
-	// this read, so the count is bounded rather than exact.
+	// Only records that can expire within the grace window are exempt: a
+	// record with minutes of TTL left must still have been written.
+	cutoff := r.options.Now().UTC().Add(rebuildDedupExpiryGrace)
+	alive := stats.dedupAlive(cutoff)
 	if actual > stats.dedupExpected {
 		return fmt.Errorf(
 			"rebuilt %d dedup records, want at most %d messages inside the dedup window",
 			actual, stats.dedupExpected,
 		)
 	}
-	if actual < stats.dedupDurable {
+	if actual < alive {
 		return fmt.Errorf(
-			"rebuilt %d dedup records, want at least %d messages inside the dedup window",
-			actual, stats.dedupDurable,
+			"rebuilt %d dedup records, want at least %d still inside the dedup window",
+			actual, alive,
 		)
 	}
-	for _, sample := range stats.directDedups {
-		if err := r.verifyDedupSample(ctx, sample); err != nil {
-			return err
-		}
-	}
-	for _, sample := range stats.groupDedups {
-		if err := r.verifyDedupSample(ctx, sample); err != nil {
-			return err
+	for _, samples := range [][]rebuildDedupSample{
+		stats.directDedups.oldest, stats.directDedups.newest,
+		stats.groupDedups.oldest, stats.groupDedups.newest,
+	} {
+		for _, sample := range samples {
+			// A record expiring inside the grace window may legitimately be
+			// gone, and the count bound already excludes it.
+			if !sample.expiry.After(cutoff) {
+				continue
+			}
+			if err := r.verifyDedupSample(ctx, sample); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

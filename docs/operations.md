@@ -252,7 +252,7 @@ install -m 0644 "$BACKUP/RELEASE" /opt/IM-Rebuild/RELEASE
 
 `imctl backup` 通过现有 MySQL 容器和容器内受保护密钥生成一致性 SQL dump 和 SHA-256，保存到仅 root 可访问的 `/opt/IM-Rebuild/backups/` 下按 UTC 时间加后缀命名的子目录，并打印路径。备份包含 `database.sql`、行数清单 `counts.tsv`、当前应用的 `bin/`、`web/`、`RELEASE`和 `SHA256SUMS`；保留历史，不自动删除，不把密码写入参数、环境变量或日志。
 
-备份不包含 Redis。v1.8.1 的 `dm:seq`、`dm:pair`、`group:{G}:seq`、`seq:ready` 都不在备份中：Redis 数据丢失或回滚后，用 `backfill-seq` 从 MySQL 重建；回滚到 v1.7 时则清空新命名空间并用旧脚本回填旧模型。切换前可以在 Redis 容器内记录只读的键数量、内存和 `run_id` 作为诊断，不要导出或修改正式键。
+备份不包含 Redis。v1.8.1 的 `dm:seq`、`dm:pair`、`group:{G}:seq`、`seq:ready` 都不在备份中：v1.8.3 起 Redis 数据丢失或回滚后，停后端执行 `imctl rebuild-redis` 从 MySQL 重建完整投影（`backfill-seq` 只用于 MySQL 里仍有未编号行的旧数据升级，不能用于整库丢失）；回滚到 v1.7 时则清空新命名空间并用旧脚本回填旧模型。切换前可以在 Redis 容器内记录只读的键数量、内存和 `run_id` 作为诊断，不要导出或修改正式键。
 
 ```bash
 BACKUP="$(/opt/IM-Rebuild/imctl backup)"
@@ -428,11 +428,14 @@ curl -fsS http://127.0.0.1:8199/ops/infra   # 检查 seq.ready 与 pipeline.reco
 
 - 可选环境变量：`REBUILD_BATCH`（默认 1000）、`REBUILD_QUEUE_TIMEOUT`（默认 10m）、`REBUILD_TIMEOUT`（默认 30m，必须大于队列超时）。
 - 执行顺序：排空两个持久化队列（含正在处理的消息）→ 写 `rebuild:pending` → 先删 `seq:ready`/`index:epoch` 再清理本命名空间 → 全局计数器 → 消息主遍 → 好友、群投影和水位 → 校验 → `index:epoch=0` → `seq:ready` → 删除 `rebuild:pending`。
-- 只删除已知前缀；不使用 `FLUSHDB`。失败时不写 `seq:ready` 且保留 `rebuild:pending`，启动提示会指向 `rebuild-redis`。
+- 运行前 `imctl` 还会检查两个持久化队列的未确认消息数；有未确认消息（可能被别的进程占用）时拒绝执行。
+- 只删除已知前缀；不使用 `FLUSHDB`。失败时不写 `seq:ready` 且保留 `rebuild:pending`，启动提示会指向 `rebuild-redis`；成功写入 `seq:ready` 后删除标记失败只记警告，不把成功当失败。
 - MySQL 中允许存在编号空洞（毒消息进死信、掉电丢尾）。重建会记录空洞数，不因此失败。
 - `rebuild:lock` 和 `backfill:lock` 原子互斥，任一存在时另一个命令和后端启动都会被拒绝。锁的 TTL 是总超时加 5 分钟；进程被杀后最多等这么久，确认无人运行后可 `SCAN` 找到并 `UNLINK` 残留键。
 - 命令按 `-addr` 的端口探测本机后端，能连上就拒绝执行。该检查只覆盖同一台机器；共享 Redis 的其他主机不在单体范围。
 - 运行期间部分丢失由对账自动发现：每 5 分钟比对条数、计数器和已读位置，每小时抽样消息实体、feed 和会话预览。少量缺失自动补 Redis（每轮最多 200 条、单会话 50 条）；超过阈值时 `needs_rebuild` 增加，按上面的步骤人工重建。对账只写 Redis，不删除、不覆盖分叉的实体，也不改 MySQL。
+- 计数器哨兵：接纳时如果算出的全局消息号已有实体，或会话编号已被占用，直接返回 503，不会覆盖已有消息或复用编号；校准和运行期对账只抬高计数器。
+- 已知限制：AMQP 客户端看不到其他连接的未确认消息，所以命令自身的排空检查只覆盖自己的 consumer；`imctl` 的未确认数预检和“停后端”守卫共同兜住这种情况。
 
 ## 死信队列处理
 

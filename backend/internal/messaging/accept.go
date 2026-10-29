@@ -13,7 +13,8 @@ import (
 var ErrMessageServiceUnavailable = errors.New("message service unavailable")
 
 // ErrSeqNotReady reports that the conversation sequence is missing, the
-// readiness marker is absent, or calibration has not finished. It wraps
+// readiness marker is absent, an allocated message ID or sequence is already
+// occupied, or calibration has not finished. It wraps
 // ErrMessageServiceUnavailable so existing 503 mapping keeps working.
 var ErrSeqNotReady = fmt.Errorf("%w: conversation sequence not ready", ErrMessageServiceUnavailable)
 
@@ -151,7 +152,7 @@ func (a *RedisAcceptor) Accept(ctx context.Context, request DirectMessageRequest
 		return DirectMessageResult{}, store.ErrMessageConflict
 	case "id_overflow":
 		return DirectMessageResult{}, store.ErrMessageIDExhausted
-	case "seq_not_ready", "seq_unavailable":
+	case "seq_not_ready", "seq_unavailable", "id_unavailable":
 		return DirectMessageResult{}, ErrSeqNotReady
 	case "seq_overflow":
 		return DirectMessageResult{}, ErrSeqOverflow

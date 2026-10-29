@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -190,37 +191,61 @@ func TestEnsureBackendStopped(t *testing.T) {
 	t.Cleanup(func() { maintenanceDial = original })
 
 	var probed []string
-	maintenanceDial = func(address string, timeout time.Duration) (net.Conn, error) {
+	refused := func(address string, timeout time.Duration) (net.Conn, error) {
 		probed = append(probed, address)
 		if timeout <= 0 {
 			t.Fatalf("probe timeout = %v, want positive", timeout)
 		}
 		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
 	}
-	if err := ensureBackendStopped("0.0.0.0:8199", "-rebuild-redis"); err != nil {
-		t.Fatalf("refused port must allow the command: %v", err)
+
+	// Without an explicit -addr every listener this binary can be running is
+	// probed: the HTTP default and both deployment ports.
+	maintenanceDial = refused
+	if err := ensureBackendStopped("", false, "-rebuild-redis"); err != nil {
+		t.Fatalf("refused default ports must allow the command: %v", err)
+	}
+	want := []string{"127.0.0.1:8080", "127.0.0.1:8198", "127.0.0.1:8199"}
+	if !reflect.DeepEqual(probed, want) {
+		t.Fatalf("default probes = %v, want %v", probed, want)
+	}
+
+	// An explicit wildcard -addr probes only that port, over loopback.
+	probed = nil
+	if err := ensureBackendStopped("0.0.0.0:8199", true, "-rebuild-redis"); err != nil {
+		t.Fatalf("refused explicit port must allow the command: %v", err)
 	}
 	if len(probed) != 1 || probed[0] != "127.0.0.1:8199" {
-		t.Fatalf("probed = %v, want 127.0.0.1:8199", probed)
+		t.Fatalf("explicit probes = %v, want 127.0.0.1:8199", probed)
 	}
 
-	// Without an explicit -addr the deployment port is checked.
+	// An explicit host is honoured, not rewritten to loopback, so a backend
+	// bound to a specific interface is still detected.
 	probed = nil
-	if err := ensureBackendStopped("", "-backfill-seq"); err != nil {
-		t.Fatalf("refused default port must allow the command: %v", err)
+	if err := ensureBackendStopped("10.0.0.5:9000", true, "-backfill-seq"); err != nil {
+		t.Fatalf("refused explicit host must allow the command: %v", err)
 	}
-	if len(probed) != 1 || probed[0] != "127.0.0.1:8198" {
-		t.Fatalf("default probe = %v, want 127.0.0.1:8198", probed)
+	if len(probed) != 1 || probed[0] != "10.0.0.5:9000" {
+		t.Fatalf("host probes = %v, want 10.0.0.5:9000", probed)
 	}
 
+	// Any candidate that accepts refuses, even when earlier candidates refused.
+	probed = nil
 	clientSide, serverSide := net.Pipe()
 	t.Cleanup(func() { _ = clientSide.Close(); _ = serverSide.Close() })
-	maintenanceDial = func(string, time.Duration) (net.Conn, error) {
-		return clientSide, nil
+	maintenanceDial = func(address string, _ time.Duration) (net.Conn, error) {
+		probed = append(probed, address)
+		if address == "127.0.0.1:8198" {
+			return clientSide, nil
+		}
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
 	}
-	err := ensureBackendStopped("0.0.0.0:8199", "-rebuild-redis")
-	if err == nil || !strings.Contains(err.Error(), "serving on 127.0.0.1:8199") {
+	err := ensureBackendStopped("", false, "-rebuild-redis")
+	if err == nil || !strings.Contains(err.Error(), "serving on 127.0.0.1:8198") {
 		t.Fatalf("serving backend error = %v", err)
+	}
+	if want := []string{"127.0.0.1:8080", "127.0.0.1:8198"}; !reflect.DeepEqual(probed, want) {
+		t.Fatalf("probes = %v, want them to stop at the first listener that accepts", probed)
 	}
 	for _, fragment := range []string{"imctl backend-stop", "imctl rebuild-redis"} {
 		if !strings.Contains(err.Error(), fragment) {
@@ -228,57 +253,209 @@ func TestEnsureBackendStopped(t *testing.T) {
 		}
 	}
 
+	// A dial failure that is not a refusal fails closed.
 	maintenanceDial = func(string, time.Duration) (net.Conn, error) {
 		return nil, errors.New("network unreachable")
 	}
-	if err := ensureBackendStopped("0.0.0.0:8199", "-rebuild-redis"); err == nil ||
+	if err := ensureBackendStopped("10.0.0.5:9000", true, "-rebuild-redis"); err == nil ||
 		!strings.Contains(err.Error(), "cannot verify") {
 		t.Fatalf("indeterminate probe error = %v", err)
 	}
 }
 
-func TestMaintenanceProbeTarget(t *testing.T) {
-	if target, err := maintenanceProbeTarget("0.0.0.0:8199"); err != nil ||
-		target != "127.0.0.1:8199" {
-		t.Fatalf("target = %q, %v", target, err)
+// TestBackendStoppedBeforeClear covers the RedisRebuilder hook that repeats the
+// probe after the queue drain and immediately before ClearNamespace.
+func TestBackendStoppedBeforeClear(t *testing.T) {
+	original := maintenanceDial
+	t.Cleanup(func() { maintenanceDial = original })
+
+	maintenanceDial = func(string, time.Duration) (net.Conn, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
 	}
-	if target, err := maintenanceProbeTarget("10.0.0.5:9000"); err != nil ||
-		target != "127.0.0.1:9000" {
-		t.Fatalf("remote binds are probed over loopback: %q, %v", target, err)
+	check := backendStoppedBeforeClear(
+		serverOptions{addr: "0.0.0.0:8199", addrSet: true}, "-rebuild-redis",
+	)
+	if check == nil {
+		t.Fatal("BeforeClear hook is nil")
 	}
-	if _, err := maintenanceProbeTarget("no-port"); err == nil {
+	if err := check(context.Background()); err != nil {
+		t.Fatalf("a stopped backend must allow the rebuild: %v", err)
+	}
+
+	clientSide, serverSide := net.Pipe()
+	t.Cleanup(func() { _ = clientSide.Close(); _ = serverSide.Close() })
+	maintenanceDial = func(string, time.Duration) (net.Conn, error) {
+		return clientSide, nil
+	}
+	err := check(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "serving on 127.0.0.1:8199") {
+		t.Fatalf("serving backend before ClearNamespace = %v", err)
+	}
+
+	// A cancelled rebuild context aborts the hook without probing.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	maintenanceDial = func(string, time.Duration) (net.Conn, error) {
+		t.Fatal("the hook must not dial with a cancelled context")
+		return nil, nil
+	}
+	if err := check(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled hook error = %v, want context.Canceled", err)
+	}
+}
+
+func TestRedisRebuildOptionsWireBeforeClear(t *testing.T) {
+	_, _, keyspace := newTestRedis(t)
+	namespace, err := messaging.NewNamespace("im:v12")
+	if err != nil {
+		t.Fatalf("namespace: %v", err)
+	}
+
+	options := redisRebuildOptions(
+		serverOptions{addr: "0.0.0.0:8199", addrSet: true}, keyspace, namespace,
+		250, time.Minute, nil,
+	)
+	if options.Keyspace != keyspace || options.Namespace.Base() != namespace.Base() ||
+		options.Batch != 250 || options.DrainQueues != nil {
+		t.Fatalf("options = %#v", options)
+	}
+	if options.BeforeClear == nil {
+		t.Fatal("the rebuild options must carry the BeforeClear probe")
+	}
+
+	original := maintenanceDial
+	t.Cleanup(func() { maintenanceDial = original })
+	maintenanceDial = func(string, time.Duration) (net.Conn, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
+	}
+	if err := options.BeforeClear(context.Background()); err != nil {
+		t.Fatalf("BeforeClear with a stopped backend = %v", err)
+	}
+	maintenanceDial = func(string, time.Duration) (net.Conn, error) {
+		return nil, errors.New("network unreachable")
+	}
+	if err := options.BeforeClear(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "cannot verify") {
+		t.Fatalf("BeforeClear probe error = %v", err)
+	}
+}
+
+func TestMaintenanceProbeTargets(t *testing.T) {
+	tests := []struct {
+		name    string
+		addr    string
+		addrSet bool
+		want    []string
+	}{
+		{"wildcard host", "0.0.0.0:8199", true, []string{"127.0.0.1:8199"}},
+		{"empty host", ":8199", true, []string{"127.0.0.1:8199"}},
+		{"IPv6 wildcard", "[::]:8199", true, []string{"127.0.0.1:8199"}},
+		{"loopback", "127.0.0.1:9000", true, []string{"127.0.0.1:9000"}},
+		{"specific host", "10.0.0.5:9000", true, []string{"10.0.0.5:9000"}},
+		{"unset", "", false, []string{"127.0.0.1:8080", "127.0.0.1:8198", "127.0.0.1:8199"}},
+		{"implicit flag default", "127.0.0.1:8080", false,
+			[]string{"127.0.0.1:8080", "127.0.0.1:8198", "127.0.0.1:8199"}},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			targets, err := maintenanceProbeTargets(testCase.addr, testCase.addrSet)
+			if err != nil {
+				t.Fatalf("maintenanceProbeTargets(%q, %t): %v", testCase.addr, testCase.addrSet, err)
+			}
+			if !reflect.DeepEqual(targets, testCase.want) {
+				t.Fatalf("targets = %v, want %v", targets, testCase.want)
+			}
+		})
+	}
+	if _, err := maintenanceProbeTargets("no-port", true); err == nil {
 		t.Fatal("an address without a port must fail")
 	}
-	options := serverOptions{}
-	if got := options.maintenanceAddr(); got != defaultMaintenanceAddr {
-		t.Fatalf("default maintenance addr = %q", got)
+	if _, err := maintenanceProbeTargets("10.0.0.5:9000", false); err != nil {
+		t.Fatalf("an implicit -addr must fall back to the defaults: %v", err)
 	}
-	options = serverOptions{addr: "0.0.0.0:9000"}
-	if got := options.maintenanceAddr(); got != defaultMaintenanceAddr {
-		t.Fatalf("implicit -addr default maintenance addr = %q", got)
+}
+
+// TestCheckMaintenanceLocks covers the startup gate that refuses a backend on a
+// namespace a one-shot maintenance command is rebuilding.
+func TestCheckMaintenanceLocks(t *testing.T) {
+	server, client, keyspace := newTestRedis(t)
+	ctx := context.Background()
+
+	if err := checkMaintenanceLocks(ctx, client, keyspace); err != nil {
+		t.Fatalf("no locks must allow startup: %v", err)
 	}
-	options = serverOptions{addr: "0.0.0.0:9000", addrSet: true}
-	if got := options.maintenanceAddr(); got != "0.0.0.0:9000" {
-		t.Fatalf("explicit -addr maintenance addr = %q", got)
+	if err := server.Set(messaging.BackfillLockKey(keyspace), "token"); err != nil {
+		t.Fatalf("set backfill lock: %v", err)
+	}
+	err := checkMaintenanceLocks(ctx, client, keyspace)
+	if err == nil || !strings.Contains(err.Error(), "seq backfill") ||
+		!strings.Contains(err.Error(), messaging.BackfillLockKey(keyspace)) {
+		t.Fatalf("backfill lock error = %v", err)
+	}
+	server.Del(messaging.BackfillLockKey(keyspace))
+
+	if err := server.Set(messaging.RebuildLockKey(keyspace), "token"); err != nil {
+		t.Fatalf("set rebuild lock: %v", err)
+	}
+	err = checkMaintenanceLocks(ctx, client, keyspace)
+	if err == nil || !strings.Contains(err.Error(), "Redis rebuild") ||
+		!strings.Contains(err.Error(), messaging.RebuildLockKey(keyspace)) {
+		t.Fatalf("rebuild lock error = %v", err)
+	}
+	server.Del(messaging.RebuildLockKey(keyspace))
+
+	if err := checkMaintenanceLocks(ctx, client, keyspace); err != nil {
+		t.Fatalf("deleted locks must allow startup again: %v", err)
 	}
 }
 
 func TestSequenceNotReadyErrorSelectsTheCommand(t *testing.T) {
 	server, client, keyspace := newTestRedis(t)
 	ctx := context.Background()
+	numbered := func(context.Context) (uint64, uint64, error) { return 0, 0, nil }
 
-	err := sequenceNotReadyError(ctx, client, keyspace)
-	if err == nil || !strings.Contains(err.Error(), "backfill-seq") ||
-		strings.Contains(err.Error(), "rebuild-redis") {
-		t.Fatalf("missing ready without a pending marker = %v", err)
+	// Total Redis loss: no marker and nothing left to number. A backfill would
+	// certify a namespace without entities, feeds, previews or dedup.
+	err := sequenceNotReadyError(ctx, client, keyspace, numbered)
+	if err == nil || !strings.Contains(err.Error(), "rebuild-redis") ||
+		strings.Contains(err.Error(), "backfill-seq") {
+		t.Fatalf("wipe hint = %v", err)
 	}
 
+	// A pending marker wins even when MySQL looks fully numbered.
 	if err := server.Set(messaging.RebuildPendingKey(keyspace), "1"); err != nil {
 		t.Fatalf("set pending marker: %v", err)
 	}
-	err = sequenceNotReadyError(ctx, client, keyspace)
+	err = sequenceNotReadyError(ctx, client, keyspace, numbered)
 	if err == nil || !strings.Contains(err.Error(), "rebuild-redis") ||
+		!strings.Contains(err.Error(), messaging.RebuildPendingKey(keyspace)) ||
 		strings.Contains(err.Error(), "backfill-seq") {
 		t.Fatalf("pending marker message = %v", err)
+	}
+	server.Del(messaging.RebuildPendingKey(keyspace))
+
+	// Rows still without a seq need the switch, not a rebuild.
+	for _, counts := range [][2]uint64{{2, 0}, {0, 3}, {4, 5}} {
+		unnumbered := func(context.Context) (uint64, uint64, error) {
+			return counts[0], counts[1], nil
+		}
+		err := sequenceNotReadyError(ctx, client, keyspace, unnumbered)
+		if err == nil || !strings.Contains(err.Error(), "backfill-seq") ||
+			strings.Contains(err.Error(), "rebuild-redis") {
+			t.Fatalf("unnumbered hint for %v = %v", counts, err)
+		}
+	}
+
+	// A MySQL failure is reported, never guessed away.
+	failing := func(context.Context) (uint64, uint64, error) {
+		return 0, 0, errors.New("mysql down")
+	}
+	if err := sequenceNotReadyError(ctx, client, keyspace, failing); err == nil ||
+		!strings.Contains(err.Error(), "count unnumbered messages") {
+		t.Fatalf("counter error = %v", err)
+	}
+	if err := sequenceNotReadyError(ctx, client, keyspace, nil); err == nil ||
+		!strings.Contains(err.Error(), "without MySQL") {
+		t.Fatalf("missing counter error = %v", err)
 	}
 }

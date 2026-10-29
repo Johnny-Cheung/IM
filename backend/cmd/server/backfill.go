@@ -45,12 +45,67 @@ func refuseIncompleteRebuild(
 	return nil
 }
 
+// maxServerMessageIDSource is the durable high-water query the projection
+// guard needs; *store.Store implements it.
+type maxServerMessageIDSource interface {
+	MaxServerMessageID(context.Context) (uint64, error)
+}
+
+// projectionMarkerKeys are the keys the message pipeline writes as soon as it
+// serves traffic: the global message counter and the feed index epoch. A
+// namespace that ever accepted persisted messages has both, so a namespace with
+// neither was wiped. The names mirror internal/messaging/keys.go.
+func projectionMarkerKeys(namespace messaging.Namespace) []string {
+	prefix := namespace.RedisPrefix()
+	return []string{prefix + "messages:next_id", prefix + "index:epoch"}
+}
+
+// refuseMissingProjection stops a seq backfill on a namespace whose Redis
+// projection was wiped. A backfill numbers MySQL rows and writes counters,
+// pair/inbox indexes and seq:ready only, so certifying a wiped namespace would
+// leave every history read on the MySQL fallback and the feed and conversation
+// previews empty until a full rebuild. MySQL holding numbered rows while both
+// projection markers are absent is the total-loss signature; an empty database
+// is a legitimate first backfill and a single surviving marker is partial loss,
+// which the audit repairs.
+func refuseMissingProjection(
+	ctx context.Context,
+	client redis.UniversalClient,
+	namespace messaging.Namespace,
+	source maxServerMessageIDSource,
+) error {
+	if source == nil {
+		return fmt.Errorf("cannot verify that the Redis projection exists without MySQL")
+	}
+	maxID, err := source.MaxServerMessageID(ctx)
+	if err != nil {
+		return fmt.Errorf("read max server message id: %w", err)
+	}
+	if maxID == 0 {
+		return nil
+	}
+	markers := projectionMarkerKeys(namespace)
+	missing, err := client.Exists(ctx, markers...).Result()
+	if err != nil {
+		return fmt.Errorf("check Redis projection markers: %w", err)
+	}
+	if missing == 0 {
+		return fmt.Errorf(
+			"the Redis message projection is missing (neither %s nor %s exists) while "+
+				"MySQL holds messages up to %d; run `imctl rebuild-redis` "+
+				"before -backfill-seq",
+			markers[0], markers[1], maxID,
+		)
+	}
+	return nil
+}
+
 // runSeqBackfill numbers direct and group history, rebuilds the seq read model
 // and writes seq:ready. It is invoked with -backfill-seq while the server is
 // stopped and can run against an empty database.
 func runSeqBackfill(options serverOptions) error {
 	// Nothing may be numbered or marked ready while a backend is serving it.
-	if err := ensureBackendStopped(options.maintenanceAddr(), "-backfill-seq"); err != nil {
+	if err := ensureBackendStopped(options.addr, options.addrSet, "-backfill-seq"); err != nil {
 		return err
 	}
 
@@ -98,6 +153,11 @@ func runSeqBackfill(options serverOptions) error {
 	// A failed rebuild leaves its pending marker behind. A backfill would
 	// certify that half-built namespace, so refuse until the rebuild is rerun.
 	if err := refuseIncompleteRebuild(ctx, redisClient, keyspace); err != nil {
+		return err
+	}
+	// The same holds for a namespace that was wiped entirely: backfilling it
+	// would write seq:ready over counters and indexes with no projection.
+	if err := refuseMissingProjection(ctx, redisClient, namespace, dataStore); err != nil {
 		return err
 	}
 	lockKey := messaging.BackfillLockKey(keyspace)

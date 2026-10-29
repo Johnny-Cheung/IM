@@ -91,6 +91,7 @@ type SeqWatcherStatus struct {
 	RunID            string    `json:"run_id,omitempty"`
 	Calibrating      bool      `json:"calibrating"`
 	WaitingSeqReady  bool      `json:"waiting_seq_ready"`
+	Maintenance      bool      `json:"maintenance"`
 	LastCalibratedAt time.Time `json:"last_calibrated_at,omitempty"`
 	Conversations    int       `json:"conversations"`
 	LastError        string    `json:"last_error,omitempty"`
@@ -114,6 +115,7 @@ type SeqWatcher struct {
 	lastRunID        string
 	calibrating      bool
 	waitingReady     bool
+	maintenance      bool
 	lastCalibratedAt time.Time
 	conversations    int
 	lastError        string
@@ -200,6 +202,7 @@ func (w *SeqWatcher) Status() SeqWatcherStatus {
 		RunID:            w.lastRunID,
 		Calibrating:      w.calibrating,
 		WaitingSeqReady:  w.waitingReady,
+		Maintenance:      w.maintenance,
 		LastCalibratedAt: w.lastCalibratedAt,
 		Conversations:    w.conversations,
 		LastError:        w.lastError,
@@ -217,16 +220,34 @@ func (w *SeqWatcher) check(ctx context.Context) {
 		w.recordError(err)
 		return
 	}
+	maintenance, err := w.maintenanceRunning(ctx)
+	if err != nil {
+		w.recordError(err)
+		return
+	}
 
 	w.mu.Lock()
 	first := !w.initialized
 	changed := first || runID != w.lastRunID
+	leftMaintenance := w.maintenance && !maintenance
 	w.initialized = true
 	w.lastRunID = runID
+	w.maintenance = maintenance
 	waiting := w.waitingReady
+	if maintenance {
+		w.waitingReady = false
+	}
 	w.mu.Unlock()
+
+	if maintenance {
+		// A rebuild or seq backfill owns the namespace: keep writing closed and
+		// never calibrate against a projection that is being rebuilt. The pair
+		// of locks is the same exclusion the backend applies at startup.
+		w.gate.Close()
+		return
+	}
 	switch {
-	case changed:
+	case changed, leftMaintenance:
 	case !ready && !waiting:
 	case ready && waiting:
 	default:
@@ -297,6 +318,19 @@ func (w *SeqWatcher) sequenceReady(ctx context.Context) (bool, error) {
 	exists, err := w.client.Exists(ctx, w.keyspace.sequenceReadyKey()).Result()
 	if err != nil {
 		return false, fmt.Errorf("read sequence readiness: %w", err)
+	}
+	return exists > 0, nil
+}
+
+// maintenanceRunning reports whether a rebuild or seq backfill holds its lock.
+// Either command rebuilds counters under a live namespace, so the gate must
+// stay closed for as long as it might be running.
+func (w *SeqWatcher) maintenanceRunning(ctx context.Context) (bool, error) {
+	exists, err := w.client.Exists(
+		ctx, RebuildLockKey(w.keyspace), w.keyspace.backfillLockKey(),
+	).Result()
+	if err != nil {
+		return false, fmt.Errorf("read maintenance locks: %w", err)
 	}
 	return exists > 0, nil
 }

@@ -302,18 +302,22 @@ backend_env_args() {
   fi
 }
 
+# The RabbitMQ vhost and queue prefix follow the selected namespace, so every
+# queue probe in --verify mode reads the isolated vhost and never production.
+messaging_scope() {
+  if [ "${VERIFY_MODE}" = "1" ]; then
+    printf 'im_v13_verify im.v13-verify\n'
+  else
+    printf 'im_v11 im.v12\n'
+  fi
+}
+
 # Read-only: reports whether both persist queues are drained. Queue names are
 # derived from the same namespace the backend uses, so --verify checks the
 # isolated vhost and never the production queues.
 queue_status() {
   local vhost prefix name counts ready unack total=0 output
-  if [ "${VERIFY_MODE}" = "1" ]; then
-    vhost=im_v13_verify
-    prefix=im.v13-verify
-  else
-    vhost=im_v11
-    prefix=im.v12
-  fi
+  read -r vhost prefix <<<"$(messaging_scope)"
   if ! output="$(DI exec "${INFRA_RABBITMQ_NAME}" rabbitmqctl list_queues \
     --quiet -p "${vhost}" name messages_ready messages_unacknowledged 2>/dev/null)"; then
     echo "queue status unavailable; check infractl health" >&2
@@ -385,6 +389,37 @@ backfill_seq() {
     -backfill-batch "${BACKFILL_BATCH:-1000}"
 }
 
+# A rebuild's own drain only reclaims deliveries it is holding: a message
+# unacknowledged on a foreign (or blackholed) connection is invisible to it, so
+# clearing Redis would lose that delivery. Refuse when either persist queue has
+# unacknowledged messages and fail closed when RabbitMQ cannot be queried.
+# messages_ready is reported but never blocks: the command drains those itself.
+rebuild_queue_preflight() {
+  local vhost prefix name counts ready unack blocked=0 output
+  read -r vhost prefix <<<"$(messaging_scope)"
+  if ! output="$(DI exec "${INFRA_RABBITMQ_NAME}" rabbitmqctl list_queues \
+    --quiet -p "${vhost}" name messages_ready messages_unacknowledged 2>/dev/null)"; then
+    echo "redis rebuild cannot inspect RabbitMQ queues; check infractl health" >&2
+    return 1
+  fi
+  for name in "${prefix}.messages.persist" "${prefix}.group.messages.persist"; do
+    counts="$(awk -v queue="${name}" '$1 == queue { print $2" "$3; exit }' <<<"${output}")"
+    if [ -z "${counts}" ]; then
+      printf '%s: not declared (ready=0 unacknowledged=0)\n' "${name}"
+      continue
+    fi
+    read -r ready unack <<<"${counts}"
+    printf '%s: ready=%s unacknowledged=%s\n' "${name}" "${ready}" "${unack}"
+    if [ "${unack}" -ne 0 ]; then
+      blocked=$((blocked + unack))
+    fi
+  done
+  if [ "${blocked}" -ne 0 ]; then
+    echo "redis rebuild refuses to run: the persist queues hold ${blocked} unacknowledged message(s); another process is likely consuming the same queues, so stop it or let it settle before rebuilding" >&2
+    return 1
+  fi
+}
+
 # A rebuild drains the persist queues and regenerates the whole Redis
 # namespace from MySQL, so it needs every backend dependency and a stopped
 # backend. Optional batch/queue/total timeout overrides come from the
@@ -411,6 +446,7 @@ rebuild_redis() {
     return 1
   fi
   require_backend_stopped "redis rebuild" || return 1
+  rebuild_queue_preflight || return 1
   local -a env_args=()
   local line
   while IFS= read -r line; do

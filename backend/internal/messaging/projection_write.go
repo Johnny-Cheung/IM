@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -515,4 +516,35 @@ func countRaised(commands []*redis.Cmd) int {
 		}
 	}
 	return raised
+}
+
+// RaiseGlobalMessageID raises messages:next_id to at least messageID and reports
+// whether it moved. It never lowers the counter; the pre-read only keeps the
+// returned bool accurate because the Lua script moves only forward.
+func (w *ProjectionWriter) RaiseGlobalMessageID(
+	ctx context.Context,
+	messageID uint64,
+) (bool, error) {
+	if w == nil || w.client == nil {
+		return false, ErrMessageServiceUnavailable
+	}
+	if messageID == 0 {
+		return false, nil
+	}
+	current, err := w.client.Get(ctx, w.keyspace.counterKey()).Uint64()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return false, fmt.Errorf("read global message counter: %w", err)
+	}
+	if current >= messageID {
+		return false, nil
+	}
+	if err := w.client.Eval(
+		ctx,
+		raiseSequenceScriptSource,
+		[]string{w.keyspace.counterKey()},
+		strconv.FormatUint(messageID, 10),
+	).Err(); err != nil {
+		return false, fmt.Errorf("raise global message counter: %w", err)
+	}
+	return true, nil
 }

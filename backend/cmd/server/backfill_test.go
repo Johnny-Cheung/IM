@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -61,5 +62,75 @@ func TestRefuseIncompleteRebuild(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "rebuild-redis") ||
 		!strings.Contains(err.Error(), messaging.RebuildPendingKey(keyspace)) {
 		t.Fatalf("pending marker error = %v", err)
+	}
+}
+
+type fakeMaxMessageIDSource struct {
+	maxID uint64
+	err   error
+}
+
+func (f fakeMaxMessageIDSource) MaxServerMessageID(context.Context) (uint64, error) {
+	return f.maxID, f.err
+}
+
+// TestRefuseMissingProjection covers the defence-in-depth guard: a direct
+// -backfill-seq on a wiped namespace must not certify counters and indexes as a
+// complete read model.
+func TestRefuseMissingProjection(t *testing.T) {
+	server, client, _ := newTestRedis(t)
+	namespace, err := messaging.NewNamespace("im:v12")
+	if err != nil {
+		t.Fatalf("namespace: %v", err)
+	}
+	ctx := context.Background()
+	prefix := namespace.RedisPrefix()
+	counterKey := prefix + "messages:next_id"
+	epochKey := prefix + "index:epoch"
+
+	// An empty database is a legitimate first backfill.
+	if err := refuseMissingProjection(ctx, client, namespace, fakeMaxMessageIDSource{}); err != nil {
+		t.Fatalf("empty MySQL must allow backfill: %v", err)
+	}
+
+	// Numbered history with both projection markers present: only seq:ready was
+	// lost, the backfill can rebuild the counters.
+	if err := server.Set(counterKey, "42"); err != nil {
+		t.Fatalf("set counter: %v", err)
+	}
+	if err := server.Set(epochKey, "0"); err != nil {
+		t.Fatalf("set epoch: %v", err)
+	}
+	if err := refuseMissingProjection(ctx, client, namespace, fakeMaxMessageIDSource{maxID: 42}); err != nil {
+		t.Fatalf("intact projection must allow backfill: %v", err)
+	}
+
+	// Both markers gone while MySQL holds history: the total-loss signature.
+	server.Del(counterKey)
+	server.Del(epochKey)
+	err = refuseMissingProjection(ctx, client, namespace, fakeMaxMessageIDSource{maxID: 42})
+	if err == nil || !strings.Contains(err.Error(), "rebuild-redis") ||
+		!strings.Contains(err.Error(), "projection") {
+		t.Fatalf("wiped projection error = %v, want the rebuild hint", err)
+	}
+
+	// One surviving marker is partial loss, which the audit repairs; it is not
+	// the total-loss signature.
+	if err := server.Set(counterKey, "42"); err != nil {
+		t.Fatalf("restore counter: %v", err)
+	}
+	if err := refuseMissingProjection(ctx, client, namespace, fakeMaxMessageIDSource{maxID: 42}); err != nil {
+		t.Fatalf("partial loss must allow backfill: %v", err)
+	}
+
+	// A MySQL read failure is reported instead of guessed away.
+	if err := refuseMissingProjection(ctx, client, namespace, fakeMaxMessageIDSource{
+		err: errors.New("mysql down"),
+	}); err == nil || !strings.Contains(err.Error(), "max server message id") {
+		t.Fatalf("MySQL error = %v", err)
+	}
+	if err := refuseMissingProjection(ctx, client, namespace, nil); err == nil ||
+		!strings.Contains(err.Error(), "without MySQL") {
+		t.Fatalf("missing source error = %v", err)
 	}
 }

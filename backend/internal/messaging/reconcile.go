@@ -49,6 +49,9 @@ type ReconcileStore interface {
 	// ListConversationBasics enumerates the peers a user has messages with,
 	// which is how the feed audit finds the rows to restore.
 	ListConversationBasics(ctx context.Context, userID uint64) ([]store.Conversation, error)
+	// MaxServerMessageID is the durable high-water mark of the global message
+	// ID counter, used to detect and raise a lost messages:next_id.
+	MaxServerMessageID(ctx context.Context) (uint64, error)
 }
 
 // ProjectionRepairer restores Redis read-model entries from durable rows. The
@@ -64,6 +67,9 @@ type ProjectionRepairer interface {
 	RaiseGroupReadWatermarks(context.Context, []store.GroupMemberReadState) (int, error)
 	RaiseDirectCounter(ctx context.Context, lowID, highID, seq uint64) error
 	RaiseGroupCounter(ctx context.Context, groupID, seq uint64) error
+	// RaiseGlobalMessageID raises messages:next_id without ever lowering it and
+	// reports whether the counter moved.
+	RaiseGlobalMessageID(ctx context.Context, messageID uint64) (bool, error)
 }
 
 // ProjectionIndexRepairer is the optional index-only extension of
@@ -144,7 +150,8 @@ type ReconcileResult struct {
 	WatermarksRaised uint64
 	// FeedRepairs counts dm:feed entries restored by the deep audit.
 	FeedRepairs uint64
-	// NeedsRebuild counts conversations and users flagged this run.
+	// NeedsRebuild counts conversations, users and unreadable watermark keys
+	// flagged this run.
 	NeedsRebuild uint64
 }
 
@@ -206,6 +213,12 @@ const (
 	// deferred row before it is reported as needing a rebuild and skipped, so a
 	// permanently failing item cannot pin the deep-audit cursor forever.
 	reconcileDeepRetryLimit = 3
+	// reconcileWatermarkRetryLimit bounds how many runs retry the same failing
+	// read-watermark chunk before it is reported and the cursor moves past it.
+	reconcileWatermarkRetryLimit = 3
+	// reconcileGlobalCounterScanKeys bounds the entity SCAN used to recover a
+	// lost global message ID counter above surviving Redis-only entities.
+	reconcileGlobalCounterScanKeys = 5000
 )
 
 // Reconciler compares Redis conversation counters with MySQL and repairs
@@ -256,7 +269,9 @@ type Reconciler struct {
 	// deepRetries counts consecutive deferrals of one deep-audit row.
 	deepRetries     map[reconcileSeqCursorKey]int
 	userDeepRetries map[uint64]int
-	lastDeepAudit   time.Time
+	// watermarkRetries counts consecutive failures of one read-watermark chunk.
+	watermarkRetries map[reconcileSeqCursorKey]int
+	lastDeepAudit    time.Time
 }
 
 // NewReconciler builds a reconciler. Only the client and store are required.
@@ -334,6 +349,7 @@ func NewReconciler(
 		deepSeqs:              make(map[reconcileSeqCursorKey]uint64),
 		deepRetries:           make(map[reconcileSeqCursorKey]int),
 		userDeepRetries:       make(map[uint64]int),
+		watermarkRetries:      make(map[reconcileSeqCursorKey]int),
 		lastDeepAudit:         options.Now().UTC(),
 	}
 }
@@ -481,6 +497,9 @@ func (r *Reconciler) reconcile(
 	}
 
 	seenPairs := make(map[[2]uint64]struct{})
+	if err := r.reconcileGlobalCounter(ctx, runAt, &result); err != nil {
+		return result, err
+	}
 	if err := r.reconcileDirect(ctx, runAt, &result, seenPairs, budget); err != nil {
 		return result, err
 	}
@@ -510,11 +529,124 @@ func (r *Reconciler) reconcile(
 	return result, nil
 }
 
+// reconcileGlobalCounter makes sure messages:next_id cannot reissue an ID that
+// already exists. A lost or stale key makes the next accept INCR from a value
+// below the durable and Redis high-water marks and then overwrite the existing
+// entity hash. The raise is monotonic: the counter is never lowered.
+func (r *Reconciler) reconcileGlobalCounter(
+	ctx context.Context,
+	runAt time.Time,
+	result *ReconcileResult,
+) error {
+	durable, err := r.store.MaxServerMessageID(ctx)
+	if err != nil {
+		return fmt.Errorf("read durable max message ID: %w", err)
+	}
+	raw, err := r.client.Get(ctx, r.keyspace.counterKey()).Result()
+	missing := errors.Is(err, redis.Nil)
+	if err != nil && !missing {
+		return fmt.Errorf("read global message counter: %w", err)
+	}
+	current := uint64(0)
+	if !missing {
+		current, err = strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+		if err != nil {
+			return fmt.Errorf("read global message counter: invalid value")
+		}
+	}
+	target := durable
+	if missing || current == 0 {
+		// A surviving entity above the durable mark proves an accepted ID that
+		// never reached MySQL; the counter must clear it too.
+		high, capped, err := r.messageIDHighWater(ctx)
+		if err != nil {
+			return err
+		}
+		if high > target {
+			target = high
+		}
+		if capped {
+			result.NeedsRebuild++
+			r.logThrottled(runAt, "needs-rebuild", "global:counter:scan",
+				"message entity scan hit its cap; the recovered ID may be below a surviving entity")
+		}
+	}
+	if current >= target {
+		return nil
+	}
+	result.RedisMissing++
+	if r.repair == nil {
+		return nil
+	}
+	raised, err := r.repair.RaiseGlobalMessageID(ctx, target)
+	if err != nil {
+		r.logThrottled(runAt, "repair-error", "global:counter",
+			"raise global message counter: "+err.Error())
+		return nil
+	}
+	if raised {
+		result.RedisRepaired++
+		result.CountersRaised++
+	}
+	return nil
+}
+
+// messageIDHighWater returns the highest numeric suffix among the message entity
+// keys. It is a bounded best-effort scan used only when the counter key is
+// absent; capped reports that the scan stopped at its key budget.
+func (r *Reconciler) messageIDHighWater(ctx context.Context) (uint64, bool, error) {
+	prefix := r.keyspace.prefixOrDefault()
+	patterns := [][2]string{
+		{prefix + "messages:*", prefix + "messages:"},
+		{prefix + "group-messages:*", prefix + "group-messages:"},
+	}
+	highest := uint64(0)
+	inspected := 0
+	for _, pattern := range patterns {
+		cursor := uint64(0)
+		for {
+			batch, next, err := r.client.Scan(
+				ctx, cursor, pattern[0], reconcileScanCountHint,
+			).Result()
+			if err != nil {
+				return 0, false, fmt.Errorf("scan message entities: %w", err)
+			}
+			for _, key := range batch {
+				inspected++
+				if id, ok := reconcileEntityKeyID(key, pattern[1]); ok && id > highest {
+					highest = id
+				}
+			}
+			if inspected >= reconcileGlobalCounterScanKeys {
+				return highest, true, nil
+			}
+			cursor = next
+			if cursor == 0 {
+				break
+			}
+		}
+	}
+	return highest, false, nil
+}
+
+func reconcileEntityKeyID(key, prefix string) (uint64, bool) {
+	raw, ok := strings.CutPrefix(key, prefix)
+	if !ok || strings.Contains(raw, ":") {
+		return 0, false
+	}
+	id, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || id == 0 {
+		return 0, false
+	}
+	return id, true
+}
+
 type reconcileDirectSuspect struct {
 	lowID, highID, counter uint64
-	// count and maxSeq are the MySQL stats the counter was compared against.
-	// They let the repair skip the already-proven prefix.
-	count, maxSeq uint64
+	// count, maxSeq and prefixIndex are the MySQL stats and the Redis index
+	// members scored inside 1..maxSeq. They let the repair skip the proven
+	// prefix only when Redis provably holds every MySQL row.
+	count, maxSeq, prefixIndex uint64
 }
 
 // reconcileDirect pages the direct conversation stats and repairs at most
@@ -547,7 +679,7 @@ func (r *Reconciler) reconcileDirect(
 	for offset := 0; offset < len(suspects) && attempted < r.maxDetail; offset++ {
 		suspect := suspects[(start+offset)%len(suspects)]
 		attempted++
-		lowerBound := reconcileSeqLowerBound(suspect.count, suspect.maxSeq, suspect.counter)
+		lowerBound := reconcileSeqLowerBound(suspect.count, suspect.maxSeq, suspect.counter, suspect.prefixIndex)
 		if err := r.repairDirectConversation(ctx, runAt, suspect.lowID, suspect.highID, suspect.counter, lowerBound, result); err != nil {
 			return err
 		}
@@ -591,20 +723,20 @@ func (r *Reconciler) scanDirectSuspects(
 			// The reverse-direction check runs even when the counter is absent:
 			// a missing dm:seq must be raised from MySQL MaxSeq (and a missing
 			// index repaired) instead of being skipped as a rebuild concern.
-			if err := r.checkDirectRedisGap(ctx, runAt, row, state, budget, result); err != nil {
+			counter, err := r.checkDirectRedisGap(ctx, runAt, row, state, budget, result)
+			if err != nil {
 				return nil, err
 			}
-			if state.counter == 0 {
-				// Just raised from MySQL; there is no Redis-only tail to walk.
-				continue
-			}
-			if state.counter <= row.MaxSeq && row.Count == row.MaxSeq {
+			// Suspicion is decided by Redis versus MySQL only. A MySQL seq hole
+			// that Redis mirrors exactly is not a Redis defect and must not keep
+			// the conversation in the forward walk forever.
+			if counter <= row.MaxSeq && state.index <= row.Count {
 				continue
 			}
 			result.Mismatched++
 			suspects = append(suspects, reconcileDirectSuspect{
-				lowID: row.LowID, highID: row.HighID, counter: state.counter,
-				count: row.Count, maxSeq: row.MaxSeq,
+				lowID: row.LowID, highID: row.HighID, counter: counter,
+				count: row.Count, maxSeq: row.MaxSeq, prefixIndex: state.prefixIndex,
 			})
 		}
 		last := rows[len(rows)-1]
@@ -651,7 +783,7 @@ func (r *Reconciler) reconcileGroups(
 	for offset := 0; offset < len(suspects) && attempted < r.maxDetail; offset++ {
 		suspect := suspects[(start+offset)%len(suspects)]
 		attempted++
-		lowerBound := reconcileSeqLowerBound(suspect.count, suspect.maxSeq, suspect.counter)
+		lowerBound := reconcileSeqLowerBound(suspect.count, suspect.maxSeq, suspect.counter, suspect.prefixIndex)
 		if err := r.repairGroupConversation(ctx, runAt, suspect.groupID, suspect.counter, lowerBound, result); err != nil {
 			return err
 		}
@@ -664,6 +796,7 @@ func (r *Reconciler) reconcileGroups(
 type reconcileGroupSuspect struct {
 	groupID, counter uint64
 	count, maxSeq    uint64
+	prefixIndex      uint64
 }
 
 func (r *Reconciler) scanGroupSuspects(
@@ -697,20 +830,17 @@ func (r *Reconciler) scanGroupSuspects(
 			seen[row.GroupID] = struct{}{}
 			state := states[row.GroupID]
 			result.Scanned++
-			if err := r.checkGroupRedisGap(ctx, runAt, row, state, budget, result); err != nil {
+			counter, err := r.checkGroupRedisGap(ctx, runAt, row, state, budget, result)
+			if err != nil {
 				return nil, err
 			}
-			if state.counter == 0 {
-				// Just raised from MySQL; there is no Redis-only tail to walk.
-				continue
-			}
-			if state.counter <= row.MaxSeq && row.Count == row.MaxSeq {
+			if counter <= row.MaxSeq && state.index <= row.Count {
 				continue
 			}
 			result.Mismatched++
 			suspects = append(suspects, reconcileGroupSuspect{
-				groupID: row.GroupID, counter: state.counter,
-				count: row.Count, maxSeq: row.MaxSeq,
+				groupID: row.GroupID, counter: counter,
+				count: row.Count, maxSeq: row.MaxSeq, prefixIndex: state.prefixIndex,
 			})
 		}
 		afterGroupID = rows[len(rows)-1].GroupID
@@ -721,10 +851,16 @@ func (r *Reconciler) scanGroupSuspects(
 }
 
 // reconcileRedisState is one conversation's Redis counter and index size, read
-// in the same pipeline as the MySQL stats row.
+// in the same pipeline as the MySQL stats row. prefixIndex counts the index
+// members scored inside 1..MySQL MAX(seq): only that count can prove the prefix
+// when the index also holds a Redis-only tail. topSeq is the highest surviving
+// index score and is filled only for a counter that lagged MySQL, because that
+// is when the high-water mark is needed to avoid reissuing a live seq.
 type reconcileRedisState struct {
-	counter uint64
-	index   uint64
+	counter     uint64
+	index       uint64
+	prefixIndex uint64
+	topSeq      uint64
 }
 
 func (r *Reconciler) readDirectStates(
@@ -734,9 +870,14 @@ func (r *Reconciler) readDirectStates(
 	pipe := r.client.Pipeline()
 	counters := make([]*redis.StringCmd, len(rows))
 	indexes := make([]*redis.IntCmd, len(rows))
+	prefixes := make([]*redis.IntCmd, len(rows))
 	for index, row := range rows {
 		counters[index] = pipe.Get(ctx, r.keyspace.directSequenceKey(row.LowID, row.HighID))
 		indexes[index] = pipe.ZCard(ctx, r.keyspace.directPairKey(row.LowID, row.HighID))
+		prefixes[index] = pipe.ZCount(
+			ctx, r.keyspace.directPairKey(row.LowID, row.HighID), "0",
+			strconv.FormatUint(row.MaxSeq, 10),
+		)
 	}
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return nil, fmt.Errorf("read conversation seq counters: %w", err)
@@ -751,12 +892,67 @@ func (r *Reconciler) readDirectStates(
 		if err != nil {
 			return nil, fmt.Errorf("read conversation index size: %w", err)
 		}
+		prefix, err := prefixes[index].Result()
+		if err != nil {
+			return nil, fmt.Errorf("read conversation index prefix size: %w", err)
+		}
 		states[[2]uint64{row.LowID, row.HighID}] = reconcileRedisState{
-			counter: counter,
-			index:   uint64(size),
+			counter:     counter,
+			index:       uint64(size),
+			prefixIndex: uint64(prefix),
 		}
 	}
+	if err := r.fillDirectTopSeqs(ctx, rows, states); err != nil {
+		return nil, err
+	}
 	return states, nil
+}
+
+// fillDirectTopSeqs reads the highest surviving dm:pair score for every
+// conversation whose counter is behind MySQL. A tail accepted but not yet
+// persisted is only visible there; raising the counter to MaxSeq alone would
+// reissue those seqs.
+func (r *Reconciler) fillDirectTopSeqs(
+	ctx context.Context,
+	rows []store.ConversationSeqStat,
+	states map[[2]uint64]reconcileRedisState,
+) error {
+	var behind []int
+	for index, row := range rows {
+		state := states[[2]uint64{row.LowID, row.HighID}]
+		if state.counter < row.MaxSeq && state.index > 0 {
+			behind = append(behind, index)
+		}
+	}
+	if len(behind) == 0 {
+		return nil
+	}
+	pipe := r.client.Pipeline()
+	commands := make([]*redis.ZSliceCmd, len(behind))
+	for offset, index := range behind {
+		row := rows[index]
+		commands[offset] = pipe.ZRangeWithScores(
+			ctx, r.keyspace.directPairKey(row.LowID, row.HighID), -1, -1,
+		)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("read conversation index high-water marks: %w", err)
+	}
+	for offset, index := range behind {
+		members, err := commands[offset].Result()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return fmt.Errorf("read conversation index high-water mark: %w", err)
+		}
+		if len(members) == 0 || members[0].Score <= 0 {
+			continue
+		}
+		row := rows[index]
+		key := [2]uint64{row.LowID, row.HighID}
+		state := states[key]
+		state.topSeq = uint64(members[0].Score)
+		states[key] = state
+	}
+	return nil
 }
 
 func (r *Reconciler) readGroupStates(
@@ -766,9 +962,14 @@ func (r *Reconciler) readGroupStates(
 	pipe := r.client.Pipeline()
 	counters := make([]*redis.StringCmd, len(rows))
 	indexes := make([]*redis.IntCmd, len(rows))
+	prefixes := make([]*redis.IntCmd, len(rows))
 	for index, row := range rows {
 		counters[index] = pipe.Get(ctx, r.keyspace.groupSequenceKey(row.GroupID))
 		indexes[index] = pipe.ZCard(ctx, r.keyspace.groupInboxKey(row.GroupID))
+		prefixes[index] = pipe.ZCount(
+			ctx, r.keyspace.groupInboxKey(row.GroupID), "0",
+			strconv.FormatUint(row.MaxSeq, 10),
+		)
 	}
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return nil, fmt.Errorf("read group seq counters: %w", err)
@@ -783,9 +984,61 @@ func (r *Reconciler) readGroupStates(
 		if err != nil {
 			return nil, fmt.Errorf("read group index size: %w", err)
 		}
-		states[row.GroupID] = reconcileRedisState{counter: counter, index: uint64(size)}
+		prefix, err := prefixes[index].Result()
+		if err != nil {
+			return nil, fmt.Errorf("read group index prefix size: %w", err)
+		}
+		states[row.GroupID] = reconcileRedisState{
+			counter:     counter,
+			index:       uint64(size),
+			prefixIndex: uint64(prefix),
+		}
+	}
+	if err := r.fillGroupTopSeqs(ctx, rows, states); err != nil {
+		return nil, err
 	}
 	return states, nil
+}
+
+// fillGroupTopSeqs mirrors fillDirectTopSeqs for group inboxes.
+func (r *Reconciler) fillGroupTopSeqs(
+	ctx context.Context,
+	rows []store.GroupSeqStat,
+	states map[uint64]reconcileRedisState,
+) error {
+	var behind []int
+	for index, row := range rows {
+		state := states[row.GroupID]
+		if state.counter < row.MaxSeq && state.index > 0 {
+			behind = append(behind, index)
+		}
+	}
+	if len(behind) == 0 {
+		return nil
+	}
+	pipe := r.client.Pipeline()
+	commands := make([]*redis.ZSliceCmd, len(behind))
+	for offset, index := range behind {
+		commands[offset] = pipe.ZRangeWithScores(
+			ctx, r.keyspace.groupInboxKey(rows[index].GroupID), -1, -1,
+		)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("read group inbox high-water marks: %w", err)
+	}
+	for offset, index := range behind {
+		members, err := commands[offset].Result()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return fmt.Errorf("read group inbox high-water mark: %w", err)
+		}
+		if len(members) == 0 || members[0].Score <= 0 {
+			continue
+		}
+		state := states[rows[index].GroupID]
+		state.topSeq = uint64(members[0].Score)
+		states[rows[index].GroupID] = state
+	}
+	return nil
 }
 
 func reconcileCounterValue(command *redis.StringCmd) (uint64, error) {
@@ -800,19 +1053,17 @@ func reconcileCounterValue(command *redis.StringCmd) (uint64, error) {
 }
 
 // reconcileSeqLowerBound returns the first seq that can be missing in MySQL.
-// Seqs start at 1 and are unique per conversation, so COUNT(*) == MAX(seq)
-// proves every seq in 1..MaxSeq is persisted and only the Redis tail above
-// MaxSeq can be missing. Any other count means the prefix is not proven: at
-// least one seq below MaxSeq is absent, or the counters disagree, so the walk
-// must start at the beginning. The stats row and the Redis counter are read at
-// different instants, but that drift is safe: the repair never deletes rows
-// and new accepts only extend the tail, so the prefix proven by the snapshot
-// stays proven. An external deletion after the snapshot shifts COUNT(*) away
-// from MAX(seq) and the next run scans the prefix again. Tail seqs accepted
-// after the snapshot are above MaxSeq and are exactly what the walk from
-// MaxSeq+1 covers.
-func reconcileSeqLowerBound(count, maxSeq, counter uint64) uint64 {
-	if counter > maxSeq && count == maxSeq {
+// Seqs start at 1 and are unique per conversation. Only a Redis index that holds
+// exactly as many members inside 1..MAX(seq) as MySQL has rows, with a counter
+// at or above MAX(seq), proves every seq in that prefix is both persisted and
+// indexed; only then may the walk skip it. COUNT(*) != MAX(seq) on its own (a
+// MySQL hole) proves nothing about Redis and must not force a full rescan. The
+// stats row and the Redis state are read at different instants, but that drift
+// is safe: the repair never deletes rows and new accepts only extend the tail,
+// so the prefix proven by the snapshot stays proven; anything accepted after the
+// snapshot is above MaxSeq and covered by the walk.
+func reconcileSeqLowerBound(count, maxSeq, counter, prefixIndex uint64) uint64 {
+	if prefixIndex == count && counter >= maxSeq {
 		return maxSeq + 1
 	}
 	return 1
@@ -1584,7 +1835,10 @@ func (r *Reconciler) conversationNeedsRebuild(gap, count uint64) bool {
 
 // checkDirectRedisGap compares one conversation against MySQL in the reverse
 // direction. It raises a lagging counter and repairs a small index gap; a gap
-// above the caps is reported as needing a rebuild instead.
+// above the caps is reported as needing a rebuild instead. It returns the
+// counter the forward walk must use: a counter recovered from a lost key is
+// raised to max(MySQL MAX(seq), the highest surviving index score), because the
+// accepted-but-unpersisted tail only exists in the index.
 func (r *Reconciler) checkDirectRedisGap(
 	ctx context.Context,
 	runAt time.Time,
@@ -1592,12 +1846,19 @@ func (r *Reconciler) checkDirectRedisGap(
 	state reconcileRedisState,
 	budget *reconcileRepairBudget,
 	result *ReconcileResult,
-) error {
+) (uint64, error) {
+	counter := state.counter
 	if state.counter < row.MaxSeq {
-		// A lagging counter would reissue seqs that MySQL already holds.
+		// A lagging counter would reissue seqs that MySQL or the surviving
+		// index already holds.
+		target := row.MaxSeq
+		if state.topSeq > target {
+			target = state.topSeq
+		}
+		counter = target
 		result.RedisMissing++
 		if r.repair != nil {
-			if err := r.repair.RaiseDirectCounter(ctx, row.LowID, row.HighID, row.MaxSeq); err != nil {
+			if err := r.repair.RaiseDirectCounter(ctx, row.LowID, row.HighID, target); err != nil {
 				r.logThrottled(runAt, "repair-error",
 					fmt.Sprintf("direct:%d:%d:counter", row.LowID, row.HighID),
 					"raise counter: "+err.Error())
@@ -1608,7 +1869,7 @@ func (r *Reconciler) checkDirectRedisGap(
 		}
 	}
 	if state.index >= row.Count {
-		return nil
+		return counter, nil
 	}
 	gap := row.Count - state.index
 	result.RedisMissing += gap
@@ -1617,11 +1878,13 @@ func (r *Reconciler) checkDirectRedisGap(
 		r.logThrottled(runAt, "needs-rebuild",
 			fmt.Sprintf("direct:%d:%d:index", row.LowID, row.HighID),
 			fmt.Sprintf("redis index gap %d of %d exceeds repair budget", gap, row.Count))
-		return nil
+		return counter, nil
 	}
-	return r.repairDirectIndexGap(ctx, runAt, row, budget, result)
+	return counter, r.repairDirectIndexGap(ctx, runAt, row, budget, result)
 }
 
+// checkGroupRedisGap mirrors checkDirectRedisGap and returns the counter the
+// forward walk must use.
 func (r *Reconciler) checkGroupRedisGap(
 	ctx context.Context,
 	runAt time.Time,
@@ -1629,11 +1892,17 @@ func (r *Reconciler) checkGroupRedisGap(
 	state reconcileRedisState,
 	budget *reconcileRepairBudget,
 	result *ReconcileResult,
-) error {
+) (uint64, error) {
+	counter := state.counter
 	if state.counter < row.MaxSeq {
+		target := row.MaxSeq
+		if state.topSeq > target {
+			target = state.topSeq
+		}
+		counter = target
 		result.RedisMissing++
 		if r.repair != nil {
-			if err := r.repair.RaiseGroupCounter(ctx, row.GroupID, row.MaxSeq); err != nil {
+			if err := r.repair.RaiseGroupCounter(ctx, row.GroupID, target); err != nil {
 				r.logThrottled(runAt, "repair-error",
 					fmt.Sprintf("group:%d:counter", row.GroupID),
 					"raise counter: "+err.Error())
@@ -1644,7 +1913,7 @@ func (r *Reconciler) checkGroupRedisGap(
 		}
 	}
 	if state.index >= row.Count {
-		return nil
+		return counter, nil
 	}
 	gap := row.Count - state.index
 	result.RedisMissing += gap
@@ -1653,9 +1922,9 @@ func (r *Reconciler) checkGroupRedisGap(
 		r.logThrottled(runAt, "needs-rebuild",
 			fmt.Sprintf("group:%d:index", row.GroupID),
 			fmt.Sprintf("redis inbox gap %d of %d exceeds repair budget", gap, row.Count))
-		return nil
+		return counter, nil
 	}
-	return r.repairGroupIndexGap(ctx, runAt, row, budget, result)
+	return counter, r.repairGroupIndexGap(ctx, runAt, row, budget, result)
 }
 
 // repairDirectIndexGap finds messages absent from dm:pair (or carrying a stale
@@ -1851,6 +2120,29 @@ func (r *Reconciler) writeDirectRepairs(
 	if len(messages) == 0 || r.repair == nil {
 		return nil
 	}
+	if _, _, err := r.repairDirectEntities(ctx, runAt, key, messages, budget, result); err != nil {
+		r.logThrottled(runAt, "repair-error", key+":index", err.Error())
+		r.setReverseSeqCursor(cursorKey, 0, false)
+	}
+	return nil
+}
+
+// repairDirectEntities applies the shared absent/match/diverged policy to a
+// batch of messages. The reverse index-gap repair, the feed repair and the
+// conversation-preview repair all use it, so none of them can overwrite an
+// entity that already exists and differs from MySQL. It returns the number of
+// messages written and whether any entity diverged.
+func (r *Reconciler) repairDirectEntities(
+	ctx context.Context,
+	runAt time.Time,
+	key string,
+	messages []store.Message,
+	budget *reconcileRepairBudget,
+	result *ReconcileResult,
+) (int, bool, error) {
+	if len(messages) == 0 || r.repair == nil {
+		return 0, false, nil
+	}
 	// The reverse path must not overwrite an entity that already exists: only
 	// an absent entity is fully projected from MySQL. A present entity is
 	// compared with its MySQL row; a match gets an index-only repair (or a
@@ -1858,7 +2150,7 @@ func (r *Reconciler) writeDirectRepairs(
 	// divergence is reported instead of being overwritten.
 	fields, err := r.directAuditEntityFields(ctx, messages)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	absent := make([]store.Message, 0, len(messages))
 	matching := make([]store.Message, 0, len(messages))
@@ -1882,24 +2174,20 @@ func (r *Reconciler) writeDirectRepairs(
 	if len(absent) > 0 {
 		count, err := r.repair.WriteDirectBatch(ctx, absent)
 		if err != nil {
-			r.logThrottled(runAt, "repair-error", key+":index", "write missing messages: "+err.Error())
-			r.setReverseSeqCursor(cursorKey, 0, false)
-			return nil
+			return 0, diverged, fmt.Errorf("write missing messages: %w", err)
 		}
 		written += count
 	}
 	if len(matching) > 0 {
 		count, err := r.repairDirectIndexOnly(ctx, matching)
 		if err != nil {
-			r.logThrottled(runAt, "repair-error", key+":index", "write missing index entries: "+err.Error())
-			r.setReverseSeqCursor(cursorKey, 0, false)
-			return nil
+			return 0, diverged, fmt.Errorf("write missing index entries: %w", err)
 		}
 		written += count
 	}
 	result.RedisRepaired += uint64(written)
 	budget.spend(written)
-	return nil
+	return written, diverged, nil
 }
 
 // repairDirectIndexOnly restores the pair and feed entries of entities that are
@@ -2087,7 +2375,7 @@ func (r *Reconciler) reconcileDirectReadWatermarks(
 			afterUser, afterPeer = 0, 0
 			break
 		}
-		stale, err := r.staleDirectWatermarks(ctx, rows)
+		stale, err := r.staleDirectWatermarks(ctx, runAt, rows, result)
 		if err != nil {
 			return err
 		}
@@ -2119,7 +2407,9 @@ func (r *Reconciler) reconcileDirectReadWatermarks(
 
 func (r *Reconciler) staleDirectWatermarks(
 	ctx context.Context,
+	runAt time.Time,
 	rows []store.ConversationReadState,
+	result *ReconcileResult,
 ) ([]store.ConversationReadState, error) {
 	pipe := r.client.Pipeline()
 	commands := make([]*redis.StringCmd, len(rows))
@@ -2130,14 +2420,26 @@ func (r *Reconciler) staleDirectWatermarks(
 			strconv.FormatUint(row.PeerID, 10),
 		)
 	}
-	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+	// A per-key reply error (WRONGTYPE) is handled row by row below; only a
+	// transport or context failure aborts the rotation.
+	if _, err := pipe.Exec(ctx); err != nil &&
+		!errors.Is(err, redis.Nil) && !reconcileWatermarkKeyError(err) {
 		return nil, fmt.Errorf("read direct read watermarks: %w", err)
 	}
 	var stale []store.ConversationReadState
+	badKeys := make(map[string]struct{})
 	for index, row := range rows {
 		current, err := reconcileCounterValue(commands[index])
 		if err != nil {
-			return nil, fmt.Errorf("read direct read watermark: %w", err)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			r.recordWatermarkKeyError(
+				runAt,
+				fmt.Sprintf("direct:read:%d", row.UserID),
+				err, badKeys, result,
+			)
+			continue
 		}
 		if current >= row.LastReadSeq {
 			continue
@@ -2145,6 +2447,31 @@ func (r *Reconciler) staleDirectWatermarks(
 		stale = append(stale, row)
 	}
 	return stale, nil
+}
+
+// reconcileWatermarkKeyError reports whether err is a per-key Redis reply
+// failure, such as WRONGTYPE on a malformed watermark key. One bad key must not
+// abort the watermark rotation, but transport and context errors still must.
+func reconcileWatermarkKeyError(err error) bool {
+	var replyErr redis.Error
+	return errors.As(err, &replyErr) && !errors.Is(err, redis.Nil)
+}
+
+// recordWatermarkKeyError counts one unreadable watermark key as a rebuild
+// signal and logs it at most once per throttle window. The key is never
+// rewritten, and the batch continues with the remaining keys.
+func (r *Reconciler) recordWatermarkKeyError(
+	runAt time.Time,
+	key string,
+	err error,
+	badKeys map[string]struct{},
+	result *ReconcileResult,
+) {
+	if _, seen := badKeys[key]; !seen {
+		badKeys[key] = struct{}{}
+		result.NeedsRebuild++
+	}
+	r.logThrottled(runAt, "needs-rebuild", key, "read watermark unreadable: "+err.Error())
 }
 
 // raiseDirectWatermarks raises the stale watermarks chunk by chunk and returns
@@ -2164,11 +2491,24 @@ func (r *Reconciler) raiseDirectWatermarks(
 		return len(states)
 	}
 	for _, chunk := range reconcileChunks(len(states), r.batch) {
-		raised, err := r.repair.RaiseDirectReadWatermarks(ctx, states[chunk[0]:chunk[1]])
+		batch := states[chunk[0]:chunk[1]]
+		key := reconcileSeqCursorKey{first: batch[0].UserID, second: batch[0].PeerID}
+		raised, err := r.repair.RaiseDirectReadWatermarks(ctx, batch)
 		if err != nil {
-			r.logThrottled(runAt, "repair-error", "direct:read", "raise watermarks: "+err.Error())
-			return chunk[0]
+			if r.bumpWatermarkRetry(key) < reconcileWatermarkRetryLimit {
+				r.logThrottled(runAt, "repair-error", "direct:read",
+					"raise watermarks: "+err.Error())
+				return chunk[0]
+			}
+			// A permanently failing chunk must not pin every later watermark.
+			r.clearWatermarkRetry(key)
+			result.NeedsRebuild++
+			r.logThrottled(runAt, "needs-rebuild",
+				fmt.Sprintf("direct:read:%d:%d", key.first, key.second),
+				fmt.Sprintf("read watermark raise failed %d times", reconcileWatermarkRetryLimit))
+			continue
 		}
+		r.clearWatermarkRetry(key)
 		result.WatermarksRaised += uint64(raised)
 	}
 	return len(states)
@@ -2195,7 +2535,7 @@ func (r *Reconciler) reconcileGroupReadWatermarks(
 			afterGroup, afterUser = 0, 0
 			break
 		}
-		stale, err := r.staleGroupWatermarks(ctx, rows)
+		stale, err := r.staleGroupWatermarks(ctx, runAt, rows, result)
 		if err != nil {
 			return err
 		}
@@ -2224,7 +2564,9 @@ func (r *Reconciler) reconcileGroupReadWatermarks(
 
 func (r *Reconciler) staleGroupWatermarks(
 	ctx context.Context,
+	runAt time.Time,
 	rows []store.GroupMemberReadState,
+	result *ReconcileResult,
 ) ([]store.GroupMemberReadState, error) {
 	pipe := r.client.Pipeline()
 	commands := make([]*redis.FloatCmd, len(rows))
@@ -2235,17 +2577,29 @@ func (r *Reconciler) staleGroupWatermarks(
 			strconv.FormatUint(row.UserID, 10),
 		)
 	}
-	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+	// A per-key reply error (WRONGTYPE) is handled row by row below; only a
+	// transport or context failure aborts the rotation.
+	if _, err := pipe.Exec(ctx); err != nil &&
+		!errors.Is(err, redis.Nil) && !reconcileWatermarkKeyError(err) {
 		return nil, fmt.Errorf("read group read watermarks: %w", err)
 	}
 	var stale []store.GroupMemberReadState
+	badKeys := make(map[string]struct{})
 	for index, row := range rows {
 		score, err := commands[index].Result()
 		current := uint64(0)
 		if err == nil {
 			current = uint64(score)
 		} else if !errors.Is(err, redis.Nil) {
-			return nil, fmt.Errorf("read group read watermark: %w", err)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			r.recordWatermarkKeyError(
+				runAt,
+				fmt.Sprintf("group:read:%d", row.GroupID),
+				err, badKeys, result,
+			)
+			continue
 		}
 		if current >= row.LastReadSeq {
 			continue
@@ -2270,11 +2624,23 @@ func (r *Reconciler) raiseGroupWatermarks(
 		return len(states)
 	}
 	for _, chunk := range reconcileChunks(len(states), r.batch) {
-		raised, err := r.repair.RaiseGroupReadWatermarks(ctx, states[chunk[0]:chunk[1]])
+		batch := states[chunk[0]:chunk[1]]
+		key := reconcileSeqCursorKey{group: true, first: batch[0].GroupID, second: batch[0].UserID}
+		raised, err := r.repair.RaiseGroupReadWatermarks(ctx, batch)
 		if err != nil {
-			r.logThrottled(runAt, "repair-error", "group:read", "raise watermarks: "+err.Error())
-			return chunk[0]
+			if r.bumpWatermarkRetry(key) < reconcileWatermarkRetryLimit {
+				r.logThrottled(runAt, "repair-error", "group:read",
+					"raise watermarks: "+err.Error())
+				return chunk[0]
+			}
+			r.clearWatermarkRetry(key)
+			result.NeedsRebuild++
+			r.logThrottled(runAt, "needs-rebuild",
+				fmt.Sprintf("group:read:%d:%d", key.first, key.second),
+				fmt.Sprintf("read watermark raise failed %d times", reconcileWatermarkRetryLimit))
+			continue
 		}
+		r.clearWatermarkRetry(key)
 		result.WatermarksRaised += uint64(raised)
 	}
 	return len(states)
@@ -2841,6 +3207,25 @@ func (r *Reconciler) clearDeepRetry(key reconcileSeqCursorKey) {
 	delete(r.deepRetries, key)
 }
 
+// bumpWatermarkRetry counts one failed chunk of read watermarks. A full map is
+// treated as exhausted so a burst cannot pin the cursor forever.
+func (r *Reconciler) bumpWatermarkRetry(key reconcileSeqCursorKey) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.watermarkRetries[key]; !exists &&
+		len(r.watermarkRetries) >= reconcileLogKeyLimit {
+		return reconcileWatermarkRetryLimit
+	}
+	r.watermarkRetries[key]++
+	return r.watermarkRetries[key]
+}
+
+func (r *Reconciler) clearWatermarkRetry(key reconcileSeqCursorKey) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.watermarkRetries, key)
+}
+
 func (r *Reconciler) bumpUserDeepRetry(userID uint64) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -3036,21 +3421,25 @@ func (r *Reconciler) auditUserFeed(
 	if err != nil {
 		return false, err
 	}
+	written := 0
 	for _, chunk := range reconcileChunks(len(missing), reconcileFeedWriteBatch) {
 		batch := missing[chunk[0]:chunk[1]]
-		written, err := r.repair.WriteDirectBatch(ctx, batch)
+		count, _, err := r.repairDirectEntities(
+			ctx, runAt, fmt.Sprintf("user:%d:feed", userID), batch, budget, result,
+		)
 		if err != nil {
 			r.logThrottled(runAt, "repair-error", fmt.Sprintf("user:%d:feed", userID),
-				"write missing feed entries: "+err.Error())
+				err.Error())
 			r.setFeedCursor(userID, reconcileFeedCursor{}, false)
 			return false, nil
 		}
-		result.FeedRepairs += uint64(written)
-		budget.spend(written)
+		written += count
 	}
-	// A budget-truncated walk leaves part of the detected gap for the next
-	// audit, so the user cursor must not move past it.
-	return previewsComplete && limit == int(gap), nil
+	result.FeedRepairs += uint64(written)
+	// Complete only when the detected gap was fully covered. A budget or
+	// check-cap truncation keeps the user cursor so the next audit retries it
+	// instead of waiting for a full user rotation.
+	return previewsComplete && limit == int(gap) && len(missing) == limit, nil
 }
 
 // auditUserConversationLast compares each conversation preview with the newest
@@ -3116,14 +3505,15 @@ func (r *Reconciler) auditUserConversationLast(
 		repairs = append(repairs, message)
 	}
 	if r.repair != nil && len(repairs) > 0 {
-		written, err := r.repair.WriteDirectBatch(ctx, repairs)
-		if err != nil {
+		// A present entity is only re-indexed; a diverged one is reported, never
+		// overwritten, exactly like the index-gap and feed repairs.
+		if _, _, err := r.repairDirectEntities(
+			ctx, runAt, fmt.Sprintf("user:%d:conv-last", userID), repairs, budget, result,
+		); err != nil {
 			r.logThrottled(runAt, "repair-error", fmt.Sprintf("user:%d:conv-last", userID),
-				"write conversation preview: "+err.Error())
+				err.Error())
 			return false, nil
 		}
-		result.RedisRepaired += uint64(written)
-		budget.spend(written)
 	}
 	return !deferred, nil
 }

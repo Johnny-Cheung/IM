@@ -176,6 +176,23 @@ VERIFY_MODE=1
 INFRA_SECRETS="${INFRA_ROOT}/secrets"
 INFRA_REDIS_URL_FILE="${INFRA_CONFIG_DIR}/redis-url"
 pass 'seq backfill requires Redis configuration'
+# The rebuild preflight and queue-status share the same queue listing, so stub
+# the private-infra Docker client once and shape the counts with TEST_* vars.
+# The first persist queue takes TEST_QUEUE_READY/TEST_QUEUE_UNACK, the dead
+# letter pair takes TEST_DEAD_READY.
+stub_infra_queues() {
+  printf 'im.v13-verify.messages.persist\t%s\t%s\n' "${TEST_QUEUE_READY:-0}" "${TEST_QUEUE_UNACK:-0}"
+  printf 'im.v13-verify.group.messages.persist\t0\t0\n'
+  printf 'im.v13-verify.messages.dead\t%s\t0\n' "${TEST_DEAD_READY:-0}"
+  printf 'im.v13-verify.group.messages.dead\t0\t0\n'
+}
+stub_infra_di() {
+  case "$*" in
+    *list_queues*) stub_infra_queues ;;
+    *) return 1 ;;
+  esac
+}
+DI() { stub_infra_di "$@"; }
 # The rebuild drains both persist queues and regenerates Redis, so it needs
 # MySQL and RabbitMQ as well, plus the same stopped-backend guards.
 : > "${TEST_DIR}/server-args"
@@ -207,6 +224,51 @@ TEST_PROCESSES="$$"
 rebuild_redis >/dev/null
 TEST_PROCESSES=""
 pass 'redis rebuild ignores its own process'
+# A delivery held by a foreign or blackholed connection is invisible to the
+# command's own drain, so unacknowledged messages must block the rebuild
+# before the binary runs. messages_ready does not block: the command drains it.
+: > "${TEST_DIR}/server-args"
+TEST_QUEUE_UNACK=2
+if output="$(rebuild_redis 2>&1)"; then
+  echo 'FAIL redis rebuild ran the backend while a persist queue held unacknowledged messages'
+  exit 1
+fi
+test ! -s "${TEST_DIR}/server-args" || {
+  echo 'FAIL redis rebuild invoked the backend despite unacknowledged messages'
+  exit 1
+}
+grep -q 'im.v13-verify.messages.persist: ready=0 unacknowledged=2' <<<"${output}" || {
+  echo 'FAIL rebuild preflight did not report the ready and unacknowledged counts'
+  exit 1
+}
+grep -q '2 unacknowledged message' <<<"${output}" || {
+  echo 'FAIL rebuild preflight did not explain the unacknowledged refusal'
+  exit 1
+}
+TEST_QUEUE_UNACK=0
+pass 'redis rebuild refuses before invoking the backend while persist queues hold unacknowledged messages'
+: > "${TEST_DIR}/server-args"
+TEST_QUEUE_READY=3
+rebuild_redis >/dev/null
+TEST_QUEUE_READY=0
+test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-addr 0.0.0.0:8199 -rebuild-redis '
+pass 'redis rebuild proceeds with ready messages because its own drain reclaims them'
+: > "${TEST_DIR}/server-args"
+DI() { return 1; }
+if output="$(rebuild_redis 2>&1)"; then
+  echo 'FAIL redis rebuild ran without being able to inspect the persist queues'
+  exit 1
+fi
+test ! -s "${TEST_DIR}/server-args" || {
+  echo 'FAIL redis rebuild invoked the backend without a queue preflight'
+  exit 1
+}
+grep -q 'cannot inspect RabbitMQ queues' <<<"${output}" || {
+  echo 'FAIL rebuild preflight did not fail closed with a clear message'
+  exit 1
+}
+DI() { stub_infra_di "$@"; }
+pass 'redis rebuild fails closed before invoking the backend when RabbitMQ is unreachable'
 rebuild_config_backup="${INFRA_CONFIG_DIR}"
 INFRA_CONFIG_DIR="${TEST_DIR}/rebuild-missing-config"
 INFRA_REDIS_URL_FILE="${INFRA_CONFIG_DIR}/redis-url"
@@ -262,17 +324,6 @@ if ! grep -q 'backfill-seq' <<<"${usage}" || ! grep -q 'rebuild-redis' <<<"${usa
   exit 1
 fi
 pass 'usage lists the seq backfill, redis rebuild, queue drain check and the dlq commands'
-DI() {
-  case "$*" in
-    *list_queues*)
-      printf 'im.v13-verify.messages.persist\t%s\t0\n' "${TEST_QUEUE_READY:-0}"
-      printf 'im.v13-verify.group.messages.persist\t0\t0\n'
-      printf 'im.v13-verify.messages.dead\t%s\t0\n' "${TEST_DEAD_READY:-0}"
-      printf 'im.v13-verify.group.messages.dead\t0\t0\n'
-      ;;
-    *) return 1 ;;
-  esac
-}
 queue_status >/dev/null
 pass 'queue status reports drained verify queues'
 TEST_QUEUE_READY=3

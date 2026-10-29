@@ -99,6 +99,63 @@ func TestSeqCalibratorRaisesOnlyAndBatches(t *testing.T) {
 	}
 }
 
+// TestSeqCalibratorRaisesToRedisIndexFloor covers a surviving accepted-but-
+// unpersisted tail: MySQL knows only seq 3, the Redis index already has 5, so
+// the counter must reach 5. An existing higher counter is never lowered.
+func TestSeqCalibratorRaisesToRedisIndexFloor(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	defer client.Close()
+	ctx := context.Background()
+
+	setDirectSequence(t, client, 1, 2, 3)
+	for seq := 1; seq <= 5; seq++ {
+		if err := client.ZAdd(ctx, directPairKey(1, 2), redis.Z{
+			Score:  float64(seq),
+			Member: strconvUint(uint64(100 + seq)),
+		}).Err(); err != nil {
+			t.Fatalf("seed dm:pair score %d: %v", seq, err)
+		}
+	}
+	setDirectSequence(t, client, 3, 4, 7)
+	if err := client.ZAdd(ctx, directPairKey(3, 4), redis.Z{
+		Score: 5, Member: "200",
+	}).Err(); err != nil {
+		t.Fatalf("seed dm:pair(3,4): %v", err)
+	}
+
+	setGroupSequence(t, client, 9, 2)
+	for seq := 1; seq <= 6; seq++ {
+		if err := client.ZAdd(ctx, defaultKeyspace.groupInboxKey(9), redis.Z{
+			Score:  float64(seq),
+			Member: strconvUint(uint64(300 + seq)),
+		}).Err(); err != nil {
+			t.Fatalf("seed inbox score %d: %v", seq, err)
+		}
+	}
+
+	fakeStore := &fakeSeqCalibrationStore{
+		conversations: []store.ConversationSeqMax{
+			{LowID: 1, HighID: 2, MaxSeq: 3},
+			{LowID: 3, HighID: 4, MaxSeq: 3},
+		},
+		groups: []store.GroupSeqMax{{GroupID: 9, MaxSeq: 2}},
+	}
+	calibrator := NewSeqCalibrator(client, defaultKeyspace, fakeStore, 10)
+	if _, err := calibrator.Calibrate(ctx); err != nil {
+		t.Fatalf("Calibrate() error = %v", err)
+	}
+	if got := client.Get(ctx, directSequenceKey(1, 2)).Val(); got != "5" {
+		t.Fatalf("dm:seq = %q, want Redis index floor 5", got)
+	}
+	if got := client.Get(ctx, directSequenceKey(3, 4)).Val(); got != "7" {
+		t.Fatalf("dm:seq = %q, want existing higher counter 7", got)
+	}
+	if got := client.Get(ctx, defaultKeyspace.groupSequenceKey(9)).Val(); got != "6" {
+		t.Fatalf("group:seq = %q, want Redis index floor 6", got)
+	}
+}
+
 func TestSeqCalibratorReturnsStoreError(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})

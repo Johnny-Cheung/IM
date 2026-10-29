@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ type recordingRepairer struct {
 	groupW  [][]store.GroupMemberReadState
 	directC [][3]uint64
 	groupC  [][2]uint64
+	global  []uint64
 }
 
 func (r *recordingRepairer) WriteDirectBatch(ctx context.Context, messages []store.Message) (int, error) {
@@ -68,6 +70,13 @@ func (r *recordingRepairer) RaiseGroupCounter(ctx context.Context, groupID, seq 
 	r.groupC = append(r.groupC, [2]uint64{groupID, seq})
 	r.mu.Unlock()
 	return r.inner.RaiseGroupCounter(ctx, groupID, seq)
+}
+
+func (r *recordingRepairer) RaiseGlobalMessageID(ctx context.Context, messageID uint64) (bool, error) {
+	r.mu.Lock()
+	r.global = append(r.global, messageID)
+	r.mu.Unlock()
+	return r.inner.RaiseGlobalMessageID(ctx, messageID)
 }
 
 func (r *recordingRepairer) directSeqs() []uint64 {
@@ -1019,7 +1028,11 @@ func TestReconcilerDeepAuditConversationPreviewEntityMissingNeedsRebuild(t *test
 	}
 
 	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{{
+		LowID: 1, HighID: 2, Count: 3, MaxSeq: 3,
+	}}
 	fakeStore.directMessages[[2]uint64{1, 2}] = messages
+	fakeStore.directSeqs[[2]uint64{1, 2}] = []uint64{1, 2, 3}
 	fakeStore.userIDs = []uint64{1}
 	fakeStore.userConversations = map[uint64][]store.Conversation{
 		1: {
@@ -1298,5 +1311,804 @@ func TestReconcilerGroupIndexGapDoesNotOverwriteDivergedEntity(t *testing.T) {
 	}
 	if body := client.HGet(ctx, defaultKeyspace.groupMessageKey(201), "body").Val(); body != "tampered" {
 		t.Fatalf("group entity body = %q, want the divergence left untouched", body)
+	}
+}
+
+// A lost dm:seq must be recovered above the surviving Redis-only tail, not just
+// to MySQL MAX(seq): otherwise the next accept reuses a seq that already has a
+// pair member and the persist loses one of the two messages.
+func TestReconcilerRaisesLostDirectCounterAboveSurvivingTail(t *testing.T) {
+	cases := []struct {
+		name    string
+		counter uint64
+		set     bool
+	}{
+		{name: "missing counter", set: false},
+		{name: "counter behind MySQL", counter: 2, set: true},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			client, _ := newReconcileTestClient(t)
+			now := reconcileTestNow()
+			old := now.Add(-30 * time.Minute)
+			// Redis knows seqs 1..5; MySQL only persisted 1..3. Seqs 4 and 5
+			// are the accepted-but-unpersisted tail.
+			for seq := uint64(1); seq <= 5; seq++ {
+				seedReconcileDirectMessage(t, client, 1, 2, 100+seq, seq, old)
+			}
+			if testCase.set {
+				setDirectSequence(t, client, 1, 2, testCase.counter)
+			}
+
+			fakeStore := newFakeReconcileStore()
+			fakeStore.conversations = []store.ConversationSeqStat{{
+				LowID: 1, HighID: 2, Count: 3, MaxSeq: 3,
+			}}
+			fakeStore.directSeqs[[2]uint64{1, 2}] = []uint64{1, 2, 3}
+
+			reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+				Repair: newAuditWriter(client, now),
+			})
+			result, err := reconciler.RunOnce(context.Background())
+			if err != nil {
+				t.Fatalf("RunOnce() error = %v", err)
+			}
+			if counter := client.Get(context.Background(), defaultKeyspace.directSequenceKey(1, 2)).Val(); counter != "5" {
+				t.Fatalf("counter = %q, want it raised to the surviving tail score 5", counter)
+			}
+			if result.Repaired != 2 || result.Unresolved != 0 {
+				t.Fatalf("result = %+v, want both tail seqs persisted", result)
+			}
+			persisted, _, _, _, _ := fakeStore.snapshot()
+			if len(persisted) != 2 || persisted[0].Seq != 4 || persisted[1].Seq != 5 {
+				t.Fatalf("persisted = %+v, want seqs 4 and 5", persisted)
+			}
+		})
+	}
+}
+
+func TestReconcilerRaisesLostGroupCounterAboveSurvivingTail(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	old := now.Add(-30 * time.Minute)
+	for seq := uint64(1); seq <= 5; seq++ {
+		seedReconcileGroupMessage(t, client, 7, 200+seq, seq, old)
+	}
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.groups = []store.GroupSeqStat{{GroupID: 7, Count: 3, MaxSeq: 3}}
+	fakeStore.groupSeqs[7] = []uint64{1, 2, 3}
+
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+		Repair: newAuditWriter(client, now),
+	})
+	result, err := reconciler.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if counter := client.Get(context.Background(), defaultKeyspace.groupSequenceKey(7)).Val(); counter != "5" {
+		t.Fatalf("group counter = %q, want it raised to the surviving tail score 5", counter)
+	}
+	if result.Repaired != 2 || result.Unresolved != 0 {
+		t.Fatalf("result = %+v, want both tail seqs persisted", result)
+	}
+	_, persistedGroups, _, _, _ := fakeStore.snapshot()
+	if len(persistedGroups) != 2 ||
+		persistedGroups[0].Seq != 4 || persistedGroups[1].Seq != 5 {
+		t.Fatalf("persisted groups = %+v, want seqs 4 and 5", persistedGroups)
+	}
+}
+
+// messages:next_id is the only guard against reusing a message ID. A lost or
+// stale key must be raised from the durable and Redis high-water marks and must
+// never move backwards.
+func TestReconcilerAuditsGlobalMessageIDCounter(t *testing.T) {
+	ctx := context.Background()
+	t.Run("missing counter is raised", func(t *testing.T) {
+		client, _ := newReconcileTestClient(t)
+		if err := client.Del(ctx, defaultKeyspace.counterKey()).Err(); err != nil {
+			t.Fatalf("delete counter: %v", err)
+		}
+		fakeStore := newFakeReconcileStore()
+		fakeStore.maxServerMessageID = 42
+		reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+			Repair: newAuditWriter(client, reconcileTestNow()),
+		})
+		result, err := reconciler.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("RunOnce() error = %v", err)
+		}
+		if counter := client.Get(ctx, defaultKeyspace.counterKey()).Val(); counter != "42" {
+			t.Fatalf("counter = %q, want 42", counter)
+		}
+		if result.CountersRaised != 1 || result.RedisRepaired != 1 || result.RedisMissing != 1 {
+			t.Fatalf("result = %+v, want one counter raised", result)
+		}
+	})
+	t.Run("counter below durable max is raised", func(t *testing.T) {
+		client, _ := newReconcileTestClient(t)
+		if err := client.Set(ctx, defaultKeyspace.counterKey(), 10, 0).Err(); err != nil {
+			t.Fatalf("seed counter: %v", err)
+		}
+		fakeStore := newFakeReconcileStore()
+		fakeStore.maxServerMessageID = 42
+		reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+			Repair: newAuditWriter(client, reconcileTestNow()),
+		})
+		result, err := reconciler.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("RunOnce() error = %v", err)
+		}
+		if counter := client.Get(ctx, defaultKeyspace.counterKey()).Val(); counter != "42" {
+			t.Fatalf("counter = %q, want 42", counter)
+		}
+		if result.CountersRaised != 1 {
+			t.Fatalf("result = %+v, want one counter raised", result)
+		}
+	})
+	t.Run("lost counter is raised above surviving entities", func(t *testing.T) {
+		client, _ := newReconcileTestClient(t)
+		if err := client.Del(ctx, defaultKeyspace.counterKey()).Err(); err != nil {
+			t.Fatalf("delete counter: %v", err)
+		}
+		for _, key := range []string{
+			defaultKeyspace.messageKey(101),
+			defaultKeyspace.messageKey(103),
+			defaultKeyspace.groupMessageKey(207),
+		} {
+			if err := client.HSet(ctx, key, "id", key).Err(); err != nil {
+				t.Fatalf("seed entity %s: %v", key, err)
+			}
+		}
+		fakeStore := newFakeReconcileStore()
+		fakeStore.maxServerMessageID = 5
+		reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+			Repair: newAuditWriter(client, reconcileTestNow()),
+		})
+		if _, err := reconciler.RunOnce(ctx); err != nil {
+			t.Fatalf("RunOnce() error = %v", err)
+		}
+		if counter := client.Get(ctx, defaultKeyspace.counterKey()).Val(); counter != "207" {
+			t.Fatalf("counter = %q, want 207 (above the surviving entity)", counter)
+		}
+	})
+	t.Run("counter is never lowered", func(t *testing.T) {
+		client, _ := newReconcileTestClient(t)
+		if err := client.Set(ctx, defaultKeyspace.counterKey(), 100, 0).Err(); err != nil {
+			t.Fatalf("seed counter: %v", err)
+		}
+		fakeStore := newFakeReconcileStore()
+		fakeStore.maxServerMessageID = 10
+		reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+			Repair: newAuditWriter(client, reconcileTestNow()),
+		})
+		result, err := reconciler.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("RunOnce() error = %v", err)
+		}
+		if counter := client.Get(ctx, defaultKeyspace.counterKey()).Val(); counter != "100" {
+			t.Fatalf("counter = %q, want it left at 100", counter)
+		}
+		if result.CountersRaised != 0 || result.RedisRepaired != 0 {
+			t.Fatalf("result = %+v, want no write", result)
+		}
+	})
+}
+
+// A present feed entity that differs from MySQL must be reported, not
+// overwritten, exactly like the index-gap and deep-entity repairs.
+func TestReconcilerDeepAuditFeedDoesNotOverwriteDivergedEntity(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	ctx := context.Background()
+	messages := auditDirectMessages(3, now.Add(-time.Hour))
+	if _, err := newAuditWriter(client, now).WriteDirectBatch(ctx, messages); err != nil {
+		t.Fatalf("seed Redis: %v", err)
+	}
+	if err := client.HSet(ctx, defaultKeyspace.messageKey(102), "body", "tampered").Err(); err != nil {
+		t.Fatalf("tamper entity: %v", err)
+	}
+	if err := client.ZRem(ctx, defaultKeyspace.directFeedKey(1), "102").Err(); err != nil {
+		t.Fatalf("remove feed member: %v", err)
+	}
+
+	logs := captureReconcileLog(t)
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{{
+		LowID: 1, HighID: 2, Count: 3, MaxSeq: 3,
+	}}
+	fakeStore.directMessages[[2]uint64{1, 2}] = messages
+	fakeStore.directSeqs[[2]uint64{1, 2}] = []uint64{1, 2, 3}
+	fakeStore.userIDs = []uint64{1}
+	fakeStore.userPeers[1] = []uint64{2}
+
+	current := now
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+		Repair:         newAuditWriter(client, now),
+		DeepAuditUsers: 1,
+		Now:            func() time.Time { return current },
+	})
+	current = now.Add(2 * time.Hour)
+	result, err := reconciler.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.NeedsRebuild == 0 || result.FeedRepairs != 0 {
+		t.Fatalf("result = %+v, want the divergence flagged without a feed repair", result)
+	}
+	if !strings.Contains(logs.String(), "needs-rebuild user:1:feed:entity") {
+		t.Fatalf("log = %s, want the feed divergence reported", logs.String())
+	}
+	if body := client.HGet(ctx, defaultKeyspace.messageKey(102), "body").Val(); body != "tampered" {
+		t.Fatalf("entity body = %q, want the divergence left untouched", body)
+	}
+	if err := client.ZScore(ctx, defaultKeyspace.directFeedKey(1), "102").Err(); !errors.Is(err, redis.Nil) {
+		t.Fatalf("feed member 102 error = %v, want the feed entry still absent", err)
+	}
+}
+
+// A diverged entity behind a stale conversation preview must not be rewritten
+// just to repair the preview.
+func TestReconcilerDeepAuditPreviewDoesNotOverwriteDivergedEntity(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	ctx := context.Background()
+	messages := auditDirectMessages(3, now.Add(-time.Hour))
+	if _, err := newAuditWriter(client, now).WriteDirectBatch(ctx, messages); err != nil {
+		t.Fatalf("seed Redis: %v", err)
+	}
+	if err := client.HSet(ctx, defaultKeyspace.messageKey(103), "body", "tampered").Err(); err != nil {
+		t.Fatalf("tamper entity: %v", err)
+	}
+	if err := client.HSet(
+		ctx, defaultKeyspace.directConversationLastKey(1), "2", 101,
+	).Err(); err != nil {
+		t.Fatalf("stale preview: %v", err)
+	}
+
+	logs := captureReconcileLog(t)
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{{
+		LowID: 1, HighID: 2, Count: 3, MaxSeq: 3,
+	}}
+	fakeStore.directMessages[[2]uint64{1, 2}] = messages
+	fakeStore.directSeqs[[2]uint64{1, 2}] = []uint64{1, 2, 3}
+	fakeStore.userIDs = []uint64{1}
+	fakeStore.userConversations = map[uint64][]store.Conversation{
+		1: {{UserID: 2, LastMessage: &messages[2]}},
+	}
+
+	current := now
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+		Repair:         newAuditWriter(client, now),
+		DeepAuditUsers: 1,
+		Now:            func() time.Time { return current },
+	})
+	current = now.Add(2 * time.Hour)
+	result, err := reconciler.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.NeedsRebuild == 0 || result.RedisRepaired != 0 {
+		t.Fatalf("result = %+v, want the divergence flagged without a rewrite", result)
+	}
+	if !strings.Contains(logs.String(), "needs-rebuild user:1:conv-last:entity") {
+		t.Fatalf("log = %s, want the preview divergence reported", logs.String())
+	}
+	if body := client.HGet(ctx, defaultKeyspace.messageKey(103), "body").Val(); body != "tampered" {
+		t.Fatalf("entity body = %q, want the divergence left untouched", body)
+	}
+	if preview := client.HGet(ctx, defaultKeyspace.directConversationLastKey(1), "2").Val(); preview != "101" {
+		t.Fatalf("preview = %q, want the stale value left in place", preview)
+	}
+}
+
+// The feed walk must not report success when it stopped at the 2000-check cap
+// before finding the whole gap; the user must be retried on the next audit.
+func TestReconcilerFeedWalkRetriesGapAfterCheckCap(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	ctx := context.Background()
+	const (
+		firstPeerMessages = 2000
+		missingID         = uint64(5000)
+	)
+	writer := newAuditWriter(client, now)
+	messages := make([]store.Message, 0, firstPeerMessages+1)
+	for seq := uint64(1); seq <= firstPeerMessages; seq++ {
+		messages = append(messages, store.Message{
+			ID:              uint64(1000) + seq,
+			Seq:             seq,
+			SenderID:        1,
+			RecipientID:     2,
+			ClientMessageID: fmt.Sprintf("cap-a-%d", seq),
+			Body:            fmt.Sprintf("cap-a-%d", seq),
+			CreatedAt:       now.Add(-time.Hour),
+		})
+	}
+	missing := store.Message{
+		ID:              missingID,
+		Seq:             1,
+		SenderID:        1,
+		RecipientID:     3,
+		ClientMessageID: "cap-b-1",
+		Body:            "cap-b-1",
+		CreatedAt:       now.Add(-time.Hour),
+	}
+	messages = append(messages, missing)
+	if _, err := writer.WriteDirectBatch(ctx, messages[:firstPeerMessages]); err != nil {
+		t.Fatalf("seed first conversation: %v", err)
+	}
+	if _, err := writer.WriteDirectBatch(ctx, []store.Message{missing}); err != nil {
+		t.Fatalf("seed second conversation: %v", err)
+	}
+	// Only the sampled user's feed loses the second conversation's message; the
+	// pair index and the entity stay healthy.
+	if err := client.ZRem(ctx, defaultKeyspace.directFeedKey(1), strconvUint(missingID)).Err(); err != nil {
+		t.Fatalf("remove feed member: %v", err)
+	}
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.directMessages[[2]uint64{1, 2}] = messages[:firstPeerMessages]
+	fakeStore.directMessages[[2]uint64{1, 3}] = []store.Message{missing}
+	fakeStore.directSeqs[[2]uint64{1, 2}] = sequenceRange(1, firstPeerMessages)
+	fakeStore.directSeqs[[2]uint64{1, 3}] = []uint64{1}
+	fakeStore.conversations = []store.ConversationSeqStat{
+		{LowID: 1, HighID: 2, Count: firstPeerMessages, MaxSeq: firstPeerMessages},
+		{LowID: 1, HighID: 3, Count: 1, MaxSeq: 1},
+	}
+	fakeStore.userIDs = []uint64{1}
+	fakeStore.userPeers[1] = []uint64{2, 3}
+
+	current := now
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+		Repair:         writer,
+		DeepAuditUsers: 1,
+		Now:            func() time.Time { return current },
+	})
+	current = now.Add(2 * time.Hour)
+	result, err := reconciler.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("first RunOnce() error = %v", err)
+	}
+	if result.FeedRepairs != 0 {
+		t.Fatalf("first result = %+v, want the capped walk to repair nothing", result)
+	}
+	if userID := reconciler.userDeepCursorState(); userID != 0 {
+		t.Fatalf("user cursor = %d, want the user retried next audit", userID)
+	}
+
+	current = now.Add(3 * time.Hour)
+	result, err = reconciler.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("second RunOnce() error = %v", err)
+	}
+	if result.FeedRepairs != 1 {
+		t.Fatalf("second result = %+v, want the deferred gap repaired", result)
+	}
+	if err := client.ZScore(
+		ctx, defaultKeyspace.directFeedKey(1), strconvUint(missingID),
+	).Err(); err != nil {
+		t.Fatalf("feed member error = %v, want the entry restored", err)
+	}
+}
+
+func sequenceRange(from, to uint64) []uint64 {
+	seqs := make([]uint64, 0, to-from+1)
+	for seq := from; seq <= to; seq++ {
+		seqs = append(seqs, seq)
+	}
+	return seqs
+}
+
+// failingWatermarkRepairer fails the direct watermark raise for one user, so a
+// test can prove the retry budget and the cursor advance past a dead chunk.
+type failingWatermarkRepairer struct {
+	ProjectionRepairer
+
+	mu         sync.Mutex
+	failUserID uint64
+	failures   int
+}
+
+func (r *failingWatermarkRepairer) RaiseDirectReadWatermarks(
+	ctx context.Context,
+	states []store.ConversationReadState,
+) (int, error) {
+	r.mu.Lock()
+	for _, state := range states {
+		if state.UserID == r.failUserID {
+			r.failures++
+			r.mu.Unlock()
+			return 0, fmt.Errorf("watermark key is permanently broken")
+		}
+	}
+	r.mu.Unlock()
+	return r.ProjectionRepairer.RaiseDirectReadWatermarks(ctx, states)
+}
+
+func (r *failingWatermarkRepairer) failureCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.failures
+}
+
+// A permanently failing watermark chunk must be marked and skipped after three
+// attempts instead of pinning every later watermark forever.
+func TestReconcilerWatermarkRetryLimitAdvancesPastFailingChunk(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	ctx := context.Background()
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversationReads = []store.ConversationReadState{
+		{UserID: 1, PeerID: 2, LastReadSeq: 5},
+		{UserID: 2, PeerID: 4, LastReadSeq: 5},
+		{UserID: 3, PeerID: 6, LastReadSeq: 5},
+	}
+	repair := &failingWatermarkRepairer{
+		ProjectionRepairer: newAuditWriter(client, now),
+		failUserID:         2,
+	}
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+		Repair: repair,
+		Batch:  1,
+		Now:    func() time.Time { return now },
+	})
+
+	var last ReconcileResult
+	for run := 0; run < reconcileWatermarkRetryLimit; run++ {
+		result, err := reconciler.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("RunOnce() run %d error = %v", run, err)
+		}
+		last = result
+	}
+	if last.NeedsRebuild != 1 {
+		t.Fatalf("last result = %+v, want the dead chunk marked for rebuild", last)
+	}
+	if repair.failureCount() != reconcileWatermarkRetryLimit {
+		t.Fatalf("failures = %d, want %d", repair.failureCount(), reconcileWatermarkRetryLimit)
+	}
+	if got := client.HGet(ctx, defaultKeyspace.directReadKey(2), "4").Val(); got != "" {
+		t.Fatalf("failed watermark = %q, want it never written", got)
+	}
+	if got := client.HGet(ctx, defaultKeyspace.directReadKey(1), "2").Val(); got != "5" {
+		t.Fatalf("first watermark = %q, want 5", got)
+	}
+	if got := client.HGet(ctx, defaultKeyspace.directReadKey(3), "6").Val(); got != "5" {
+		t.Fatalf("later watermark = %q, want 5 after the cursor moved past the dead chunk", got)
+	}
+	if userID, peerID := reconciler.directReadCursorState(); userID != 0 || peerID != 0 {
+		t.Fatalf("read cursor = (%d,%d), want it advanced past the scan", userID, peerID)
+	}
+}
+
+// A wrong-type watermark key is one unrecoverable key, not a failed audit. The
+// batch must keep comparing and raising the remaining direct and group keys,
+// report the malformed keys for a rebuild, never overwrite them, and still
+// advance the read cursors.
+func TestReconcilerToleratesWrongTypeWatermarkKeys(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	ctx := context.Background()
+
+	if err := client.Set(ctx, defaultKeyspace.directReadKey(2), "not-a-hash", 0).Err(); err != nil {
+		t.Fatalf("seed wrong-type direct watermark: %v", err)
+	}
+	if err := client.Set(ctx, defaultKeyspace.groupReadKey(8), "not-a-zset", 0).Err(); err != nil {
+		t.Fatalf("seed wrong-type group watermark: %v", err)
+	}
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversationReads = []store.ConversationReadState{
+		{UserID: 1, PeerID: 2, LastReadSeq: 5},
+		{UserID: 2, PeerID: 3, LastReadSeq: 6},
+		{UserID: 3, PeerID: 4, LastReadSeq: 7},
+	}
+	fakeStore.groupReads = []store.GroupMemberReadState{
+		{GroupID: 7, UserID: 9, LastReadSeq: 4},
+		{GroupID: 8, UserID: 9, LastReadSeq: 4},
+	}
+	logs := captureReconcileLog(t)
+
+	current := now
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+		Repair: newAuditWriter(client, now),
+		Now:    func() time.Time { return current },
+	})
+	result, err := reconciler.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v, want a per-key watermark error tolerated", err)
+	}
+	if result.WatermarksRaised != 3 || result.NeedsRebuild != 2 {
+		t.Fatalf("result = %+v, want three watermarks raised and two rebuild flags", result)
+	}
+	if got := client.HGet(ctx, defaultKeyspace.directReadKey(1), "2").Val(); got != "5" {
+		t.Fatalf("direct watermark before the bad key = %q, want 5", got)
+	}
+	if got := client.HGet(ctx, defaultKeyspace.directReadKey(3), "4").Val(); got != "7" {
+		t.Fatalf("direct watermark after the bad key = %q, want 7", got)
+	}
+	if score := client.ZScore(ctx, defaultKeyspace.groupReadKey(7), "9").Val(); score != 4 {
+		t.Fatalf("group watermark = %v, want 4", score)
+	}
+	if got := client.Get(ctx, defaultKeyspace.directReadKey(2)).Val(); got != "not-a-hash" {
+		t.Fatalf("wrong-type direct key = %q, want it left untouched", got)
+	}
+	if got := client.Get(ctx, defaultKeyspace.groupReadKey(8)).Val(); got != "not-a-zset" {
+		t.Fatalf("wrong-type group key = %q, want it left untouched", got)
+	}
+	if userID, peerID := reconciler.directReadCursorState(); userID != 0 || peerID != 0 {
+		t.Fatalf("read cursor = (%d,%d), want it advanced past the scan", userID, peerID)
+	}
+	if groupID, userID := reconciler.groupReadCursorState(); groupID != 0 || userID != 0 {
+		t.Fatalf("group read cursor = (%d,%d), want it advanced past the scan", groupID, userID)
+	}
+	for _, want := range []string{"needs-rebuild direct:read:2", "needs-rebuild group:read:8"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("log = %s, want %q", logs.String(), want)
+		}
+	}
+	if got := strings.Count(logs.String(), "direct:read:2"); got != 1 {
+		t.Fatalf("bad direct key logged %d times, want one throttled line: %s", got, logs.String())
+	}
+
+	// The bad keys stay malformed, so the second audit reports them again but
+	// must still not stop the rotation or abort the run.
+	current = now.Add(time.Hour)
+	second, err := reconciler.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("second RunOnce() error = %v", err)
+	}
+	if second.WatermarksRaised != 0 || second.NeedsRebuild != 2 {
+		t.Fatalf("second result = %+v, want no new raises and the same rebuild flags", second)
+	}
+}
+
+// A malformed group read key must not abort the group watermark rotation on its
+// own: later groups are still raised, and the bad key is reported, not written.
+func TestReconcilerToleratesWrongTypeGroupWatermarkKey(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	ctx := context.Background()
+
+	if err := client.Set(ctx, defaultKeyspace.groupReadKey(8), "not-a-zset", 0).Err(); err != nil {
+		t.Fatalf("seed wrong-type group watermark: %v", err)
+	}
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.groupReads = []store.GroupMemberReadState{
+		{GroupID: 7, UserID: 9, LastReadSeq: 4},
+		{GroupID: 8, UserID: 9, LastReadSeq: 4},
+	}
+	logs := captureReconcileLog(t)
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+		Repair: newAuditWriter(client, now),
+	})
+	result, err := reconciler.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v, want the per-key group error tolerated", err)
+	}
+	if result.WatermarksRaised != 1 || result.NeedsRebuild != 1 {
+		t.Fatalf("result = %+v, want one watermark raised and one rebuild flag", result)
+	}
+	if score := client.ZScore(ctx, defaultKeyspace.groupReadKey(7), "9").Val(); score != 4 {
+		t.Fatalf("healthy group watermark = %v, want 4", score)
+	}
+	if got := client.Get(ctx, defaultKeyspace.groupReadKey(8)).Val(); got != "not-a-zset" {
+		t.Fatalf("wrong-type group key = %q, want it left untouched", got)
+	}
+	if groupID, userID := reconciler.groupReadCursorState(); groupID != 0 || userID != 0 {
+		t.Fatalf("group read cursor = (%d,%d), want it advanced past the scan", groupID, userID)
+	}
+	if !strings.Contains(logs.String(), "needs-rebuild group:read:8") {
+		t.Fatalf("log = %s, want the bad group key reported", logs.String())
+	}
+}
+
+// The middle-entity sample must rotate across audits, wrap back to the start of
+// the window, and restart from the beginning when the sample page is empty.
+func TestReconcilerDeepAuditRotatesMiddleSample(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	ctx := context.Background()
+	const messageCount = 7
+	messages := auditDirectMessages(messageCount, now.Add(-time.Hour))
+	writer := newAuditWriter(client, now)
+	if _, err := writer.WriteDirectBatch(ctx, messages); err != nil {
+		t.Fatalf("seed Redis: %v", err)
+	}
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{{
+		LowID: 1, HighID: 2, Count: messageCount, MaxSeq: messageCount,
+	}}
+	fakeStore.directMessages[[2]uint64{1, 2}] = messages
+
+	current := now
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+		Repair:            writer,
+		DeepAuditBoundary: 1,
+		Now:               func() time.Time { return current },
+	})
+	key := reconcileSeqCursorKey{first: 1, second: 2}
+	// With boundary 1 the middle window is 2..6 and each audit samples exactly
+	// one seq. Deleting that entity before the audit proves the cursor moved.
+	for seq := uint64(2); seq <= 6; seq++ {
+		if err := client.Del(ctx, defaultKeyspace.messageKey(100+seq)).Err(); err != nil {
+			t.Fatalf("delete entity %d: %v", seq, err)
+		}
+		current = current.Add(time.Hour)
+		result, err := reconciler.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("RunOnce() seq %d error = %v", seq, err)
+		}
+		if result.RedisRepaired != 1 {
+			t.Fatalf("seq %d result = %+v, want only that middle entity repaired", seq, result)
+		}
+		if body := client.HGet(ctx, defaultKeyspace.messageKey(100+seq), "body").Val(); body == "" {
+			t.Fatalf("seq %d entity was not repaired", seq)
+		}
+	}
+	if start := reconciler.deepSeqStart(key, 2, 6); start != 2 {
+		t.Fatalf("middle cursor start = %d, want the wrapped window start 2", start)
+	}
+
+	// The wrapped cursor must sample the first middle entity again.
+	if err := client.Del(ctx, defaultKeyspace.messageKey(102)).Err(); err != nil {
+		t.Fatalf("delete wrapped entity: %v", err)
+	}
+	current = current.Add(time.Hour)
+	result, err := reconciler.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("wrapped RunOnce() error = %v", err)
+	}
+	if result.RedisRepaired != 1 {
+		t.Fatalf("wrapped result = %+v, want the first middle entity sampled again", result)
+	}
+	if body := client.HGet(ctx, defaultKeyspace.messageKey(102), "body").Val(); body != "body-2" {
+		t.Fatalf("wrapped entity body = %q, want body-2", body)
+	}
+}
+
+func TestReconcilerDeepAuditMiddleSampleResetsOnEmptyPage(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	ctx := context.Background()
+	// MySQL claims a long conversation but only holds seqs 1 and 2, so the middle
+	// page after seq 3 is empty.
+	messages := auditDirectMessages(2, now.Add(-time.Hour))
+	if _, err := newAuditWriter(client, now).WriteDirectBatch(ctx, messages); err != nil {
+		t.Fatalf("seed Redis: %v", err)
+	}
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{{
+		LowID: 1, HighID: 2, Count: 2, MaxSeq: 7,
+	}}
+	fakeStore.directMessages[[2]uint64{1, 2}] = messages
+
+	current := now
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+		Repair:            newAuditWriter(client, now),
+		DeepAuditBoundary: 1,
+		Now:               func() time.Time { return current },
+	})
+	key := reconcileSeqCursorKey{first: 1, second: 2}
+	reconciler.setDeepSeqCursor(key, 4, false)
+	if start := reconciler.deepSeqStart(key, 2, 6); start != 4 {
+		t.Fatalf("middle cursor start = %d, want the seeded 4", start)
+	}
+
+	current = now.Add(2 * time.Hour)
+	if _, err := reconciler.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if start := reconciler.deepSeqStart(key, 2, 6); start != 2 {
+		t.Fatalf("middle cursor start = %d, want the empty page to reset it", start)
+	}
+}
+
+// The group middle-entity sample must rotate across audits, wrap back to the
+// start of the window, and restart from the beginning when the page is empty.
+func TestReconcilerDeepAuditRotatesMiddleGroupSample(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	ctx := context.Background()
+	const messageCount = 7
+	messages := auditGroupMessages(messageCount, now.Add(-time.Hour))
+	writer := newAuditWriter(client, now)
+	if _, err := writer.WriteGroupBatch(ctx, messages); err != nil {
+		t.Fatalf("seed Redis: %v", err)
+	}
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.groups = []store.GroupSeqStat{{
+		GroupID: 7, Count: messageCount, MaxSeq: messageCount,
+	}}
+	fakeStore.groupMessages[7] = messages
+
+	current := now
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+		Repair:            writer,
+		DeepAuditBoundary: 1,
+		Now:               func() time.Time { return current },
+	})
+	key := reconcileSeqCursorKey{group: true, first: 7}
+	// With boundary 1 the middle window is 2..6 and each audit samples exactly
+	// one seq. Deleting that entity before the audit proves the cursor moved.
+	for seq := uint64(2); seq <= 6; seq++ {
+		if err := client.Del(ctx, defaultKeyspace.groupMessageKey(200+seq)).Err(); err != nil {
+			t.Fatalf("delete entity %d: %v", seq, err)
+		}
+		current = current.Add(time.Hour)
+		result, err := reconciler.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("RunOnce() seq %d error = %v", seq, err)
+		}
+		if result.RedisRepaired != 1 {
+			t.Fatalf("seq %d result = %+v, want only that middle group entity repaired", seq, result)
+		}
+		if body := client.HGet(ctx, defaultKeyspace.groupMessageKey(200+seq), "body").Val(); body == "" {
+			t.Fatalf("seq %d group entity was not repaired", seq)
+		}
+	}
+	if start := reconciler.deepSeqStart(key, 2, 6); start != 2 {
+		t.Fatalf("middle cursor start = %d, want the wrapped window start 2", start)
+	}
+
+	// The wrapped cursor must sample the first middle entity again.
+	if err := client.Del(ctx, defaultKeyspace.groupMessageKey(202)).Err(); err != nil {
+		t.Fatalf("delete wrapped entity: %v", err)
+	}
+	current = current.Add(time.Hour)
+	result, err := reconciler.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("wrapped RunOnce() error = %v", err)
+	}
+	if result.RedisRepaired != 1 {
+		t.Fatalf("wrapped result = %+v, want the first middle entity sampled again", result)
+	}
+	if body := client.HGet(ctx, defaultKeyspace.groupMessageKey(202), "body").Val(); body != "gbody-2" {
+		t.Fatalf("wrapped entity body = %q, want gbody-2", body)
+	}
+}
+
+func TestReconcilerDeepAuditMiddleGroupSampleResetsOnEmptyPage(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	ctx := context.Background()
+	// MySQL claims a long group but only holds seqs 1 and 2, so the middle page
+	// after seq 3 is empty.
+	messages := auditGroupMessages(2, now.Add(-time.Hour))
+	if _, err := newAuditWriter(client, now).WriteGroupBatch(ctx, messages); err != nil {
+		t.Fatalf("seed Redis: %v", err)
+	}
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.groups = []store.GroupSeqStat{{
+		GroupID: 7, Count: 2, MaxSeq: 7,
+	}}
+	fakeStore.groupMessages[7] = messages
+
+	current := now
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
+		Repair:            newAuditWriter(client, now),
+		DeepAuditBoundary: 1,
+		Now:               func() time.Time { return current },
+	})
+	key := reconcileSeqCursorKey{group: true, first: 7}
+	reconciler.setDeepSeqCursor(key, 4, false)
+	if start := reconciler.deepSeqStart(key, 2, 6); start != 4 {
+		t.Fatalf("middle cursor start = %d, want the seeded 4", start)
+	}
+
+	current = now.Add(2 * time.Hour)
+	if _, err := reconciler.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if start := reconciler.deepSeqStart(key, 2, 6); start != 2 {
+		t.Fatalf("middle cursor start = %d, want the empty page to reset it", start)
 	}
 }

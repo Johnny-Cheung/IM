@@ -89,10 +89,22 @@ if message_id > max_safe_id then
   return {'id_overflow'}
 end
 
+-- A lost or stale global counter can reallocate an ID that already has an
+-- entity. Never overwrite it; fail closed until calibration repairs the
+-- counter. The ID is consumed (a gap is acceptable).
+local message_key = message_prefix .. tostring(message_id)
+if redis.call('EXISTS', message_key) == 1 then
+  return {'id_unavailable'}
+end
+
+-- The surviving inbox is authoritative for live seqs. Fail before advancing
+-- the counter so an accepted-but-unpersisted seq is never reused.
 local seq = last_seq + 1
+if redis.call('ZCOUNT', KEYS[6], seq, seq) > 0 then
+  return {'seq_unavailable'}
+end
 redis.call('SET', KEYS[7], tostring(seq))
 
-local message_key = message_prefix .. tostring(message_id)
 redis.call('HSET', message_key,
   'id', tostring(message_id),
   'group_id', group_id,

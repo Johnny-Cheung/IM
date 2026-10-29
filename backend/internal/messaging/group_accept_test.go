@@ -165,6 +165,89 @@ func TestGroupRedisAcceptorConcurrentSequencesHaveNoGaps(t *testing.T) {
 	}
 }
 
+// TestGroupRedisAcceptorFailsClosedWhenMessageIDTaken mirrors the direct case:
+// a reused global ID must never overwrite an existing group message entity.
+func TestGroupRedisAcceptorFailsClosedWhenMessageIDTaken(t *testing.T) {
+	client, _ := newGroupAcceptTest(t)
+	ctx := context.Background()
+	seedGroupProjection(t, client, 9, []uint64{1})
+	const takenID = 42
+	if err := client.HSet(ctx, defaultKeyspace.groupMessageKey(takenID), map[string]interface{}{
+		"id": takenID, "body": "existing", "seq": 9,
+	}).Err(); err != nil {
+		t.Fatalf("seed existing entity: %v", err)
+	}
+	acceptor := NewGroupRedisAcceptor(
+		client, defaultKeyspace, RedisAcceptorOptions{SeedFloor: takenID - 1},
+	)
+	_, err := acceptor.Accept(ctx, GroupMessageRequest{
+		SenderID: 1, GroupID: 9, ClientMessageID: "taken-id", Body: "new body",
+	})
+	if !errors.Is(err, ErrSeqNotReady) {
+		t.Fatalf("taken ID error = %v, want ErrSeqNotReady", err)
+	}
+	if got := client.HGet(ctx, defaultKeyspace.groupMessageKey(takenID), "body").Val(); got != "existing" {
+		t.Fatalf("existing entity overwritten: body = %q", got)
+	}
+	if got := client.Get(ctx, counterKey()).Val(); got != "42" {
+		t.Fatalf("global counter = %q, want consumed 42", got)
+	}
+	if got := client.Exists(ctx, defaultKeyspace.groupSequenceKey(9)).Val(); got != 0 {
+		t.Fatalf("group:seq written after rejected ID = %d, want 0", got)
+	}
+	if got := client.ZCard(ctx, defaultKeyspace.groupInboxKey(9)).Val(); got != 0 {
+		t.Fatalf("inbox written after rejected ID = %d, want 0", got)
+	}
+	if got := client.XLen(ctx, defaultKeyspace.groupMessageStreamKey()).Val(); got != 0 {
+		t.Fatalf("group stream written after rejected ID = %d, want 0", got)
+	}
+	if got := client.Exists(ctx, defaultKeyspace.groupDedupKey(9, 1, "taken-id")).Val(); got != 0 {
+		t.Fatalf("group dedup written after rejected ID = %d, want 0", got)
+	}
+}
+
+// TestGroupRedisAcceptorFailsClosedWhenSequenceTaken mirrors the direct case:
+// a live seq in the inbox stops the accept before the counter is advanced.
+func TestGroupRedisAcceptorFailsClosedWhenSequenceTaken(t *testing.T) {
+	client, _ := newGroupAcceptTest(t)
+	ctx := context.Background()
+	seedGroupProjection(t, client, 9, []uint64{1})
+	setGroupSequence(t, client, 9, 3)
+	if err := client.ZAdd(ctx, defaultKeyspace.groupInboxKey(9), redis.Z{
+		Score: 4, Member: "900",
+	}).Err(); err != nil {
+		t.Fatalf("seed inbox: %v", err)
+	}
+	acceptor := NewGroupRedisAcceptor(client, defaultKeyspace, RedisAcceptorOptions{})
+	_, err := acceptor.Accept(ctx, GroupMessageRequest{
+		SenderID: 1, GroupID: 9, ClientMessageID: "taken-seq", Body: "hello",
+	})
+	if !errors.Is(err, ErrSeqNotReady) {
+		t.Fatalf("taken seq error = %v, want ErrSeqNotReady", err)
+	}
+	if got := client.Get(ctx, defaultKeyspace.groupSequenceKey(9)).Val(); got != "3" {
+		t.Fatalf("group:seq = %q, want unchanged 3", got)
+	}
+	if got := client.Get(ctx, counterKey()).Val(); got != "1" {
+		t.Fatalf("global counter = %q, want consumed 1", got)
+	}
+	if got := client.Exists(ctx, defaultKeyspace.groupMessageKey(1)).Val(); got != 0 {
+		t.Fatalf("entity written after rejected seq = %d, want 0", got)
+	}
+	if got := client.ZCard(ctx, defaultKeyspace.groupInboxKey(9)).Val(); got != 1 {
+		t.Fatalf("inbox size = %d, want only the seeded member", got)
+	}
+	if got := client.ZScore(ctx, defaultKeyspace.groupInboxKey(9), "900").Val(); got != 4 {
+		t.Fatalf("seeded inbox member score = %v, want 4", got)
+	}
+	if got := client.XLen(ctx, defaultKeyspace.groupMessageStreamKey()).Val(); got != 0 {
+		t.Fatalf("group stream written after rejected seq = %d, want 0", got)
+	}
+	if got := client.Exists(ctx, defaultKeyspace.groupDedupKey(9, 1, "taken-seq")).Val(); got != 0 {
+		t.Fatalf("group dedup written after rejected seq = %d, want 0", got)
+	}
+}
+
 func TestGroupRedisAcceptorRequiresSequenceReady(t *testing.T) {
 	client, server := newGroupAcceptTest(t)
 	ctx := context.Background()

@@ -189,9 +189,9 @@ func TestSeqWatcherRetriesReadinessProbe(t *testing.T) {
 	base := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = base.Close() })
 	seedSequenceReady(t, base)
-	// The first Exists call is check's readiness probe; fail the one right
-	// after calibration.
-	client := &probeFailureClient{UniversalClient: base, failAt: 2}
+	// Each check probes seq:ready then the maintenance locks; fail the readiness
+	// probe right after calibration.
+	client := &probeFailureClient{UniversalClient: base, failAt: 3}
 	gate := NewSeqGate()
 	calibrator := &fakeCalibrator{gate: gate, conversations: 3}
 	runIDs := &fakeRunIDSource{id: "run-a"}
@@ -332,6 +332,88 @@ func TestSeqWatcherRetriesCalibrationWithBackoff(t *testing.T) {
 	}
 	if status := watcher.Status(); status.LastError != "" {
 		t.Fatalf("last error = %q, want cleared after success", status.LastError)
+	}
+}
+
+func TestSeqWatcherMaintenanceLockClosesGate(t *testing.T) {
+	client, _, _, calibrator, gate, watcher := newWatcherTest(t)
+	seedSequenceReady(t, client)
+	ctx := context.Background()
+
+	watcher.check(ctx)
+	if err := gate.Ready(); err != nil {
+		t.Fatalf("gate closed on the baseline check: %v", err)
+	}
+
+	if err := client.Set(ctx, RebuildLockKey(defaultKeyspace), "token", 0).Err(); err != nil {
+		t.Fatalf("seed rebuild lock: %v", err)
+	}
+	watcher.check(ctx)
+	if gate.Ready() == nil {
+		t.Fatal("gate open while a rebuild lock exists")
+	}
+	status := watcher.Status()
+	if status.Ready || !status.Maintenance || status.WaitingSeqReady {
+		t.Fatalf("status with a rebuild lock = %#v", status)
+	}
+	if calibrator.callCount() != 0 {
+		t.Fatalf("calibrate calls = %d, want 0 during maintenance", calibrator.callCount())
+	}
+
+	if err := client.Del(ctx, RebuildLockKey(defaultKeyspace)).Err(); err != nil {
+		t.Fatalf("remove rebuild lock: %v", err)
+	}
+	watcher.check(ctx)
+	if calibrator.callCount() != 1 {
+		t.Fatalf("calibrate calls = %d, want 1 after maintenance", calibrator.callCount())
+	}
+	if err := gate.Ready(); err != nil {
+		t.Fatalf("gate not reopened after maintenance: %v", err)
+	}
+	if status := watcher.Status(); status.Maintenance || !status.Ready {
+		t.Fatalf("status after maintenance = %#v", status)
+	}
+}
+
+func TestSeqWatcherMaintenanceLockAtStartupKeepsGateClosed(t *testing.T) {
+	client, _, runIDs, calibrator, gate, watcher := newWatcherTest(t)
+	seedSequenceReady(t, client)
+	ctx := context.Background()
+	if err := client.Set(ctx, BackfillLockKey(defaultKeyspace), "token", 0).Err(); err != nil {
+		t.Fatalf("seed backfill lock: %v", err)
+	}
+
+	watcher.check(ctx)
+	if gate.Ready() == nil {
+		t.Fatal("gate open on the first check while a backfill lock exists")
+	}
+	if calibrator.callCount() != 0 {
+		t.Fatalf("calibrate calls = %d, want 0 during maintenance", calibrator.callCount())
+	}
+
+	// A restart detected while the lock is held must not calibrate either.
+	runIDs.set("run-b")
+	watcher.check(ctx)
+	if calibrator.callCount() != 0 {
+		t.Fatalf("calibrate calls = %d, want 0 while locked", calibrator.callCount())
+	}
+	if err := gate.Ready(); err == nil {
+		t.Fatal("gate reopened while the backfill lock still exists")
+	}
+
+	if err := client.Del(ctx, BackfillLockKey(defaultKeyspace)).Err(); err != nil {
+		t.Fatalf("remove backfill lock: %v", err)
+	}
+	watcher.check(ctx)
+	if calibrator.callCount() != 1 {
+		t.Fatalf("calibrate calls = %d, want 1 once the lock is gone", calibrator.callCount())
+	}
+	if err := gate.Ready(); err != nil {
+		t.Fatalf("gate not reopened: %v", err)
+	}
+	status := watcher.Status()
+	if status.Maintenance || !status.Ready || status.RunID != "run-b" {
+		t.Fatalf("status after maintenance = %#v", status)
 	}
 }
 

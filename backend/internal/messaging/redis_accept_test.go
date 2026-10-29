@@ -300,6 +300,109 @@ func TestRedisAcceptorRejectsLostCounterWithNonEmptyIndex(t *testing.T) {
 	}
 }
 
+// TestRedisAcceptorFailsClosedWhenMessageIDTaken proves a lost or stale global
+// counter never overwrites an existing entity: the allocated ID is already in
+// use, so acceptance stops with 503 semantics instead of replaying the ID.
+func TestRedisAcceptorFailsClosedWhenMessageIDTaken(t *testing.T) {
+	client, _ := newAcceptTest(t)
+	ctx := context.Background()
+	if err := client.SAdd(ctx, friendshipKey(1), 2).Err(); err != nil {
+		t.Fatalf("seed friendship: %v", err)
+	}
+	const takenID = 42
+	if err := client.HSet(ctx, messageKey(takenID), map[string]interface{}{
+		"id": takenID, "body": "existing", "seq": 9,
+	}).Err(); err != nil {
+		t.Fatalf("seed existing entity: %v", err)
+	}
+	acceptor := NewRedisAcceptor(client, RedisAcceptorOptions{SeedFloor: takenID - 1})
+	_, err := acceptor.Accept(ctx, DirectMessageRequest{
+		SenderID: 1, RecipientID: 2, ClientMessageID: "taken-id", Body: "new body",
+	})
+	if !errors.Is(err, ErrSeqNotReady) {
+		t.Fatalf("taken ID error = %v, want ErrSeqNotReady", err)
+	}
+	if got := client.HGet(ctx, messageKey(takenID), "body").Val(); got != "existing" {
+		t.Fatalf("existing entity overwritten: body = %q", got)
+	}
+	if got := client.HGet(ctx, messageKey(takenID), "seq").Val(); got != "9" {
+		t.Fatalf("existing entity seq = %q, want untouched 9", got)
+	}
+	// The global ID may be consumed (a gap is acceptable), the conversation
+	// state must not be.
+	if got := client.Get(ctx, counterKey()).Val(); got != "42" {
+		t.Fatalf("global counter = %q, want consumed 42", got)
+	}
+	if got := client.Exists(ctx, directSequenceKey(1, 2)).Val(); got != 0 {
+		t.Fatalf("dm:seq written after rejected ID = %d, want 0", got)
+	}
+	if got := client.ZCard(ctx, directPairKey(1, 2)).Val(); got != 0 {
+		t.Fatalf("dm:pair written after rejected ID = %d, want 0", got)
+	}
+	if got := client.XLen(ctx, messageStreamKey()).Val(); got != 0 {
+		t.Fatalf("stream written after rejected ID = %d, want 0", got)
+	}
+	if got := client.Exists(ctx, dedupKey(1, 2, "taken-id")).Val(); got != 0 {
+		t.Fatalf("dedup written after rejected ID = %d, want 0", got)
+	}
+}
+
+// TestRedisAcceptorFailsClosedWhenSequenceTaken proves the counter is not
+// advanced past a live seq still present in the surviving index: the accept
+// fails before any write, leaving counter and index untouched.
+func TestRedisAcceptorFailsClosedWhenSequenceTaken(t *testing.T) {
+	client, _ := newAcceptTest(t)
+	ctx := context.Background()
+	if err := client.SAdd(ctx, friendshipKey(1), 2).Err(); err != nil {
+		t.Fatalf("seed friendship: %v", err)
+	}
+	setDirectSequence(t, client, 1, 2, 3)
+	if err := client.ZAdd(ctx, directPairKey(1, 2), redis.Z{
+		Score: 4, Member: "900",
+	}).Err(); err != nil {
+		t.Fatalf("seed dm:pair: %v", err)
+	}
+	acceptor := NewRedisAcceptor(client, RedisAcceptorOptions{})
+	_, err := acceptor.Accept(ctx, DirectMessageRequest{
+		SenderID: 1, RecipientID: 2, ClientMessageID: "taken-seq", Body: "hello",
+	})
+	if !errors.Is(err, ErrSeqNotReady) {
+		t.Fatalf("taken seq error = %v, want ErrSeqNotReady", err)
+	}
+	if got := client.Get(ctx, directSequenceKey(1, 2)).Val(); got != "3" {
+		t.Fatalf("dm:seq = %q, want unchanged 3", got)
+	}
+	// The global ID is consumed; the entity, index, feed and dedup must not be
+	// written for it.
+	if got := client.Get(ctx, counterKey()).Val(); got != "1" {
+		t.Fatalf("global counter = %q, want consumed 1", got)
+	}
+	if got := client.Exists(ctx, messageKey(1)).Val(); got != 0 {
+		t.Fatalf("entity written after rejected seq = %d, want 0", got)
+	}
+	if got := client.ZCard(ctx, directPairKey(1, 2)).Val(); got != 1 {
+		t.Fatalf("dm:pair size = %d, want only the seeded member", got)
+	}
+	if got := client.ZScore(ctx, directPairKey(1, 2), "900").Val(); got != 4 {
+		t.Fatalf("seeded index member score = %v, want 4", got)
+	}
+	if got := client.ZCard(ctx, directFeedKey(1)).Val(); got != 0 {
+		t.Fatalf("sender feed written = %d, want 0", got)
+	}
+	if got := client.ZCard(ctx, directFeedKey(2)).Val(); got != 0 {
+		t.Fatalf("recipient feed written = %d, want 0", got)
+	}
+	if got := client.XLen(ctx, messageStreamKey()).Val(); got != 0 {
+		t.Fatalf("stream written after rejected seq = %d, want 0", got)
+	}
+	if got := client.Exists(ctx, dedupKey(1, 2, "taken-seq")).Val(); got != 0 {
+		t.Fatalf("dedup written after rejected seq = %d, want 0", got)
+	}
+	if got := client.Exists(ctx, directConversationLastKey(1)).Val(); got != 0 {
+		t.Fatalf("conv-last written after rejected seq = %d, want 0", got)
+	}
+}
+
 func TestRedisAcceptorRejectsSequenceOverflow(t *testing.T) {
 	client, _ := newAcceptTest(t)
 	ctx := context.Background()

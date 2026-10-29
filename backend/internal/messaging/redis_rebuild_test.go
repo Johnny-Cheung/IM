@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -909,6 +910,76 @@ func TestClearNamespaceInvalidatesMarkersBeforeFailing(t *testing.T) {
 	}
 }
 
+// addRecentDirectMessages appends count recent messages to the 1:2
+// conversation so its dedup set is larger than the verifier's sample size.
+func addRecentDirectMessages(fakeStore *fakeRebuildStore, now time.Time, count int) {
+	for index := 0; index < count; index++ {
+		messageID := uint64(100 + index)
+		senderID, recipientID := uint64(1), uint64(2)
+		if index%2 == 1 {
+			senderID, recipientID = 2, 1
+		}
+		fakeStore.direct = append(fakeStore.direct, store.Message{
+			ID:              messageID,
+			Seq:             uint64(4 + index),
+			SenderID:        senderID,
+			RecipientID:     recipientID,
+			ClientMessageID: fmt.Sprintf("extra-%d", messageID),
+			Body:            fmt.Sprintf("body-%d", messageID),
+			CreatedAt:       now.Add(-time.Hour),
+		})
+	}
+}
+
+// TestRedisRebuildSamplesOldestDedupRecord proves the verifier reads back the
+// old end of the dedup window, not just the newest records.
+func TestRedisRebuildSamplesOldestDedupRecord(t *testing.T) {
+	ctx := context.Background()
+	now := time.UnixMilli(1700000000000).UTC()
+	client, fakeStore, drain := newRebuildTest(t, now)
+	// c1 is closest to expiry; the newer records push it out of a newest-only
+	// sample. Its count is unchanged, so only a field read can catch this.
+	addRecentDirectMessages(fakeStore, now, 10)
+	fakeStore.beforeConvStats = func() {
+		if err := client.HSet(ctx, dedupKey(1, 2, "c1"), "body_hash", "tampered").Err(); err != nil {
+			t.Fatalf("tamper dedup record: %v", err)
+		}
+	}
+
+	_, err := runRebuild(t, client, fakeStore, drain, now, 2)
+	if err == nil || !strings.Contains(err.Error(), "dedup") {
+		t.Fatalf("Run() error = %v, want a dedup sample mismatch", err)
+	}
+	if exists := client.Exists(ctx, sequenceReadyKey()).Val(); exists != 0 {
+		t.Fatalf("seq:ready was written with a tampered dedup record")
+	}
+}
+
+// TestRedisRebuildVerifiesDedupNearExpiry proves an under-write of a record
+// with little TTL left inside the window is still a verification failure.
+func TestRedisRebuildVerifiesDedupNearExpiry(t *testing.T) {
+	ctx := context.Background()
+	now := time.UnixMilli(1700000000000).UTC()
+	client, fakeStore, drain := newRebuildTest(t, now)
+	// Thirty minutes of TTL used to fall inside the one-hour exclusion margin
+	// and outside the newest sample; it must still be required.
+	fakeStore.direct[0].CreatedAt = now.Add(-(7*24*time.Hour - 30*time.Minute))
+	addRecentDirectMessages(fakeStore, now, 10)
+	fakeStore.beforeConvStats = func() {
+		if err := client.Del(ctx, dedupKey(1, 2, "c1")).Err(); err != nil {
+			t.Fatalf("delete dedup record: %v", err)
+		}
+	}
+
+	_, err := runRebuild(t, client, fakeStore, drain, now, 2)
+	if err == nil || !strings.Contains(err.Error(), "dedup") {
+		t.Fatalf("Run() error = %v, want a dedup count mismatch", err)
+	}
+	if exists := client.Exists(ctx, sequenceReadyKey()).Val(); exists != 0 {
+		t.Fatalf("seq:ready was written without a required dedup record")
+	}
+}
+
 func TestRedisRebuildVerifyCatchesMissingDedup(t *testing.T) {
 	ctx := context.Background()
 	now := time.UnixMilli(1700000000000).UTC()
@@ -998,6 +1069,127 @@ func TestRedisRebuildPendingMarkerLifetime(t *testing.T) {
 		}
 		if exists := client.Exists(ctx, sequenceReadyKey()).Val(); exists != 0 {
 			t.Fatalf("seq:ready survived a failed clear")
+		}
+	})
+}
+
+func TestRedisRebuildToleratesPendingCleanupFailure(t *testing.T) {
+	ctx := context.Background()
+	now := time.UnixMilli(1700000000000).UTC()
+	client, fakeStore, drain := newRebuildTest(t, now)
+	var logs []string
+	failing := &delFailClient{
+		UniversalClient: client,
+		failOn: func(keys []string) bool {
+			return len(keys) == 1 && keys[0] == RebuildPendingKey(defaultKeyspace)
+		},
+	}
+	rebuilder := NewRedisRebuilder(failing, fakeStore, RedisRebuildOptions{
+		Keyspace:    defaultKeyspace,
+		Batch:       2,
+		DedupTTL:    7 * 24 * time.Hour,
+		Now:         func() time.Time { return now },
+		Logf:        func(format string, args ...interface{}) { logs = append(logs, fmt.Sprintf(format, args...)) },
+		DrainQueues: drain.Drain,
+	})
+
+	result, err := rebuilder.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want the committed namespace to succeed", err)
+	}
+	if result.DirectMessages != 5 || result.GroupMessages != 3 {
+		t.Fatalf("messages = %d/%d, want 5/3", result.DirectMessages, result.GroupMessages)
+	}
+	expectString(t, client, sequenceReadyKey(), "1")
+	expectString(t, client, defaultKeyspace.indexEpochKey(), "0")
+	if exists := client.Exists(ctx, RebuildPendingKey(defaultKeyspace)).Val(); exists != 1 {
+		t.Fatalf("rebuild:pending did not survive the injected delete failure")
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), RebuildPendingKey(defaultKeyspace)) {
+		t.Fatalf("logs = %v, want a rebuild:pending cleanup warning", logs)
+	}
+}
+
+func TestRedisRebuildBeforeClear(t *testing.T) {
+	now := time.UnixMilli(1700000000000).UTC()
+
+	t.Run("runs after the drain and before the clear", func(t *testing.T) {
+		ctx := context.Background()
+		client, fakeStore, drain := newRebuildTest(t, now)
+		sentinel := messageKey(999)
+		if err := client.Set(ctx, sentinel, "keep", 0).Err(); err != nil {
+			t.Fatalf("seed sentinel: %v", err)
+		}
+		hooked := false
+		rebuilder := NewRedisRebuilder(client, fakeStore, RedisRebuildOptions{
+			Keyspace:    defaultKeyspace,
+			Batch:       2,
+			DedupTTL:    7 * 24 * time.Hour,
+			Now:         func() time.Time { return now },
+			Logf:        func(string, ...interface{}) {},
+			DrainQueues: drain.Drain,
+			BeforeClear: func(ctx context.Context) error {
+				hooked = true
+				if drain.calls != 1 {
+					t.Fatalf("BeforeClear ran with %d drains, want 1", drain.calls)
+				}
+				if exists := client.Exists(ctx, sentinel).Val(); exists != 1 {
+					t.Fatalf("BeforeClear ran after the namespace was cleared")
+				}
+				return nil
+			},
+		})
+
+		if _, err := rebuilder.Run(ctx); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if !hooked {
+			t.Fatal("BeforeClear was not called")
+		}
+		if exists := client.Exists(ctx, sentinel).Val(); exists != 0 {
+			t.Fatal("sentinel survived the clear")
+		}
+	})
+
+	t.Run("error leaves the namespace untouched", func(t *testing.T) {
+		ctx := context.Background()
+		client, fakeStore, drain := newRebuildTest(t, now)
+		sentinel := messageKey(999)
+		if err := client.Set(ctx, sentinel, "keep", 0).Err(); err != nil {
+			t.Fatalf("seed sentinel: %v", err)
+		}
+		if err := client.Set(ctx, sequenceReadyKey(), "1", 0).Err(); err != nil {
+			t.Fatalf("seed stale seq:ready: %v", err)
+		}
+		backendRunning := errors.New("a backend is serving on 127.0.0.1:8198")
+		rebuilder := NewRedisRebuilder(client, fakeStore, RedisRebuildOptions{
+			Keyspace:    defaultKeyspace,
+			Batch:       2,
+			DedupTTL:    7 * 24 * time.Hour,
+			Now:         func() time.Time { return now },
+			Logf:        func(string, ...interface{}) {},
+			DrainQueues: drain.Drain,
+			BeforeClear: func(context.Context) error { return backendRunning },
+		})
+
+		result, err := rebuilder.Run(ctx)
+		if !errors.Is(err, backendRunning) {
+			t.Fatalf("Run() error = %v, want the BeforeClear error", err)
+		}
+		if drain.calls != 1 {
+			t.Fatalf("drain calls = %d, want 1", drain.calls)
+		}
+		if result.Cleared != 0 {
+			t.Fatalf("cleared = %d, want 0", result.Cleared)
+		}
+		if exists := client.Exists(ctx, sentinel).Val(); exists != 1 {
+			t.Fatal("namespace was cleared although BeforeClear failed")
+		}
+		if exists := client.Exists(ctx, sequenceReadyKey()).Val(); exists != 1 {
+			t.Fatal("stale seq:ready was removed although BeforeClear failed")
+		}
+		if exists := client.Exists(ctx, RebuildPendingKey(defaultKeyspace)).Val(); exists != 0 {
+			t.Fatal("rebuild:pending was written although BeforeClear failed")
 		}
 	})
 }

@@ -138,7 +138,7 @@ func (a *GroupRedisAcceptor) Accept(
 		return GroupMessageResult{}, store.ErrMessageConflict
 	case "id_overflow":
 		return GroupMessageResult{}, store.ErrMessageIDExhausted
-	case "seq_not_ready", "seq_unavailable":
+	case "seq_not_ready", "seq_unavailable", "id_unavailable":
 		return GroupMessageResult{}, ErrSeqNotReady
 	case "seq_overflow":
 		return GroupMessageResult{}, ErrSeqOverflow

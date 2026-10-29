@@ -28,13 +28,22 @@ const (
 	// redisRebuildLockMargin outlives the command's own deadline so its lock is
 	// never dropped while the rebuild is still working.
 	redisRebuildLockMargin = 5 * time.Minute
-	// defaultMaintenanceAddr is the rebuild deployment's backend port. It is
-	// the port the stopped-backend check probes when -addr was not given.
-	defaultMaintenanceAddr = "0.0.0.0:8198"
 	// backendProbeTimeout bounds the stopped-backend check; a listening
 	// loopback socket accepts immediately.
 	backendProbeTimeout = 250 * time.Millisecond
 )
+
+// maintenanceDefaultTargets are the loopback listeners this binary can
+// plausibly be serving on when -addr was not given: the HTTP server's own
+// development default and the production (8198) and verify (8199) deployment
+// ports.
+func maintenanceDefaultTargets() []string {
+	return []string{
+		net.JoinHostPort("127.0.0.1", "8080"),
+		net.JoinHostPort("127.0.0.1", "8198"),
+		net.JoinHostPort("127.0.0.1", "8199"),
+	}
+}
 
 // acquireMaintenanceLockScript takes one one-shot maintenance lock only when
 // the other command's lock is absent. Redis runs a script atomically, so the
@@ -108,59 +117,96 @@ var maintenanceDial = func(address string, timeout time.Duration) (net.Conn, err
 	return net.DialTimeout("tcp", address, timeout)
 }
 
-// maintenanceProbeTarget returns the loopback address to probe. The host in
-// -addr is ignored: the supported deployment runs the maintenance command on
-// the same host as the backend, whose listener is reachable over loopback. A
-// remote backend is out of scope for this check.
-func maintenanceProbeTarget(addr string) (string, error) {
-	if addr == "" {
-		addr = defaultMaintenanceAddr
+// maintenanceProbeTargets returns every address the stopped-backend check
+// dials. An explicit -addr names the only listener to probe, and its host is
+// honoured so a backend bound to a specific interface is still found; wildcard
+// binds are probed over loopback. Without -addr the command probes every
+// listener this binary can be running, because the HTTP server defaults to
+// 127.0.0.1:8080 while the deployment and verify instances use 8198 and 8199.
+// A busy unrelated service on one of those ports refuses the command, which is
+// the safe direction for a destructive one-shot command.
+func maintenanceProbeTargets(addr string, addrSet bool) ([]string, error) {
+	if !addrSet || addr == "" {
+		return maintenanceDefaultTargets(), nil
 	}
-	_, port, err := net.SplitHostPort(addr)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		return "", fmt.Errorf("parse -addr %q: %w", addr, err)
+		return nil, fmt.Errorf("parse -addr %q: %w", addr, err)
 	}
 	if port == "" {
-		return "", fmt.Errorf("parse -addr %q: missing port", addr)
+		return nil, fmt.Errorf("parse -addr %q: missing port", addr)
 	}
-	return net.JoinHostPort("127.0.0.1", port), nil
+	switch host {
+	case "", "0.0.0.0", "::":
+		host = "127.0.0.1"
+	}
+	return []string{net.JoinHostPort(host, port)}, nil
 }
 
 // ensureBackendStopped refuses a destructive one-shot command while a backend
-// accepts connections on its HTTP port. imctl performs the same check; this is
-// the in-process backstop for `im-server -rebuild-redis` run directly.
-func ensureBackendStopped(addr, command string) error {
-	target, err := maintenanceProbeTarget(addr)
+// accepts connections on any candidate listener. imctl performs the same check;
+// this is the in-process backstop for `im-server -rebuild-redis` run directly.
+func ensureBackendStopped(addr string, addrSet bool, command string) error {
+	targets, err := maintenanceProbeTargets(addr, addrSet)
 	if err != nil {
 		return err
 	}
-	connection, err := maintenanceDial(target, backendProbeTimeout)
-	if err != nil {
-		if errors.Is(err, syscall.ECONNREFUSED) {
-			return nil
+	for _, target := range targets {
+		connection, err := maintenanceDial(target, backendProbeTimeout)
+		if err != nil {
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				continue
+			}
+			return fmt.Errorf(
+				"cannot verify that no backend is serving on %s before the %s: %w; "+
+					"stop the backend first",
+				target, command, err,
+			)
 		}
+		_ = connection.Close()
 		return fmt.Errorf(
-			"cannot verify that no backend is serving on %s before the %s: %w; "+
-				"stop the backend first",
-			target, command, err,
+			"a backend is serving on %s; stop the backend (`imctl backend-stop`) "+
+				"before the %s, or run `imctl %s` which repeats these checks",
+			target, command, strings.TrimPrefix(command, "-"),
 		)
 	}
-	_ = connection.Close()
-	return fmt.Errorf(
-		"a backend is serving on %s; stop the backend (`imctl backend-stop`) "+
-			"before the %s, or run `imctl %s` which repeats these checks",
-		target, command, strings.TrimPrefix(command, "-"),
-	)
+	return nil
 }
 
-// maintenanceAddr is the address the stopped-backend check probes. Without an
-// explicit -addr the one-shot commands default to the rebuild deployment's
-// port rather than the HTTP server's development default.
-func (o serverOptions) maintenanceAddr() string {
-	if !o.addrSet || o.addr == "" {
-		return defaultMaintenanceAddr
+// backendStoppedBeforeClear is the RedisRebuilder BeforeClear hook: the same
+// stopped-backend probe, repeated after the queue drain and immediately before
+// the namespace is cleared, so a backend that started in between aborts the
+// destructive pass.
+func backendStoppedBeforeClear(
+	options serverOptions,
+	command string,
+) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return ensureBackendStopped(options.addr, options.addrSet, command)
 	}
-	return o.addr
+}
+
+// redisRebuildOptions builds the rebuild settings. BeforeClear re-checks that
+// the backend is still stopped after the drain, right before ClearNamespace.
+func redisRebuildOptions(
+	options serverOptions,
+	keyspace messaging.Keyspace,
+	namespace messaging.Namespace,
+	batch int,
+	queueTimeout time.Duration,
+	drainQueues func(context.Context) (messaging.QueueDrainResult, error),
+) messaging.RedisRebuildOptions {
+	return messaging.RedisRebuildOptions{
+		Keyspace:    keyspace,
+		Namespace:   namespace,
+		Batch:       batch,
+		Logf:        log.Printf,
+		DrainQueues: drainQueues,
+		BeforeClear: backendStoppedBeforeClear(options, "-rebuild-redis"),
+	}
 }
 
 // rebuildSettings validates the rebuild flags so a bad batch size or timeout
@@ -199,7 +245,7 @@ func runRedisRebuild(options serverOptions) error {
 		return err
 	}
 	// Nothing may be drained or cleared while a backend is serving it.
-	if err := ensureBackendStopped(options.maintenanceAddr(), "-rebuild-redis"); err != nil {
+	if err := ensureBackendStopped(options.addr, options.addrSet, "-rebuild-redis"); err != nil {
 		return err
 	}
 
@@ -280,12 +326,13 @@ func runRedisRebuild(options serverOptions) error {
 	rebuilder := messaging.NewRedisRebuilder(
 		redisClient,
 		dataStore,
-		messaging.RedisRebuildOptions{
-			Keyspace:  keyspace,
-			Namespace: namespace,
-			Batch:     batch,
-			Logf:      log.Printf,
-			DrainQueues: func(ctx context.Context) (messaging.QueueDrainResult, error) {
+		redisRebuildOptions(
+			options,
+			keyspace,
+			namespace,
+			batch,
+			queueTimeout,
+			func(ctx context.Context) (messaging.QueueDrainResult, error) {
 				return messaging.DrainPersistQueues(ctx, messaging.QueueDrainOptions{
 					Namespace:       namespace,
 					Rabbit:          infraConfig.RabbitMQ,
@@ -296,7 +343,7 @@ func runRedisRebuild(options serverOptions) error {
 					Logf:            log.Printf,
 				})
 			},
-		},
+		),
 	)
 
 	result, err := rebuilder.Run(ctx)

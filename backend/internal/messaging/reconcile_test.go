@@ -48,6 +48,10 @@ type fakeReconcileStore struct {
 	conversationReads []store.ConversationReadState
 	groupReads        []store.GroupMemberReadState
 
+	// maxServerMessageID is the durable global counter the reconciler compares
+	// messages:next_id with.
+	maxServerMessageID uint64
+
 	persisted        []store.Message
 	persistedGroups  []store.GroupMessage
 	attempts         int
@@ -506,6 +510,12 @@ func (f *fakeReconcileStore) ListConversationBasics(
 	return conversations, nil
 }
 
+func (f *fakeReconcileStore) MaxServerMessageID(_ context.Context) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.maxServerMessageID, nil
+}
+
 func (f *fakeReconcileStore) snapshot() ([]store.Message, []store.GroupMessage, int, int, int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -526,11 +536,22 @@ func (f *fakeReconcileStore) userCountCallsSnapshot() []uint64 {
 	return append([]uint64(nil), f.userCountCalls...)
 }
 
+// reconcileTestGlobalCounter is the messages:next_id value every test starts
+// with, above every message ID a fixture creates. Tests that exercise a lost or
+// stale counter delete or overwrite the key themselves.
+const reconcileTestGlobalCounter = 10_000_000
+
 func newReconcileTestClient(t *testing.T) (redis.UniversalClient, *miniredis.Miniredis) {
 	t.Helper()
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
+	if err := client.Set(
+		context.Background(), defaultKeyspace.counterKey(),
+		reconcileTestGlobalCounter, 0,
+	).Err(); err != nil {
+		t.Fatalf("seed global message counter: %v", err)
+	}
 	return client, server
 }
 
@@ -778,6 +799,11 @@ func TestReconcilerRepairsHoleInMiddle(t *testing.T) {
 	now := reconcileTestNow()
 	old := now.Add(-10 * time.Minute)
 	setDirectSequence(t, client, 1, 2, 5)
+	// Redis holds every message, including the two rows MySQL lost. The index
+	// is larger than MySQL's count, which is what makes the conversation a
+	// forward suspect under the Redis-versus-MySQL rule.
+	seedReconcileDirectMessage(t, client, 1, 2, 101, 1, old)
+	seedReconcileDirectMessage(t, client, 1, 2, 102, 2, old)
 	seedReconcileDirectMessage(t, client, 1, 2, 103, 3, old)
 	seedReconcileDirectMessage(t, client, 1, 2, 104, 4, old)
 
@@ -1348,7 +1374,23 @@ func TestReconcilerPagesLargeConversationGapWalk(t *testing.T) {
 	const stored = 200000
 	const upTo = 200001
 	setDirectSequence(t, client, 1, 2, upTo)
-	seedReconcileDirectMessage(t, client, 1, 2, 900001, gap, now.Add(-10*time.Minute))
+	seedReconcileDirectMessage(t, client, 1, 2, 500001, gap, now.Add(-10*time.Minute))
+	// Redis holds every message, so the index is one member larger than MySQL's
+	// count: the conversation is a forward suspect and the walk must page all
+	// the way to the hole.
+	members := make([]redis.Z, 0, upTo)
+	for seq := uint64(1); seq <= upTo; seq++ {
+		id := uint64(900000) + seq
+		if seq == gap {
+			id = 500001
+		}
+		members = append(members, redis.Z{Score: float64(seq), Member: strconvUint(id)})
+	}
+	if err := client.ZAdd(
+		context.Background(), defaultKeyspace.directPairKey(1, 2), members...,
+	).Err(); err != nil {
+		t.Fatalf("seed pair index: %v", err)
+	}
 
 	seqs := make([]uint64, 0, stored)
 	for seq := uint64(1); seq <= upTo; seq++ {
@@ -1370,7 +1412,7 @@ func TestReconcilerPagesLargeConversationGapWalk(t *testing.T) {
 		t.Fatalf("result = %+v, want the single gap repaired", result)
 	}
 	persisted, _, attempts, _, detailCalls := fakeStore.snapshot()
-	if len(persisted) != 1 || persisted[0].Seq != gap || persisted[0].ID != 900001 {
+	if len(persisted) != 1 || persisted[0].Seq != gap || persisted[0].ID != 500001 {
 		t.Fatalf("persisted = %+v, want only seq %d", persisted, gap)
 	}
 	if attempts != 1 {
@@ -1390,6 +1432,15 @@ func TestReconcilerPureTailLagStartsAfterProvenPrefix(t *testing.T) {
 	const counter = maxSeq + 1
 	setDirectSequence(t, client, 1, 2, counter)
 	seedReconcileDirectMessage(t, client, 1, 2, 900001, counter, now.Add(-10*time.Minute))
+	prefix := make([]redis.Z, 0, maxSeq)
+	for seq := uint64(1); seq <= maxSeq; seq++ {
+		prefix = append(prefix, redis.Z{Score: float64(seq), Member: strconvUint(700000 + seq)})
+	}
+	if err := client.ZAdd(
+		context.Background(), defaultKeyspace.directPairKey(1, 2), prefix...,
+	).Err(); err != nil {
+		t.Fatalf("seed pair index: %v", err)
+	}
 
 	seqs := make([]uint64, 0, maxSeq)
 	for seq := uint64(1); seq <= maxSeq; seq++ {
@@ -1437,6 +1488,15 @@ func TestReconcilerPureTailLagStartsAfterProvenPrefixGroup(t *testing.T) {
 	const counter = maxSeq + 1
 	setGroupSequence(t, client, 7, counter)
 	seedReconcileGroupMessage(t, client, 7, 900002, counter, now.Add(-10*time.Minute))
+	prefix := make([]redis.Z, 0, maxSeq)
+	for seq := uint64(1); seq <= maxSeq; seq++ {
+		prefix = append(prefix, redis.Z{Score: float64(seq), Member: strconvUint(600000 + seq)})
+	}
+	if err := client.ZAdd(
+		context.Background(), defaultKeyspace.groupInboxKey(7), prefix...,
+	).Err(); err != nil {
+		t.Fatalf("seed group inbox: %v", err)
+	}
 
 	seqs := make([]uint64, 0, maxSeq)
 	for seq := uint64(1); seq <= maxSeq; seq++ {
@@ -1467,15 +1527,27 @@ func TestReconcilerPureTailLagStartsAfterProvenPrefixGroup(t *testing.T) {
 	}
 }
 
-// A real hole below MAX(seq) makes COUNT(*) != MAX(seq), which proves nothing
-// about the prefix, so the walk must still start at seq 1 and page through it.
-func TestReconcilerMidGapStillWalksFromStart(t *testing.T) {
+// A MySQL seq hole with a Redis index that mirrors it exactly is not a Redis
+// defect. COUNT(*) != MAX(seq) on its own must not keep the conversation in the
+// forward walk, or every hole-tolerant rebuild turns into an endless rescan.
+func TestReconcilerMySQLHoleWithMatchingRedisIsNotASuspect(t *testing.T) {
 	client, _ := newReconcileTestClient(t)
-	now := reconcileTestNow()
 	const maxSeq uint64 = 20000
 	const gap uint64 = 10000
 	setDirectSequence(t, client, 1, 2, maxSeq)
-	seedReconcileDirectMessage(t, client, 1, 2, 900010, gap, now.Add(-10*time.Minute))
+
+	members := make([]redis.Z, 0, maxSeq-1)
+	for seq := uint64(1); seq <= maxSeq; seq++ {
+		if seq == gap {
+			continue
+		}
+		members = append(members, redis.Z{Score: float64(seq), Member: strconvUint(900000 + seq)})
+	}
+	if err := client.ZAdd(
+		context.Background(), defaultKeyspace.directPairKey(1, 2), members...,
+	).Err(); err != nil {
+		t.Fatalf("seed pair index: %v", err)
+	}
 
 	seqs := make([]uint64, 0, maxSeq-1)
 	for seq := uint64(1); seq <= maxSeq; seq++ {
@@ -1495,19 +1567,12 @@ func TestReconcilerMidGapStillWalksFromStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunOnce() error = %v", err)
 	}
-	if result.Repaired != 1 || result.Unresolved != 0 {
-		t.Fatalf("result = %+v, want the mid gap repaired", result)
-	}
-	persisted, _, _, _, _ := fakeStore.snapshot()
-	if len(persisted) != 1 || persisted[0].Seq != gap || persisted[0].ID != 900010 {
-		t.Fatalf("persisted = %+v, want seq %d", persisted, gap)
+	if result.Mismatched != 0 || result.Repaired != 0 || result.Unresolved != 0 {
+		t.Fatalf("result = %+v, want the MySQL hole ignored", result)
 	}
 	directCalls, _ := fakeStore.seqCalls()
-	if len(directCalls) < 2 {
-		t.Fatalf("detail page calls = %d, want the prefix paged", len(directCalls))
-	}
-	if directCalls[0].afterSeq != 0 {
-		t.Fatalf("first page afterSeq = %d, want 0 when the prefix is unproven", directCalls[0].afterSeq)
+	if len(directCalls) != 0 {
+		t.Fatalf("detail page calls = %d, want no walk for a MySQL-only hole", len(directCalls))
 	}
 }
 
@@ -1565,21 +1630,28 @@ func TestReconcilerHoleAndTailAreBothRepaired(t *testing.T) {
 
 func TestReconcileSeqLowerBound(t *testing.T) {
 	cases := []struct {
-		name                   string
-		count, maxSeq, counter uint64
-		want                   uint64
+		name                                string
+		count, maxSeq, counter, prefixIndex uint64
+		want                                uint64
 	}{
-		{"pure tail", 5, 5, 6, 6},
-		{"hole below max", 4, 5, 5, 1},
-		{"hole plus tail", 4, 5, 6, 1},
-		{"counter not ahead", 5, 5, 5, 1},
-		{"no numbered rows", 0, 0, 1, 1},
+		{"pure tail", 5, 5, 6, 5, 6},
+		{"mysql hole mirrored by redis", 4, 5, 5, 4, 6},
+		{"hole plus a tail with a fully indexed prefix", 4, 5, 6, 4, 6},
+		{"redis index short of the prefix", 5, 5, 6, 4, 1},
+		{"counter not ahead and redis index short", 5, 5, 5, 4, 1},
+		{"no numbered rows", 0, 0, 0, 0, 1},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			if got := reconcileSeqLowerBound(testCase.count, testCase.maxSeq, testCase.counter); got != testCase.want {
-				t.Fatalf("reconcileSeqLowerBound(%d, %d, %d) = %d, want %d",
-					testCase.count, testCase.maxSeq, testCase.counter, got, testCase.want)
+			got := reconcileSeqLowerBound(
+				testCase.count, testCase.maxSeq, testCase.counter, testCase.prefixIndex,
+			)
+			if got != testCase.want {
+				t.Fatalf(
+					"reconcileSeqLowerBound(%d, %d, %d, %d) = %d, want %d",
+					testCase.count, testCase.maxSeq, testCase.counter, testCase.prefixIndex,
+					got, testCase.want,
+				)
 			}
 		})
 	}
