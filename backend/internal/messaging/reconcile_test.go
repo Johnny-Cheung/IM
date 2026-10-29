@@ -34,10 +34,17 @@ type fakeReconcileStore struct {
 	seqsErr       error
 	rangeErr      error
 
-	directMessages    map[[2]uint64][]store.Message
-	groupMessages     map[uint64][]store.GroupMessage
-	userIDs           []uint64
-	userPeers         map[uint64][]uint64
+	directMessages map[[2]uint64][]store.Message
+	groupMessages  map[uint64][]store.GroupMessage
+	userIDs        []uint64
+	userPeers      map[uint64][]uint64
+	// peerOrder overrides ListConversationBasics ordering to mirror the
+	// production store, which returns conversations by latest message rather
+	// than by peer.
+	peerOrder map[uint64][]uint64
+	// userConversations overrides ListConversationBasics with full rows,
+	// including the newest message, as the preview audit needs.
+	userConversations map[uint64][]store.Conversation
 	conversationReads []store.ConversationReadState
 	groupReads        []store.GroupMemberReadState
 
@@ -51,6 +58,7 @@ type fakeReconcileStore struct {
 	userCountCalls   []uint64
 	directSeqCalls   []fakeSeqCall
 	groupSeqCalls    []fakeSeqCall
+	rangeQueries     []fakeRangeQuery
 
 	firstCall  chan struct{}
 	signalOnce sync.Once
@@ -172,6 +180,20 @@ type fakeSeqCall struct {
 	upTo, afterSeq uint64
 }
 
+// fakeRangeQuery records one ListMessagesBySeqRange call so a test can prove
+// which conversation and offset an audit resumed from.
+type fakeRangeQuery struct {
+	lowID, highID uint64
+	afterSeq      uint64
+	limit         int
+}
+
+func (f *fakeReconcileStore) rangeQuerySnapshot() []fakeRangeQuery {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeRangeQuery(nil), f.rangeQueries...)
+}
+
 func (f *fakeReconcileStore) seqCalls() ([]fakeSeqCall, []fakeSeqCall) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -280,6 +302,9 @@ func (f *fakeReconcileStore) ListMessagesBySeqRange(
 	defer f.mu.Unlock()
 	f.rangeCalls++
 	f.directRangeCount++
+	f.rangeQueries = append(f.rangeQueries, fakeRangeQuery{
+		lowID: lowID, highID: highID, afterSeq: afterSeq, limit: limit,
+	})
 	if f.rangeErr != nil {
 		return nil, f.rangeErr
 	}
@@ -464,8 +489,16 @@ func (f *fakeReconcileStore) ListConversationBasics(
 	if f.seqsErr != nil {
 		return nil, f.seqsErr
 	}
+	if conversations, ok := f.userConversations[userID]; ok {
+		return append([]store.Conversation(nil), conversations...), nil
+	}
 	peers := append([]uint64(nil), f.userPeers[userID]...)
-	sort.Slice(peers, func(i, j int) bool { return peers[i] < peers[j] })
+	if order, ok := f.peerOrder[userID]; ok {
+		// Mirror the production store's order (latest message first).
+		peers = append([]uint64(nil), order...)
+	} else {
+		sort.Slice(peers, func(i, j int) bool { return peers[i] < peers[j] })
+	}
 	conversations := make([]store.Conversation, 0, len(peers))
 	for _, peer := range peers {
 		conversations = append(conversations, store.Conversation{UserID: peer})
@@ -1007,7 +1040,11 @@ func TestReconcilerPagesRowsAndLimitsDetail(t *testing.T) {
 	}
 }
 
-func TestReconcilerSkipsMissingCounter(t *testing.T) {
+// A missing counter used to be skipped by the reverse audit, which left every
+// send returning seq_unavailable or dead-lettering on a seq conflict. The
+// reverse check now runs first; see
+// TestReconcilerRepairsMissingCounterAndEmptyIndex for the repair path.
+func TestReconcilerMissingCounterStillCountsAsScanned(t *testing.T) {
 	client, _ := newReconcileTestClient(t)
 
 	fakeStore := newFakeReconcileStore()
@@ -1019,12 +1056,13 @@ func TestReconcilerSkipsMissingCounter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunOnce() error = %v", err)
 	}
-	if result.Scanned != 0 || result.Mismatched != 0 || result.Repaired != 0 {
-		t.Fatalf("result = %+v, want the conversation skipped", result)
+	// With no repairer the counter cannot be raised, but the conversation is
+	// still examined and its counter plus whole index gap are reported.
+	if result.Scanned != 1 || result.RedisMissing != 3 || result.CountersRaised != 0 {
+		t.Fatalf("result = %+v, want the missing counter audited", result)
 	}
-	_, _, attempts, _, detailCalls := fakeStore.snapshot()
-	if attempts != 0 || detailCalls != 0 {
-		t.Fatalf("attempts = %d detail calls = %d, want none", attempts, detailCalls)
+	if result.Mismatched != 0 || result.Repaired != 0 {
+		t.Fatalf("result = %+v, want the forward direction untouched", result)
 	}
 }
 
@@ -1737,5 +1775,92 @@ func TestReconcilerIncompleteGroupEntityNotPersisted(t *testing.T) {
 	_, persistedGroups, attempts, _, _ := fakeStore.snapshot()
 	if attempts != 0 || len(persistedGroups) != 0 {
 		t.Fatalf("attempts = %d groups = %+v, want the incomplete group entity rejected", attempts, persistedGroups)
+	}
+}
+
+// The feed audit's resume cursor is peer-ordered, but the store returns
+// conversations by latest message. Paging must sort by peer, otherwise the walk
+// oscillates between the newest conversations and never reaches a quiet one.
+func TestReconcilerFeedCursorFollowsPeerOrderNotRecency(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	ctx := context.Background()
+
+	fakeStore := newFakeReconcileStore()
+	// Recency order: peer 500 is first, peer 100 second.
+	fakeStore.userPeers[1] = []uint64{500, 100}
+	fakeStore.peerOrder = map[uint64][]uint64{1: {500, 100}}
+
+	const (
+		firstPeerMessages  = 2000
+		secondPeerMessages = 3000
+		missingSeq         = 2500
+	)
+	missingID := uint64(700000 + missingSeq)
+	feedMembers := make([]redis.Z, 0, firstPeerMessages+secondPeerMessages-1)
+	for seq := uint64(1); seq <= firstPeerMessages; seq++ {
+		message := store.Message{
+			ID: uint64(100000 + seq), Seq: seq, SenderID: 1, RecipientID: 500,
+			ClientMessageID: fmt.Sprintf("a-%d", seq), Body: fmt.Sprintf("a-%d", seq),
+		}
+		fakeStore.directMessages[[2]uint64{1, 500}] = append(fakeStore.directMessages[[2]uint64{1, 500}], message)
+		feedMembers = append(feedMembers, redis.Z{Score: float64(message.ID), Member: strconvUint(message.ID)})
+	}
+	for seq := uint64(1); seq <= secondPeerMessages; seq++ {
+		message := store.Message{
+			ID: uint64(700000 + seq), Seq: seq, SenderID: 1, RecipientID: 100,
+			ClientMessageID: fmt.Sprintf("b-%d", seq), Body: fmt.Sprintf("b-%d", seq),
+		}
+		fakeStore.directMessages[[2]uint64{1, 100}] = append(fakeStore.directMessages[[2]uint64{1, 100}], message)
+		if seq != missingSeq {
+			feedMembers = append(feedMembers, redis.Z{Score: float64(message.ID), Member: strconvUint(message.ID)})
+		}
+	}
+	if err := client.ZAdd(ctx, defaultKeyspace.directFeedKey(1), feedMembers...).Err(); err != nil {
+		t.Fatalf("seed feed: %v", err)
+	}
+
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+	missing, err := reconciler.missingFeedMessages(ctx, 1, 1)
+	if err != nil {
+		t.Fatalf("first missingFeedMessages() error = %v", err)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("first missing = %+v, want none in the first 2000 checks", missing)
+	}
+	if cursor := reconciler.feedCursorStart(1); cursor.peer != 100 || cursor.seq != firstPeerMessages {
+		t.Fatalf("first cursor = %+v, want the peer-ordered second conversation at seq %d", cursor, firstPeerMessages)
+	}
+
+	missing, err = reconciler.missingFeedMessages(ctx, 1, 1)
+	if err != nil {
+		t.Fatalf("second missingFeedMessages() error = %v", err)
+	}
+	if len(missing) != 1 || missing[0].ID != missingID {
+		t.Fatalf("second missing = %+v, want message %d found by resuming", missing, missingID)
+	}
+	if cursor := reconciler.feedCursorStart(1); cursor.peer != 0 {
+		t.Fatalf("second cursor = %+v, want it cleared after the gap was covered", cursor)
+	}
+	for _, query := range fakeStore.rangeQuerySnapshot() {
+		if query.lowID == 1 && query.highID == 500 && query.afterSeq == 0 {
+			t.Fatalf("recency-first conversation was rescanned from seq 0: %+v", query)
+		}
+	}
+}
+
+// needs-rebuild and repair-error for the same conversation must both reach the
+// log inside one throttling window.
+func TestReconcilerLogThrottleSeparatesEventKinds(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	fakeStore := newFakeReconcileStore()
+	logs := captureReconcileLog(t)
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+	now := reconcileTestNow()
+
+	reconciler.logThrottled(now, "needs-rebuild", "direct:1:2:index", "redis index gap")
+	reconciler.logThrottled(now, "repair-error", "direct:1:2:index", "write missing messages")
+
+	if got := strings.Count(logs.String(), "direct:1:2:index"); got != 2 {
+		t.Fatalf("log lines = %d, want both events: %s", got, logs.String())
 	}
 }

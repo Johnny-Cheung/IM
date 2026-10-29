@@ -7,6 +7,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/Johnny-Cheung/IM/backend/internal/config"
 	"github.com/Johnny-Cheung/IM/backend/internal/infra"
 	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
@@ -20,10 +22,38 @@ end
 return 0
 `
 
+// refuseIncompleteRebuild stops a seq backfill on a namespace whose rebuild did
+// not finish. seq:ready written there would certify exactly the incomplete
+// projection the rebuild still has to regenerate.
+func refuseIncompleteRebuild(
+	ctx context.Context,
+	client redis.UniversalClient,
+	keyspace messaging.Keyspace,
+) error {
+	pendingKey := messaging.RebuildPendingKey(keyspace)
+	pending, err := client.Exists(ctx, pendingKey).Result()
+	if err != nil {
+		return fmt.Errorf("check rebuild pending marker: %w", err)
+	}
+	if pending > 0 {
+		return fmt.Errorf(
+			"a Redis rebuild did not finish (marker %s); run `imctl rebuild-redis` "+
+				"before -backfill-seq",
+			pendingKey,
+		)
+	}
+	return nil
+}
+
 // runSeqBackfill numbers direct and group history, rebuilds the seq read model
 // and writes seq:ready. It is invoked with -backfill-seq while the server is
 // stopped and can run against an empty database.
 func runSeqBackfill(options serverOptions) error {
+	// Nothing may be numbered or marked ready while a backend is serving it.
+	if err := ensureBackendStopped(options.maintenanceAddr(), "-backfill-seq"); err != nil {
+		return err
+	}
+
 	dsn, err := config.MySQLDSN()
 	if err != nil {
 		return fmt.Errorf("load MySQL configuration: %w", err)
@@ -65,18 +95,24 @@ func runSeqBackfill(options serverOptions) error {
 	}
 	keyspace := messaging.NewKeyspace(namespace)
 	redisClient := infraManager.Redis()
+	// A failed rebuild leaves its pending marker behind. A backfill would
+	// certify that half-built namespace, so refuse until the rebuild is rerun.
+	if err := refuseIncompleteRebuild(ctx, redisClient, keyspace); err != nil {
+		return err
+	}
 	lockKey := messaging.BackfillLockKey(keyspace)
 	token := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
-	acquired, err := redisClient.SetNX(
-		ctx, lockKey, token, messaging.SeqBackfillLockTTL,
-	).Result()
-	if err != nil {
-		return fmt.Errorf("acquire seq backfill lock: %w", err)
-	}
-	if !acquired {
-		return fmt.Errorf(
-			"another seq backfill is running (lock %s); wait for it to finish", lockKey,
-		)
+	// The lock is taken only when the rebuild lock is absent; the reverse is
+	// enforced by the rebuild's copy of the same atomic script.
+	if err := acquireMaintenanceLock(ctx, redisClient, maintenanceLock{
+		OwnKey:    lockKey,
+		OwnName:   "seq backfill",
+		OtherKey:  messaging.RebuildLockKey(keyspace),
+		OtherName: "Redis rebuild",
+		Token:     token,
+		TTL:       messaging.SeqBackfillLockTTL,
+	}); err != nil {
+		return err
 	}
 	defer func() {
 		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

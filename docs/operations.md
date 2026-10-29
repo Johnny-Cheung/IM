@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、两轮审查修复和 8199 隔离验证（含真实 MySQL 测试与故障演练），同样暂不切换 8198。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、审查修复和 8199 隔离验证；v1.8.3 Redis 重建与双向一致性检查已完成开发与审查修复，待 8199 隔离验证。三者同样暂不切换 8198。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -47,7 +47,7 @@ sha256sum -c SHA256SUMS         # Linux
 | --- | --- |
 | `/health` | HTTP 进程可响应即返回 200；不检查 MySQL。 |
 | `/ready` | 2 秒内成功 ping MySQL 时返回 200（`database=ok`）；否则返回 503（`database=unavailable`）。它仍然只检查 MySQL，不反映消息号闸门。 |
-| `/ops/infra` | 基础设施连通性、`seq` 就绪/校准状态。v1.8.2 启用消息链路时增加 `pipeline`：私聊/群聊 Stream 长度、pending、最老条目年龄、积压告警、死信数、relay/consumer 错误及对账结果。返回最近采样，不在请求中连接基础设施。 |
+| `/ops/infra` | 基础设施连通性、`seq` 就绪/校准状态。v1.8.2 启用消息链路时增加 `pipeline`：Stream 长度、pending、最老条目年龄、积压告警、死信数、relay/consumer 错误及对账结果。v1.8.3 起对账还包含 `redis_missing`、`redis_repaired`、`watermarks_raised`、`feed_repairs`、`needs_rebuild`、`last_deep_audit_at`、`deep_audit_error`；consumer 增加 `in_flight`。返回最近采样，不在请求中连接基础设施。 |
 
 ```bash
 /opt/IM-Rebuild/imctl health
@@ -172,7 +172,7 @@ grep -q 'backfill-group-read' "$PRE" \
 5. 执行回填：`/opt/IM-Rebuild/imctl backfill-seq`（验证实例为 `/opt/IM-Rebuild/imctl --verify backfill-seq`）。命令先执行迁移，再填充 MySQL 的会话列与 `seq`、重建 Redis 计数器/`dm:pair`/群 inbox、换算水位、校验，全部通过后写入 `seq:ready`（正式 `im:v12:seq:ready`，验证 `im:v13-verify:seq:ready`）；失败时不写 `seq:ready`。回填期间持有 `backfill:lock`（30 分钟 TTL），后端在锁存在时拒绝启动。重跑时只有 `seq:ready` 能证明 Redis 水位已是 `seq`：缺少它就把所有 Redis 水位按旧全局消息号重新换算，MySQL 的 `last_read_seq` 作为下限；已存在 `seq:ready` 时保留 `seq` 值并截断到计数器。崩溃残留的锁最多阻塞启动 30 分钟，可用 `SCAN` 确认后 `UNLINK` 该键。
 6. 启动：`/opt/IM-Rebuild/imctl backend-start`。缺少 `seq:ready` 时后端拒绝启动。
 7. 启动后验证：
-   - `/ready` 200（仍只查 MySQL），并观察 `/ops/infra` 的 `seq` 段：`calibrating:true`（或 `run_id` 与切换前记录的不同）表示 Redis 重启后正在重新校准，等待即可；`ready:false` 且 `waiting_seq_ready:true` 表示 `seq:ready` 丢失，需要停止后端并重新执行 `backfill-seq`。校准完成前发送、`focus`、未读、`read-stats` 返回 503，历史读取正常。
+   - `/ready` 200（仍只查 MySQL），并观察 `/ops/infra` 的 `seq` 段：`calibrating:true`（或 `run_id` 与切换前记录的不同）表示 Redis 重启后正在重新校准，等待即可；`ready:false` 且 `waiting_seq_ready:true` 表示 `seq:ready` 丢失，需要停止后端重新执行 `backfill-seq`（v1.8.3 起，若存在 `rebuild:pending` 或 MySQL 无未编号行，改用 `rebuild-redis`）。校准完成前发送、`focus`、未读、`read-stats` 返回 503，历史读取正常。
    - `imctl health`、`imctl status`、`imctl logs backend` 无 `seq:ready`、校准或唯一索引错误。
    - `imctl queue-status` 在回归后重新排空；`infractl status` 观察 Redis 内存变化（新的 `dm:seq`/`dm:pair` 取代两个方向的 `dm:conv`，容量治理留到 v1.9）。
    - 用独立验证账号回归**正式切换后的 8198**（必须显式设置 `BASE_URL`；不设置时 smoke 默认打 8199 canary）：`BASE_URL=http://10.12.75.191:8198 node scripts/smoke.mjs`、`BASE_URL=http://10.12.75.191:8198 node scripts/browser-smoke.mjs`、`BASE_URL=http://10.12.75.191:8198 node scripts/cache-smoke.mjs`；在开发机上执行时用 `http://127.0.0.1:8198`。每个会话 `seq` 从 1 连续、重复发送返回同一 `seq`、未读等于 `last_seq - read_seq`、三个旧已读接口返回 404 或 405。本轮 manifest 必须用数据库 `im` 清理。
@@ -190,7 +190,7 @@ grep -q 'backfill-group-read' "$PRE" \
 - 闸门关闭期间（启动校准、检测到 Redis 重启后的重新校准、`seq:ready` 丢失、计数器缺失但会话索引非空），发送、`focus`、未读和 `read-stats` 返回 503；历史读取照常，缺失部分从 MySQL 补。
 - Redis 不可用同样返回 503，不回落 MySQL；MySQL 不可用时编号、未读、已读照常，但校准无法完成，发送保持 503。
 - `/ready` 与 `imctl health` 不反映闸门，全绿也可能发送 503。以 `/ops/infra`、后端日志和 503 响应码为准。
-- `seq:ready` 丢失后必须重新执行 `backfill-seq`，不能手工补键。
+- `seq:ready` 丢失后：如果存在 `rebuild:pending`，说明上一次重建没有完成，必须停后端执行 `rebuild-redis`；否则先检查 MySQL 是否有未编号的消息行，有则执行 `backfill-seq`，没有则执行 `rebuild-redis`。不能手工补键。
 
 ### 回滚（v1.8.1 → v1.7）
 
@@ -414,6 +414,25 @@ curl -fsS http://127.0.0.1:8199/ops/infra   # 检查 pipeline 段
 - 真实基础设施演练（`TestV182PipelineLive`，104.7 秒）在独立命名空间 `im:v182-drill`、验证 vhost `im_v13_verify` 和独立 schema `im_v182_pipeline_test` 上通过，覆盖：手工 pending 恢复、关闭被捕获的 relay 连接后重连、对账修复与幂等、外键毒消息 6 次/31 秒后进死信并重放、删除死信绑定后 mandatory 返回触发重连重建、scoped 间隙锁 62 秒触发 1205 退避重试。演练测试默认跳过，只在 `IM_TEST_PIPELINE_LIVE=true` 时运行；它拒绝复用已有命名空间或已存在的 schema，结束时只删除自己创建的数据。
 - 清理：按 manifest 精确删除 16+10+2 个测试账号和 7+3 个群；验证库回到 0 行；验证命名空间只剩 `seq:ready`、`index:epoch` 和空 Stream；验证 vhost 的两个主队列为 0。临时授予的 schema 权限已撤销。
 - 未执行：停止或重启共享 Redis、RabbitMQ、MySQL 容器（会同时影响 8198，需要单独维护窗口）。
+
+## v1.8.3 Redis 重建与一致性检查
+
+Redis 数据整体丢失（`seq:ready` 也没了）或部分丢失时，用重建命令照 MySQL 重新生成聊天数据。命令必须在后端停止时运行；它会自己检查后端是否在跑。
+
+```bash
+/opt/IM-Rebuild/imctl --verify stop
+/opt/IM-Rebuild/imctl --verify rebuild-redis
+/opt/IM-Rebuild/imctl --verify start
+curl -fsS http://127.0.0.1:8199/ops/infra   # 检查 seq.ready 与 pipeline.reconcile
+```
+
+- 可选环境变量：`REBUILD_BATCH`（默认 1000）、`REBUILD_QUEUE_TIMEOUT`（默认 10m）、`REBUILD_TIMEOUT`（默认 30m，必须大于队列超时）。
+- 执行顺序：排空两个持久化队列（含正在处理的消息）→ 写 `rebuild:pending` → 先删 `seq:ready`/`index:epoch` 再清理本命名空间 → 全局计数器 → 消息主遍 → 好友、群投影和水位 → 校验 → `index:epoch=0` → `seq:ready` → 删除 `rebuild:pending`。
+- 只删除已知前缀；不使用 `FLUSHDB`。失败时不写 `seq:ready` 且保留 `rebuild:pending`，启动提示会指向 `rebuild-redis`。
+- MySQL 中允许存在编号空洞（毒消息进死信、掉电丢尾）。重建会记录空洞数，不因此失败。
+- `rebuild:lock` 和 `backfill:lock` 原子互斥，任一存在时另一个命令和后端启动都会被拒绝。锁的 TTL 是总超时加 5 分钟；进程被杀后最多等这么久，确认无人运行后可 `SCAN` 找到并 `UNLINK` 残留键。
+- 命令按 `-addr` 的端口探测本机后端，能连上就拒绝执行。该检查只覆盖同一台机器；共享 Redis 的其他主机不在单体范围。
+- 运行期间部分丢失由对账自动发现：每 5 分钟比对条数、计数器和已读位置，每小时抽样消息实体、feed 和会话预览。少量缺失自动补 Redis（每轮最多 200 条、单会话 50 条）；超过阈值时 `needs_rebuild` 增加，按上面的步骤人工重建。对账只写 Redis，不删除、不覆盖分叉的实体，也不改 MySQL。
 
 ## 死信队列处理
 

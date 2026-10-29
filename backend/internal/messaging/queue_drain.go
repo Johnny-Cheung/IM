@@ -19,7 +19,8 @@ const (
 	// queueDrainStablePolls is how many consecutive clean polls end a drain.
 	queueDrainStablePolls = 2
 	// queueDrainStopGrace bounds the wait for consumers to acknowledge the
-	// cancel; a delivery in flight is retried by the broker when it expires.
+	// cancel. A delivery still unacknowledged is requeued by the broker and is
+	// caught by the post-stop depth re-inspection.
 	queueDrainStopGrace = 15 * time.Second
 	// queueInspectTimeout bounds one passive declare so a wedged broker cannot
 	// block the drain past the rebuild context.
@@ -27,7 +28,8 @@ const (
 )
 
 // QueueDrainOptions configures draining the persist queues before a rebuild.
-// The group chain is drained only when GroupPersister is set.
+// The group queue is always inspected; GroupPersister is required as soon as it
+// holds a message.
 type QueueDrainOptions struct {
 	Namespace       Namespace
 	Rabbit          config.RabbitMQConfig
@@ -38,16 +40,21 @@ type QueueDrainOptions struct {
 	Timeout time.Duration
 	// PollEvery is the queue inspection interval.
 	PollEvery time.Duration
-	Logf      func(string, ...interface{})
+	// Now is the clock the timeout deadline is measured against; tests inject
+	// it. Nil means time.Now.
+	Now  func() time.Time
+	Logf func(string, ...interface{})
 }
 
 // drainObservation is one poll of both persist queues and their consumers.
 // Backlog counts ready messages only: AMQP queue.declare-ok does not report
-// unacknowledged deliveries, but those belong to our own consumers and are
-// covered by the persisted stability window and the retrying flag.
+// unacknowledged deliveries, so the consumers' InFlight counters cover the
+// deliveries they still hold.
 type drainObservation struct {
 	directBacklog      int
 	groupBacklog       int
+	directInFlight     int
+	groupInFlight      int
 	directPersisted    uint64
 	groupPersisted     uint64
 	directRetrying     bool
@@ -78,6 +85,8 @@ func (p *drainProgress) observe(observation drainObservation, stablePolls int) b
 	switch {
 	case observation.directBacklog > 0,
 		observation.groupBacklog > 0,
+		observation.directInFlight > 0,
+		observation.groupInFlight > 0,
 		observation.directRetrying,
 		observation.groupRetrying,
 		advanced:
@@ -92,21 +101,33 @@ func (p *drainProgress) observe(observation drainObservation, stablePolls int) b
 type drainLoop struct {
 	pollEvery   time.Duration
 	stablePolls int
-	maxPolls    int
-	observe     func(context.Context) (drainObservation, error)
-	wait        func(context.Context, time.Duration) bool
+	// timeout is a wall-clock budget, not a poll count: a slow inspect must not
+	// stretch the drain far past it. Zero means no deadline.
+	timeout time.Duration
+	// now is the clock used for the deadline; tests inject it.
+	now     func() time.Time
+	observe func(context.Context) (drainObservation, error)
+	wait    func(context.Context, time.Duration) bool
 }
 
-// run polls until both queues are quiet for the stable window, the attempt
-// budget is spent, or the context is canceled. The result carries the counters
-// of the last observation in every case.
+// run polls until both queues are quiet for the stable window, the deadline
+// passes, or the context is canceled. The result carries the counters of the
+// last observation in every case.
 func (l drainLoop) run(ctx context.Context) (QueueDrainResult, error) {
+	now := l.now
+	if now == nil {
+		now = time.Now
+	}
+	var deadline time.Time
+	if l.timeout > 0 {
+		deadline = now().Add(l.timeout)
+	}
 	var (
 		result      QueueDrainResult
 		progress    drainProgress
 		observation drainObservation
 	)
-	for attempt := 1; ; attempt++ {
+	for {
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
@@ -119,21 +140,30 @@ func (l drainLoop) run(ctx context.Context) (QueueDrainResult, error) {
 		if progress.observe(observation, l.stablePolls) {
 			return result, nil
 		}
-		if attempt >= l.maxPolls {
+		if !deadline.IsZero() && !now().Before(deadline) {
 			return result, fmt.Errorf(
-				"persist queues did not drain in %d polls: direct_ready=%d "+
-					"group_ready=%d direct_persisted=%d group_persisted=%d "+
+				"persist queues did not drain within %s: direct_ready=%d "+
+					"group_ready=%d direct_in_flight=%d group_in_flight=%d "+
+					"direct_persisted=%d group_persisted=%d "+
 					"direct_retrying=%t group_retrying=%t",
-				l.maxPolls,
+				l.timeout,
 				observation.directBacklog,
 				observation.groupBacklog,
+				observation.directInFlight,
+				observation.groupInFlight,
 				observation.directPersisted,
 				observation.groupPersisted,
 				observation.directRetrying,
 				observation.groupRetrying,
 			)
 		}
-		if !l.wait(ctx, l.pollEvery) {
+		waitFor := l.pollEvery
+		if !deadline.IsZero() {
+			if remaining := deadline.Sub(now()); remaining < waitFor {
+				waitFor = remaining
+			}
+		}
+		if !l.wait(ctx, waitFor) {
 			if err := ctx.Err(); err != nil {
 				return result, err
 			}
@@ -150,9 +180,10 @@ func drainResultOf(observation drainObservation) QueueDrainResult {
 	}
 }
 
-// DrainPersistQueues runs the existing direct and group consumers until both
-// persist queues are empty and idle, then stops them. It never publishes and
-// leaves dead-letter handling to the consumers.
+// DrainPersistQueues runs the direct consumer, and the group consumer when a
+// group persister is configured, until both persist queues are empty and idle,
+// then stops them. It never publishes and leaves dead-letter handling to the
+// consumers.
 func DrainPersistQueues(
 	ctx context.Context,
 	options QueueDrainOptions,
@@ -188,10 +219,9 @@ func DrainPersistQueues(
 		)
 	}
 	directQueue := directQueueName(namespace)
-	groupQueue := ""
-	if groupConsumer != nil {
-		groupQueue = groupQueueName(namespace)
-	}
+	// The group queue is inspected even without a group persister: a rebuild
+	// must never clear a namespace while group deliveries are still waiting.
+	groupQueue := groupQueueName(namespace)
 
 	inspector := newQueueDepthInspector(options.Rabbit, options.Dialer)
 	defer inspector.Close()
@@ -232,12 +262,14 @@ func DrainPersistQueues(
 		if err != nil {
 			return drainObservation{}, err
 		}
-		groupBacklog := 0
-		if groupConsumer != nil {
-			groupBacklog, err = inspector.Depth(ctx, groupQueue)
-			if err != nil {
-				return drainObservation{}, err
-			}
+		groupBacklog, err := inspector.Depth(ctx, groupQueue)
+		if err != nil {
+			return drainObservation{}, err
+		}
+		if err := requireGroupPersister(
+			groupQueue, groupBacklog, groupConsumer != nil,
+		); err != nil {
+			return drainObservation{}, err
 		}
 		directStatus := directConsumer.Status()
 		groupStatus := ConsumerStatus{}
@@ -247,6 +279,8 @@ func DrainPersistQueues(
 		return drainObservation{
 			directBacklog:      directBacklog,
 			groupBacklog:       groupBacklog,
+			directInFlight:     directStatus.InFlight,
+			groupInFlight:      groupStatus.InFlight,
 			directPersisted:    directStatus.Persisted,
 			groupPersisted:     groupStatus.Persisted,
 			directRetrying:     directStatus.Retrying,
@@ -256,14 +290,11 @@ func DrainPersistQueues(
 		}, nil
 	}
 
-	maxPolls := 1
-	if pollEvery > 0 {
-		maxPolls += int(timeout / pollEvery)
-	}
 	loop := drainLoop{
 		pollEvery:   pollEvery,
 		stablePolls: queueDrainStablePolls,
-		maxPolls:    maxPolls,
+		timeout:     timeout,
+		now:         options.Now,
 		observe:     observe,
 		wait:        waitMessaging,
 	}
@@ -275,11 +306,62 @@ func DrainPersistQueues(
 	if err := waitConsumers(consumersDone, queueDrainStopGrace); err != nil {
 		return drained, err
 	}
+	// Stopping the consumers cancels anything still in flight, and the broker
+	// requeues an unacknowledged delivery when the channel closes. The stable
+	// window can therefore have observed an empty queue that is no longer empty:
+	// re-inspect both depths before the caller is allowed to clear the
+	// namespace.
+	if err := verifyQueuesEmpty(ctx, inspector, directQueue, groupQueue); err != nil {
+		return drained, err
+	}
 	logf(
 		"persist queues drained direct=%d group=%d dead_lettered=%d",
 		drained.Direct, drained.Group, drained.DeadLettered,
 	)
 	return drained, nil
+}
+
+// requireGroupPersister refuses a non-empty group queue that this drain cannot
+// consume: the rebuild must never clear group data it did not drain.
+func requireGroupPersister(queue string, backlog int, configured bool) error {
+	if configured || backlog <= 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"group persist queue %s holds %d message(s) but no group persister "+
+			"is configured; refusing to clear the namespace",
+		queue, backlog,
+	)
+}
+
+// queueDepthReader is the part of queueDepthInspector the drain needs.
+type queueDepthReader interface {
+	Depth(ctx context.Context, queue string) (int, error)
+}
+
+// verifyQueuesEmpty refuses the drain when a queue received a message after
+// the consumers stopped. The AMQP channel close that requeues an unacked
+// delivery completes before the consumer goroutine returns, so the depths read
+// here are those the rebuild would otherwise wipe.
+func verifyQueuesEmpty(
+	ctx context.Context,
+	inspector queueDepthReader,
+	directQueue, groupQueue string,
+) error {
+	for _, queue := range []string{directQueue, groupQueue} {
+		depth, err := inspector.Depth(ctx, queue)
+		if err != nil {
+			return fmt.Errorf("re-inspect queue %s after the drain: %w", queue, err)
+		}
+		if depth > 0 {
+			return fmt.Errorf(
+				"persist queue %s still holds %d message(s) after the drain stopped; "+
+					"refusing to clear the namespace",
+				queue, depth,
+			)
+		}
+	}
+	return nil
 }
 
 func waitConsumers(done <-chan struct{}, grace time.Duration) error {

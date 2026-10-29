@@ -352,7 +352,23 @@ queue_status() {
   echo "persist queues are drained"
 }
 
+# The app secret the command will be run with. In verify mode it is a
+# pre-provisioned file under the verify app root.
+mysql_app_secret_file() {
+  if [ "${VERIFY_MODE}" = "1" ]; then
+    printf '%s' "${BACKEND_APP_SECRET}"
+  else
+    printf '%s' "${MYSQL_APP_SECRET}"
+  fi
+}
+
 backfill_seq() {
+  # Check before prepare_backend_config: its install/cp failure would abort
+  # under set -e with no friendly message.
+  if [ ! -s "$(mysql_app_secret_file)" ]; then
+    echo "seq backfill requires MySQL configuration" >&2
+    return 1
+  fi
   prepare_backend_config
   if ! infra_ready; then
     echo "seq backfill requires Redis configuration" >&2
@@ -365,14 +381,22 @@ backfill_seq() {
     env_args+=("${line}")
   done < <(backend_env_args)
   /usr/bin/env "${env_args[@]}" \
-    "${APP_ROOT}/bin/im-server" -backfill-seq \
+    "${APP_ROOT}/bin/im-server" -addr "${ADDR}" -backfill-seq \
     -backfill-batch "${BACKFILL_BATCH:-1000}"
 }
 
 # A rebuild drains the persist queues and regenerates the whole Redis
 # namespace from MySQL, so it needs every backend dependency and a stopped
-# backend. Optional batch/queue-timeout overrides come from the environment.
+# backend. Optional batch/queue/total timeout overrides come from the
+# environment. -addr carries the deployment port so the command's own
+# stopped-backend check probes the same listener.
 rebuild_redis() {
+  # Check before prepare_backend_config so a missing secret reports the
+  # actionable error instead of an install/cp failure.
+  if [ ! -s "$(mysql_app_secret_file)" ]; then
+    echo "redis rebuild requires MySQL configuration" >&2
+    return 1
+  fi
   prepare_backend_config
   if [ ! -s "${BACKEND_APP_SECRET}" ]; then
     echo "redis rebuild requires MySQL configuration" >&2
@@ -392,12 +416,15 @@ rebuild_redis() {
   while IFS= read -r line; do
     env_args+=("${line}")
   done < <(backend_env_args)
-  local -a server_args=("-rebuild-redis")
+  local -a server_args=(-addr "${ADDR}" -rebuild-redis)
   if [ -n "${REBUILD_BATCH:-}" ]; then
     server_args+=(-rebuild-batch "${REBUILD_BATCH}")
   fi
   if [ -n "${REBUILD_QUEUE_TIMEOUT:-}" ]; then
     server_args+=(-rebuild-queue-timeout "${REBUILD_QUEUE_TIMEOUT}")
+  fi
+  if [ -n "${REBUILD_TIMEOUT:-}" ]; then
+    server_args+=(-rebuild-timeout "${REBUILD_TIMEOUT}")
   fi
   /usr/bin/env "${env_args[@]}" "${APP_ROOT}/bin/im-server" "${server_args[@]}"
   echo "Redis rebuild finished; seq:ready is written for the selected namespace."

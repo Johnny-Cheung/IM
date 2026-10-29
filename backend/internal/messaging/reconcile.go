@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,7 +53,10 @@ type ReconcileStore interface {
 
 // ProjectionRepairer restores Redis read-model entries from durable rows. The
 // reconciler only adds: it never deletes an index member, overwrites an
-// existing entity or lowers a counter.
+// existing entity or lowers a counter. Existing entities are only rewritten by
+// WriteDirectBatch/WriteGroupBatch when the reconciler has proved the entity is
+// absent; a present entity is either repaired by ProjectionIndexRepairer or
+// left untouched and reported as needing a rebuild.
 type ProjectionRepairer interface {
 	WriteDirectBatch(context.Context, []store.Message) (int, error)
 	WriteGroupBatch(context.Context, []store.GroupMessage) (int, error)
@@ -60,6 +64,17 @@ type ProjectionRepairer interface {
 	RaiseGroupReadWatermarks(context.Context, []store.GroupMemberReadState) (int, error)
 	RaiseDirectCounter(ctx context.Context, lowID, highID, seq uint64) error
 	RaiseGroupCounter(ctx context.Context, groupID, seq uint64) error
+}
+
+// ProjectionIndexRepairer is the optional index-only extension of
+// ProjectionRepairer. When the configured repairer implements it, a message
+// entity that already exists and matches MySQL gets its conversation index,
+// feed entries, preview and counter restored without rewriting the entity body.
+// The reconciler falls back to WriteDirectBatch/WriteGroupBatch when it is not
+// implemented, but only for entities it has proved match MySQL.
+type ProjectionIndexRepairer interface {
+	WriteDirectIndexBatch(context.Context, []store.Message) (int, error)
+	WriteGroupIndexBatch(context.Context, []store.GroupMessage) (int, error)
 }
 
 // ReconcileOptions configures the background reconciler. Zero values select the
@@ -187,6 +202,10 @@ const (
 	reconcileReadStatesPerRun    = 2000
 	reconcileFeedChecksPerUser   = 2000
 	reconcileFeedWriteBatch      = 50
+	// reconcileDeepRetryLimit bounds how many hourly audits retry the same
+	// deferred row before it is reported as needing a rebuild and skipped, so a
+	// permanently failing item cannot pin the deep-audit cursor forever.
+	reconcileDeepRetryLimit = 3
 )
 
 // Reconciler compares Redis conversation counters with MySQL and repairs
@@ -232,7 +251,12 @@ type Reconciler struct {
 	directDeepCursor  [2]uint64
 	groupDeepCursor   uint64
 	userDeepCursor    uint64
-	lastDeepAudit     time.Time
+	// deepSeqs rotates the hourly middle-entity sample of each conversation.
+	deepSeqs map[reconcileSeqCursorKey]uint64
+	// deepRetries counts consecutive deferrals of one deep-audit row.
+	deepRetries     map[reconcileSeqCursorKey]int
+	userDeepRetries map[uint64]int
+	lastDeepAudit   time.Time
 }
 
 // NewReconciler builds a reconciler. Only the client and store are required.
@@ -307,6 +331,9 @@ func NewReconciler(
 		missingSeqs:           make(map[reconcileSeqCursorKey]uint64),
 		reverseSeqs:           make(map[reconcileSeqCursorKey]uint64),
 		feedCursors:           make(map[uint64]reconcileFeedCursor),
+		deepSeqs:              make(map[reconcileSeqCursorKey]uint64),
+		deepRetries:           make(map[reconcileSeqCursorKey]int),
+		userDeepRetries:       make(map[uint64]int),
 		lastDeepAudit:         options.Now().UTC(),
 	}
 }
@@ -445,7 +472,13 @@ func (r *Reconciler) reconcile(
 	r.runLogs = 0
 	r.runSuppressed = 0
 	r.mu.Unlock()
+	deepDue := r.deepAuditDue(runAt)
 	budget := newReconcileRepairBudget(r.repairLimit)
+	if deepDue {
+		// Reserve half of the pass for the hourly deep audit so a busy 5-minute
+		// reverse-gap repair cannot starve it.
+		budget.reserve(r.repairLimit / 2)
+	}
 
 	seenPairs := make(map[[2]uint64]struct{})
 	if err := r.reconcileDirect(ctx, runAt, &result, seenPairs, budget); err != nil {
@@ -464,7 +497,7 @@ func (r *Reconciler) reconcile(
 	if err := r.reconcileOrphanGroupCounters(ctx, runAt, &result, seenGroups); err != nil {
 		return result, err
 	}
-	if r.deepAuditDue(runAt) {
+	if deepDue {
 		auditErr := r.deepAudit(ctx, runAt, &result, budget)
 		r.recordDeepAudit(runAt, auditErr)
 		if auditErr != nil {
@@ -554,14 +587,16 @@ func (r *Reconciler) scanDirectSuspects(
 			}
 			seen[[2]uint64{row.LowID, row.HighID}] = struct{}{}
 			state := states[[2]uint64{row.LowID, row.HighID}]
-			if state.counter == 0 {
-				// A conversation absent from Redis is a rebuild concern; the
-				// incremental path only repairs live conversations.
-				continue
-			}
 			result.Scanned++
+			// The reverse-direction check runs even when the counter is absent:
+			// a missing dm:seq must be raised from MySQL MaxSeq (and a missing
+			// index repaired) instead of being skipped as a rebuild concern.
 			if err := r.checkDirectRedisGap(ctx, runAt, row, state, budget, result); err != nil {
 				return nil, err
+			}
+			if state.counter == 0 {
+				// Just raised from MySQL; there is no Redis-only tail to walk.
+				continue
 			}
 			if state.counter <= row.MaxSeq && row.Count == row.MaxSeq {
 				continue
@@ -661,12 +696,13 @@ func (r *Reconciler) scanGroupSuspects(
 			}
 			seen[row.GroupID] = struct{}{}
 			state := states[row.GroupID]
-			if state.counter == 0 {
-				continue
-			}
 			result.Scanned++
 			if err := r.checkGroupRedisGap(ctx, runAt, row, state, budget, result); err != nil {
 				return nil, err
+			}
+			if state.counter == 0 {
+				// Just raised from MySQL; there is no Redis-only tail to walk.
+				continue
 			}
 			if state.counter <= row.MaxSeq && row.Count == row.MaxSeq {
 				continue
@@ -1442,9 +1478,12 @@ func (r *Reconciler) logUnresolved(runAt time.Time, key, reason string) {
 }
 
 // logThrottled logs one repair or unresolved item at most once per LogEvery.
+// The throttle identity includes the event kind so a needs-rebuild warning and
+// a repair error for the same subject never mask each other.
 func (r *Reconciler) logThrottled(runAt time.Time, kind, key, reason string) {
+	throttleKey := kind + "\x00" + key
 	r.mu.Lock()
-	if when, ok := r.logged[key]; ok && runAt.Sub(when) < r.logEvery {
+	if when, ok := r.logged[throttleKey]; ok && runAt.Sub(when) < r.logEvery {
 		r.mu.Unlock()
 		return
 	}
@@ -1462,7 +1501,7 @@ func (r *Reconciler) logThrottled(runAt time.Time, kind, key, reason string) {
 		}
 	}
 	r.runLogs++
-	r.logged[key] = runAt
+	r.logged[throttleKey] = runAt
 	r.mu.Unlock()
 	log.Printf("reconcile %s %s: %s", kind, key, reason)
 }
@@ -1478,21 +1517,48 @@ func (r *Reconciler) expireLoggedLocked(now time.Time) {
 }
 
 // reconcileRepairBudget bounds how many Redis messages one run writes across
-// the 5-minute repair pass and the deep audit.
+// the 5-minute repair pass and the deep audit. reserved is a slice of limit the
+// 5-minute pass may not spend, so the hourly deep audit always has room.
 type reconcileRepairBudget struct {
-	limit int
-	used  int
+	limit    int
+	used     int
+	reserved int
 }
 
 func newReconcileRepairBudget(limit int) *reconcileRepairBudget {
 	return &reconcileRepairBudget{limit: limit}
 }
 
+// reserve sets aside a slice of the budget for the deep audit.
+func (b *reconcileRepairBudget) reserve(count int) {
+	if b == nil || count <= 0 {
+		return
+	}
+	if count > b.limit {
+		count = b.limit
+	}
+	b.reserved = count
+}
+
+// remaining is what any phase may still spend, including the deep audit.
 func (b *reconcileRepairBudget) remaining() int {
 	if b == nil || b.used >= b.limit {
 		return 0
 	}
 	return b.limit - b.used
+}
+
+// quickRemaining is what the 5-minute pass may spend without touching the slice
+// reserved for the deep audit.
+func (b *reconcileRepairBudget) quickRemaining() int {
+	if b == nil {
+		return 0
+	}
+	usable := b.limit - b.reserved
+	if usable <= 0 || b.used >= usable {
+		return 0
+	}
+	return usable - b.used
 }
 
 func (b *reconcileRepairBudget) spend(count int) {
@@ -1604,7 +1670,7 @@ func (r *Reconciler) repairDirectIndexGap(
 ) error {
 	capacity := r.repairPerConversation
 	if r.repair != nil {
-		if remaining := budget.remaining(); remaining < capacity {
+		if remaining := budget.quickRemaining(); remaining < capacity {
 			capacity = remaining
 		}
 	}
@@ -1665,7 +1731,7 @@ func (r *Reconciler) repairGroupIndexGap(
 ) error {
 	capacity := r.repairPerConversation
 	if r.repair != nil {
-		if remaining := budget.remaining(); remaining < capacity {
+		if remaining := budget.quickRemaining(); remaining < capacity {
 			capacity = remaining
 		}
 	}
@@ -1785,15 +1851,127 @@ func (r *Reconciler) writeDirectRepairs(
 	if len(messages) == 0 || r.repair == nil {
 		return nil
 	}
-	written, err := r.repair.WriteDirectBatch(ctx, messages)
+	// The reverse path must not overwrite an entity that already exists: only
+	// an absent entity is fully projected from MySQL. A present entity is
+	// compared with its MySQL row; a match gets an index-only repair (or a
+	// byte-identical rewrite when the repairer has no index-only method) and a
+	// divergence is reported instead of being overwritten.
+	fields, err := r.directAuditEntityFields(ctx, messages)
 	if err != nil {
-		r.logThrottled(runAt, "repair-error", key+":index", "write missing messages: "+err.Error())
-		r.setReverseSeqCursor(cursorKey, 0, false)
-		return nil
+		return err
+	}
+	absent := make([]store.Message, 0, len(messages))
+	matching := make([]store.Message, 0, len(messages))
+	diverged := false
+	for index, message := range messages {
+		if len(fields[index]) == 0 {
+			absent = append(absent, message)
+			continue
+		}
+		if !directEntityMatches(message, fields[index]) {
+			diverged = true
+			continue
+		}
+		matching = append(matching, message)
+	}
+	if diverged {
+		result.NeedsRebuild++
+		r.logThrottled(runAt, "needs-rebuild", key+":entity", "redis entity differs from MySQL")
+	}
+	written := 0
+	if len(absent) > 0 {
+		count, err := r.repair.WriteDirectBatch(ctx, absent)
+		if err != nil {
+			r.logThrottled(runAt, "repair-error", key+":index", "write missing messages: "+err.Error())
+			r.setReverseSeqCursor(cursorKey, 0, false)
+			return nil
+		}
+		written += count
+	}
+	if len(matching) > 0 {
+		count, err := r.repairDirectIndexOnly(ctx, matching)
+		if err != nil {
+			r.logThrottled(runAt, "repair-error", key+":index", "write missing index entries: "+err.Error())
+			r.setReverseSeqCursor(cursorKey, 0, false)
+			return nil
+		}
+		written += count
 	}
 	result.RedisRepaired += uint64(written)
 	budget.spend(written)
 	return nil
+}
+
+// repairDirectIndexOnly restores the pair and feed entries of entities that are
+// already present and equal to MySQL. It falls back to a full write, which
+// converges the entity to the same bytes, only when the repairer offers no
+// index-only method.
+func (r *Reconciler) repairDirectIndexOnly(
+	ctx context.Context,
+	messages []store.Message,
+) (int, error) {
+	if indexer, ok := r.repair.(ProjectionIndexRepairer); ok {
+		return indexer.WriteDirectIndexBatch(ctx, messages)
+	}
+	return r.repair.WriteDirectBatch(ctx, messages)
+}
+
+func (r *Reconciler) repairGroupIndexOnly(
+	ctx context.Context,
+	messages []store.GroupMessage,
+) (int, error) {
+	if indexer, ok := r.repair.(ProjectionIndexRepairer); ok {
+		return indexer.WriteGroupIndexBatch(ctx, messages)
+	}
+	return r.repair.WriteGroupBatch(ctx, messages)
+}
+
+// directAuditEntityFields reads the entities of the given messages so the repair
+// can tell absent from present, and present-equal from diverged.
+func (r *Reconciler) directAuditEntityFields(
+	ctx context.Context,
+	messages []store.Message,
+) ([]map[string]string, error) {
+	pipe := r.client.Pipeline()
+	commands := make([]*redis.MapStringStringCmd, len(messages))
+	for index, message := range messages {
+		commands[index] = pipe.HGetAll(ctx, r.keyspace.messageKey(message.ID))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read direct entities for repair: %w", err)
+	}
+	fields := make([]map[string]string, len(messages))
+	for index, command := range commands {
+		value, err := command.Result()
+		if err != nil {
+			return nil, fmt.Errorf("read direct entity for repair: %w", err)
+		}
+		fields[index] = value
+	}
+	return fields, nil
+}
+
+func (r *Reconciler) groupAuditEntityFields(
+	ctx context.Context,
+	messages []store.GroupMessage,
+) ([]map[string]string, error) {
+	pipe := r.client.Pipeline()
+	commands := make([]*redis.MapStringStringCmd, len(messages))
+	for index, message := range messages {
+		commands[index] = pipe.HGetAll(ctx, r.keyspace.groupMessageKey(message.ID))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read group entities for repair: %w", err)
+	}
+	fields := make([]map[string]string, len(messages))
+	for index, command := range commands {
+		value, err := command.Result()
+		if err != nil {
+			return nil, fmt.Errorf("read group entity for repair: %w", err)
+		}
+		fields[index] = value
+	}
+	return fields, nil
 }
 
 func (r *Reconciler) writeGroupRepairs(
@@ -1808,11 +1986,46 @@ func (r *Reconciler) writeGroupRepairs(
 	if len(messages) == 0 || r.repair == nil {
 		return nil
 	}
-	written, err := r.repair.WriteGroupBatch(ctx, messages)
+	fields, err := r.groupAuditEntityFields(ctx, messages)
 	if err != nil {
-		r.logThrottled(runAt, "repair-error", key+":inbox", "write missing messages: "+err.Error())
-		r.setReverseSeqCursor(cursorKey, 0, false)
-		return nil
+		return err
+	}
+	absent := make([]store.GroupMessage, 0, len(messages))
+	matching := make([]store.GroupMessage, 0, len(messages))
+	diverged := false
+	for index, message := range messages {
+		if len(fields[index]) == 0 {
+			absent = append(absent, message)
+			continue
+		}
+		if !groupEntityMatches(message, fields[index]) {
+			diverged = true
+			continue
+		}
+		matching = append(matching, message)
+	}
+	if diverged {
+		result.NeedsRebuild++
+		r.logThrottled(runAt, "needs-rebuild", key+":entity", "redis entity differs from MySQL")
+	}
+	written := 0
+	if len(absent) > 0 {
+		count, err := r.repair.WriteGroupBatch(ctx, absent)
+		if err != nil {
+			r.logThrottled(runAt, "repair-error", key+":inbox", "write missing messages: "+err.Error())
+			r.setReverseSeqCursor(cursorKey, 0, false)
+			return nil
+		}
+		written += count
+	}
+	if len(matching) > 0 {
+		count, err := r.repairGroupIndexOnly(ctx, matching)
+		if err != nil {
+			r.logThrottled(runAt, "repair-error", key+":inbox", "write missing inbox entries: "+err.Error())
+			r.setReverseSeqCursor(cursorKey, 0, false)
+			return nil
+		}
+		written += count
 	}
 	result.RedisRepaired += uint64(written)
 	budget.spend(written)
@@ -1858,7 +2071,8 @@ func (r *Reconciler) reconcileDirectReadWatermarks(
 	runAt time.Time,
 	result *ReconcileResult,
 ) error {
-	afterUser, afterPeer := r.directReadCursorState()
+	startUser, startPeer := r.directReadCursorState()
+	afterUser, afterPeer := startUser, startPeer
 	scanned := 0
 	var raised []store.ConversationReadState
 	for scanned < reconcileReadStatesPerRun {
@@ -1886,8 +2100,21 @@ func (r *Reconciler) reconcileDirectReadWatermarks(
 			break
 		}
 	}
+	// Advance only past watermarks that were actually raised. On the first
+	// failed chunk the cursor stays before the failed state so the next run
+	// retries it instead of skipping a full rotation.
+	handled := r.raiseDirectWatermarks(ctx, runAt, raised, result)
+	if handled < len(raised) {
+		if handled > 0 {
+			last := raised[handled-1]
+			r.setDirectReadCursor(last.UserID, last.PeerID)
+		} else {
+			r.setDirectReadCursor(startUser, startPeer)
+		}
+		return nil
+	}
 	r.setDirectReadCursor(afterUser, afterPeer)
-	return r.raiseDirectWatermarks(ctx, runAt, raised, result)
+	return nil
 }
 
 func (r *Reconciler) staleDirectWatermarks(
@@ -1920,28 +2147,31 @@ func (r *Reconciler) staleDirectWatermarks(
 	return stale, nil
 }
 
+// raiseDirectWatermarks raises the stale watermarks chunk by chunk and returns
+// how many states were handled before the first failure. A nil repairer is
+// detection-only, so everything counts as handled and the cursor advances.
 func (r *Reconciler) raiseDirectWatermarks(
 	ctx context.Context,
 	runAt time.Time,
 	states []store.ConversationReadState,
 	result *ReconcileResult,
-) error {
+) int {
 	if len(states) == 0 {
-		return nil
+		return 0
 	}
 	result.RedisMissing += uint64(len(states))
 	if r.repair == nil {
-		return nil
+		return len(states)
 	}
 	for _, chunk := range reconcileChunks(len(states), r.batch) {
 		raised, err := r.repair.RaiseDirectReadWatermarks(ctx, states[chunk[0]:chunk[1]])
 		if err != nil {
 			r.logThrottled(runAt, "repair-error", "direct:read", "raise watermarks: "+err.Error())
-			return nil
+			return chunk[0]
 		}
 		result.WatermarksRaised += uint64(raised)
 	}
-	return nil
+	return len(states)
 }
 
 func (r *Reconciler) reconcileGroupReadWatermarks(
@@ -1949,7 +2179,8 @@ func (r *Reconciler) reconcileGroupReadWatermarks(
 	runAt time.Time,
 	result *ReconcileResult,
 ) error {
-	afterGroup, afterUser := r.groupReadCursorState()
+	startGroup, startUser := r.groupReadCursorState()
+	afterGroup, afterUser := startGroup, startUser
 	scanned := 0
 	var raised []store.GroupMemberReadState
 	for scanned < reconcileReadStatesPerRun {
@@ -1977,8 +2208,18 @@ func (r *Reconciler) reconcileGroupReadWatermarks(
 			break
 		}
 	}
+	handled := r.raiseGroupWatermarks(ctx, runAt, raised, result)
+	if handled < len(raised) {
+		if handled > 0 {
+			last := raised[handled-1]
+			r.setGroupReadCursor(last.GroupID, last.UserID)
+		} else {
+			r.setGroupReadCursor(startGroup, startUser)
+		}
+		return nil
+	}
 	r.setGroupReadCursor(afterGroup, afterUser)
-	return r.raiseGroupWatermarks(ctx, runAt, raised, result)
+	return nil
 }
 
 func (r *Reconciler) staleGroupWatermarks(
@@ -2014,28 +2255,29 @@ func (r *Reconciler) staleGroupWatermarks(
 	return stale, nil
 }
 
+// raiseGroupWatermarks mirrors raiseDirectWatermarks for group members.
 func (r *Reconciler) raiseGroupWatermarks(
 	ctx context.Context,
 	runAt time.Time,
 	states []store.GroupMemberReadState,
 	result *ReconcileResult,
-) error {
+) int {
 	if len(states) == 0 {
-		return nil
+		return 0
 	}
 	result.RedisMissing += uint64(len(states))
 	if r.repair == nil {
-		return nil
+		return len(states)
 	}
 	for _, chunk := range reconcileChunks(len(states), r.batch) {
 		raised, err := r.repair.RaiseGroupReadWatermarks(ctx, states[chunk[0]:chunk[1]])
 		if err != nil {
 			r.logThrottled(runAt, "repair-error", "group:read", "raise watermarks: "+err.Error())
-			return nil
+			return chunk[0]
 		}
 		result.WatermarksRaised += uint64(raised)
 	}
-	return nil
+	return len(states)
 }
 
 // reconcileChunks splits n items into [start, end) batches of at most size.
@@ -2167,13 +2409,34 @@ func (r *Reconciler) deepAuditDirectEntities(
 	if err != nil {
 		return fmt.Errorf("list conversation seq stats for deep audit: %w", err)
 	}
-	for _, row := range rows {
+	for index, row := range rows {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := r.auditDirectEntities(ctx, runAt, row, result, budget); err != nil {
+		key := reconcileSeqCursorKey{first: row.LowID, second: row.HighID}
+		complete, err := r.auditDirectEntities(ctx, runAt, row, result, budget)
+		if err != nil {
 			return err
 		}
+		if !complete {
+			if r.bumpDeepRetry(key) < reconcileDeepRetryLimit {
+				// Keep the cursor before the deferred conversation so the next
+				// hourly audit retries its repairs instead of waiting a full
+				// rotation.
+				if index > 0 {
+					previous := rows[index-1]
+					r.setDirectDeepCursor(previous.LowID, previous.HighID)
+				}
+				return nil
+			}
+			r.clearDeepRetry(key)
+			result.NeedsRebuild++
+			r.logThrottled(runAt, "needs-rebuild",
+				fmt.Sprintf("direct:%d:%d:deferred", row.LowID, row.HighID),
+				"sampled repair deferred across audits")
+			continue
+		}
+		r.clearDeepRetry(key)
 	}
 	// Advance only after the page is done so an aborted audit retries it.
 	if len(rows) < reconcileDeepAuditPerRun {
@@ -2185,19 +2448,22 @@ func (r *Reconciler) deepAuditDirectEntities(
 	return nil
 }
 
+// auditDirectEntities samples one conversation's boundary and rotating middle
+// entities. It returns false when a repair was deferred by the budget or failed,
+// so the caller can stop the page and retry the same conversation next audit.
 func (r *Reconciler) auditDirectEntities(
 	ctx context.Context,
 	runAt time.Time,
 	row store.ConversationSeqStat,
 	result *ReconcileResult,
 	budget *reconcileRepairBudget,
-) error {
-	samples, err := r.directBoundaryMessages(ctx, row)
+) (bool, error) {
+	samples, advance, err := r.directBoundaryMessages(ctx, row)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(samples) == 0 {
-		return nil
+		return true, nil
 	}
 	pipe := r.client.Pipeline()
 	commands := make([]*redis.MapStringStringCmd, len(samples))
@@ -2205,14 +2471,14 @@ func (r *Reconciler) auditDirectEntities(
 		commands[index] = pipe.HGetAll(ctx, r.keyspace.messageKey(message.ID))
 	}
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
-		return fmt.Errorf("read direct entities for deep audit: %w", err)
+		return false, fmt.Errorf("read direct entities for deep audit: %w", err)
 	}
 	var missing []store.Message
 	diverged := false
 	for index, message := range samples {
 		fields, err := commands[index].Result()
 		if err != nil {
-			return fmt.Errorf("read direct entity for deep audit: %w", err)
+			return false, fmt.Errorf("read direct entity for deep audit: %w", err)
 		}
 		if len(fields) == 0 {
 			missing = append(missing, message)
@@ -2228,7 +2494,13 @@ func (r *Reconciler) auditDirectEntities(
 			fmt.Sprintf("direct:%d:%d:entity", row.LowID, row.HighID),
 			"redis entity differs from MySQL")
 	}
-	return r.writeSampledDirectRepairs(ctx, runAt, missing, budget, result)
+	complete, err := r.writeSampledDirectRepairs(ctx, runAt, missing, budget, result)
+	if complete && advance != nil {
+		// The middle sample rotates only once this batch's repairs landed, so a
+		// deferred middle entity is sampled again rather than skipped.
+		advance()
+	}
+	return complete, err
 }
 
 func (r *Reconciler) writeSampledDirectRepairs(
@@ -2237,31 +2509,32 @@ func (r *Reconciler) writeSampledDirectRepairs(
 	missing []store.Message,
 	budget *reconcileRepairBudget,
 	result *ReconcileResult,
-) error {
+) (bool, error) {
 	if len(missing) == 0 {
-		return nil
+		return true, nil
 	}
 	result.RedisMissing += uint64(len(missing))
 	if r.repair == nil {
-		return nil
+		return true, nil
 	}
-	for _, chunk := range reconcileChunks(len(missing), r.repairPerConversation) {
+	limit := len(missing)
+	if remaining := budget.remaining(); remaining < limit {
+		limit = remaining
+	}
+	if limit <= 0 {
+		return false, nil
+	}
+	for _, chunk := range reconcileChunks(limit, r.repairPerConversation) {
 		batch := missing[chunk[0]:chunk[1]]
-		if remaining := budget.remaining(); remaining < len(batch) {
-			batch = batch[:remaining]
-		}
-		if len(batch) == 0 {
-			return nil
-		}
 		written, err := r.repair.WriteDirectBatch(ctx, batch)
 		if err != nil {
 			r.logThrottled(runAt, "repair-error", "deep:direct:entity", "write missing entity: "+err.Error())
-			return nil
+			return false, nil
 		}
 		result.RedisRepaired += uint64(written)
 		budget.spend(written)
 	}
-	return nil
+	return limit == len(missing), nil
 }
 
 func (r *Reconciler) deepAuditGroupEntities(
@@ -2275,13 +2548,30 @@ func (r *Reconciler) deepAuditGroupEntities(
 	if err != nil {
 		return fmt.Errorf("list group seq stats for deep audit: %w", err)
 	}
-	for _, row := range rows {
+	for index, row := range rows {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := r.auditGroupEntities(ctx, runAt, row, result, budget); err != nil {
+		key := reconcileSeqCursorKey{group: true, first: row.GroupID}
+		complete, err := r.auditGroupEntities(ctx, runAt, row, result, budget)
+		if err != nil {
 			return err
 		}
+		if !complete {
+			if r.bumpDeepRetry(key) < reconcileDeepRetryLimit {
+				if index > 0 {
+					r.setGroupDeepCursor(rows[index-1].GroupID)
+				}
+				return nil
+			}
+			r.clearDeepRetry(key)
+			result.NeedsRebuild++
+			r.logThrottled(runAt, "needs-rebuild",
+				fmt.Sprintf("group:%d:deferred", row.GroupID),
+				"sampled repair deferred across audits")
+			continue
+		}
+		r.clearDeepRetry(key)
 	}
 	if len(rows) < reconcileDeepAuditPerRun {
 		r.setGroupDeepCursor(0)
@@ -2297,13 +2587,13 @@ func (r *Reconciler) auditGroupEntities(
 	row store.GroupSeqStat,
 	result *ReconcileResult,
 	budget *reconcileRepairBudget,
-) error {
-	samples, err := r.groupBoundaryMessages(ctx, row)
+) (bool, error) {
+	samples, advance, err := r.groupBoundaryMessages(ctx, row)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(samples) == 0 {
-		return nil
+		return true, nil
 	}
 	pipe := r.client.Pipeline()
 	commands := make([]*redis.MapStringStringCmd, len(samples))
@@ -2311,14 +2601,14 @@ func (r *Reconciler) auditGroupEntities(
 		commands[index] = pipe.HGetAll(ctx, r.keyspace.groupMessageKey(message.ID))
 	}
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
-		return fmt.Errorf("read group entities for deep audit: %w", err)
+		return false, fmt.Errorf("read group entities for deep audit: %w", err)
 	}
 	var missing []store.GroupMessage
 	diverged := false
 	for index, message := range samples {
 		fields, err := commands[index].Result()
 		if err != nil {
-			return fmt.Errorf("read group entity for deep audit: %w", err)
+			return false, fmt.Errorf("read group entity for deep audit: %w", err)
 		}
 		if len(fields) == 0 {
 			missing = append(missing, message)
@@ -2334,80 +2624,237 @@ func (r *Reconciler) auditGroupEntities(
 			fmt.Sprintf("group:%d:entity", row.GroupID),
 			"redis entity differs from MySQL")
 	}
+	complete, err := r.writeSampledGroupRepairs(ctx, runAt, missing, budget, result)
+	if complete && advance != nil {
+		advance()
+	}
+	return complete, err
+}
+
+func (r *Reconciler) writeSampledGroupRepairs(
+	ctx context.Context,
+	runAt time.Time,
+	missing []store.GroupMessage,
+	budget *reconcileRepairBudget,
+	result *ReconcileResult,
+) (bool, error) {
 	if len(missing) == 0 {
-		return nil
+		return true, nil
 	}
 	result.RedisMissing += uint64(len(missing))
 	if r.repair == nil {
-		return nil
+		return true, nil
 	}
-	for _, chunk := range reconcileChunks(len(missing), r.repairPerConversation) {
+	limit := len(missing)
+	if remaining := budget.remaining(); remaining < limit {
+		limit = remaining
+	}
+	if limit <= 0 {
+		return false, nil
+	}
+	for _, chunk := range reconcileChunks(limit, r.repairPerConversation) {
 		batch := missing[chunk[0]:chunk[1]]
-		if remaining := budget.remaining(); remaining < len(batch) {
-			batch = batch[:remaining]
-		}
-		if len(batch) == 0 {
-			return nil
-		}
 		written, err := r.repair.WriteGroupBatch(ctx, batch)
 		if err != nil {
 			r.logThrottled(runAt, "repair-error", "deep:group:entity", "write missing entity: "+err.Error())
-			return nil
+			return false, nil
 		}
 		result.RedisRepaired += uint64(written)
 		budget.spend(written)
 	}
-	return nil
+	return limit == len(missing), nil
 }
 
 // directBoundaryMessages samples the oldest and newest seqs of a conversation,
-// which is where a partial tail loss or a wiped prefix shows first.
+// plus one rotating middle batch, which together find a partial tail loss, a
+// wiped prefix and an entity lost in the middle. advance commits the middle
+// cursor and is nil when no middle batch was read; it must be called only after
+// the batch's repairs completed.
 func (r *Reconciler) directBoundaryMessages(
 	ctx context.Context,
 	row store.ConversationSeqStat,
-) ([]store.Message, error) {
+) ([]store.Message, func(), error) {
 	boundary := r.deepAuditBoundary
 	if boundary <= 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	first, err := r.store.ListMessagesBySeqRange(ctx, row.LowID, row.HighID, 0, boundary)
 	if err != nil {
-		return nil, fmt.Errorf("sample oldest direct messages: %w", err)
+		return nil, nil, fmt.Errorf("sample oldest direct messages: %w", err)
 	}
 	if row.MaxSeq <= uint64(boundary) {
-		return first, nil
+		return first, nil, nil
 	}
 	last, err := r.store.ListMessagesBySeqRange(
 		ctx, row.LowID, row.HighID, row.MaxSeq-uint64(boundary), boundary,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("sample newest direct messages: %w", err)
+		return nil, nil, fmt.Errorf("sample newest direct messages: %w", err)
 	}
-	return reconcileUniqueDirect(append(first, last...)), nil
+	middle, advance, err := r.directMiddleSample(ctx, row, boundary)
+	if err != nil {
+		return nil, nil, err
+	}
+	return reconcileUniqueDirect(append(append(first, last...), middle...)), advance, nil
+}
+
+// directMiddleSample reads one rotating batch of messages strictly between the
+// boundary samples. The per-conversation cursor advances once per hourly audit
+// and wraps back to the start of the middle window.
+func (r *Reconciler) directMiddleSample(
+	ctx context.Context,
+	row store.ConversationSeqStat,
+	boundary int,
+) ([]store.Message, func(), error) {
+	low := uint64(boundary) + 1
+	if row.MaxSeq < low {
+		return nil, nil, nil
+	}
+	high := row.MaxSeq - uint64(boundary)
+	if high < low {
+		return nil, nil, nil
+	}
+	key := reconcileSeqCursorKey{first: row.LowID, second: row.HighID}
+	start := r.deepSeqStart(key, low, high)
+	page, err := r.store.ListMessagesBySeqRange(ctx, row.LowID, row.HighID, start-1, boundary)
+	if err != nil {
+		return nil, nil, fmt.Errorf("sample rotating direct messages: %w", err)
+	}
+	if len(page) == 0 {
+		return nil, func() { r.setDeepSeqCursor(key, 0, true) }, nil
+	}
+	next := page[len(page)-1].Seq + 1
+	reset := next > high
+	advance := func() { r.setDeepSeqCursor(key, next, reset) }
+	middle := make([]store.Message, 0, len(page))
+	for _, message := range page {
+		if message.Seq <= high {
+			middle = append(middle, message)
+		}
+	}
+	return middle, advance, nil
 }
 
 func (r *Reconciler) groupBoundaryMessages(
 	ctx context.Context,
 	row store.GroupSeqStat,
-) ([]store.GroupMessage, error) {
+) ([]store.GroupMessage, func(), error) {
 	boundary := r.deepAuditBoundary
 	if boundary <= 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	first, err := r.store.ListGroupMessagesBySeqRange(ctx, row.GroupID, 0, boundary)
 	if err != nil {
-		return nil, fmt.Errorf("sample oldest group messages: %w", err)
+		return nil, nil, fmt.Errorf("sample oldest group messages: %w", err)
 	}
 	if row.MaxSeq <= uint64(boundary) {
-		return first, nil
+		return first, nil, nil
 	}
 	last, err := r.store.ListGroupMessagesBySeqRange(
 		ctx, row.GroupID, row.MaxSeq-uint64(boundary), boundary,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("sample newest group messages: %w", err)
+		return nil, nil, fmt.Errorf("sample newest group messages: %w", err)
 	}
-	return reconcileUniqueGroup(append(first, last...)), nil
+	middle, advance, err := r.groupMiddleSample(ctx, row, boundary)
+	if err != nil {
+		return nil, nil, err
+	}
+	return reconcileUniqueGroup(append(append(first, last...), middle...)), advance, nil
+}
+
+func (r *Reconciler) groupMiddleSample(
+	ctx context.Context,
+	row store.GroupSeqStat,
+	boundary int,
+) ([]store.GroupMessage, func(), error) {
+	low := uint64(boundary) + 1
+	if row.MaxSeq < low {
+		return nil, nil, nil
+	}
+	high := row.MaxSeq - uint64(boundary)
+	if high < low {
+		return nil, nil, nil
+	}
+	key := reconcileSeqCursorKey{group: true, first: row.GroupID}
+	start := r.deepSeqStart(key, low, high)
+	page, err := r.store.ListGroupMessagesBySeqRange(ctx, row.GroupID, start-1, boundary)
+	if err != nil {
+		return nil, nil, fmt.Errorf("sample rotating group messages: %w", err)
+	}
+	if len(page) == 0 {
+		return nil, func() { r.setDeepSeqCursor(key, 0, true) }, nil
+	}
+	next := page[len(page)-1].Seq + 1
+	reset := next > high
+	advance := func() { r.setDeepSeqCursor(key, next, reset) }
+	middle := make([]store.GroupMessage, 0, len(page))
+	for _, message := range page {
+		if message.Seq <= high {
+			middle = append(middle, message)
+		}
+	}
+	return middle, advance, nil
+}
+
+// deepSeqStart returns the rotating middle-sample cursor, restarting when the
+// stored position falls outside the conversation's current middle window.
+func (r *Reconciler) deepSeqStart(key reconcileSeqCursorKey, low, high uint64) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	start := r.deepSeqs[key]
+	if start < low || start > high {
+		return low
+	}
+	return start
+}
+
+func (r *Reconciler) setDeepSeqCursor(key reconcileSeqCursorKey, next uint64, reset bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if reset || next == 0 {
+		delete(r.deepSeqs, key)
+		return
+	}
+	if _, exists := r.deepSeqs[key]; !exists && len(r.deepSeqs) >= reconcileLogKeyLimit {
+		// Bounded state: dropping the cursor only restarts the sample at the
+		// beginning of the middle window.
+		return
+	}
+	r.deepSeqs[key] = next
+}
+
+// bumpDeepRetry counts one deferral of a deep-audit row.
+func (r *Reconciler) bumpDeepRetry(key reconcileSeqCursorKey) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.deepRetries[key]; !exists && len(r.deepRetries) >= reconcileLogKeyLimit {
+		return reconcileDeepRetryLimit
+	}
+	r.deepRetries[key]++
+	return r.deepRetries[key]
+}
+
+func (r *Reconciler) clearDeepRetry(key reconcileSeqCursorKey) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.deepRetries, key)
+}
+
+func (r *Reconciler) bumpUserDeepRetry(userID uint64) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.userDeepRetries[userID]; !exists && len(r.userDeepRetries) >= reconcileLogKeyLimit {
+		return reconcileDeepRetryLimit
+	}
+	r.userDeepRetries[userID]++
+	return r.userDeepRetries[userID]
+}
+
+func (r *Reconciler) clearUserDeepRetry(userID uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.userDeepRetries, userID)
 }
 
 func reconcileUniqueDirect(messages []store.Message) []store.Message {
@@ -2503,13 +2950,31 @@ func (r *Reconciler) deepAuditFeeds(
 	if err != nil {
 		return fmt.Errorf("list user IDs for deep audit: %w", err)
 	}
-	for _, userID := range ids {
+	for index, userID := range ids {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := r.auditUserFeed(ctx, runAt, userID, result, budget); err != nil {
+		complete, err := r.auditUserFeed(ctx, runAt, userID, result, budget)
+		if err != nil {
 			return err
 		}
+		if !complete {
+			if r.bumpUserDeepRetry(userID) < reconcileDeepRetryLimit {
+				// Keep the cursor before this user so the next hourly audit
+				// retries the deferred feed/preview repairs.
+				if index > 0 {
+					r.setUserDeepCursor(ids[index-1])
+				}
+				return nil
+			}
+			r.clearUserDeepRetry(userID)
+			result.NeedsRebuild++
+			r.logThrottled(runAt, "needs-rebuild",
+				fmt.Sprintf("user:%d:feed", userID),
+				"sampled repair deferred across audits")
+			continue
+		}
+		r.clearUserDeepRetry(userID)
 	}
 	if len(ids) < r.deepAuditUsers {
 		r.setUserDeepCursor(0)
@@ -2519,27 +2984,34 @@ func (r *Reconciler) deepAuditFeeds(
 	return nil
 }
 
+// auditUserFeed samples one user's feed size, conversation previews and, when
+// the feed is short, the missing feed entries. It returns false when a repair
+// was deferred by the budget or failed.
 func (r *Reconciler) auditUserFeed(
 	ctx context.Context,
 	runAt time.Time,
 	userID uint64,
 	result *ReconcileResult,
 	budget *reconcileRepairBudget,
-) error {
+) (bool, error) {
+	previewsComplete, err := r.auditUserConversationLast(ctx, runAt, userID, result, budget)
+	if err != nil {
+		return false, err
+	}
 	count, err := r.store.CountMessagesInvolvingUser(ctx, userID)
 	if err != nil {
-		return fmt.Errorf("count messages involving user: %w", err)
+		return false, fmt.Errorf("count messages involving user: %w", err)
 	}
 	if count == 0 {
-		return nil
+		return previewsComplete, nil
 	}
 	key := r.keyspace.directFeedKey(userID)
 	card, err := r.client.ZCard(ctx, key).Result()
 	if err != nil {
-		return fmt.Errorf("read direct feed size: %w", err)
+		return false, fmt.Errorf("read direct feed size: %w", err)
 	}
 	if card >= int64(count) {
-		return nil
+		return previewsComplete, nil
 	}
 	gap := count - uint64(card)
 	result.RedisMissing += gap
@@ -2548,21 +3020,21 @@ func (r *Reconciler) auditUserFeed(
 		r.logThrottled(runAt, "needs-rebuild",
 			fmt.Sprintf("user:%d:feed", userID),
 			fmt.Sprintf("direct feed gap %d exceeds repair budget", gap))
-		return nil
+		return previewsComplete, nil
 	}
 	if r.repair == nil {
-		return nil
+		return previewsComplete, nil
 	}
 	limit := int(gap)
 	if remaining := budget.remaining(); remaining < limit {
 		limit = remaining
 	}
 	if limit <= 0 {
-		return nil
+		return false, nil
 	}
 	missing, err := r.missingFeedMessages(ctx, userID, limit)
 	if err != nil {
-		return err
+		return false, err
 	}
 	for _, chunk := range reconcileChunks(len(missing), reconcileFeedWriteBatch) {
 		batch := missing[chunk[0]:chunk[1]]
@@ -2571,12 +3043,97 @@ func (r *Reconciler) auditUserFeed(
 			r.logThrottled(runAt, "repair-error", fmt.Sprintf("user:%d:feed", userID),
 				"write missing feed entries: "+err.Error())
 			r.setFeedCursor(userID, reconcileFeedCursor{}, false)
-			return nil
+			return false, nil
 		}
 		result.FeedRepairs += uint64(written)
 		budget.spend(written)
 	}
-	return nil
+	// A budget-truncated walk leaves part of the detected gap for the next
+	// audit, so the user cursor must not move past it.
+	return previewsComplete && limit == int(gap), nil
+}
+
+// auditUserConversationLast compares each conversation preview with the newest
+// MySQL message through the sampled user. A preview that is absent or older is
+// restored by the projection writer only when its entity exists; otherwise the
+// user is flagged as needing a rebuild.
+func (r *Reconciler) auditUserConversationLast(
+	ctx context.Context,
+	runAt time.Time,
+	userID uint64,
+	result *ReconcileResult,
+	budget *reconcileRepairBudget,
+) (bool, error) {
+	conversations, err := r.store.ListConversationBasics(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("list user conversations for preview audit: %w", err)
+	}
+	if len(conversations) == 0 {
+		return true, nil
+	}
+	previews, err := r.client.HGetAll(ctx, r.keyspace.directConversationLastKey(userID)).Result()
+	if err != nil {
+		return false, fmt.Errorf("read direct conversation previews: %w", err)
+	}
+	limit := r.repairPerConversation
+	if remaining := budget.remaining(); remaining < limit {
+		limit = remaining
+	}
+	var repairs []store.Message
+	deferred := false
+	for _, conversation := range conversations {
+		peerID := conversation.UserID
+		if peerID == 0 || peerID == userID || conversation.LastMessage == nil {
+			continue
+		}
+		message := *conversation.LastMessage
+		if message.ID == 0 {
+			continue
+		}
+		current := reconcilePreviewValue(previews[strconv.FormatUint(peerID, 10)])
+		if current >= message.ID {
+			continue
+		}
+		result.RedisMissing++
+		exists, err := r.client.Exists(ctx, r.keyspace.messageKey(message.ID)).Result()
+		if err != nil {
+			return false, fmt.Errorf("read conversation preview entity: %w", err)
+		}
+		if exists == 0 {
+			result.NeedsRebuild++
+			r.logThrottled(runAt, "needs-rebuild",
+				fmt.Sprintf("user:%d:conv-last", userID),
+				"newest conversation message entity is missing")
+			continue
+		}
+		if r.repair == nil {
+			continue
+		}
+		if len(repairs) >= limit {
+			deferred = true
+			continue
+		}
+		repairs = append(repairs, message)
+	}
+	if r.repair != nil && len(repairs) > 0 {
+		written, err := r.repair.WriteDirectBatch(ctx, repairs)
+		if err != nil {
+			r.logThrottled(runAt, "repair-error", fmt.Sprintf("user:%d:conv-last", userID),
+				"write conversation preview: "+err.Error())
+			return false, nil
+		}
+		result.RedisRepaired += uint64(written)
+		budget.spend(written)
+	}
+	return !deferred, nil
+}
+
+func reconcilePreviewValue(raw string) uint64 {
+	value, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return value
 }
 
 // reconcileFeedCursor resumes a capped feed scan at one conversation's seq.
@@ -2616,15 +3173,24 @@ func (r *Reconciler) missingFeedMessages(
 	if err != nil {
 		return nil, fmt.Errorf("list user conversations: %w", err)
 	}
+	// ListConversationBasics is ordered by latest message, not by peer. The
+	// resume cursor below is peer-ordered, so sort a copy to make paging
+	// monotonic and independent of recency.
+	sort.SliceStable(conversations, func(i, j int) bool {
+		return conversations[i].UserID < conversations[j].UserID
+	})
 	cursor := r.feedCursorStart(userID)
 	start := 0
 	if cursor.peer != 0 {
-		start = len(conversations)
-		for index, conversation := range conversations {
-			if conversation.UserID >= cursor.peer {
-				start = index
-				break
-			}
+		start = sort.Search(len(conversations), func(index int) bool {
+			return conversations[index].UserID >= cursor.peer
+		})
+		if start == len(conversations) {
+			// The cursor peer no longer exists: restart the walk so a gap in
+			// an earlier conversation is not skipped forever.
+			start = 0
+			cursor = reconcileFeedCursor{}
+			r.setFeedCursor(userID, reconcileFeedCursor{}, false)
 		}
 	}
 	key := r.keyspace.directFeedKey(userID)

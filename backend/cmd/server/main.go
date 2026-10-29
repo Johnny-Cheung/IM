@@ -30,13 +30,17 @@ const (
 )
 
 type serverOptions struct {
-	addr                string
+	addr string
+	// addrSet records an explicit -addr. The one-shot maintenance commands
+	// default the stopped-backend check to the deployment port instead.
+	addrSet             bool
 	webDir              string
 	backfillSeq         bool
 	backfillBatch       int
 	rebuildRedis        bool
 	rebuildBatch        int
 	rebuildQueueTimeout time.Duration
+	rebuildTimeout      time.Duration
 	dlqList             bool
 	dlqReplay           bool
 	dlqDiscard          bool
@@ -55,6 +59,7 @@ func main() {
 	flag.BoolVar(&options.rebuildRedis, "rebuild-redis", false, "rebuild the Redis messaging projection from MySQL, then exit")
 	flag.IntVar(&options.rebuildBatch, "rebuild-batch", defaultRedisRebuildBatch, "rows per rebuild batch")
 	flag.DurationVar(&options.rebuildQueueTimeout, "rebuild-queue-timeout", defaultRedisRebuildQueueTimeout, "how long the rebuild waits for the persist queues to drain")
+	flag.DurationVar(&options.rebuildTimeout, "rebuild-timeout", defaultRedisRebuildTimeout, "total budget for the Redis rebuild; must exceed -rebuild-queue-timeout")
 	flag.BoolVar(&options.dlqList, "dlq-list", false, "list dead letters and exit")
 	flag.BoolVar(&options.dlqReplay, "dlq-replay", false, "replay dead letters to the main exchange and exit")
 	flag.BoolVar(&options.dlqDiscard, "dlq-discard", false, "discard dead letters and exit")
@@ -63,6 +68,11 @@ func main() {
 	flag.IntVar(&options.dlqLimit, "dlq-limit", dlqDefaultLimit, "maximum dead letters to scan per chain")
 	flag.BoolVar(&options.dlqYes, "dlq-yes", false, "confirm discard or replay of every dead letter")
 	flag.Parse()
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "addr" {
+			options.addrSet = true
+		}
+	})
 
 	if err := validateCommandModes(options); err != nil {
 		log.Fatal(err)
@@ -192,9 +202,7 @@ func run(options serverOptions) error {
 			return fmt.Errorf("check conversation sequence readiness: %w", err)
 		}
 		if !ready {
-			return fmt.Errorf(
-				"conversation sequence is not ready; stop the backend and run `imctl backfill-seq` first",
-			)
+			return sequenceNotReadyError(startupCtx, infraManager.Redis(), keyspace)
 		}
 
 		indexEpoch, err := messaging.EnsureIndexEpoch(
@@ -585,6 +593,31 @@ func (a notifyingGroupAcceptor) Accept(
 	result, err := a.inner.Accept(ctx, request)
 	notifySeqWatcher(a.watcher, err)
 	return result, err
+}
+
+// sequenceNotReadyError explains how to make the namespace ready. A failed
+// rebuild leaves its pending marker; pointing the operator at a seq backfill
+// there would certify the half-built projection the rebuild must regenerate.
+func sequenceNotReadyError(
+	ctx context.Context,
+	client redis.UniversalClient,
+	keyspace messaging.Keyspace,
+) error {
+	pendingKey := messaging.RebuildPendingKey(keyspace)
+	pending, err := client.Exists(ctx, pendingKey).Result()
+	if err != nil {
+		return fmt.Errorf("check rebuild pending marker: %w", err)
+	}
+	if pending > 0 {
+		return fmt.Errorf(
+			"conversation sequence is not ready because a Redis rebuild did not finish "+
+				"(marker %s); run `imctl rebuild-redis`",
+			pendingKey,
+		)
+	}
+	return fmt.Errorf(
+		"conversation sequence is not ready; stop the backend and run `imctl backfill-seq` first",
+	)
 }
 
 // checkMaintenanceLocks refuses startup while a one-shot maintenance command

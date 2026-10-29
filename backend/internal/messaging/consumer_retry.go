@@ -21,6 +21,10 @@ type ConsumerStatus struct {
 	MessageRetries   uint64    `json:"message_retries"`
 	DeadLettered     uint64    `json:"dead_lettered"`
 	Retrying         bool      `json:"retrying"`
+	// InFlight is the number of deliveries the consumer holds unacknowledged
+	// right now: decoded, persisting, acking or dead-lettering. A queue can
+	// report zero ready messages while a delivery is still in flight.
+	InFlight int `json:"in_flight"`
 }
 
 // consumeStatusState collects counters and timestamps shared by both chains.
@@ -35,6 +39,7 @@ type consumeStatusState struct {
 	messageRetries   uint64
 	deadLettered     uint64
 	retrying         bool
+	inFlight         int
 }
 
 func (s *consumeStatusState) snapshot() ConsumerStatus {
@@ -49,6 +54,7 @@ func (s *consumeStatusState) snapshot() ConsumerStatus {
 		MessageRetries:   s.messageRetries,
 		DeadLettered:     s.deadLettered,
 		Retrying:         s.retrying,
+		InFlight:         s.inFlight,
 	}
 }
 
@@ -106,6 +112,30 @@ func (s *consumeStatusState) setRetrying(retrying bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.retrying = retrying
+}
+
+// beginDelivery marks one delivery as unacknowledged. A drain must not declare
+// the queues empty while another consumer still holds a delivery.
+func (s *consumeStatusState) beginDelivery() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inFlight++
+}
+
+// endDelivery clears the marker set by beginDelivery, including on the
+// context-canceled returns of persist and deadLetter.
+func (s *consumeStatusState) endDelivery() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inFlight > 0 {
+		s.inFlight--
+	}
 }
 
 // consumeDelivery is the part of amqp091.Delivery the consumers use.

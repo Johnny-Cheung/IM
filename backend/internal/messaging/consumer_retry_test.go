@@ -88,6 +88,46 @@ func (p *consumeFakeMessagePersister) PersistMessage(context.Context, store.Mess
 	return true, nil
 }
 
+// consumeMessagePersisterFunc lets a test observe consumer state from inside a
+// persist call.
+type consumeMessagePersisterFunc func(context.Context, store.Message) (bool, error)
+
+func (f consumeMessagePersisterFunc) PersistMessage(
+	ctx context.Context, message store.Message,
+) (bool, error) {
+	return f(ctx, message)
+}
+
+// consumeGroupPersisterFunc is the group-chain equivalent.
+type consumeGroupPersisterFunc func(context.Context, store.GroupMessage) (bool, error)
+
+func (f consumeGroupPersisterFunc) PersistGroupMessage(
+	ctx context.Context, message store.GroupMessage,
+) (bool, error) {
+	return f(ctx, message)
+}
+
+func TestConsumeStatusTracksInFlight(t *testing.T) {
+	var status consumeStatusState
+	if inFlight := status.snapshot().InFlight; inFlight != 0 {
+		t.Fatalf("initial in flight = %d, want 0", inFlight)
+	}
+	status.beginDelivery()
+	status.beginDelivery()
+	if inFlight := status.snapshot().InFlight; inFlight != 2 {
+		t.Fatalf("in flight = %d, want 2", inFlight)
+	}
+	status.endDelivery()
+	if inFlight := status.snapshot().InFlight; inFlight != 1 {
+		t.Fatalf("in flight = %d, want 1", inFlight)
+	}
+	status.endDelivery()
+	status.endDelivery()
+	if inFlight := status.snapshot().InFlight; inFlight != 0 {
+		t.Fatalf("in flight = %d, want 0 and never negative", inFlight)
+	}
+}
+
 type consumeFakeGroupPersister struct {
 	calls int
 	fail  func(call int) error

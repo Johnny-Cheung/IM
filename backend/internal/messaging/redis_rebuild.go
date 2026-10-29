@@ -34,6 +34,15 @@ const (
 	defaultRebuildBatch  = 1000
 	rebuildScanCountHint = 500
 	rebuildEntitySamples = 8
+	// rebuildDedupSamples bounds the dedup records read back per message kind.
+	rebuildDedupSamples = 8
+	// rebuildConvLastUsers bounds how many users' conversation previews are
+	// verified; the sample is the first users met in message ID order.
+	rebuildConvLastUsers = 64
+	// rebuildDedupExpiryMargin keeps records that may expire during the
+	// rebuild out of the dedup-count lower bound.
+	rebuildDedupExpiryMargin = time.Hour
+	rebuildCleanupTimeout    = 5 * time.Second
 )
 
 // RebuildStore is the durable source of a full Redis rebuild. *store.Store
@@ -49,6 +58,7 @@ type RebuildStore interface {
 	ListGroupSeqStats(context.Context, uint64, int) ([]store.GroupSeqStat, error)
 	ListGroupMembershipProjections(context.Context) ([]store.GroupMembershipProjection, error)
 	ListFriendshipPairs(context.Context) ([]store.FriendshipPair, error)
+	CountUnnumberedMessages(context.Context) (uint64, uint64, error)
 }
 
 // RedisRebuildOptions configures a full rebuild. Zero values select defaults.
@@ -69,9 +79,20 @@ type RedisRebuildResult struct {
 	Drained                       QueueDrainResult
 	DirectMessages, GroupMessages uint64
 	DedupRecords, Watermarks      uint64
-	Conversations, Groups         int
-	Cleared                       int
-	Duration                      time.Duration
+	// Holes counts seq numbers that were allocated but never persisted. They
+	// are reported, not repaired: only MySQL can explain them.
+	Holes                 uint64
+	Conversations, Groups int
+	Cleared               int
+	Duration              time.Duration
+}
+
+// rebuildDedupSample is one dedup record the rebuild should have written.
+type rebuildDedupSample struct {
+	key         string
+	id          string
+	createdAtMS string
+	bodyHash    string
 }
 
 // rebuildStats accumulates what the passes wrote so verification can compare it
@@ -81,6 +102,14 @@ type rebuildStats struct {
 	maxSeqByGroup  map[uint64]uint64
 	feedCounts     map[uint64]uint64
 	groupPositions map[uint64]map[uint64]uint64
+	dedupExpected  uint64
+	// dedupDurable excludes records whose TTL may run out before verification.
+	dedupDurable uint64
+	directDedups []rebuildDedupSample
+	groupDedups  []rebuildDedupSample
+	// convLast holds, per sampled user, the newest message ID per peer.
+	convLast map[uint64]map[uint64]uint64
+	holes    uint64
 }
 
 func newRebuildStats() *rebuildStats {
@@ -89,7 +118,57 @@ func newRebuildStats() *rebuildStats {
 		maxSeqByGroup:  make(map[uint64]uint64),
 		feedCounts:     make(map[uint64]uint64),
 		groupPositions: make(map[uint64]map[uint64]uint64),
+		convLast:       make(map[uint64]map[uint64]uint64),
 	}
+}
+
+// noteConversationLast records the expected dm:conv-last entry for one user,
+// admitting at most rebuildConvLastUsers users to bound memory.
+func (s *rebuildStats) noteConversationLast(userID, peerID, messageID uint64) {
+	if userID == 0 || peerID == 0 || userID == peerID {
+		return
+	}
+	peers, ok := s.convLast[userID]
+	if !ok {
+		if len(s.convLast) >= rebuildConvLastUsers {
+			return
+		}
+		peers = make(map[uint64]uint64)
+		s.convLast[userID] = peers
+	}
+	if messageID > peers[peerID] {
+		peers[peerID] = messageID
+	}
+}
+
+func (s *rebuildStats) noteDirectDedup(sample rebuildDedupSample, ttl time.Duration) {
+	s.noteDedup(ttl)
+	s.directDedups = appendRollingDedup(s.directDedups, sample)
+}
+
+func (s *rebuildStats) noteGroupDedup(sample rebuildDedupSample, ttl time.Duration) {
+	s.noteDedup(ttl)
+	s.groupDedups = appendRollingDedup(s.groupDedups, sample)
+}
+
+func (s *rebuildStats) noteDedup(ttl time.Duration) {
+	s.dedupExpected++
+	if ttl > rebuildDedupExpiryMargin {
+		s.dedupDurable++
+	}
+}
+
+// appendRollingDedup keeps the newest samples, which have the longest TTL and
+// therefore survive the verification read.
+func appendRollingDedup(
+	samples []rebuildDedupSample,
+	sample rebuildDedupSample,
+) []rebuildDedupSample {
+	samples = append(samples, sample)
+	if len(samples) > rebuildDedupSamples {
+		samples = samples[len(samples)-rebuildDedupSamples:]
+	}
+	return samples
 }
 
 // RedisRebuilder regenerates the whole messaging namespace from MySQL. It must
@@ -170,6 +249,14 @@ func (r *RedisRebuilder) Run(ctx context.Context) (result RedisRebuildResult, er
 		drained.Direct, drained.Group, drained.DeadLettered,
 	)
 
+	// Mark the rebuild as unfinished before anything is destroyed. The marker
+	// stays behind on every failure so an operator knows to re-run.
+	if err := r.client.Set(
+		ctx, RebuildPendingKey(keyspace), "1", 0,
+	).Err(); err != nil {
+		return result, fmt.Errorf("mark rebuild pending: %w", err)
+	}
+
 	cleared, err := ClearNamespace(ctx, r.client, keyspace)
 	if err != nil {
 		return result, err
@@ -201,24 +288,47 @@ func (r *RedisRebuilder) Run(ctx context.Context) (result RedisRebuildResult, er
 	result.Conversations = len(stats.maxSeqByPair)
 	result.Groups = len(stats.maxSeqByGroup)
 
-	if err := r.client.Set(ctx, keyspace.indexEpochKey(), "0", 0).Err(); err != nil {
-		return result, fmt.Errorf("reset index epoch: %w", err)
-	}
-
-	if err := r.verify(ctx, stats); err != nil {
-		return result, err
+	verifyErr := r.verify(ctx, stats)
+	result.Holes = stats.holes
+	r.logf("rebuild: verification holes=%d", stats.holes)
+	if verifyErr != nil {
+		return result, verifyErr
 	}
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
+
+	// index:epoch claims the feed is complete, so it may only exist for a
+	// verified namespace; withdraw it again if anything later fails.
+	epochSet := false
+	readySet := false
+	defer func() {
+		if !epochSet || readySet || err == nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), rebuildCleanupTimeout)
+		defer cancel()
+		if delErr := r.client.Del(cleanupCtx, keyspace.indexEpochKey()).Err(); delErr != nil {
+			r.logf("rebuild: withdraw index epoch: %v", delErr)
+		}
+	}()
+	if err := r.client.Set(ctx, keyspace.indexEpochKey(), "0", 0).Err(); err != nil {
+		return result, fmt.Errorf("reset index epoch: %w", err)
+	}
+	epochSet = true
 	if err := r.client.Set(ctx, keyspace.sequenceReadyKey(), "1", 0).Err(); err != nil {
 		return result, fmt.Errorf("mark sequence ready: %w", err)
 	}
+	readySet = true
+	if err := r.client.Del(ctx, RebuildPendingKey(keyspace)).Err(); err != nil {
+		return result, fmt.Errorf("clear rebuild pending marker: %w", err)
+	}
 
 	r.logf(
-		"rebuild: done direct=%d group=%d conversations=%d groups=%d dedup=%d watermarks=%d",
+		"rebuild: done direct=%d group=%d conversations=%d groups=%d dedup=%d "+
+			"watermarks=%d holes=%d",
 		result.DirectMessages, result.GroupMessages, result.Conversations,
-		result.Groups, result.DedupRecords, result.Watermarks,
+		result.Groups, result.DedupRecords, result.Watermarks, result.Holes,
 	)
 	return result, nil
 }
@@ -229,16 +339,10 @@ func (r *RedisRebuilder) logf(format string, args ...interface{}) {
 	}
 }
 
-// checkMissingSeq refuses the rebuild before anything is cleared when the store
-// can report unnumbered rows cheaply.
+// checkMissingSeq refuses the rebuild before anything is cleared when MySQL
+// still has rows without a seq.
 func (r *RedisRebuilder) checkMissingSeq(ctx context.Context) error {
-	counter, ok := r.store.(interface {
-		CountUnnumberedMessages(context.Context) (uint64, uint64, error)
-	})
-	if !ok {
-		return nil
-	}
-	direct, group, err := counter.CountUnnumberedMessages(ctx)
+	direct, group, err := r.store.CountUnnumberedMessages(ctx)
 	if err != nil {
 		return fmt.Errorf("count unnumbered messages: %w", err)
 	}
@@ -277,10 +381,19 @@ func (r *RedisRebuilder) rebuildDirectPass(
 		nextCursor := cursor
 		for _, message := range messages {
 			nextCursor = message.ID
-			if _, ok := messageDedupTTL(
+			if ttl, ok := messageDedupTTL(
 				message.ClientMessageID, message.CreatedAt, now, r.options.DedupTTL,
 			); ok {
 				result.DedupRecords++
+				createdAt := message.CreatedAt.UTC().Truncate(time.Millisecond)
+				stats.noteDirectDedup(rebuildDedupSample{
+					key: r.options.Keyspace.dedupKey(
+						message.SenderID, message.RecipientID, message.ClientMessageID,
+					),
+					id:          strconv.FormatUint(message.ID, 10),
+					createdAtMS: strconv.FormatInt(createdAt.UnixMilli(), 10),
+					bodyHash:    hashMessageBody(message.Body),
+				}, ttl)
 			}
 			pair := [2]uint64{}
 			pair[0], pair[1] = sortedPair(message.SenderID, message.RecipientID)
@@ -291,6 +404,8 @@ func (r *RedisRebuilder) rebuildDirectPass(
 			if message.RecipientID != message.SenderID {
 				stats.feedCounts[message.RecipientID]++
 			}
+			stats.noteConversationLast(message.SenderID, message.RecipientID, message.ID)
+			stats.noteConversationLast(message.RecipientID, message.SenderID, message.ID)
 		}
 		if nextCursor <= cursor {
 			return fmt.Errorf("direct rebuild cursor did not advance at %d", cursor)
@@ -335,10 +450,19 @@ func (r *RedisRebuilder) rebuildGroupPass(
 		nextCursor := cursor
 		for _, message := range messages {
 			nextCursor = message.ID
-			if _, ok := messageDedupTTL(
+			if ttl, ok := messageDedupTTL(
 				message.ClientMessageID, message.CreatedAt, now, r.options.DedupTTL,
 			); ok {
 				result.DedupRecords++
+				createdAt := message.CreatedAt.UTC().Truncate(time.Millisecond)
+				stats.noteGroupDedup(rebuildDedupSample{
+					key: r.options.Keyspace.groupDedupKey(
+						message.GroupID, message.SenderID, message.ClientMessageID,
+					),
+					id:          strconv.FormatUint(message.ID, 10),
+					createdAtMS: strconv.FormatInt(createdAt.UnixMilli(), 10),
+					bodyHash:    hashMessageBody(message.Body),
+				}, ttl)
 			}
 			if message.Seq > stats.maxSeqByGroup[message.GroupID] {
 				stats.maxSeqByGroup[message.GroupID] = message.Seq
@@ -400,7 +524,23 @@ func (r *RedisRebuilder) rebuildRelations(
 		}
 		afterUserID = states[len(states)-1].UserID
 		afterPeerID = states[len(states)-1].PeerID
-		raised, err := r.writer.RaiseDirectReadWatermarks(ctx, states)
+		// A durable watermark can sit past MAX(seq) when the tail was lost;
+		// clamping means "everything there is read".
+		clamped := make([]store.ConversationReadState, 0, len(states))
+		for _, state := range states {
+			if state.UserID == 0 || state.PeerID == 0 ||
+				state.UserID == state.PeerID {
+				clamped = append(clamped, state)
+				continue
+			}
+			pair := [2]uint64{}
+			pair[0], pair[1] = sortedPair(state.UserID, state.PeerID)
+			if counter := stats.maxSeqByPair[pair]; state.LastReadSeq > counter {
+				state.LastReadSeq = counter
+			}
+			clamped = append(clamped, state)
+		}
+		raised, err := r.writer.RaiseDirectReadWatermarks(ctx, clamped)
 		if err != nil {
 			return err
 		}
@@ -429,8 +569,16 @@ func (r *RedisRebuilder) rebuildRelations(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		counter := stats.maxSeqByGroup[group.GroupID]
+		positions := make(map[uint64]uint64, len(group.Positions))
+		for userID, position := range group.Positions {
+			if position > counter {
+				position = counter
+			}
+			positions[userID] = position
+		}
 		raised, err := r.writer.RaiseGroupReadPositions(
-			ctx, group.GroupID, group.Positions,
+			ctx, group.GroupID, positions,
 		)
 		if err != nil {
 			return err
@@ -453,6 +601,12 @@ func (r *RedisRebuilder) verify(ctx context.Context, stats *rebuildStats) error 
 		return err
 	}
 	if err := r.verifyFeeds(ctx, stats); err != nil {
+		return err
+	}
+	if err := r.verifyDedup(ctx, stats); err != nil {
+		return err
+	}
+	if err := r.verifyConversationLast(ctx, stats); err != nil {
 		return err
 	}
 	return r.verifyWatermarks(ctx, stats)
@@ -484,10 +638,14 @@ func (r *RedisRebuilder) verifyDirectConversations(
 			if row.LowID == 0 || row.HighID == 0 || row.LowID == row.HighID {
 				return fmt.Errorf("conversation %d:%d is invalid", row.LowID, row.HighID)
 			}
-			if row.Count != row.MaxSeq {
-				return fmt.Errorf(
-					"conversation %d:%d mysql count %d does not equal max seq %d",
-					row.LowID, row.HighID, row.Count, row.MaxSeq,
+			// Seq numbers allocated but never persisted leave a permanent gap;
+			// they are a MySQL fact that a rebuild must report, not refuse.
+			if row.MaxSeq > row.Count {
+				holes := row.MaxSeq - row.Count
+				stats.holes += holes
+				r.logf(
+					"rebuild: conversation %d:%d has %d seq holes",
+					row.LowID, row.HighID, holes,
 				)
 			}
 			indexed, err := r.client.ZCard(
@@ -567,11 +725,10 @@ func (r *RedisRebuilder) verifyGroups(
 			if row.GroupID == 0 {
 				return fmt.Errorf("group 0 is invalid")
 			}
-			if row.Count != row.MaxSeq {
-				return fmt.Errorf(
-					"group %d mysql count %d does not equal max seq %d",
-					row.GroupID, row.Count, row.MaxSeq,
-				)
+			if row.MaxSeq > row.Count {
+				holes := row.MaxSeq - row.Count
+				stats.holes += holes
+				r.logf("rebuild: group %d has %d seq holes", row.GroupID, holes)
 			}
 			indexed, err := r.client.ZCard(ctx, keyspace.groupInboxKey(row.GroupID)).Result()
 			if err != nil {
@@ -801,6 +958,139 @@ func (r *RedisRebuilder) verifyFeeds(ctx context.Context, stats *rebuildStats) e
 	return nil
 }
 
+// verifyDedup compares the rebuilt dedup layer with the messages the passes
+// found inside the dedup window, then reads back a bounded sample.
+func (r *RedisRebuilder) verifyDedup(
+	ctx context.Context,
+	stats *rebuildStats,
+) error {
+	keyspace := r.options.Keyspace
+	prefix := keyspace.prefixOrDefault()
+	actual := uint64(0)
+	for _, pattern := range []string{prefix + "dedup:*", prefix + "group-dedup:*"} {
+		cursor := uint64(0)
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			keys, next, err := r.client.Scan(
+				ctx, cursor, pattern, rebuildScanCountHint,
+			).Result()
+			if err != nil {
+				return fmt.Errorf("scan rebuilt dedup keys: %w", err)
+			}
+			actual += uint64(len(keys))
+			cursor = next
+			if cursor == 0 {
+				break
+			}
+		}
+	}
+	// Records close to the end of their TTL may expire between the pass and
+	// this read, so the count is bounded rather than exact.
+	if actual > stats.dedupExpected {
+		return fmt.Errorf(
+			"rebuilt %d dedup records, want at most %d messages inside the dedup window",
+			actual, stats.dedupExpected,
+		)
+	}
+	if actual < stats.dedupDurable {
+		return fmt.Errorf(
+			"rebuilt %d dedup records, want at least %d messages inside the dedup window",
+			actual, stats.dedupDurable,
+		)
+	}
+	for _, sample := range stats.directDedups {
+		if err := r.verifyDedupSample(ctx, sample); err != nil {
+			return err
+		}
+	}
+	for _, sample := range stats.groupDedups {
+		if err := r.verifyDedupSample(ctx, sample); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *RedisRebuilder) verifyDedupSample(
+	ctx context.Context,
+	sample rebuildDedupSample,
+) error {
+	values, err := r.client.HMGet(ctx, sample.key,
+		"id", "created_at_ms", "body_hash",
+	).Result()
+	if err != nil {
+		return fmt.Errorf("read rebuilt dedup record: %w", err)
+	}
+	want := []string{sample.id, sample.createdAtMS, sample.bodyHash}
+	if len(values) != len(want) {
+		return fmt.Errorf("rebuilt dedup record has %d fields, want %d", len(values), len(want))
+	}
+	for index, value := range values {
+		got, ok := value.(string)
+		if !ok || got != want[index] {
+			return fmt.Errorf("rebuilt dedup record field %d does not match the message", index)
+		}
+	}
+	ttl, err := r.client.TTL(ctx, sample.key).Result()
+	if err != nil {
+		return fmt.Errorf("read rebuilt dedup ttl: %w", err)
+	}
+	if ttl <= 0 || ttl > r.options.DedupTTL {
+		return fmt.Errorf("rebuilt dedup record ttl %s is outside the dedup window", ttl)
+	}
+	return nil
+}
+
+// verifyConversationLast compares the sampled users' conversation previews
+// with the newest message seen for each peer during the direct pass.
+func (r *RedisRebuilder) verifyConversationLast(
+	ctx context.Context,
+	stats *rebuildStats,
+) error {
+	keyspace := r.options.Keyspace
+	userIDs := make([]uint64, 0, len(stats.convLast))
+	for userID := range stats.convLast {
+		userIDs = append(userIDs, userID)
+	}
+	sort.Slice(userIDs, func(i, j int) bool { return userIDs[i] < userIDs[j] })
+	for _, userID := range userIDs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		actual, err := r.client.HGetAll(
+			ctx, keyspace.directConversationLastKey(userID),
+		).Result()
+		if err != nil {
+			return fmt.Errorf("read user %d conversation previews: %w", userID, err)
+		}
+		expected := stats.convLast[userID]
+		if len(actual) != len(expected) {
+			return fmt.Errorf(
+				"user %d has %d conversation previews, want %d",
+				userID, len(actual), len(expected),
+			)
+		}
+		for peerID, messageID := range expected {
+			raw, ok := actual[strconv.FormatUint(peerID, 10)]
+			if !ok {
+				return fmt.Errorf(
+					"user %d conversation preview for peer %d is missing", userID, peerID,
+				)
+			}
+			gotID, err := strconv.ParseUint(raw, 10, 64)
+			if err != nil || gotID != messageID {
+				return fmt.Errorf(
+					"user %d conversation preview for peer %d is %s, want %d",
+					userID, peerID, raw, messageID,
+				)
+			}
+		}
+	}
+	return nil
+}
+
 func (r *RedisRebuilder) verifyWatermarks(
 	ctx context.Context,
 	stats *rebuildStats,
@@ -835,10 +1125,14 @@ func (r *RedisRebuilder) verifyWatermarks(
 			pair := [2]uint64{}
 			pair[0], pair[1] = sortedPair(state.UserID, state.PeerID)
 			counter := stats.maxSeqByPair[pair]
-			if state.LastReadSeq > position {
+			want := state.LastReadSeq
+			if want > counter {
+				want = counter
+			}
+			if want > position {
 				return fmt.Errorf(
 					"conversation %d:%d watermark %d is below durable seq %d",
-					state.UserID, state.PeerID, position, state.LastReadSeq,
+					state.UserID, state.PeerID, position, want,
 				)
 			}
 			if position > counter {
@@ -875,10 +1169,14 @@ func (r *RedisRebuilder) verifyWatermarks(
 			if err != nil {
 				return err
 			}
-			if positions[userID] > position {
+			want := positions[userID]
+			if want > counter {
+				want = counter
+			}
+			if want > position {
 				return fmt.Errorf(
 					"group %d member %d watermark %d is below durable seq %d",
-					groupID, userID, position, positions[userID],
+					groupID, userID, position, want,
 				)
 			}
 			if position > counter {
@@ -970,10 +1268,19 @@ func ClearNamespace(
 	}
 	prefix := keyspace.prefixOrDefault()
 	protected := map[string]struct{}{
-		RebuildLockKey(keyspace):   {},
-		keyspace.backfillLockKey(): {},
+		RebuildLockKey(keyspace):    {},
+		keyspace.backfillLockKey():  {},
+		RebuildPendingKey(keyspace): {},
 	}
-	deleted := 0
+	// Readiness is invalidated before anything is destroyed: an interrupted
+	// clear must never leave a namespace that still claims to be complete.
+	removed, err := client.Del(
+		ctx, keyspace.sequenceReadyKey(), keyspace.indexEpochKey(),
+	).Result()
+	if err != nil {
+		return 0, fmt.Errorf("delete rebuild readiness markers: %w", err)
+	}
+	deleted := int(removed)
 	for _, suffix := range rebuildClearPatterns {
 		pattern := prefix + suffix
 		cursor := uint64(0)
@@ -1013,12 +1320,10 @@ func ClearNamespace(
 		keyspace.groupMessageStreamKey(),
 		keyspace.directReadStreamKey(),
 		keyspace.groupReadStreamKey(),
-		keyspace.indexEpochKey(),
-		keyspace.sequenceReadyKey(),
 	}
-	removed, err := client.Del(ctx, exact...).Result()
+	removed, err = client.Del(ctx, exact...).Result()
 	if err != nil {
-		return deleted, fmt.Errorf("delete rebuild marker keys: %w", err)
+		return deleted, fmt.Errorf("delete rebuild keys: %w", err)
 	}
 	return deleted + int(removed), nil
 }

@@ -147,6 +147,13 @@ func RebuildLockKey(keyspace Keyspace) string {
 	return keyspace.prefixOrDefault() + "rebuild:lock"
 }
 
+// RebuildPendingKey marks a namespace whose rebuild has started but has not
+// written seq:ready yet. It survives every failure so the operator re-runs the
+// rebuild instead of starting on a half-built namespace.
+func RebuildPendingKey(keyspace Keyspace) string {
+	return keyspace.prefixOrDefault() + "rebuild:pending"
+}
+
 // indexEpochKey records the highest message ID that is not guaranteed to be
 // present in the private feed index. It is a global-ID score floor for
 // dm:feed only and must never be used for conversation seq ranges.

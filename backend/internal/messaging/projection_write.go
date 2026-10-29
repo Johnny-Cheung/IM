@@ -191,6 +191,70 @@ func (w *ProjectionWriter) WriteDirectBatch(
 	return written, nil
 }
 
+// WriteDirectIndexBatch restores only the conversation index, both feeds, both
+// previews and the counter of direct messages whose entity already exists and
+// matches MySQL. It never writes an entity hash or a dedup record, so the
+// reconciler's index-gap repair cannot overwrite a diverged entity. It returns
+// the number of messages handled.
+func (w *ProjectionWriter) WriteDirectIndexBatch(
+	ctx context.Context,
+	messages []store.Message,
+) (int, error) {
+	if w == nil || w.client == nil {
+		return 0, ErrMessageServiceUnavailable
+	}
+	if len(messages) == 0 {
+		return 0, nil
+	}
+	pipe := w.client.Pipeline()
+	maxSeqs := make(map[[2]uint64]uint64, len(messages))
+	written := 0
+	for _, message := range messages {
+		if message.ID == 0 || message.Seq == 0 {
+			return 0, fmt.Errorf("repair direct message %d has no seq", message.ID)
+		}
+		if message.SenderID == 0 || message.RecipientID == 0 ||
+			message.SenderID == message.RecipientID {
+			return 0, fmt.Errorf("repair direct message %d has invalid participants", message.ID)
+		}
+		idValue := strconv.FormatUint(message.ID, 10)
+		senderValue := strconv.FormatUint(message.SenderID, 10)
+		recipientValue := strconv.FormatUint(message.RecipientID, 10)
+
+		pipe.ZAdd(ctx, w.keyspace.directPairKey(message.SenderID, message.RecipientID),
+			redis.Z{Score: float64(message.Seq), Member: idValue})
+		pipe.ZAdd(ctx, w.keyspace.directFeedKey(message.SenderID),
+			redis.Z{Score: float64(message.ID), Member: idValue})
+		pipe.ZAdd(ctx, w.keyspace.directFeedKey(message.RecipientID),
+			redis.Z{Score: float64(message.ID), Member: idValue})
+		pipe.Eval(ctx, convLastAdvanceScriptSource,
+			[]string{w.keyspace.directConversationLastKey(message.SenderID)},
+			recipientValue, idValue,
+		)
+		pipe.Eval(ctx, convLastAdvanceScriptSource,
+			[]string{w.keyspace.directConversationLastKey(message.RecipientID)},
+			senderValue, idValue,
+		)
+
+		pair := [2]uint64{}
+		pair[0], pair[1] = sortedPair(message.SenderID, message.RecipientID)
+		if message.Seq > maxSeqs[pair] {
+			maxSeqs[pair] = message.Seq
+		}
+		written++
+	}
+	for pair, seq := range maxSeqs {
+		pipe.Eval(ctx, raiseSequenceScriptSource,
+			[]string{w.keyspace.directSequenceKey(pair[0], pair[1])},
+			strconv.FormatUint(seq, 10),
+		)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, fmt.Errorf("write direct index batch: %w", err)
+	}
+	return written, nil
+}
+
 // WriteGroupBatch writes group message entities, the group inbox, the group
 // counter and the dedup records. A missing sender snapshot is written as empty
 // strings rather than rejected.
@@ -263,6 +327,48 @@ func (w *ProjectionWriter) WriteGroupBatch(
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return 0, fmt.Errorf("write group projection batch: %w", err)
+	}
+	return written, nil
+}
+
+// WriteGroupIndexBatch restores only the group inbox and counter of group
+// messages whose entity already exists and matches MySQL. It never writes an
+// entity hash or a dedup record.
+func (w *ProjectionWriter) WriteGroupIndexBatch(
+	ctx context.Context,
+	messages []store.GroupMessage,
+) (int, error) {
+	if w == nil || w.client == nil {
+		return 0, ErrMessageServiceUnavailable
+	}
+	if len(messages) == 0 {
+		return 0, nil
+	}
+	pipe := w.client.Pipeline()
+	maxSeqs := make(map[uint64]uint64, len(messages))
+	written := 0
+	for _, message := range messages {
+		if message.ID == 0 || message.Seq == 0 {
+			return 0, fmt.Errorf("repair group message %d has no seq", message.ID)
+		}
+		if message.GroupID == 0 || message.SenderID == 0 {
+			return 0, fmt.Errorf("repair group message %d has invalid participants", message.ID)
+		}
+		pipe.ZAdd(ctx, w.keyspace.groupInboxKey(message.GroupID),
+			redis.Z{Score: float64(message.Seq), Member: strconv.FormatUint(message.ID, 10)})
+		if message.Seq > maxSeqs[message.GroupID] {
+			maxSeqs[message.GroupID] = message.Seq
+		}
+		written++
+	}
+	for groupID, seq := range maxSeqs {
+		pipe.Eval(ctx, raiseSequenceScriptSource,
+			[]string{w.keyspace.groupSequenceKey(groupID)},
+			strconv.FormatUint(seq, 10),
+		)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, fmt.Errorf("write group index batch: %w", err)
 	}
 	return written, nil
 }

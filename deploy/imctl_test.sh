@@ -10,6 +10,7 @@ APP_ROOT="${ROOT}/app"
 BASELINE="${ROOT}/baseline"
 UNIT=im-test
 PORT=8199
+ADDR="0.0.0.0:${PORT}"
 VERIFY_MODE=0
 # Re-point every path derived by the wrapper at source time into the temporary
 # directory, so the real prepare functions never touch /opt.
@@ -67,6 +68,7 @@ pgrep() {
 # The wrapper runs as root in production; in the test it owns the temporary
 # files already, so ignore the ownership flags and copy.
 install() {
+  printf 'install\n' >> "${TEST_DIR}/install-calls"
   local source="" target=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -147,7 +149,7 @@ rm -f "${TEST_DIR}/active"
 : > "${TEST_DIR}/server-args"
 : > "${TEST_DIR}/server-env"
 backfill_seq >/dev/null
-test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-backfill-seq -backfill-batch 1000 '
+test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-addr 0.0.0.0:8199 -backfill-seq -backfill-batch 1000 '
 test "$(cat "${TEST_DIR}/server-env")" = 'im:v13-verify 1 true'
 pass 'seq backfill runs the backend with the seq flag in the verify namespace'
 touch "${TEST_DIR}/active"
@@ -180,14 +182,15 @@ pass 'seq backfill requires Redis configuration'
 : > "${TEST_DIR}/server-env"
 unset REBUILD_BATCH REBUILD_QUEUE_TIMEOUT || true
 output="$(rebuild_redis)"
-test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-rebuild-redis '
+test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-addr 0.0.0.0:8199 -rebuild-redis '
 test "$(cat "${TEST_DIR}/server-env")" = 'im:v13-verify 1 true'
 grep -q 'Redis rebuild finished' <<<"${output}"
 pass 'redis rebuild runs the backend with the rebuild flag in the verify namespace'
 : > "${TEST_DIR}/server-args"
-REBUILD_BATCH=250 REBUILD_QUEUE_TIMEOUT=5m rebuild_redis >/dev/null
-test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-rebuild-redis -rebuild-batch 250 -rebuild-queue-timeout 5m '
-pass 'redis rebuild maps the batch and queue timeout overrides'
+REBUILD_BATCH=250 REBUILD_QUEUE_TIMEOUT=5m REBUILD_TIMEOUT=45m rebuild_redis >/dev/null
+test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-addr 0.0.0.0:8199 -rebuild-redis -rebuild-batch 250 -rebuild-queue-timeout 5m -rebuild-timeout 45m '
+unset REBUILD_TIMEOUT || true
+pass 'redis rebuild maps the batch, queue and total timeout overrides'
 touch "${TEST_DIR}/active"
 if rebuild_redis >/dev/null 2>&1; then exit 1; fi
 rm -f "${TEST_DIR}/active"
@@ -224,6 +227,28 @@ INFRA_REDIS_PASSWORD_FILE="${INFRA_CONFIG_DIR}/redis-password"
 INFRA_RABBITMQ_URL_FILE="${INFRA_CONFIG_DIR}/rabbitmq-url"
 INFRA_RABBITMQ_PASSWORD_FILE="${INFRA_CONFIG_DIR}/rabbitmq-password"
 INFRA_SECRETS="${INFRA_ROOT}/secrets"
+# The MySQL secret is checked before prepare_backend_config, so a host without
+# it reports the actionable error instead of dying inside install/cp.
+mysql_app_secret_backup="${MYSQL_APP_SECRET}"
+backend_app_secret_backup="${BACKEND_APP_SECRET}"
+verify_mode_backup="${VERIFY_MODE}"
+VERIFY_MODE=0
+MYSQL_APP_SECRET="${TEST_DIR}/absent/mysql-app"
+BACKEND_APP_SECRET="${TEST_DIR}/absent/backend-mysql-app"
+: > "${TEST_DIR}/install-calls"
+output="$(rebuild_redis 2>&1 || true)"
+grep -q 'redis rebuild requires MySQL configuration' <<<"${output}" || {
+  echo 'FAIL missing MySQL secret did not report the friendly error'
+  exit 1
+}
+test ! -s "${TEST_DIR}/install-calls" || {
+  echo 'FAIL redis rebuild touched backend config before checking the MySQL secret'
+  exit 1
+}
+MYSQL_APP_SECRET="${mysql_app_secret_backup}"
+BACKEND_APP_SECRET="${backend_app_secret_backup}"
+VERIFY_MODE="${verify_mode_backup}"
+pass 'redis rebuild reports a missing MySQL secret before preparing config'
 if main rebuild-read >/dev/null 2>&1; then exit 1; fi
 if main backfill-read >/dev/null 2>&1; then exit 1; fi
 if main backfill-group-read >/dev/null 2>&1; then exit 1; fi

@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
 )
 
 func TestSeqBackfillLockReleaseOnlyDeletesOwnToken(t *testing.T) {
@@ -41,5 +44,22 @@ func TestSeqBackfillLockReleaseOnlyDeletesOwnToken(t *testing.T) {
 	}
 	if exists := client.Exists(ctx, key).Val(); exists != 0 {
 		t.Fatalf("lock still present after its owner released it")
+	}
+}
+
+func TestRefuseIncompleteRebuild(t *testing.T) {
+	server, client, keyspace := newTestRedis(t)
+	ctx := context.Background()
+
+	if err := refuseIncompleteRebuild(ctx, client, keyspace); err != nil {
+		t.Fatalf("no pending marker must allow backfill: %v", err)
+	}
+	if err := server.Set(messaging.RebuildPendingKey(keyspace), "1"); err != nil {
+		t.Fatalf("set pending marker: %v", err)
+	}
+	err := refuseIncompleteRebuild(ctx, client, keyspace)
+	if err == nil || !strings.Contains(err.Error(), "rebuild-redis") ||
+		!strings.Contains(err.Error(), messaging.RebuildPendingKey(keyspace)) {
+		t.Fatalf("pending marker error = %v", err)
 	}
 }

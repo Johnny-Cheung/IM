@@ -468,3 +468,43 @@ func TestRabbitConsumerRunBacksOffAndReportsReconnectErrors(t *testing.T) {
 		t.Fatalf("attempts = %d, want %d", attempts, len(wantDelays))
 	}
 }
+
+func TestRabbitConsumerCountsInFlightDeliveries(t *testing.T) {
+	consumer := &RabbitMessageConsumer{
+		retry: consumeTestRetryPolicy(&consumeFakeClock{}, consumeTestNow),
+	}
+	observed := -1
+	consumer.persister = consumeMessagePersisterFunc(
+		func(context.Context, store.Message) (bool, error) {
+			observed = consumer.Status().InFlight
+			return true, nil
+		},
+	)
+	delivery := &consumeFakeDelivery{body: consumeTestDirectBody(t), messageID: "42"}
+
+	if err := consumer.handleDelivery(
+		context.Background(), delivery, &consumeFakePublisher{},
+	); err != nil {
+		t.Fatalf("handleDelivery() error = %v", err)
+	}
+	if observed != 1 {
+		t.Fatalf("in flight during persist = %d, want 1", observed)
+	}
+	if inFlight := consumer.Status().InFlight; inFlight != 0 {
+		t.Fatalf("in flight after the ack = %d, want 0", inFlight)
+	}
+
+	// A canceled context returns from persist without persisting; the delivery
+	// marker must still be cleared.
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	delivery = &consumeFakeDelivery{body: consumeTestDirectBody(t), messageID: "43"}
+	if err := consumer.handleDelivery(
+		canceled, delivery, &consumeFakePublisher{},
+	); err != nil {
+		t.Fatalf("handleDelivery() with a canceled context = %v", err)
+	}
+	if inFlight := consumer.Status().InFlight; inFlight != 0 {
+		t.Fatalf("in flight after a canceled delivery = %d, want 0", inFlight)
+	}
+}

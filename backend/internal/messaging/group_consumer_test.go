@@ -13,6 +13,7 @@ import (
 	"github.com/rabbitmq/amqp091-go"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/config"
+	"github.com/Johnny-Cheung/IM/backend/internal/store"
 )
 
 func TestGroupConsumerDeadLettersMessageClassAfterSixAttempts(t *testing.T) {
@@ -209,5 +210,43 @@ func TestGroupConsumerRunBacksOffAndReportsReconnectErrors(t *testing.T) {
 	}
 	if !reflect.DeepEqual(delays, wantDelays) {
 		t.Fatalf("delays = %v, want %v", delays, wantDelays)
+	}
+}
+
+func TestGroupConsumerCountsInFlightDeliveries(t *testing.T) {
+	consumer := &GroupMessageConsumer{
+		retry: consumeTestRetryPolicy(&consumeFakeClock{}, consumeTestNow),
+	}
+	observed := -1
+	consumer.persister = consumeGroupPersisterFunc(
+		func(context.Context, store.GroupMessage) (bool, error) {
+			observed = consumer.Status().InFlight
+			return true, nil
+		},
+	)
+	delivery := &consumeFakeDelivery{body: consumeTestGroupBody(t), messageID: "7"}
+
+	if err := consumer.handleDelivery(
+		context.Background(), delivery, &consumeFakePublisher{},
+	); err != nil {
+		t.Fatalf("handleDelivery() error = %v", err)
+	}
+	if observed != 1 {
+		t.Fatalf("in flight during persist = %d, want 1", observed)
+	}
+	if inFlight := consumer.Status().InFlight; inFlight != 0 {
+		t.Fatalf("in flight after the ack = %d, want 0", inFlight)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	delivery = &consumeFakeDelivery{body: consumeTestGroupBody(t), messageID: "8"}
+	if err := consumer.handleDelivery(
+		canceled, delivery, &consumeFakePublisher{},
+	); err != nil {
+		t.Fatalf("handleDelivery() with a canceled context = %v", err)
+	}
+	if inFlight := consumer.Status().InFlight; inFlight != 0 {
+		t.Fatalf("in flight after a canceled delivery = %d, want 0", inFlight)
 	}
 }

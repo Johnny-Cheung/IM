@@ -183,6 +183,10 @@ func (c *RabbitMessageConsumer) handleDelivery(
 	delivery consumeDelivery,
 	publisher consumeDeadLetterPublisher,
 ) error {
+	// The delivery is unacknowledged for the whole decode/persist/ack path, so
+	// a drain must see it and wait instead of treating the queue as empty.
+	c.status.beginDelivery()
+	defer c.status.endDelivery()
 	job := consumeDeliveryJob{
 		delivery:  delivery,
 		publisher: publisher,

@@ -22,6 +22,9 @@ type fakeRebuildStore struct {
 	maxID              uint64
 	convStatsOverride  []store.ConversationSeqStat
 	groupStatsOverride []store.GroupSeqStat
+	// beforeConvStats runs once, on the first verify read, so a test can damage
+	// the namespace between the write passes and their verification.
+	beforeConvStats func()
 }
 
 func newFakeRebuildStore(now time.Time) *fakeRebuildStore {
@@ -185,6 +188,11 @@ func (f *fakeRebuildStore) ListConversationSeqStats(
 	afterLowID, afterHighID uint64,
 	limit int,
 ) ([]store.ConversationSeqStat, error) {
+	if f.beforeConvStats != nil {
+		before := f.beforeConvStats
+		f.beforeConvStats = nil
+		before()
+	}
 	rows := f.convStatsOverride
 	if rows == nil {
 		type stats struct {
@@ -282,6 +290,23 @@ func (f *fakeRebuildStore) ListFriendshipPairs(
 	context.Context,
 ) ([]store.FriendshipPair, error) {
 	return f.friends, nil
+}
+
+func (f *fakeRebuildStore) CountUnnumberedMessages(
+	context.Context,
+) (uint64, uint64, error) {
+	direct, group := uint64(0), uint64(0)
+	for _, message := range f.direct {
+		if message.Seq == 0 {
+			direct++
+		}
+	}
+	for _, message := range f.groups {
+		if message.Seq == 0 {
+			group++
+		}
+	}
+	return direct, group, nil
 }
 
 type drainRecorder struct {
@@ -531,9 +556,14 @@ func TestRedisRebuildPagesWithBatchOne(t *testing.T) {
 }
 
 func TestRedisRebuildRefusesMessagesWithoutSeq(t *testing.T) {
+	ctx := context.Background()
 	now := time.UnixMilli(1700000000000).UTC()
 	client, fakeStore, drain := newRebuildTest(t, now)
 	fakeStore.direct[0].Seq = 0
+	keepKey := messageKey(999)
+	if err := client.Set(ctx, keepKey, "keep", 0).Err(); err != nil {
+		t.Fatalf("seed stale entity: %v", err)
+	}
 
 	_, err := runRebuild(t, client, fakeStore, drain, now, 2)
 	if !errors.Is(err, ErrRebuildMissingSeq) {
@@ -542,7 +572,13 @@ func TestRedisRebuildRefusesMessagesWithoutSeq(t *testing.T) {
 	if !strings.Contains(err.Error(), "backfill-seq") {
 		t.Fatalf("Run() error = %v, want a backfill-seq hint", err)
 	}
-	if exists := client.Exists(context.Background(), sequenceReadyKey()).Val(); exists != 0 {
+	if drain.calls != 0 {
+		t.Fatalf("drain calls = %d, want 0", drain.calls)
+	}
+	if exists := client.Exists(ctx, keepKey).Val(); exists != 1 {
+		t.Fatalf("namespace was cleared before the NULL-seq refusal")
+	}
+	if exists := client.Exists(ctx, sequenceReadyKey()).Val(); exists != 0 {
 		t.Fatalf("seq:ready was written after the refusal")
 	}
 }
@@ -639,6 +675,12 @@ func TestRedisRebuildVerifyFailureDoesNotWriteReady(t *testing.T) {
 	if exists := client.Exists(context.Background(), sequenceReadyKey()).Val(); exists != 0 {
 		t.Fatalf("seq:ready was written after a failed verification")
 	}
+	if exists := client.Exists(context.Background(), defaultKeyspace.indexEpochKey()).Val(); exists != 0 {
+		t.Fatalf("index:epoch was written before verification passed")
+	}
+	if exists := client.Exists(context.Background(), RebuildPendingKey(defaultKeyspace)).Val(); exists != 1 {
+		t.Fatalf("rebuild:pending was cleared although the rebuild failed")
+	}
 }
 
 func TestRedisRebuildHonorsCancellation(t *testing.T) {
@@ -692,6 +734,7 @@ func TestClearNamespaceKeepsLocksAndUnknownKeys(t *testing.T) {
 	}
 	protected := []string{
 		RebuildLockKey(defaultKeyspace),
+		RebuildPendingKey(defaultKeyspace),
 		BackfillLockKey(defaultKeyspace),
 		"im:v12:unknown:key",
 		"other:messages:1",
@@ -742,6 +785,250 @@ func TestClearNamespaceUsesItsOwnPrefix(t *testing.T) {
 	}
 	if exists := client.Exists(ctx, other).Val(); exists != 1 {
 		t.Fatalf("key outside the keyspace was deleted")
+	}
+}
+
+func TestRedisRebuildToleratesSeqHoles(t *testing.T) {
+	now := time.UnixMilli(1700000000000).UTC()
+	client, fakeStore, drain := newRebuildTest(t, now)
+	// A dead-lettered persist leaves seq 2 of 1:2 and seq 1 of group 7 unused.
+	keepDirect := make([]store.Message, 0, len(fakeStore.direct))
+	for _, message := range fakeStore.direct {
+		if message.ID == 2 {
+			continue
+		}
+		keepDirect = append(keepDirect, message)
+	}
+	fakeStore.direct = keepDirect
+	keepGroups := make([]store.GroupMessage, 0, len(fakeStore.groups))
+	for _, message := range fakeStore.groups {
+		if message.ID == 6 {
+			continue
+		}
+		keepGroups = append(keepGroups, message)
+	}
+	fakeStore.groups = keepGroups
+
+	result, err := runRebuild(t, client, fakeStore, drain, now, 2)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want holes to be tolerated", err)
+	}
+	if result.Holes != 2 {
+		t.Fatalf("holes = %d, want 2", result.Holes)
+	}
+	expectZCard(t, client, directPairKey(1, 2), 2)
+	expectString(t, client, directSequenceKey(1, 2), "3")
+	expectZCard(t, client, defaultKeyspace.groupInboxKey(7), 1)
+	expectString(t, client, defaultKeyspace.groupSequenceKey(7), "2")
+	expectString(t, client, sequenceReadyKey(), "1")
+}
+
+func TestRedisRebuildClampsWatermarksPastLostTail(t *testing.T) {
+	ctx := context.Background()
+	now := time.UnixMilli(1700000000000).UTC()
+	client, fakeStore, drain := newRebuildTest(t, now)
+	// Read receipts can outlive a lost tail: durable seq 10 over a max seq of 3.
+	fakeStore.convReads[0] = store.ConversationReadState{UserID: 1, PeerID: 2, LastReadSeq: 10}
+	fakeStore.groupProjections[0].Positions[1] = 9
+
+	if _, err := runRebuild(t, client, fakeStore, drain, now, 2); err != nil {
+		t.Fatalf("Run() error = %v, want the watermarks clamped", err)
+	}
+	if got := client.HGet(ctx, directReadKey(1), "2").Val(); got != "3" {
+		t.Fatalf("dm:read:1 peer 2 = %q, want 3", got)
+	}
+	if score := client.ZScore(ctx, defaultKeyspace.groupReadKey(7), "1").Val(); score != 2 {
+		t.Fatalf("group 7 member 1 watermark = %v, want 2", score)
+	}
+	expectString(t, client, sequenceReadyKey(), "1")
+}
+
+// delFailClient fails one DEL so a test can interrupt a destructive pass.
+type delFailClient struct {
+	redis.UniversalClient
+	failOn func(keys []string) bool
+}
+
+func (c *delFailClient) Del(ctx context.Context, keys ...string) *redis.IntCmd {
+	if c.failOn(keys) {
+		return redis.NewIntResult(0, errors.New("injected del failure"))
+	}
+	return c.UniversalClient.Del(ctx, keys...)
+}
+
+// setFailClient fails one SET so a test can interrupt the final writes.
+type setFailClient struct {
+	redis.UniversalClient
+	failOn func(key string) bool
+}
+
+func (c *setFailClient) Set(
+	ctx context.Context,
+	key string,
+	value interface{},
+	expiration time.Duration,
+) *redis.StatusCmd {
+	if c.failOn(key) {
+		return redis.NewStatusResult("", errors.New("injected set failure"))
+	}
+	return c.UniversalClient.Set(ctx, key, value, expiration)
+}
+
+func TestClearNamespaceInvalidatesMarkersBeforeFailing(t *testing.T) {
+	ctx := context.Background()
+	client, _ := newProjectionTest(t)
+	if err := client.Set(ctx, sequenceReadyKey(), "1", 0).Err(); err != nil {
+		t.Fatalf("seed seq:ready: %v", err)
+	}
+	if err := client.Set(ctx, defaultKeyspace.indexEpochKey(), "0", 0).Err(); err != nil {
+		t.Fatalf("seed index:epoch: %v", err)
+	}
+	if err := client.Set(ctx, dedupKey(1, 2, "x"), "1", 0).Err(); err != nil {
+		t.Fatalf("seed dedup: %v", err)
+	}
+	failing := &delFailClient{
+		UniversalClient: client,
+		failOn: func(keys []string) bool {
+			for _, key := range keys {
+				if strings.Contains(key, "dedup:") {
+					return true
+				}
+			}
+			return false
+		},
+	}
+
+	if _, err := ClearNamespace(ctx, failing, defaultKeyspace); err == nil {
+		t.Fatalf("ClearNamespace() succeeded despite the injected DEL failure")
+	}
+	if exists := client.Exists(ctx, sequenceReadyKey()).Val(); exists != 0 {
+		t.Fatalf("seq:ready survived a failed clear")
+	}
+	if exists := client.Exists(ctx, defaultKeyspace.indexEpochKey()).Val(); exists != 0 {
+		t.Fatalf("index:epoch survived a failed clear")
+	}
+}
+
+func TestRedisRebuildVerifyCatchesMissingDedup(t *testing.T) {
+	ctx := context.Background()
+	now := time.UnixMilli(1700000000000).UTC()
+	client, fakeStore, drain := newRebuildTest(t, now)
+	fakeStore.beforeConvStats = func() {
+		if err := client.Del(ctx, dedupKey(1, 2, "c1")).Err(); err != nil {
+			t.Fatalf("delete dedup record: %v", err)
+		}
+	}
+
+	_, err := runRebuild(t, client, fakeStore, drain, now, 2)
+	if err == nil || !strings.Contains(err.Error(), "dedup") {
+		t.Fatalf("Run() error = %v, want a dedup mismatch", err)
+	}
+	if exists := client.Exists(ctx, sequenceReadyKey()).Val(); exists != 0 {
+		t.Fatalf("seq:ready was written without its dedup records")
+	}
+}
+
+func TestRedisRebuildVerifyCatchesStaleConversationPreview(t *testing.T) {
+	ctx := context.Background()
+	now := time.UnixMilli(1700000000000).UTC()
+	client, fakeStore, drain := newRebuildTest(t, now)
+	fakeStore.beforeConvStats = func() {
+		if err := client.HDel(ctx, directConversationLastKey(1), "2").Err(); err != nil {
+			t.Fatalf("delete conversation preview: %v", err)
+		}
+	}
+
+	_, err := runRebuild(t, client, fakeStore, drain, now, 2)
+	if err == nil || !strings.Contains(err.Error(), "conversation preview") {
+		t.Fatalf("Run() error = %v, want a conversation preview mismatch", err)
+	}
+	if exists := client.Exists(ctx, sequenceReadyKey()).Val(); exists != 0 {
+		t.Fatalf("seq:ready was written with a stale conversation preview")
+	}
+}
+
+func TestRedisRebuildPendingMarkerLifetime(t *testing.T) {
+	now := time.UnixMilli(1700000000000).UTC()
+
+	t.Run("cleared after success", func(t *testing.T) {
+		ctx := context.Background()
+		client, fakeStore, drain := newRebuildTest(t, now)
+		if _, err := runRebuild(t, client, fakeStore, drain, now, 2); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if exists := client.Exists(ctx, RebuildPendingKey(defaultKeyspace)).Val(); exists != 0 {
+			t.Fatalf("rebuild:pending survived a successful rebuild")
+		}
+	})
+
+	t.Run("kept when the clear fails", func(t *testing.T) {
+		ctx := context.Background()
+		client, fakeStore, drain := newRebuildTest(t, now)
+		if err := client.Set(ctx, sequenceReadyKey(), "1", 0).Err(); err != nil {
+			t.Fatalf("seed stale seq:ready: %v", err)
+		}
+		if err := client.Set(ctx, dedupKey(1, 2, "stale"), "1", 0).Err(); err != nil {
+			t.Fatalf("seed stale dedup: %v", err)
+		}
+		failing := &delFailClient{
+			UniversalClient: client,
+			failOn: func(keys []string) bool {
+				for _, key := range keys {
+					if strings.Contains(key, "dedup:") {
+						return true
+					}
+				}
+				return false
+			},
+		}
+		rebuilder := NewRedisRebuilder(failing, fakeStore, RedisRebuildOptions{
+			Keyspace:    defaultKeyspace,
+			Batch:       2,
+			DedupTTL:    7 * 24 * time.Hour,
+			Now:         func() time.Time { return now },
+			Logf:        func(string, ...interface{}) {},
+			DrainQueues: drain.Drain,
+		})
+
+		if _, err := rebuilder.Run(ctx); err == nil {
+			t.Fatalf("Run() succeeded despite the injected DEL failure")
+		}
+		if exists := client.Exists(ctx, RebuildPendingKey(defaultKeyspace)).Val(); exists != 1 {
+			t.Fatalf("rebuild:pending was removed by a failed rebuild")
+		}
+		if exists := client.Exists(ctx, sequenceReadyKey()).Val(); exists != 0 {
+			t.Fatalf("seq:ready survived a failed clear")
+		}
+	})
+}
+
+func TestRedisRebuildClearsEpochWhenReadyWriteFails(t *testing.T) {
+	ctx := context.Background()
+	now := time.UnixMilli(1700000000000).UTC()
+	client, fakeStore, drain := newRebuildTest(t, now)
+	failing := &setFailClient{
+		UniversalClient: client,
+		failOn: func(key string) bool {
+			return key == sequenceReadyKey()
+		},
+	}
+	rebuilder := NewRedisRebuilder(failing, fakeStore, RedisRebuildOptions{
+		Keyspace:    defaultKeyspace,
+		Batch:       2,
+		DedupTTL:    7 * 24 * time.Hour,
+		Now:         func() time.Time { return now },
+		Logf:        func(string, ...interface{}) {},
+		DrainQueues: drain.Drain,
+	})
+
+	if _, err := rebuilder.Run(ctx); err == nil {
+		t.Fatalf("Run() succeeded despite the injected SET failure")
+	}
+	if exists := client.Exists(ctx, defaultKeyspace.indexEpochKey()).Val(); exists != 0 {
+		t.Fatalf("index:epoch survived a failed seq:ready write")
+	}
+	if exists := client.Exists(ctx, sequenceReadyKey()).Val(); exists != 0 {
+		t.Fatalf("seq:ready exists after the injected SET failure")
 	}
 }
 
