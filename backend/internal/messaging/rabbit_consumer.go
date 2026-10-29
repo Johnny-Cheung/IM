@@ -2,14 +2,12 @@ package messaging
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/config"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
-	"github.com/rabbitmq/amqp091-go"
 )
 
 // MessagePersister is the MySQL side of the RabbitMQ consumer.
@@ -23,6 +21,8 @@ type RabbitMessageConsumer struct {
 	dialer    RabbitDialer
 	persister MessagePersister
 	namespace Namespace
+	retry     consumeRetryPolicy
+	status    consumeStatusState
 }
 
 func NewRabbitMessageConsumer(
@@ -44,7 +44,16 @@ func NewRabbitMessageConsumerWithNamespace(
 		dialer:    dialer,
 		persister: persister,
 		namespace: namespace,
+		retry:     defaultConsumeRetryPolicy(),
 	}
+}
+
+// Status returns a snapshot of the consumer counters for /ops/infra.
+func (c *RabbitMessageConsumer) Status() ConsumerStatus {
+	if c == nil {
+		return ConsumerStatus{}
+	}
+	return c.status.snapshot()
 }
 
 // Run blocks until the context is canceled and reconnects after consumer
@@ -82,6 +91,14 @@ func (c *RabbitMessageConsumer) runConnection(ctx context.Context) error {
 	if err := declareDirectTopology(channel, c.namespace); err != nil {
 		return err
 	}
+	deadLetterTopology := DeadLetterTopologyFor(c.namespace, DeadLetterDirect)
+	if err := DeclareDeadLetterTopology(channel, deadLetterTopology); err != nil {
+		return err
+	}
+	publisher, err := newDLQAMQPPublisher(channel, deadLetterTopology)
+	if err != nil {
+		return err
+	}
 	if err := channel.Qos(1, 0, false); err != nil {
 		return fmt.Errorf("set RabbitMQ consumer qos: %w", err)
 	}
@@ -106,36 +123,37 @@ func (c *RabbitMessageConsumer) runConnection(ctx context.Context) error {
 			if !ok {
 				return fmt.Errorf("RabbitMQ delivery channel closed")
 			}
-			if err := c.handleDelivery(ctx, delivery); err != nil {
+			if err := c.handleDelivery(ctx, consumeAMQPDelivery{delivery: delivery}, publisher); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func (c *RabbitMessageConsumer) handleDelivery(ctx context.Context, delivery amqp091.Delivery) error {
-	message, err := decodeDirectMessage(delivery.Body)
+func (c *RabbitMessageConsumer) handleDelivery(
+	ctx context.Context,
+	delivery consumeDelivery,
+	publisher consumeDeadLetterPublisher,
+) error {
+	job := consumeDeliveryJob{
+		delivery:  delivery,
+		publisher: publisher,
+		kind:      DeadLetterDirect,
+		retry:     c.retry,
+		status:    &c.status,
+	}
+	message, err := decodeDirectMessage(delivery.Body())
 	if err != nil {
-		// A malformed message cannot be repaired by retrying. Ack it so a
-		// poison message cannot block the queue forever.
-		log.Printf("drop malformed direct message delivery: %v", err)
-		return delivery.Ack(false)
+		log.Printf("dead-letter malformed direct message delivery: %v", err)
+		job.label = "malformed direct message delivery"
+		return job.deadLetterNow(ctx, dlqReasonMalformed, err)
 	}
-	if _, err := c.persister.PersistMessage(ctx, message); err != nil {
-		if errors.Is(err, store.ErrMessageConflict) {
-			return delivery.Ack(false)
-		}
-		if errors.Is(err, store.ErrSeqConflict) || errors.Is(err, store.ErrSeqInvalid) {
-			log.Printf(
-				"drop direct message id=%d sender=%d recipient=%d seq=%d: %v",
-				message.ID, message.SenderID, message.RecipientID, message.Seq, err,
-			)
-			return delivery.Ack(false)
-		}
-		if nackErr := delivery.Nack(false, true); nackErr != nil {
-			return fmt.Errorf("nack message %d after persist error: %v (persist error: %w)", message.ID, nackErr, err)
-		}
-		return nil
-	}
-	return delivery.Ack(false)
+	job.label = fmt.Sprintf(
+		"direct message id=%d sender=%d recipient=%d seq=%d",
+		message.ID, message.SenderID, message.RecipientID, message.Seq,
+	)
+	return job.persist(ctx, func(ctx context.Context) error {
+		_, err := c.persister.PersistMessage(ctx, message)
+		return err
+	})
 }

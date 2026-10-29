@@ -96,6 +96,28 @@ func TestGroupRedisAcceptorAcceptsDeduplicatesAndRejects(t *testing.T) {
 	}
 }
 
+func TestGroupRedisAcceptorNeverTrimsMessageStream(t *testing.T) {
+	client, _ := newGroupAcceptTest(t)
+	ctx := context.Background()
+	seedGroupProjection(t, client, 9, []uint64{1, 2})
+	acceptor := NewGroupRedisAcceptor(client, defaultKeyspace, RedisAcceptorOptions{})
+	for index := 1; index <= 3; index++ {
+		if _, err := acceptor.Accept(ctx, GroupMessageRequest{
+			SenderID:        1,
+			GroupID:         9,
+			ClientMessageID: fmt.Sprintf("client-%d", index),
+			Body:            "hello",
+			SenderUsername:  "alice",
+			SenderNickname:  "Alice",
+		}); err != nil {
+			t.Fatalf("accept %d: %v", index, err)
+		}
+	}
+	if got := client.XLen(ctx, defaultKeyspace.groupMessageStreamKey()).Val(); got != 3 {
+		t.Fatalf("stream length = %d, want 3 without trimming", got)
+	}
+}
+
 func TestGroupRedisAcceptorConcurrentSequencesHaveNoGaps(t *testing.T) {
 	client, _ := newGroupAcceptTest(t)
 	ctx := context.Background()

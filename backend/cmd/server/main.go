@@ -33,6 +33,13 @@ type serverOptions struct {
 	webDir        string
 	backfillSeq   bool
 	backfillBatch int
+	dlqList       bool
+	dlqReplay     bool
+	dlqDiscard    bool
+	dlqKind       string
+	dlqID         uint64
+	dlqLimit      int
+	dlqYes        bool
 }
 
 func main() {
@@ -41,8 +48,21 @@ func main() {
 	flag.StringVar(&options.webDir, "web-dir", "", "directory containing the frontend build")
 	flag.BoolVar(&options.backfillSeq, "backfill-seq", false, "number conversation history and write seq:ready, then exit")
 	flag.IntVar(&options.backfillBatch, "backfill-batch", 1000, "rows per backfill batch")
+	flag.BoolVar(&options.dlqList, "dlq-list", false, "list dead letters and exit")
+	flag.BoolVar(&options.dlqReplay, "dlq-replay", false, "replay dead letters to the main exchange and exit")
+	flag.BoolVar(&options.dlqDiscard, "dlq-discard", false, "discard dead letters and exit")
+	flag.StringVar(&options.dlqKind, "dlq-kind", "all", "dead letter chain: direct, group or all")
+	flag.Uint64Var(&options.dlqID, "dlq-id", 0, "server message id to replay or discard; 0 means all")
+	flag.IntVar(&options.dlqLimit, "dlq-limit", dlqDefaultLimit, "maximum dead letters to scan per chain")
+	flag.BoolVar(&options.dlqYes, "dlq-yes", false, "confirm discard or replay of every dead letter")
 	flag.Parse()
 
+	if options.dlqList || options.dlqReplay || options.dlqDiscard {
+		if err := runDeadLetterAdmin(options); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if options.backfillSeq {
 		if err := runSeqBackfill(options); err != nil {
 			log.Fatal(err)
@@ -111,6 +131,7 @@ func run(options serverOptions) error {
 	var groupProjector *messaging.GroupProjection
 	var groupReadTracker *messaging.GroupReadTracker
 	var seqWatcher *messaging.SeqWatcher
+	var pipelineMonitor *messaging.PipelineMonitor
 	var workerContext context.Context
 	var cancelWorkers context.CancelFunc
 	var workers sync.WaitGroup
@@ -283,6 +304,8 @@ func run(options serverOptions) error {
 		}()
 		log.Printf("direct message pipeline enabled namespace=%s", namespace.Base())
 
+		var groupRelayStatus func() messaging.RelayStatus
+		var groupConsumerStatus func() messaging.ConsumerStatus
 		if infraConfig.GroupMessagingEnabled {
 			groupRelay := messaging.NewGroupStreamRelay(
 				infraManager.Redis(), infraConfig.RabbitMQ, infra.DialRabbit, keyspace, namespace,
@@ -290,6 +313,8 @@ func run(options serverOptions) error {
 			groupConsumer := messaging.NewGroupMessageConsumer(
 				infraConfig.RabbitMQ, infra.DialRabbit, dataStore, namespace,
 			)
+			groupRelayStatus = func() messaging.RelayStatus { return groupRelay.Status() }
+			groupConsumerStatus = func() messaging.ConsumerStatus { return groupConsumer.Status() }
 			groupReadPersister := messaging.NewGroupReadPersister(
 				infraManager.Redis(), keyspace, namespace, dataStore,
 			)
@@ -314,6 +339,39 @@ func run(options serverOptions) error {
 			}()
 			log.Printf("group message pipeline enabled namespace=%s", namespace.Base())
 		}
+
+		reconciler := messaging.NewReconciler(
+			infraManager.Redis(),
+			dataStore,
+			messaging.ReconcileOptions{Keyspace: keyspace, Gate: gate},
+		)
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			reconciler.Run(workerContext)
+		}()
+		log.Printf("message reconciler started")
+
+		pipelineMonitor = messaging.NewPipelineMonitor(
+			infraManager.Redis(),
+			infraConfig.RabbitMQ,
+			infra.DialRabbit,
+			messaging.PipelineMonitorOptions{
+				Keyspace:       keyspace,
+				Namespace:      namespace,
+				DirectRelay:    func() messaging.RelayStatus { return relay.Status() },
+				DirectConsumer: func() messaging.ConsumerStatus { return consumer.Status() },
+				GroupRelay:     groupRelayStatus,
+				GroupConsumer:  groupConsumerStatus,
+				Reconcile:      func() messaging.ReconcileStatus { return reconciler.Status() },
+			},
+		)
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			pipelineMonitor.Run(workerContext)
+		}()
+		log.Printf("pipeline monitor started")
 	} else if infraManager != nil && (infraManager.RedisEnabled() || infraConfig.RabbitMQ.Enabled()) {
 		log.Printf("message pipeline disabled: Redis and RabbitMQ must both be configured")
 	}
@@ -323,13 +381,24 @@ func run(options serverOptions) error {
 		return err
 	}
 	if infraManager != nil {
-		registerInfraStatus(router, infraManager, func() *messaging.SeqWatcherStatus {
-			if seqWatcher == nil {
-				return nil
-			}
-			status := seqWatcher.Status()
-			return &status
-		})
+		registerInfraStatus(
+			router,
+			infraManager,
+			func() *messaging.SeqWatcherStatus {
+				if seqWatcher == nil {
+					return nil
+				}
+				status := seqWatcher.Status()
+				return &status
+			},
+			func() *messaging.PipelineStatus {
+				if pipelineMonitor == nil {
+					return nil
+				}
+				status := pipelineMonitor.Status()
+				return &status
+			},
+		)
 	}
 	apiOptions := make([]httpapi.Option, 0, 8)
 	if directAcceptor != nil {
@@ -403,18 +472,25 @@ type infraStatusProvider interface {
 
 type infraStatusResponse struct {
 	infra.Snapshot
-	Seq *messaging.SeqWatcherStatus `json:"seq,omitempty"`
+	Seq      *messaging.SeqWatcherStatus `json:"seq,omitempty"`
+	Pipeline *messaging.PipelineStatus   `json:"pipeline,omitempty"`
 }
 
 func registerInfraStatus(
 	router *gin.Engine,
 	provider infraStatusProvider,
 	seqStatus func() *messaging.SeqWatcherStatus,
+	pipelineStatus func() *messaging.PipelineStatus,
 ) {
 	router.GET("/ops/infra", func(c *gin.Context) {
 		response := infraStatusResponse{Snapshot: provider.Snapshot()}
 		if seqStatus != nil {
 			response.Seq = seqStatus()
+		}
+		// The endpoint only serves the monitor's last sample; it never queries
+		// Redis or RabbitMQ on the request path.
+		if pipelineStatus != nil {
+			response.Pipeline = pipelineStatus()
 		}
 		c.JSON(http.StatusOK, response)
 	})

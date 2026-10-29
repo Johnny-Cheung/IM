@@ -46,9 +46,6 @@ func NewGroupRedisAcceptor(
 	if options.DedupTTL <= 0 {
 		options.DedupTTL = defaultDedupTTL
 	}
-	if options.StreamMaxLen <= 0 {
-		options.StreamMaxLen = defaultStreamMaxLen
-	}
 	return &GroupRedisAcceptor{client: client, keyspace: keyspace, options: options}
 }
 
@@ -88,7 +85,6 @@ func (a *GroupRedisAcceptor) Accept(
 		store.MaxSafeMessageID,
 		store.MaxSafeSeq,
 		int64(a.options.DedupTTL / time.Second),
-		a.options.StreamMaxLen,
 		a.keyspace.prefixOrDefault() + "group-messages:",
 		request.SenderUsername,
 		request.SenderNickname,

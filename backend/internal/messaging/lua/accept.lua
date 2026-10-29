@@ -19,8 +19,7 @@
 -- ARGV[8] = max safe global message ID
 -- ARGV[9] = max safe conversation seq
 -- ARGV[10] = dedup TTL seconds
--- ARGV[11] = stream max length
--- ARGV[12] = message entity key prefix
+-- ARGV[11] = message entity key prefix
 
 local sender_id = ARGV[1]
 local recipient_id = ARGV[2]
@@ -32,8 +31,7 @@ local seed_floor = tonumber(ARGV[7])
 local max_safe_id = tonumber(ARGV[8])
 local max_safe_seq = tonumber(ARGV[9])
 local dedup_ttl = tonumber(ARGV[10])
-local stream_max_len = tonumber(ARGV[11])
-local message_prefix = ARGV[12]
+local message_prefix = ARGV[11]
 
 if redis.call('EXISTS', KEYS[11]) == 0 then
   return {'seq_not_ready'}
@@ -112,7 +110,9 @@ redis.call('ZADD', KEYS[6], seq, tostring(message_id))
 redis.call('HSET', KEYS[8], recipient_id, tostring(message_id))
 redis.call('HSET', KEYS[9], sender_id, tostring(message_id))
 
-redis.call('XADD', KEYS[10], 'MAXLEN', '~', stream_max_len, '*',
+-- The message stream is never trimmed: an entry leaves it only after the
+-- relay published it and acknowledged it.
+redis.call('XADD', KEYS[10], '*',
   'id', tostring(message_id),
   'seq', tostring(seq),
   'sender_id', sender_id,

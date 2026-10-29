@@ -48,25 +48,18 @@ type RedisAcceptor struct {
 // entity. Bounding the hot window is deferred until the read path owns an
 // explicit window marker.
 type RedisAcceptorOptions struct {
-	SeedFloor    uint64
-	Keyspace     Keyspace
-	DedupTTL     time.Duration
-	StreamMaxLen int64
+	SeedFloor uint64
+	Keyspace  Keyspace
+	DedupTTL  time.Duration
 	// Gate blocks acceptance while Redis is being calibrated. Nil means ready.
 	Gate *SeqGate
 }
 
-const (
-	defaultDedupTTL     = 7 * 24 * time.Hour
-	defaultStreamMaxLen = int64(10000)
-)
+const defaultDedupTTL = 7 * 24 * time.Hour
 
 func NewRedisAcceptor(client redis.Scripter, options RedisAcceptorOptions) *RedisAcceptor {
 	if options.DedupTTL <= 0 {
 		options.DedupTTL = defaultDedupTTL
-	}
-	if options.StreamMaxLen <= 0 {
-		options.StreamMaxLen = defaultStreamMaxLen
 	}
 	return &RedisAcceptor{client: client, options: options}
 }
@@ -108,7 +101,6 @@ func (a *RedisAcceptor) Accept(ctx context.Context, request DirectMessageRequest
 		store.MaxSafeMessageID,
 		store.MaxSafeSeq,
 		int64(a.options.DedupTTL / time.Second),
-		a.options.StreamMaxLen,
 		keyspace.prefixOrDefault() + "messages:",
 	}
 	values, err := acceptScript.Run(ctx, a.client, keys, args...).Slice()

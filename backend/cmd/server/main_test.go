@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/infra"
@@ -32,7 +33,7 @@ func TestInfraStatusExposesSnapshotWithoutChangingReadiness(t *testing.T) {
 		RabbitMQ: infra.ComponentStatus{Enabled: true, Connected: false},
 	}}, func() *messaging.SeqWatcherStatus {
 		return &messaging.SeqWatcherStatus{Ready: true, Conversations: 3}
-	})
+	}, nil)
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ops/infra", nil))
@@ -41,7 +42,8 @@ func TestInfraStatusExposesSnapshotWithoutChangingReadiness(t *testing.T) {
 	}
 	var snapshot struct {
 		infra.Snapshot
-		Seq *messaging.SeqWatcherStatus `json:"seq"`
+		Seq      *messaging.SeqWatcherStatus `json:"seq"`
+		Pipeline *messaging.PipelineStatus   `json:"pipeline"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &snapshot); err != nil {
 		t.Fatalf("decode response: %v", err)
@@ -52,11 +54,108 @@ func TestInfraStatusExposesSnapshotWithoutChangingReadiness(t *testing.T) {
 	if snapshot.Seq == nil || !snapshot.Seq.Ready || snapshot.Seq.Conversations != 3 {
 		t.Fatalf("seq status = %#v, want ready with 3 conversations", snapshot.Seq)
 	}
+	if snapshot.Pipeline != nil {
+		t.Fatalf("pipeline = %#v, want omitted without a monitor", snapshot.Pipeline)
+	}
 
 	ready := httptest.NewRecorder()
 	router.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/ready", nil))
 	if ready.Code != http.StatusOK {
 		t.Fatalf("ready status = %d, want %d", ready.Code, http.StatusOK)
+	}
+}
+
+func TestInfraStatusExposesPipelineSnapshot(t *testing.T) {
+	router, err := newRouter("", nil)
+	if err != nil {
+		t.Fatalf("newRouter() error = %v", err)
+	}
+	deadLetters := int64(4)
+	registerInfraStatus(
+		router,
+		fakeInfraStatus{snapshot: infra.Snapshot{
+			Redis:    infra.ComponentStatus{Enabled: true, Connected: true},
+			RabbitMQ: infra.ComponentStatus{Enabled: true, Connected: true},
+		}},
+		nil,
+		func() *messaging.PipelineStatus {
+			return &messaging.PipelineStatus{
+				Direct: messaging.PipelineChainStatus{
+					StreamLength:     12,
+					Pending:          3,
+					OldestAgeSeconds: 90,
+					Unrelayed:        12,
+					BacklogAlert:     true,
+					DeadLetterCount:  &deadLetters,
+					Relay:            messaging.RelayStatus{Connected: true, Relayed: 7},
+				},
+				Reconcile: messaging.ReconcileStatus{Repaired: 2, TotalRepaired: 5},
+			}
+		},
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ops/infra", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var response struct {
+		infra.Snapshot
+		Pipeline *messaging.PipelineStatus `json:"pipeline"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.Redis.Connected || !response.RabbitMQ.Connected {
+		t.Fatalf("snapshot = %#v", response.Snapshot)
+	}
+	if response.Pipeline == nil {
+		t.Fatal("pipeline = nil, want the monitor snapshot")
+	}
+	if response.Pipeline.Direct.StreamLength != 12 ||
+		response.Pipeline.Direct.Pending != 3 ||
+		response.Pipeline.Direct.OldestAgeSeconds != 90 ||
+		!response.Pipeline.Direct.BacklogAlert {
+		t.Fatalf("pipeline direct = %#v", response.Pipeline.Direct)
+	}
+	if response.Pipeline.Direct.DeadLetterCount == nil ||
+		*response.Pipeline.Direct.DeadLetterCount != 4 {
+		t.Fatalf(
+			"dead letter count = %v, want 4",
+			response.Pipeline.Direct.DeadLetterCount,
+		)
+	}
+	if response.Pipeline.Reconcile.Repaired != 2 ||
+		response.Pipeline.Reconcile.TotalRepaired != 5 {
+		t.Fatalf("pipeline reconcile = %#v", response.Pipeline.Reconcile)
+	}
+}
+
+func TestInfraStatusOmitsPipelineWhenMonitorIsAbsent(t *testing.T) {
+	router, err := newRouter("", nil)
+	if err != nil {
+		t.Fatalf("newRouter() error = %v", err)
+	}
+	registerInfraStatus(
+		router,
+		fakeInfraStatus{},
+		nil,
+		func() *messaging.PipelineStatus { return nil },
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ops/infra", nil))
+	var response struct {
+		Pipeline *messaging.PipelineStatus `json:"pipeline"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Pipeline != nil {
+		t.Fatalf("pipeline = %#v, want omitted", response.Pipeline)
+	}
+	if strings.Contains(recorder.Body.String(), `"pipeline"`) {
+		t.Fatalf("body = %s, want no pipeline key", recorder.Body.String())
 	}
 }
 

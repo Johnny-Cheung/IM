@@ -2,14 +2,12 @@ package messaging
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/config"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
-	"github.com/rabbitmq/amqp091-go"
 )
 
 // GroupMessagePersister is the MySQL side of the group RabbitMQ consumer.
@@ -23,6 +21,8 @@ type GroupMessageConsumer struct {
 	dialer    RabbitDialer
 	persister GroupMessagePersister
 	namespace Namespace
+	retry     consumeRetryPolicy
+	status    consumeStatusState
 }
 
 func NewGroupMessageConsumer(
@@ -31,7 +31,21 @@ func NewGroupMessageConsumer(
 	persister GroupMessagePersister,
 	namespace Namespace,
 ) *GroupMessageConsumer {
-	return &GroupMessageConsumer{config: rabbitConfig, dialer: dialer, persister: persister, namespace: namespace}
+	return &GroupMessageConsumer{
+		config:    rabbitConfig,
+		dialer:    dialer,
+		persister: persister,
+		namespace: namespace,
+		retry:     defaultConsumeRetryPolicy(),
+	}
+}
+
+// Status returns a snapshot of the consumer counters for /ops/infra.
+func (c *GroupMessageConsumer) Status() ConsumerStatus {
+	if c == nil {
+		return ConsumerStatus{}
+	}
+	return c.status.snapshot()
 }
 
 func (c *GroupMessageConsumer) Run(ctx context.Context) error {
@@ -66,6 +80,14 @@ func (c *GroupMessageConsumer) runConnection(ctx context.Context) error {
 	if err := declareGroupTopology(channel, c.namespace); err != nil {
 		return err
 	}
+	deadLetterTopology := DeadLetterTopologyFor(c.namespace, DeadLetterGroup)
+	if err := DeclareDeadLetterTopology(channel, deadLetterTopology); err != nil {
+		return err
+	}
+	publisher, err := newDLQAMQPPublisher(channel, deadLetterTopology)
+	if err != nil {
+		return err
+	}
 	if err := channel.Qos(1, 0, false); err != nil {
 		return fmt.Errorf("set RabbitMQ group consumer qos: %w", err)
 	}
@@ -89,34 +111,37 @@ func (c *GroupMessageConsumer) runConnection(ctx context.Context) error {
 			if !ok {
 				return fmt.Errorf("RabbitMQ group delivery channel closed")
 			}
-			if err := c.handleDelivery(ctx, delivery); err != nil {
+			if err := c.handleDelivery(ctx, consumeAMQPDelivery{delivery: delivery}, publisher); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func (c *GroupMessageConsumer) handleDelivery(ctx context.Context, delivery amqp091.Delivery) error {
-	message, err := decodeGroupMessage(delivery.Body)
+func (c *GroupMessageConsumer) handleDelivery(
+	ctx context.Context,
+	delivery consumeDelivery,
+	publisher consumeDeadLetterPublisher,
+) error {
+	job := consumeDeliveryJob{
+		delivery:  delivery,
+		publisher: publisher,
+		kind:      DeadLetterGroup,
+		retry:     c.retry,
+		status:    &c.status,
+	}
+	message, err := decodeGroupMessage(delivery.Body())
 	if err != nil {
-		log.Printf("drop malformed group message delivery: %v", err)
-		return delivery.Ack(false)
+		log.Printf("dead-letter malformed group message delivery: %v", err)
+		job.label = "malformed group message delivery"
+		return job.deadLetterNow(ctx, dlqReasonMalformed, err)
 	}
-	if _, err := c.persister.PersistGroupMessage(ctx, message); err != nil {
-		if errors.Is(err, store.ErrMessageConflict) {
-			return delivery.Ack(false)
-		}
-		if errors.Is(err, store.ErrSeqConflict) || errors.Is(err, store.ErrSeqInvalid) {
-			log.Printf(
-				"drop group message id=%d group=%d sender=%d seq=%d: %v",
-				message.ID, message.GroupID, message.SenderID, message.Seq, err,
-			)
-			return delivery.Ack(false)
-		}
-		if nackErr := delivery.Nack(false, true); nackErr != nil {
-			return fmt.Errorf("nack group message %d after persist error: %v (persist error: %w)", message.ID, nackErr, err)
-		}
-		return nil
-	}
-	return delivery.Ack(false)
+	job.label = fmt.Sprintf(
+		"group message id=%d group=%d sender=%d seq=%d",
+		message.ID, message.GroupID, message.SenderID, message.Seq,
+	)
+	return job.persist(ctx, func(ctx context.Context) error {
+		_, err := c.persister.PersistGroupMessage(ctx, message)
+		return err
+	})
 }

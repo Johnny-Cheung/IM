@@ -393,6 +393,40 @@ canary 的 Redis DB 1 与正式 `8198` 的 DB 0 在同一个 `im-v11-redis` 容�
 - 回滚应用文件仍使用切换前备份。v1.7 没有数据库迁移，v1.6 不读取新的 Redis 键；v1.7 写入 MySQL 的已读位置只增不减，回退后继续可用。
 - 验证实例 `8199` 已停止；验证库 64 个测试账号和 31 个测试群已清除，测试用 Redis 键已按清单删除。
 
+## 死信队列处理
+
+v1.8.2 为私聊和群聊各增加一个死信队列（正式 `<前缀>` 为 `im.v12`，即 `im.v12.messages.dead`、`im.v12.group.messages.dead`；验证为 `im.v13-verify.*`），持久、不设 TTL、不自动消费。consumer 落库失败时按错误类型处理：暂时错误（连接中断、超时、死锁）不计次数并持续退避重试；与消息有关的错误重试 5 次（约 31 秒）后进死信；无法解码、正文冲突和 `seq` 冲突不重试、直接进死信。死信消息体与原消息一致，消息头记录原因、最后一次错误、尝试次数、首次失败时间和来源链路。
+
+| 原因 | 含义 |
+| --- | --- |
+| `malformed` | 消息无法解码，通常是正文格式错误或版本不匹配。 |
+| `conflict` | 正文或客户端消息号与已落库消息冲突（`ErrMessageConflict`）。 |
+| `seq_conflict` | 会话内 `seq` 冲突或非法（`ErrSeqConflict`/`ErrSeqInvalid`）。 |
+| `retries_exhausted` | 与消息有关的错误重试 5 次后仍未落库，例如外键失败或数据超长。 |
+
+`imctl` 提供以下命令，均可加 `--verify` 操作验证实例（vhost `im_v13_verify`、命名空间 `im:v13-verify`）。这些命令只读取 RabbitMQ 配置，不需要 MySQL 或 Redis，也不需要停止后端：
+
+| 命令 | 作用 |
+| --- | --- |
+| `imctl dlq-list` | 列出死信并全部重新入队，只读。 |
+| `imctl dlq-replay [--id N]` | 按条或全部重放到主交换机，broker 确认后从死信队列删除。 |
+| `imctl dlq-discard [--id N] --yes` | 按条或全部确认删除，必须显式确认。 |
+
+```bash
+/opt/IM-Rebuild/imctl dlq-list
+/opt/IM-Rebuild/imctl dlq-list --kind group --limit 50
+/opt/IM-Rebuild/imctl dlq-replay --id 123
+/opt/IM-Rebuild/imctl dlq-replay --yes
+/opt/IM-Rebuild/imctl dlq-discard --id 123 --yes
+/opt/IM-Rebuild/imctl --verify dlq-list
+```
+
+- `--kind direct|group|all` 选择链路，默认 `all`；`--id` 是服务端消息号（消息头 `MessageId`），0 表示全部；`--limit` 默认 100、最大 10000，表示一次最多检查的消息数。
+- `dlq-list` 逐条打印消息号、`seq`、链路、原因、尝试次数、首次失败时间和简短错误，不输出正文，然后全部重新入队。`dlq-replay` 把原消息重新发布到主交换机，确认后才删除死信；某条发布失败时该条重新入队并停止，已经重放的不会重复。`dlq-discard` 直接确认删除，必须加 `--yes`；不带 `--id` 的重放同样必须加 `--yes`。
+- 一次运行只检查有界窗口（`--limit`），重新入队的消息可能改变位置，因此多次 `dlq-list` 不是稳定快照；队列很长时用 `--kind` 和 `--id` 缩小范围。扫描期间消息保持未确认，不会因为重读同一批而无限循环。
+- 重放不修改消息内容。如果导致落库失败的原因（如外键缺失、字段超长）没有消除，消息会在再次重试 5 次后重新进入死信队列。先修复原因，或确认无用后用 `dlq-discard` 明确丢弃。
+- `imctl queue-status` 会额外打印两个死信队列的 `ready`/`unacknowledged`；死信数为非 0 只打印 warning，不影响“持久化队列已排空”的判断，因为死信队列不会自动消费。
+
 ## 回归检查
 
 以下命令在 Mac 仓库根目录执行，默认目标为 `8199` 的独立验证库：

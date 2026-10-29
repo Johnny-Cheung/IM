@@ -17,10 +17,9 @@
 -- ARGV[8] = max safe global message ID
 -- ARGV[9] = max safe group seq
 -- ARGV[10] = dedup TTL seconds
--- ARGV[11] = stream max length
--- ARGV[12] = message entity key prefix
--- ARGV[13] = sender username
--- ARGV[14] = sender nickname
+-- ARGV[11] = message entity key prefix
+-- ARGV[12] = sender username
+-- ARGV[13] = sender nickname
 
 local sender_id = ARGV[1]
 local group_id = ARGV[2]
@@ -32,10 +31,9 @@ local seed_floor = tonumber(ARGV[7])
 local max_safe_id = tonumber(ARGV[8])
 local max_safe_seq = tonumber(ARGV[9])
 local dedup_ttl = tonumber(ARGV[10])
-local stream_max_len = tonumber(ARGV[11])
-local message_prefix = ARGV[12]
-local sender_username = ARGV[13]
-local sender_nickname = ARGV[14]
+local message_prefix = ARGV[11]
+local sender_username = ARGV[12]
+local sender_nickname = ARGV[13]
 
 if redis.call('EXISTS', KEYS[9]) == 0 then
   return {'seq_not_ready'}
@@ -115,7 +113,9 @@ redis.call('EXPIRE', KEYS[4], dedup_ttl)
 
 redis.call('ZADD', KEYS[6], seq, tostring(message_id))
 
-redis.call('XADD', KEYS[8], 'MAXLEN', '~', stream_max_len, '*',
+-- The group message stream is never trimmed: an entry leaves it only after
+-- the relay published it and acknowledged it.
+redis.call('XADD', KEYS[8], '*',
   'id', tostring(message_id),
   'seq', tostring(seq),
   'group_id', group_id,

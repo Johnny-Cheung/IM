@@ -226,6 +226,11 @@ infra_ready() {
     && [ -s "${INFRA_RABBITMQ_PASSWORD_FILE}" ]
 }
 
+rabbitmq_ready() {
+  [ -s "${INFRA_RABBITMQ_URL_FILE}" ] \
+    && [ -s "${INFRA_RABBITMQ_PASSWORD_FILE}" ]
+}
+
 backend_env_args() {
   printf '%s\n' \
     "IM_MYSQL_HOST=127.0.0.1" \
@@ -273,6 +278,22 @@ queue_status() {
     printf '%s: ready=%s unacknowledged=%s\n' "${name}" "${ready}" "${unack}"
     total=$((total + ready + unack))
   done
+  # Dead letters are reported separately and never fail the drain check: the
+  # queues are not consumed automatically.
+  local dead_name dead_counts dead_ready dead_unack dead_total=0
+  for dead_name in "${prefix}.messages.dead" "${prefix}.group.messages.dead"; do
+    dead_counts="$(awk -v queue="${dead_name}" '$1 == queue { print $2" "$3; exit }' <<<"${output}")"
+    if [ -z "${dead_counts}" ]; then
+      printf '%s: not declared (no dead letters)\n' "${dead_name}"
+      continue
+    fi
+    read -r dead_ready dead_unack <<<"${dead_counts}"
+    printf '%s: ready=%s unacknowledged=%s\n' "${dead_name}" "${dead_ready}" "${dead_unack}"
+    dead_total=$((dead_total + dead_ready + dead_unack))
+  done
+  if [ "${dead_total}" -ne 0 ]; then
+    echo "warning: dead letter queues hold ${dead_total} message(s); inspect with imctl dlq-list" >&2
+  fi
   if [ "${total}" -ne 0 ]; then
     echo "persist queues still hold ${total} message(s); wait for the relay and consumer to drain them" >&2
     return 1
@@ -310,6 +331,78 @@ backfill_seq() {
   /usr/bin/env "${env_args[@]}" \
     "${APP_ROOT}/bin/im-server" -backfill-seq \
     -backfill-batch "${BACKFILL_BATCH:-1000}"
+}
+
+# Dead letter commands only need RabbitMQ configuration. They work against the
+# selected namespace and never stop, restart or wait for the backend.
+dlq_env_args() {
+  printf '%s\n' \
+    "IM_RABBITMQ_URL_FILE=${INFRA_RABBITMQ_URL_FILE}" \
+    "IM_RABBITMQ_PASSWORD_FILE=${INFRA_RABBITMQ_PASSWORD_FILE}" \
+    "IM_MESSAGING_NAMESPACE=$([ "${VERIFY_MODE}" = "1" ] && printf 'im:v13-verify' || printf 'im:v12')"
+}
+
+dlq_admin() {
+  local mode="${1:-}"
+  if [ -z "${mode}" ]; then
+    echo "Usage: $0 dlq-{list,replay,discard} [--kind direct|group|all] [--id N] [--limit N] [--yes]" >&2
+    return 2
+  fi
+  shift
+  local kind=all id=0 limit=100 yes=0
+  while [ $# -gt 0 ]; do
+    case "${1}" in
+      --kind|--id|--limit)
+        if [ $# -lt 2 ]; then
+          echo "${1} requires a value" >&2
+          return 2
+        fi
+        case "${1}" in
+          --kind) kind="${2}" ;;
+          --id) id="${2}" ;;
+          --limit) limit="${2}" ;;
+        esac
+        shift 2
+        ;;
+      --yes) yes=1; shift ;;
+      *) echo "unknown dead letter option: ${1}" >&2; return 2 ;;
+    esac
+  done
+  case "${kind}" in
+    direct|group|all) ;;
+    *) echo "--kind must be direct, group or all" >&2; return 2 ;;
+  esac
+  if ! [[ "${id}" =~ ^[0-9]+$ ]]; then
+    echo "--id must be a non-negative integer" >&2
+    return 2
+  fi
+  if ! [[ "${limit}" =~ ^[1-9][0-9]*$ ]] || [ "${limit}" -gt 10000 ]; then
+    echo "--limit must be between 1 and 10000" >&2
+    return 2
+  fi
+  if [ "${mode}" = "discard" ] && [ "${yes}" != "1" ]; then
+    echo "dlq-discard requires --yes" >&2
+    return 1
+  fi
+  if [ "${mode}" = "replay" ] && [ "${id}" = "0" ] && [ "${yes}" != "1" ]; then
+    echo "replaying every dead letter requires --id or --yes" >&2
+    return 1
+  fi
+  prepare_backend_config
+  if ! rabbitmq_ready; then
+    echo "dead letter commands require RabbitMQ configuration" >&2
+    return 1
+  fi
+  local -a env_args=()
+  local line
+  while IFS= read -r line; do
+    env_args+=("${line}")
+  done < <(dlq_env_args)
+  local -a server_args=("-dlq-${mode}" -dlq-kind "${kind}" -dlq-id "${id}" -dlq-limit "${limit}")
+  if [ "${yes}" = "1" ]; then
+    server_args+=(-dlq-yes)
+  fi
+  /usr/bin/env "${env_args[@]}" "${APP_ROOT}/bin/im-server" "${server_args[@]}"
 }
 
 backend_start() {
@@ -556,6 +649,9 @@ main() {
     backend-start) backend_start ;;
     backend-stop) backend_stop ;;
     backfill-seq) backfill_seq ;;
+    dlq-list) dlq_admin list "${@:2}" ;;
+    dlq-replay) dlq_admin replay "${@:2}" ;;
+    dlq-discard) dlq_admin discard "${@:2}" ;;
     queue-status) queue_status ;;
     health) health ;;
     status) status ;;
@@ -568,7 +664,7 @@ main() {
     runtime-stop) runtime_stop ;;
     verify-host) verify_host ;;
     logs) logs "${2:-backend}" "${3:-80}" ;;
-    *) echo "Usage: $0 [--verify] {start|stop|restart|backend-start|backend-stop|backfill-seq|queue-status|health|status|backup|restore-check <backup>|mysql-start|mysql-stop|mysql-status|runtime-start|runtime-stop|verify-host|logs [backend|mysql|runtime] [lines]}" >&2; return 2 ;;
+    *) echo "Usage: $0 [--verify] {start|stop|restart|backend-start|backend-stop|backfill-seq|dlq-list|dlq-replay|dlq-discard|queue-status|health|status|backup|restore-check <backup>|mysql-start|mysql-stop|mysql-status|runtime-start|runtime-stop|verify-host|logs [backend|mysql|runtime] [lines]}" >&2; return 2 ;;
   esac
 }
 

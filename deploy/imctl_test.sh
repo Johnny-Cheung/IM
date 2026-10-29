@@ -143,16 +143,20 @@ if main backfill-read >/dev/null 2>&1; then exit 1; fi
 if main backfill-group-read >/dev/null 2>&1; then exit 1; fi
 pass 'removed read backfill subcommands are rejected'
 usage="$(main unknown-command 2>&1 || true)"
-if ! grep -q 'backfill-seq' <<<"${usage}" || ! grep -q 'queue-status' <<<"${usage}"; then
-  echo 'FAIL usage does not list backfill-seq and queue-status'
+if ! grep -q 'backfill-seq' <<<"${usage}" || ! grep -q 'queue-status' <<<"${usage}" \
+  || ! grep -q 'dlq-list' <<<"${usage}" || ! grep -q 'dlq-replay' <<<"${usage}" \
+  || ! grep -q 'dlq-discard' <<<"${usage}"; then
+  echo 'FAIL usage does not list backfill-seq, queue-status and the dlq commands'
   exit 1
 fi
-pass 'usage lists the seq backfill and the queue drain check'
+pass 'usage lists the seq backfill, the queue drain check and the dlq commands'
 DI() {
   case "$*" in
     *list_queues*)
       printf 'im.v13-verify.messages.persist\t%s\t0\n' "${TEST_QUEUE_READY:-0}"
       printf 'im.v13-verify.group.messages.persist\t0\t0\n'
+      printf 'im.v13-verify.messages.dead\t%s\t0\n' "${TEST_DEAD_READY:-0}"
+      printf 'im.v13-verify.group.messages.dead\t0\t0\n'
       ;;
     *) return 1 ;;
   esac
@@ -163,9 +167,46 @@ TEST_QUEUE_READY=3
 if queue_status >/dev/null 2>&1; then exit 1; fi
 pass 'queue status fails while persist messages are pending'
 TEST_QUEUE_READY=0
+TEST_DEAD_READY=4
+queue_status >/dev/null 2>"${TEST_DIR}/queue-warning"
+grep -q 'dead letter queues hold 4 message' "${TEST_DIR}/queue-warning"
+pass 'queue status warns about dead letters without failing the drain check'
+TEST_DEAD_READY=0
 DI() { return 1; }
 if queue_status >/dev/null 2>&1; then exit 1; fi
 pass 'queue status fails when RabbitMQ is unreachable'
+
+: > "${TEST_DIR}/server-args"
+dlq_admin list >/dev/null
+test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-dlq-list -dlq-kind all -dlq-id 0 -dlq-limit 100 '
+pass 'dlq-list maps to the list flags with defaults'
+: > "${TEST_DIR}/server-args"
+dlq_admin replay --kind group --id 42 --limit 25 >/dev/null
+test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-dlq-replay -dlq-kind group -dlq-id 42 -dlq-limit 25 '
+pass 'dlq-replay maps kind, id and limit'
+: > "${TEST_DIR}/server-args"
+dlq_admin discard --yes >/dev/null
+test "$(tr '\n' ' ' < "${TEST_DIR}/server-args")" = '-dlq-discard -dlq-kind all -dlq-id 0 -dlq-limit 100 -dlq-yes '
+pass 'dlq-discard with --yes adds the confirmation flag'
+if dlq_admin discard >/dev/null 2>&1; then exit 1; fi
+pass 'dlq-discard refuses to run without --yes'
+if dlq_admin replay >/dev/null 2>&1; then exit 1; fi
+pass 'dlq-replay of every message refuses to run without --yes'
+dlq_admin replay --id 7 >/dev/null
+pass 'dlq-replay of one message needs no confirmation'
+if dlq_admin list --kind both >/dev/null 2>&1; then exit 1; fi
+if dlq_admin list --limit 0 >/dev/null 2>&1; then exit 1; fi
+if dlq_admin list --limit 10001 >/dev/null 2>&1; then exit 1; fi
+if dlq_admin list --id abc >/dev/null 2>&1; then exit 1; fi
+if dlq_admin list --bogus >/dev/null 2>&1; then exit 1; fi
+if dlq_admin list --kind >/dev/null 2>&1; then exit 1; fi
+pass 'dlq commands reject invalid arguments'
+VERIFY_MODE=0
+INFRA_RABBITMQ_URL_FILE="${TEST_DIR}/missing-rabbitmq-url"
+if dlq_admin list >/dev/null 2>&1; then exit 1; fi
+VERIFY_MODE=1
+INFRA_RABBITMQ_URL_FILE="${INFRA_CONFIG_DIR}/rabbitmq-url"
+pass 'dlq commands require RabbitMQ configuration'
 if grep -q 'IM_REDIS_URL_FILE' "${SCRIPT_DIR}/imctl" \
   && grep -q 'IM_REDIS_PASSWORD_FILE' "${SCRIPT_DIR}/imctl" \
   && grep -q 'IM_RABBITMQ_URL_FILE' "${SCRIPT_DIR}/imctl" \

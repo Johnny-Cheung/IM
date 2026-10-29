@@ -31,9 +31,8 @@ func TestRedisAcceptorAcceptsAndDeduplicates(t *testing.T) {
 		t.Fatalf("seed friendship: %v", err)
 	}
 	acceptor := NewRedisAcceptor(client, RedisAcceptorOptions{
-		SeedFloor:    41,
-		DedupTTL:     time.Hour,
-		StreamMaxLen: 10,
+		SeedFloor: 41,
+		DedupTTL:  time.Hour,
 	})
 	createdAt := time.UnixMilli(1700000000123).UTC()
 	request := DirectMessageRequest{
@@ -106,6 +105,28 @@ func TestRedisAcceptorAcceptsAndDeduplicates(t *testing.T) {
 	conflictRequest.Body = "changed"
 	if _, err := acceptor.Accept(ctx, conflictRequest); !errors.Is(err, store.ErrMessageConflict) {
 		t.Fatalf("conflict error = %v, want ErrMessageConflict", err)
+	}
+}
+
+func TestRedisAcceptorNeverTrimsMessageStream(t *testing.T) {
+	client, _ := newAcceptTest(t)
+	ctx := context.Background()
+	if err := client.SAdd(ctx, friendshipKey(1), 2).Err(); err != nil {
+		t.Fatalf("seed friendship: %v", err)
+	}
+	acceptor := NewRedisAcceptor(client, RedisAcceptorOptions{})
+	for index := 1; index <= 3; index++ {
+		if _, err := acceptor.Accept(ctx, DirectMessageRequest{
+			SenderID:        1,
+			RecipientID:     2,
+			ClientMessageID: fmt.Sprintf("client-%d", index),
+			Body:            "hello",
+		}); err != nil {
+			t.Fatalf("accept %d: %v", index, err)
+		}
+	}
+	if got := client.XLen(ctx, messageStreamKey()).Val(); got != 3 {
+		t.Fatalf("stream length = %d, want 3 without trimming", got)
 	}
 }
 

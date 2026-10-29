@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -19,6 +20,14 @@ type GroupStreamRelay struct {
 	dialer    RabbitDialer
 	keyspace  Keyspace
 	namespace Namespace
+
+	status  *relayStatusTracker
+	backoff *relayBackoff
+	block   time.Duration
+	// connect runs one connection attempt; tests replace it.
+	connect func(context.Context) error
+	// wait pauses between reconnect attempts; tests replace it.
+	wait func(context.Context, time.Duration) bool
 }
 
 func NewGroupStreamRelay(
@@ -28,25 +37,72 @@ func NewGroupStreamRelay(
 	keyspace Keyspace,
 	namespace Namespace,
 ) *GroupStreamRelay {
-	return &GroupStreamRelay{redis: client, config: rabbitConfig, dialer: dialer, keyspace: keyspace, namespace: namespace}
+	relay := &GroupStreamRelay{
+		redis:     client,
+		config:    rabbitConfig,
+		dialer:    dialer,
+		keyspace:  keyspace,
+		namespace: namespace,
+		status:    &relayStatusTracker{},
+		backoff:   newRelayBackoff(relayDefaultBackoff, relayDefaultMaxBackoff),
+		block:     relayDefaultBlock,
+		wait:      waitMessaging,
+	}
+	relay.connect = relay.runConnection
+	return relay
 }
 
+// Run blocks until the context is canceled. It reconnects with exponential
+// backoff after a failed connection or publish; each new connection first
+// redelivers this consumer's pending entries.
 func (r *GroupStreamRelay) Run(ctx context.Context) error {
 	if r == nil || r.redis == nil || r.dialer == nil {
 		return ErrMessageServiceUnavailable
 	}
+	r.ensureDefaults()
 	for {
-		err := r.runConnection(ctx)
+		relayedBefore := r.status.relayedTotal()
+		err := r.connect(ctx)
 		if ctx.Err() != nil {
 			return nil
 		}
 		if err == nil {
 			err = fmt.Errorf("group stream relay stopped")
 		}
-		if !waitMessaging(ctx, time.Second) {
+		if r.status.relayedTotal() > relayedBefore {
+			r.backoff.reset()
+		}
+		r.status.recordError(err)
+		if !r.wait(ctx, r.backoff.next()) {
 			return nil
 		}
 	}
+}
+
+func (r *GroupStreamRelay) ensureDefaults() {
+	if r.status == nil {
+		r.status = &relayStatusTracker{}
+	}
+	if r.backoff == nil {
+		r.backoff = newRelayBackoff(relayDefaultBackoff, relayDefaultMaxBackoff)
+	}
+	if r.block <= 0 {
+		r.block = relayDefaultBlock
+	}
+	if r.connect == nil {
+		r.connect = r.runConnection
+	}
+	if r.wait == nil {
+		r.wait = waitMessaging
+	}
+}
+
+// Status returns a snapshot for /ops/infra.
+func (r *GroupStreamRelay) Status() RelayStatus {
+	if r == nil || r.status == nil {
+		return RelayStatus{}
+	}
+	return r.status.snapshot()
 }
 
 func (r *GroupStreamRelay) runConnection(ctx context.Context) error {
@@ -63,11 +119,21 @@ func (r *GroupStreamRelay) runConnection(ctx context.Context) error {
 	if err := declareGroupTopology(channel, r.namespace); err != nil {
 		return err
 	}
-	if err := channel.Confirm(false); err != nil {
-		return fmt.Errorf("enable RabbitMQ group publisher confirms: %w", err)
+	publisher, err := newAMQPRelayPublisher(channel)
+	if err != nil {
+		return err
 	}
-	confirms := channel.NotifyPublish(make(chan amqp091.Confirmation, 1))
 	if err := ensureGroupRelayGroup(ctx, r.redis, r.keyspace, r.namespace); err != nil {
+		return err
+	}
+	r.status.setConnected(true)
+	defer r.status.setConnected(false)
+	return r.runPublisher(ctx, publisher)
+}
+
+// runPublisher drains this consumer's pending entries, then relays new ones.
+func (r *GroupStreamRelay) runPublisher(ctx context.Context, publisher relayPublisher) error {
+	if err := r.drainPending(ctx, publisher); err != nil {
 		return err
 	}
 	for {
@@ -76,66 +142,94 @@ func (r *GroupStreamRelay) runConnection(ctx context.Context) error {
 			Consumer: groupConsumerName(r.namespace),
 			Streams:  []string{r.keyspace.groupMessageStreamKey(), ">"},
 			Count:    10,
-			Block:    2 * time.Second,
+			Block:    r.block,
 		}).Result()
-		if err == redis.Nil {
+		if errors.Is(err, redis.Nil) {
 			continue
 		}
 		if err != nil {
 			return fmt.Errorf("read Redis group message stream: %w", err)
 		}
-		for _, stream := range streams {
-			for _, entry := range stream.Messages {
-				if err := r.relayEntry(ctx, channel, confirms, entry); err != nil {
-					return err
-				}
-			}
+		if err := r.relayStreams(ctx, publisher, streams, false); err != nil {
+			return err
 		}
 	}
 }
 
+func (r *GroupStreamRelay) drainPending(ctx context.Context, publisher relayPublisher) error {
+	for {
+		streams, err := r.redis.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    groupRelayName(r.namespace),
+			Consumer: groupConsumerName(r.namespace),
+			Streams:  []string{r.keyspace.groupMessageStreamKey(), "0"},
+			Count:    100,
+		}).Result()
+		if errors.Is(err, redis.Nil) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read pending group stream messages: %w", err)
+		}
+		if relayStreamCount(streams) == 0 {
+			return nil
+		}
+		if err := r.relayStreams(ctx, publisher, streams, true); err != nil {
+			return err
+		}
+	}
+}
+
+func (r *GroupStreamRelay) relayStreams(
+	ctx context.Context,
+	publisher relayPublisher,
+	streams []redis.XStream,
+	recovered bool,
+) error {
+	for _, stream := range streams {
+		for _, entry := range stream.Messages {
+			if err := r.relayEntry(ctx, publisher, entry, recovered); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (r *GroupStreamRelay) relayEntry(
 	ctx context.Context,
-	channel *amqp091.Channel,
-	confirms <-chan amqp091.Confirmation,
+	publisher relayPublisher,
 	entry redis.XMessage,
+	recovered bool,
 ) error {
 	message, err := groupStreamMessage(entry.Values)
 	if err != nil {
 		log.Printf("drop malformed group stream entry %s: %v", entry.ID, err)
-		if ackErr := r.redis.XAck(ctx, r.keyspace.groupMessageStreamKey(), groupRelayName(r.namespace), entry.ID).Err(); ackErr != nil {
-			return fmt.Errorf("ack malformed group stream entry %s: %w", entry.ID, ackErr)
-		}
-		if delErr := r.redis.XDel(ctx, r.keyspace.groupMessageStreamKey(), entry.ID).Err(); delErr != nil {
-			return fmt.Errorf("delete malformed group stream entry %s: %w", entry.ID, delErr)
-		}
-		return nil
+		return r.ackAndDelete(ctx, entry.ID)
 	}
 	payload, err := encodeGroupMessage(message)
 	if err != nil {
 		return err
 	}
-	if err := channel.PublishWithContext(ctx, groupExchangeName(r.namespace), groupRoutingKey(), false, false, amqp091.Publishing{
-		ContentType:  "application/json",
-		DeliveryMode: amqp091.Persistent,
-		MessageId:    groupMessageIDString(message.ID),
-		Body:         payload,
-	}); err != nil {
-		return fmt.Errorf("publish group message %d: %w", message.ID, err)
-	}
-	select {
-	case confirmation := <-confirms:
-		if !confirmation.Ack {
-			return fmt.Errorf("RabbitMQ rejected group message %d", message.ID)
+	err = publisher.Publish(ctx, groupExchangeName(r.namespace), groupRoutingKey(), groupMessageIDString(message.ID), payload)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-	case <-ctx.Done():
-		return nil
+		return fmt.Errorf("relay group message %d: %w", message.ID, err)
 	}
-	if err := r.redis.XAck(ctx, r.keyspace.groupMessageStreamKey(), groupRelayName(r.namespace), entry.ID).Err(); err != nil {
-		return fmt.Errorf("ack group stream message %s: %w", entry.ID, err)
+	if err := r.ackAndDelete(ctx, entry.ID); err != nil {
+		return err
 	}
-	if err := r.redis.XDel(ctx, r.keyspace.groupMessageStreamKey(), entry.ID).Err(); err != nil {
-		return fmt.Errorf("delete group stream message %s: %w", entry.ID, err)
+	r.status.recordRelayed(recovered)
+	return nil
+}
+
+func (r *GroupStreamRelay) ackAndDelete(ctx context.Context, entryID string) error {
+	if err := r.redis.XAck(ctx, r.keyspace.groupMessageStreamKey(), groupRelayName(r.namespace), entryID).Err(); err != nil {
+		return fmt.Errorf("ack group stream message %s: %w", entryID, err)
+	}
+	if err := r.redis.XDel(ctx, r.keyspace.groupMessageStreamKey(), entryID).Err(); err != nil {
+		return fmt.Errorf("delete group stream message %s: %w", entryID, err)
 	}
 	return nil
 }
