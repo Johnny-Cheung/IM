@@ -83,14 +83,29 @@ func (c *RabbitMessageConsumer) Run(ctx context.Context) error {
 			c.backoff.reset()
 		}
 		c.status.recordError(err, time.Now())
-		if err.Error() != c.lastLoggedError {
-			c.logf("direct message consumer reconnecting: %v", err)
-			c.lastLoggedError = err.Error()
-		}
+		c.logReconnect(err)
 		if !c.wait(ctx, c.backoff.next()) {
 			return nil
 		}
 	}
+}
+
+// logReconnect logs a reconnect failure unless the identical text was already
+// logged for the current failure streak.
+func (c *RabbitMessageConsumer) logReconnect(err error) {
+	if err.Error() == c.lastLoggedError {
+		return
+	}
+	c.logf("direct message consumer reconnecting: %v", err)
+	c.lastLoggedError = err.Error()
+}
+
+// markConnectionReady clears the reconnect log de-duplication once a fresh
+// connection has declared the topology and started consuming. A later outage
+// with the same error text is then logged again instead of staying silent for
+// the life of the process.
+func (c *RabbitMessageConsumer) markConnectionReady() {
+	c.lastLoggedError = ""
 }
 
 // ensureDefaults fills collaborators omitted by a zero-value consumer.
@@ -144,6 +159,9 @@ func (c *RabbitMessageConsumer) runConnection(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("consume direct messages: %w", err)
 	}
+	// Topology is declared and the consumer is ready: a later identical failure
+	// is a new incident and must be logged again.
+	c.markConnectionReady()
 
 	for {
 		select {

@@ -31,15 +31,16 @@ const (
 
 // transientMySQLNumbers are server-side errors that survive a reconnect.
 // Client-side 20xx numbers appear when go-sql-driver could not mask a broken
-// connection behind driver.ErrBadConn.
+// connection behind driver.ErrBadConn. 1105 (ER_UNKNOWN_ERROR) and 1153
+// (ER_NET_PACKET_TOO_LARGE) are deliberately absent: a deterministic occurrence
+// is caused by the message itself, so they use the bounded message class
+// instead of being retried forever.
 var transientMySQLNumbers = map[uint16]bool{
 	1040: true, // too many connections
 	1041: true, // out of memory
 	1053: true, // server shutdown in progress
 	1077: true, // server shutdown complete
-	1105: true, // unknown error
 	1152: true, // connection aborted
-	1153: true, // packets out of order
 	1205: true, // lock wait timeout exceeded
 	1213: true, // deadlock found, transaction rolled back
 	1290: true, // server in read-only mode

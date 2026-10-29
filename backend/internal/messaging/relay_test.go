@@ -230,6 +230,126 @@ func (c xdelFailingClient) XDel(ctx context.Context, _ string, _ ...string) *red
 	return cmd
 }
 
+// relayCommandRecorder records standalone and pipeline command shapes at the
+// go-redis hook level. Overriding a single client method cannot prove that
+// XACK and XDEL were issued atomically: a Pipeline or a second Eval bypasses
+// that method entirely.
+type relayCommandRecorder struct {
+	mu         sync.Mutex
+	standalone []string
+	pipelines  [][]string
+}
+
+func (r *relayCommandRecorder) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (r *relayCommandRecorder) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		r.mu.Lock()
+		r.standalone = append(r.standalone, strings.ToLower(cmd.Name()))
+		r.mu.Unlock()
+		return next(ctx, cmd)
+	}
+}
+
+func (r *relayCommandRecorder) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		names := make([]string, len(cmds))
+		for index, cmd := range cmds {
+			names[index] = strings.ToLower(cmd.Name())
+		}
+		r.mu.Lock()
+		r.pipelines = append(r.pipelines, names)
+		r.mu.Unlock()
+		return next(ctx, cmds)
+	}
+}
+
+func (r *relayCommandRecorder) snapshot() ([]string, [][]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	standalone := append([]string(nil), r.standalone...)
+	pipelines := make([][]string, len(r.pipelines))
+	for index, names := range r.pipelines {
+		pipelines[index] = append([]string(nil), names...)
+	}
+	return standalone, pipelines
+}
+
+// relayAckDeleteIsAtomic reports whether the recorded commands show one atomic
+// ack+delete: a single Lua script execution (EVALSHA, possibly preceded by the
+// NOSCRIPT SCRIPT cache miss) or one MULTI/EXEC transaction. A bare pipeline or
+// two separate EVALs is not atomic.
+func relayAckDeleteIsAtomic(standalone []string, pipelines [][]string) bool {
+	scripts := make([]string, 0, 2)
+	for _, name := range standalone {
+		if name == "eval" || name == "evalsha" {
+			scripts = append(scripts, name)
+		}
+	}
+	if len(scripts) > 0 {
+		if len(pipelines) != 0 {
+			return false
+		}
+		if scripts[0] != "evalsha" {
+			return false
+		}
+		return len(scripts) == 1 || (len(scripts) == 2 && scripts[1] == "eval")
+	}
+	if len(pipelines) != 1 {
+		return false
+	}
+	names := pipelines[0]
+	if len(names) != 4 {
+		return false
+	}
+	return names[0] == "multi" && names[1] == "xack" && names[2] == "xdel" && names[3] == "exec"
+}
+
+func TestRelayAckDeleteCommandShape(t *testing.T) {
+	cases := []struct {
+		name       string
+		standalone []string
+		pipelines  [][]string
+		wantAtomic bool
+	}{
+		{
+			name:       "lua script",
+			standalone: []string{"xreadgroup", "evalsha", "xreadgroup"},
+			wantAtomic: true,
+		},
+		{
+			name:       "lua script after cache miss",
+			standalone: []string{"evalsha", "eval"},
+			wantAtomic: true,
+		},
+		{
+			name:       "multi exec transaction",
+			pipelines:  [][]string{{"multi", "xack", "xdel", "exec"}},
+			wantAtomic: true,
+		},
+		{
+			name:      "plain pipeline",
+			pipelines: [][]string{{"xack", "xdel"}},
+		},
+		{
+			name:       "two evals",
+			standalone: []string{"eval", "eval"},
+		},
+		{
+			name:       "script and pipeline",
+			standalone: []string{"evalsha"},
+			pipelines:  [][]string{{"xack", "xdel"}},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := relayAckDeleteIsAtomic(testCase.standalone, testCase.pipelines); got != testCase.wantAtomic {
+				t.Fatalf("relayAckDeleteIsAtomic() = %v, want %v", got, testCase.wantAtomic)
+			}
+		})
+	}
+}
+
 func TestStreamRelayAckAndDeleteIsAtomicWhenXDelFails(t *testing.T) {
 	env := newRelayTestEnv(t)
 	ctx := context.Background()
@@ -249,9 +369,15 @@ func TestStreamRelayAckAndDeleteIsAtomicWhenXDelFails(t *testing.T) {
 
 	relay := newDirectRelayTest(env)
 	relay.redis = xdelFailingClient{UniversalClient: env.client}
+	recorder := &relayCommandRecorder{}
+	env.client.AddHook(recorder)
 	publisher := newFakeRelayPublisher()
 	if err := relay.drainPending(ctx, publisher); err != nil {
 		t.Fatalf("drainPending() error = %v, want success: an ack must not leave the entry in the stream", err)
+	}
+	standalone, pipelines := recorder.snapshot()
+	if !relayAckDeleteIsAtomic(standalone, pipelines) {
+		t.Fatalf("ack+delete commands = %v pipelines = %v, want one atomic Lua script or MULTI/EXEC transaction", standalone, pipelines)
 	}
 	if got := len(publisher.snapshot()); got != 1 {
 		t.Fatalf("publishes = %d, want 1", got)

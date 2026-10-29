@@ -69,19 +69,61 @@ func runDeadLetterAdmin(options serverOptions) error {
 	ctx, cancel := context.WithTimeout(context.Background(), dlqCommandTimeout)
 	defer cancel()
 
+	return dlqRunKinds(
+		ctx,
+		command,
+		namespace,
+		os.Stdout,
+		os.Stderr,
+		func(ctx context.Context, topology messaging.DeadLetterTopology, out io.Writer, totals *dlqTotals) (int, error) {
+			return dlqRunKind(ctx, connection, command, topology, out, totals)
+		},
+	)
+}
+
+// dlqRunKinds runs the command against every selected chain. A not-found
+// result in one chain is not fatal: -dlq-kind all must try the other chain
+// before reporting that the id is missing, and a hit in either chain is
+// success. Real broker errors still abort the run.
+func dlqRunKinds(
+	ctx context.Context,
+	command dlqCommand,
+	namespace messaging.Namespace,
+	out, errOut io.Writer,
+	runKind func(context.Context, messaging.DeadLetterTopology, io.Writer, *dlqTotals) (int, error),
+) error {
 	var totals dlqTotals
+	// Report what was done even when a later chain fails: a successful replay
+	// in the first chain must not look like nothing happened.
+	defer func() { dlqPrintTotals(out, command.mode, totals) }()
+	missing := make([]dlqIDMiss, 0, len(command.kinds))
+	matched := 0
 	for _, kind := range command.kinds {
 		topology := messaging.DeadLetterTopologyFor(namespace, kind)
-		if err := dlqRunKind(ctx, connection, command, topology, os.Stdout, &totals); err != nil {
-			if dlqQueueMissing(err) && len(command.kinds) > 1 {
-				fmt.Fprintf(os.Stderr, "kind=%s skipped: %v\n", kind, err)
-				continue
-			}
-			return err
+		kindMatched, err := runKind(ctx, topology, out, &totals)
+		if err == nil {
+			matched += kindMatched
+			continue
 		}
+		var miss *dlqIDMiss
+		if errors.As(err, &miss) {
+			missing = append(missing, *miss)
+			fmt.Fprintf(errOut, "kind=%s: %v\n", kind, err)
+			continue
+		}
+		if dlqQueueMissing(err) && len(command.kinds) > 1 {
+			fmt.Fprintf(errOut, "kind=%s skipped: %v\n", kind, err)
+			if command.messageID != 0 {
+				missing = append(missing, dlqIDMiss{kind: kind, id: command.messageID})
+			}
+			continue
+		}
+		return err
 	}
-	dlqPrintTotals(os.Stdout, command.mode, totals)
-	return nil
+	if command.messageID == 0 || matched > 0 || len(missing) == 0 {
+		return nil
+	}
+	return &dlqIDNotFoundError{misses: missing}
 }
 
 type dlqTotals struct {
@@ -99,20 +141,23 @@ func dlqRunKind(
 	topology messaging.DeadLetterTopology,
 	out io.Writer,
 	totals *dlqTotals,
-) error {
+) (int, error) {
 	channel, err := connection.Channel()
 	if err != nil {
-		return fmt.Errorf("open RabbitMQ channel: %w", err)
+		return 0, fmt.Errorf("open RabbitMQ channel: %w", err)
 	}
 	defer func() { _ = channel.Close() }()
 
 	adminChannel, err := messaging.NewAMQPDeadLetterChannel(channel)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	return dlqRunKindChannel(ctx, adminChannel, command, topology, out, totals)
 }
 
+// dlqRunKindChannel returns how many messages matched the requested id. A
+// specific id that was not seen yields a *dlqIDMiss so -dlq-kind all can try
+// the other chain before reporting failure.
 func dlqRunKindChannel(
 	ctx context.Context,
 	adminChannel messaging.DeadLetterChannel,
@@ -120,13 +165,14 @@ func dlqRunKindChannel(
 	topology messaging.DeadLetterTopology,
 	out io.Writer,
 	totals *dlqTotals,
-) error {
+) (int, error) {
 	queued, err := messaging.DeadLetterCount(ctx, adminChannel, topology)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	fmt.Fprintf(out, "kind=%s queued=%d\n", topology.Kind, queued)
 
+	matched := 0
 	switch command.mode {
 	case dlqModeList:
 		entries, err := messaging.ListDeadLetters(ctx, adminChannel, topology, command.limit)
@@ -136,7 +182,7 @@ func dlqRunKindChannel(
 		fmt.Fprintf(out, "kind=%s listed=%d\n", topology.Kind, len(entries))
 		totals.listed += len(entries)
 		if err != nil {
-			return err
+			return 0, err
 		}
 	case dlqModeReplay:
 		limit := dlqScanLimit(command, queued)
@@ -146,11 +192,12 @@ func dlqRunKindChannel(
 		totals.scanned += result.Scanned
 		totals.replayed += result.Replayed
 		totals.skipped += result.Skipped
+		matched = result.Replayed
 		if err == nil {
-			err = dlqCheckIDFound(command, topology, queued, limit, result.Replayed)
+			err = dlqCheckIDFound(command, topology, queued, limit, matched)
 		}
 		if err != nil {
-			return err
+			return matched, err
 		}
 		fmt.Fprintf(
 			out, "kind=%s scanned=%d replayed=%d skipped=%d\n",
@@ -162,15 +209,16 @@ func dlqRunKindChannel(
 			ctx, adminChannel, topology, command.messageID, limit,
 		)
 		totals.discarded += discarded
+		matched = discarded
 		if err == nil {
-			err = dlqCheckIDFound(command, topology, queued, limit, discarded)
+			err = dlqCheckIDFound(command, topology, queued, limit, matched)
 		}
 		if err != nil {
-			return err
+			return matched, err
 		}
 		fmt.Fprintf(out, "kind=%s discarded=%d\n", topology.Kind, discarded)
 	}
-	return nil
+	return matched, nil
 }
 
 // dlqScanLimit widens a single-id search to the whole queue when the default
@@ -186,21 +234,63 @@ func dlqScanLimit(command dlqCommand, queued int) int {
 	return queued
 }
 
-// dlqCheckIDFound refuses to report success when a specific id was not seen in
-// a window that was cut short by the absolute limit. Without this the CLI
-// prints replayed=0 and exits 0 while the target may sit beyond the window.
+// dlqCheckIDFound refuses to report success when a specific id was not seen.
+// The error distinguishes a fully scanned queue from a window cut short by the
+// absolute cap so the operator knows whether draining the head can help.
 func dlqCheckIDFound(
 	command dlqCommand,
 	topology messaging.DeadLetterTopology,
 	queued, limit, matched int,
 ) error {
-	if command.messageID == 0 || matched > 0 || queued <= limit {
+	if command.messageID == 0 || matched > 0 {
 		return nil
 	}
-	return fmt.Errorf(
-		"dead letter id %d not found in the first %d of %d queued %s messages; raise -dlq-limit (max %d) or drain the head first",
-		command.messageID, limit, queued, topology.Kind, dlqMaxLimit,
+	return &dlqIDMiss{
+		kind:   topology.Kind,
+		id:     command.messageID,
+		limit:  limit,
+		queued: queued,
+	}
+}
+
+// dlqIDMiss records one chain that did not contain the requested message id.
+type dlqIDMiss struct {
+	kind   messaging.DeadLetterKind
+	id     uint64
+	limit  int
+	queued int
+}
+
+func (miss *dlqIDMiss) Error() string {
+	if miss.capped() {
+		return fmt.Sprintf(
+			"dead letter id %d not found in the first %d of %d queued %s messages; the scan window is capped at %d, drain the head first",
+			miss.id, miss.limit, miss.queued, miss.kind, dlqMaxLimit,
+		)
+	}
+	return fmt.Sprintf(
+		"dead letter id %d not found in %d queued %s messages",
+		miss.id, miss.queued, miss.kind,
 	)
+}
+
+// capped reports whether the scan window was cut short by the absolute limit
+// instead of covering the whole queue.
+func (miss *dlqIDMiss) capped() bool {
+	return miss.queued > miss.limit
+}
+
+// dlqIDNotFoundError reports that no selected chain contained the id.
+type dlqIDNotFoundError struct {
+	misses []dlqIDMiss
+}
+
+func (err *dlqIDNotFoundError) Error() string {
+	parts := make([]string, len(err.misses))
+	for index := range err.misses {
+		parts[index] = err.misses[index].Error()
+	}
+	return strings.Join(parts, "; ")
 }
 
 func dlqPrintTotals(out io.Writer, mode dlqMode, totals dlqTotals) {

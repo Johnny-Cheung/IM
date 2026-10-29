@@ -113,6 +113,50 @@ func TestGroupConsumerMalformedBodyDeadLettersImmediately(t *testing.T) {
 	}
 }
 
+func TestGroupConsumerUnroutableDeadLetterReturnsForReconnect(t *testing.T) {
+	delivery := &consumeFakeDelivery{body: consumeTestGroupBody(t), messageID: "7"}
+	persister := &consumeFakeGroupPersister{fail: consumeAlwaysFail(errors.New("permanent"))}
+	publisher := &consumeFakePublisher{
+		failures: 2,
+		err:      fmt.Errorf("group dead letter unroutable: %w", errDLQUnroutable),
+	}
+	clock := &consumeFakeClock{}
+	consumer := &GroupMessageConsumer{persister: persister, retry: consumeTestRetryPolicy(clock, consumeTestNow)}
+
+	err := consumer.handleDelivery(context.Background(), delivery, publisher)
+	if err == nil || !errors.Is(err, errDLQUnroutable) {
+		t.Fatalf("handleDelivery() error = %v, want an unroutable error for reconnect", err)
+	}
+	if delivery.acks != 0 || delivery.nacks != 0 {
+		t.Fatalf("acks/nacks = %d/%d, want 0/0: the original delivery must stay unacked", delivery.acks, delivery.nacks)
+	}
+	if publisher.publishCalls != 1 {
+		t.Fatalf("publish calls = %d, want 1: an unroutable DLQ must not be retried in place", publisher.publishCalls)
+	}
+	if want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}; !reflect.DeepEqual(clock.sleeps, want) {
+		t.Fatalf("sleeps = %v, want only the five message waits", clock.sleeps)
+	}
+}
+
+func TestGroupConsumerReconnectLogResetsAfterConnectionReady(t *testing.T) {
+	consumer := &GroupMessageConsumer{}
+	var logs []string
+	consumer.logf = func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+	err := errors.New("dial failed")
+	consumer.logReconnect(err)
+	consumer.logReconnect(err)
+	if len(logs) != 1 {
+		t.Fatalf("logs = %v, want one line for the repeated failure", logs)
+	}
+	consumer.markConnectionReady()
+	consumer.logReconnect(err)
+	if len(logs) != 2 || logs[1] != logs[0] {
+		t.Fatalf("logs = %v, want the later identical outage logged again", logs)
+	}
+}
+
 func TestGroupConsumerRunBacksOffAndReportsReconnectErrors(t *testing.T) {
 	consumer := NewGroupMessageConsumer(
 		config.RabbitMQConfig{},

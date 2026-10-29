@@ -121,6 +121,52 @@ write_protected_file() {
   rm -f "${temporary}"
 }
 
+prepare_redis_config() {
+  if [ ! -s "${INFRA_SECRETS}/redis-password" ]; then
+    return 0
+  fi
+  mkdir -p "${INFRA_CONFIG_DIR}"
+  chmod 755 "${INFRA_CONFIG_DIR}"
+  install -o nobody -g root -m 0400 \
+    "${INFRA_SECRETS}/redis-password" "${INFRA_REDIS_PASSWORD_FILE}"
+  if [ "${VERIFY_MODE}" = "1" ]; then
+    write_protected_file \
+      "redis://127.0.0.1:26379/1" "${INFRA_REDIS_URL_FILE}"
+  else
+    write_protected_file \
+      "redis://127.0.0.1:26379/0" "${INFRA_REDIS_URL_FILE}"
+  fi
+}
+
+prepare_rabbitmq_config() {
+  if [ ! -s "${INFRA_SECRETS}/rabbitmq-password" ]; then
+    return 0
+  fi
+  mkdir -p "${INFRA_CONFIG_DIR}"
+  chmod 755 "${INFRA_CONFIG_DIR}"
+  install -o nobody -g root -m 0400 \
+    "${INFRA_SECRETS}/rabbitmq-password" "${INFRA_RABBITMQ_PASSWORD_FILE}"
+  if [ "${VERIFY_MODE}" = "1" ]; then
+    write_protected_file \
+      "amqp://im_v11@127.0.0.1:25676/im_v13_verify" "${INFRA_RABBITMQ_URL_FILE}"
+  else
+    write_protected_file \
+      "amqp://im_v11@127.0.0.1:25676/im_v11" "${INFRA_RABBITMQ_URL_FILE}"
+  fi
+}
+
+prepare_infra_config() {
+  prepare_redis_config
+  prepare_rabbitmq_config
+}
+
+# Dead letter commands only need RabbitMQ. Reading or copying the MySQL app
+# secret or the Redis password here would make a RabbitMQ-only command fail on
+# a host where those unrelated files are missing.
+prepare_dlq_config() {
+  prepare_rabbitmq_config
+}
+
 prepare_backend_config() {
   mkdir -p "${CONFIG_DIR}" "${INFRA_CONFIG_DIR}"
   chmod 755 "${CONFIG_DIR}" "${INFRA_CONFIG_DIR}"
@@ -130,24 +176,7 @@ prepare_backend_config() {
     install -o nobody -g root -m 0400 "${MYSQL_APP_SECRET}" "${BACKEND_APP_SECRET}"
   fi
 
-  if [ -s "${INFRA_SECRETS}/redis-password" ] \
-    && [ -s "${INFRA_SECRETS}/rabbitmq-password" ]; then
-    install -o nobody -g root -m 0400 \
-      "${INFRA_SECRETS}/redis-password" "${INFRA_REDIS_PASSWORD_FILE}"
-    install -o nobody -g root -m 0400 \
-      "${INFRA_SECRETS}/rabbitmq-password" "${INFRA_RABBITMQ_PASSWORD_FILE}"
-    if [ "${VERIFY_MODE}" = "1" ]; then
-      write_protected_file \
-        "redis://127.0.0.1:26379/1" "${INFRA_REDIS_URL_FILE}"
-      write_protected_file \
-        "amqp://im_v11@127.0.0.1:25676/im_v13_verify" "${INFRA_RABBITMQ_URL_FILE}"
-    else
-      write_protected_file \
-        "redis://127.0.0.1:26379/0" "${INFRA_REDIS_URL_FILE}"
-      write_protected_file \
-        "amqp://im_v11@127.0.0.1:25676/im_v11" "${INFRA_RABBITMQ_URL_FILE}"
-    fi
-  fi
+  prepare_infra_config
 }
 
 mysql_start() {
@@ -388,7 +417,7 @@ dlq_admin() {
     echo "replaying every dead letter requires --id or --yes" >&2
     return 1
   fi
-  prepare_backend_config
+  prepare_dlq_config
   if ! rabbitmq_ready; then
     echo "dead letter commands require RabbitMQ configuration" >&2
     return 1

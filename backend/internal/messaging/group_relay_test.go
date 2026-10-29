@@ -70,9 +70,15 @@ func TestGroupStreamRelayAckAndDeleteIsAtomicWhenXDelFails(t *testing.T) {
 
 	relay := newGroupRelayTest(env)
 	relay.redis = xdelFailingClient{UniversalClient: env.client}
+	recorder := &relayCommandRecorder{}
+	env.client.AddHook(recorder)
 	publisher := newFakeRelayPublisher()
 	if err := relay.drainPending(ctx, publisher); err != nil {
 		t.Fatalf("drainPending() error = %v, want success: an ack must not leave the entry in the stream", err)
+	}
+	standalone, pipelines := recorder.snapshot()
+	if !relayAckDeleteIsAtomic(standalone, pipelines) {
+		t.Fatalf("ack+delete commands = %v pipelines = %v, want one atomic Lua script or MULTI/EXEC transaction", standalone, pipelines)
 	}
 	if got := len(publisher.snapshot()); got != 1 {
 		t.Fatalf("publishes = %d, want 1", got)

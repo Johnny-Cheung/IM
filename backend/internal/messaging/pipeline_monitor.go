@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -468,30 +469,110 @@ type monitorAMQPProber interface {
 	Close() error
 }
 
+// monitorAMQPConnector is the connection surface the monitor needs. It keeps
+// the dial and channel-open legs testable without a broker.
+type monitorAMQPConnector interface {
+	Channel() (*amqp091.Channel, error)
+	CloseDeadline(time.Time) error
+}
+
 // monitorAMQPLink is the amqp091-backed prober.
 type monitorAMQPLink struct {
-	connection *amqp091.Connection
+	connection monitorAMQPConnector
 	channel    *amqp091.Channel
 }
 
+// monitorOpenAMQPLink bounds the dial and the channel-open RPC. amqp091 offers
+// no context or per-call deadline for either, so both run in a goroutine and
+// are abandoned with a bounded close when the context ends.
 func monitorOpenAMQPLink(
 	ctx context.Context,
 	dialer RabbitDialer,
 	cfg config.RabbitMQConfig,
 ) (*monitorAMQPLink, error) {
+	openCtx, cancel := context.WithTimeout(ctx, monitorDeadLetterProbeTimeout)
+	defer cancel()
+	return monitorOpenAMQPLinkContext(openCtx, func() (monitorAMQPConnector, error) {
+		return dialer(cfg)
+	})
+}
+
+func monitorOpenAMQPLinkContext(
+	ctx context.Context,
+	connect func() (monitorAMQPConnector, error),
+) (*monitorAMQPLink, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	connection, err := dialer(cfg)
+	connection, err := monitorDialAMQP(ctx, connect)
 	if err != nil {
 		return nil, err
 	}
-	channel, err := connection.Channel()
+	channel, err := monitorOpenChannel(ctx, connection)
 	if err != nil {
-		_ = connection.CloseDeadline(time.Now().Add(monitorDeadLetterProbeTimeout))
 		return nil, err
 	}
 	return &monitorAMQPLink{connection: connection, channel: channel}, nil
+}
+
+// monitorDialAMQP runs a context-less dialer in its own goroutine and bounds
+// the wait. A connection that arrives after the caller gave up is closed so it
+// cannot leak; production dialers already carry their own dial timeout.
+func monitorDialAMQP(
+	ctx context.Context,
+	connect func() (monitorAMQPConnector, error),
+) (monitorAMQPConnector, error) {
+	type dialResult struct {
+		connection monitorAMQPConnector
+		err        error
+	}
+	done := make(chan dialResult, 1)
+	go func() {
+		connection, err := connect()
+		done <- dialResult{connection: connection, err: err}
+	}()
+	select {
+	case result := <-done:
+		return result.connection, result.err
+	case <-ctx.Done():
+		go func() {
+			result := <-done
+			if result.connection != nil {
+				_ = result.connection.CloseDeadline(
+					time.Now().Add(monitorDeadLetterProbeTimeout),
+				)
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
+
+// monitorOpenChannel bounds connection.Channel(), which has no deadline of its
+// own. Closing the connection unblocks the abandoned goroutine.
+func monitorOpenChannel(
+	ctx context.Context,
+	connection monitorAMQPConnector,
+) (*amqp091.Channel, error) {
+	type channelResult struct {
+		channel *amqp091.Channel
+		err     error
+	}
+	done := make(chan channelResult, 1)
+	go func() {
+		channel, err := connection.Channel()
+		done <- channelResult{channel: channel, err: err}
+	}()
+	select {
+	case result := <-done:
+		if result.err != nil {
+			_ = connection.CloseDeadline(time.Now().Add(monitorDeadLetterProbeTimeout))
+			return nil, result.err
+		}
+		return result.channel, nil
+	case <-ctx.Done():
+		_ = connection.CloseDeadline(time.Now().Add(monitorDeadLetterProbeTimeout))
+		return nil, ctx.Err()
+	}
 }
 
 func (l *monitorAMQPLink) QueueDepth(queue string) (int64, error) {
@@ -507,6 +588,8 @@ func (l *monitorAMQPLink) Close() error {
 	return l.connection.CloseDeadline(time.Now().Add(monitorDeadLetterProbeTimeout))
 }
 
+var errMonitorDeadLetterClosed = errors.New("dead letter monitor is closed")
+
 // monitorAMQPDeadLetterCounter reads queue depths over one connection held
 // across samples: opened on first use and reopened after a probe failure.
 type monitorAMQPDeadLetterCounter struct {
@@ -521,6 +604,7 @@ type monitorAMQPDeadLetterCounter struct {
 
 	mu     sync.Mutex
 	prober monitorAMQPProber
+	closed bool
 }
 
 func (c *monitorAMQPDeadLetterCounter) CountDeadLetters(
@@ -530,37 +614,79 @@ func (c *monitorAMQPDeadLetterCounter) CountDeadLetters(
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	prober, err := c.ensureProber(ctx)
+	prober, err := c.acquireProber(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("open RabbitMQ connection for %s dead letter count: %w", kind, err)
 	}
 	depth, err := c.probe(ctx, prober, DeadLetterTopologyFor(c.namespace, kind).Queue)
 	if err != nil {
 		// The channel is closed after a 404 or a timeout; redial next sample.
-		c.resetLocked()
+		c.discardProber(prober)
 		return 0, fmt.Errorf("inspect %s dead letter queue: %w", kind, err)
 	}
 	return depth, nil
 }
 
-func (c *monitorAMQPDeadLetterCounter) ensureProber(ctx context.Context) (monitorAMQPProber, error) {
-	if c.prober != nil {
-		return c.prober, nil
+// acquireProber reuses the cached connection. The dial and channel-open run
+// without the mutex, so a slow broker never blocks Close or a later sample
+// behind an unbounded open.
+func (c *monitorAMQPDeadLetterCounter) acquireProber(
+	ctx context.Context,
+) (monitorAMQPProber, error) {
+	c.mu.Lock()
+	prober := c.prober
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return nil, errMonitorDeadLetterClosed
 	}
-	open := c.open
-	if open == nil {
-		open = func(ctx context.Context) (monitorAMQPProber, error) {
-			return monitorOpenAMQPLink(ctx, c.dialer, c.config)
-		}
+	if prober != nil {
+		return prober, nil
 	}
-	prober, err := open(ctx)
+
+	opened, err := c.openProber(ctx)
 	if err != nil {
 		return nil, err
 	}
-	c.prober = prober
-	return prober, nil
+
+	c.mu.Lock()
+	closed = c.closed
+	winner := c.prober
+	if !closed && winner == nil {
+		c.prober = opened
+	}
+	c.mu.Unlock()
+	if closed {
+		_ = opened.Close()
+		return nil, errMonitorDeadLetterClosed
+	}
+	if winner != nil {
+		_ = opened.Close()
+		return winner, nil
+	}
+	return opened, nil
+}
+
+func (c *monitorAMQPDeadLetterCounter) openProber(
+	ctx context.Context,
+) (monitorAMQPProber, error) {
+	if c.open != nil {
+		return c.open(ctx)
+	}
+	return monitorOpenAMQPLink(ctx, c.dialer, c.config)
+}
+
+// discardProber forgets prober only if it is still the cached one. The close
+// itself runs outside the mutex.
+func (c *monitorAMQPDeadLetterCounter) discardProber(prober monitorAMQPProber) {
+	c.mu.Lock()
+	if c.prober != prober {
+		c.mu.Unlock()
+		return
+	}
+	c.prober = nil
+	c.mu.Unlock()
+	_ = prober.Close()
 }
 
 // probe bounds the declare itself because amqp091 offers no per-call
@@ -599,17 +725,15 @@ func (c *monitorAMQPDeadLetterCounter) newProbeContext(
 	return context.WithTimeout(ctx, monitorDeadLetterProbeTimeout)
 }
 
-func (c *monitorAMQPDeadLetterCounter) resetLocked() {
-	if c.prober == nil {
-		return
-	}
-	_ = c.prober.Close()
-	c.prober = nil
-}
-
-// Close releases the cached connection on monitor shutdown.
+// Close releases the cached connection on monitor shutdown. The network close
+// runs outside the mutex so it cannot block on an in-flight open.
 func (c *monitorAMQPDeadLetterCounter) Close() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.resetLocked()
+	c.closed = true
+	prober := c.prober
+	c.prober = nil
+	c.mu.Unlock()
+	if prober != nil {
+		_ = prober.Close()
+	}
 }

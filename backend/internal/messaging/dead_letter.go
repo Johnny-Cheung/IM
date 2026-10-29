@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 	"unicode/utf8"
 
@@ -40,6 +41,12 @@ const dlqErrorLimit = 500
 // dlqErrPublisherClosed reports that the publishing channel cannot recover
 // without a new connection. The consumer reconnects instead of retrying.
 var dlqErrPublisherClosed = errors.New("dead letter publisher channel closed")
+
+// errDLQUnroutable reports that the broker returned a mandatory dead letter.
+// It is terminal for the current connection: the caller returns so the consumer
+// reconnects and re-declares the dead-letter topology, which is the only way a
+// deleted queue or binding is recreated.
+var errDLQUnroutable = errors.New("dead letter unroutable")
 
 // DeadLetterTopology is the pair of exchanges and queues used to park messages
 // that cannot be persisted. Source* names the main chain used by replay.
@@ -158,13 +165,20 @@ type dlqPublishChannel interface {
 
 // dlqAMQPPublisher publishes dead letters on a confirm-mode channel. Publish
 // calls are sequential, so the confirmation for one publish can be matched by
-// its delivery tag.
+// its delivery tag and its mandatory return by a per-publish correlation id.
 type dlqAMQPPublisher struct {
 	channel  dlqPublishChannel
 	topology DeadLetterTopology
 	confirms chan amqp091.Confirmation
 	returns  chan amqp091.Return
 	timeout  time.Duration
+	// publishIDs numbers publishes within this connection so a basic.return can
+	// be attributed to the publish that produced it.
+	publishIDs uint64
+	// closed retires the publisher after a timed-out or interrupted publish. The
+	// outcome of that publish is unknown; reusing the confirmation and return
+	// stream would charge its late notifications to the next message.
+	closed bool
 }
 
 func newDLQAMQPPublisher(channel dlqPublishChannel, topology DeadLetterTopology) (*dlqAMQPPublisher, error) {
@@ -187,6 +201,9 @@ func (p *dlqAMQPPublisher) PublishDeadLetter(ctx context.Context, message dlqMes
 	if p == nil || p.channel == nil || p.confirms == nil {
 		return fmt.Errorf("dead letter publisher is not ready")
 	}
+	if p.closed {
+		return fmt.Errorf("%w: %s dead letter publisher was retired after an uncertain publish", dlqErrPublisherClosed, message.Kind)
+	}
 	timeout := p.timeout
 	if timeout <= 0 {
 		timeout = dlqPublishTimeout
@@ -194,30 +211,79 @@ func (p *dlqAMQPPublisher) PublishDeadLetter(ctx context.Context, message dlqMes
 	publishCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Publishes on one channel are sequential, so a return already buffered here
+	// belongs to an earlier publish. Draining it keeps it from being charged to
+	// this one and frees the single-slot return buffer for the broker.
+	dlqDrainReturns(p.returns)
+	p.publishIDs++
+	correlationID := strconv.FormatUint(p.publishIDs, 10)
+
 	sequence := p.channel.GetNextPublishSeqNo()
 	err := p.channel.PublishWithContext(publishCtx, p.topology.Exchange, p.topology.RoutingKey, true, false, amqp091.Publishing{
-		ContentType:  "application/json",
-		DeliveryMode: amqp091.Persistent,
-		MessageId:    message.MessageID,
-		Headers:      message.headers(),
-		Body:         message.Body,
+		ContentType:   "application/json",
+		DeliveryMode:  amqp091.Persistent,
+		MessageId:     message.MessageID,
+		CorrelationId: correlationID,
+		Headers:       message.headers(),
+		Body:          message.Body,
 	})
 	if err != nil {
-		return fmt.Errorf("publish %s dead letter: %w", message.Kind, err)
+		// The frame may have reached the broker before the write was interrupted.
+		p.closed = true
+		return fmt.Errorf("%w: publish %s dead letter: %w", dlqErrPublisherClosed, message.Kind, err)
 	}
-	return dlqAwaitConfirm(publishCtx, p.confirms, p.returns, sequence, string(message.Kind))
+	if err := dlqAwaitPublishConfirm(publishCtx, p.confirms, p.returns, sequence, correlationID, string(message.Kind), nil); err != nil {
+		p.closed = true
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, dlqErrPublisherClosed) {
+			// The broker may still route and confirm this publish later. Terminal
+			// for this connection: the caller reconnects and the original delivery
+			// stays unacked, so at-least-once delivery is preserved.
+			return fmt.Errorf("%w: %w", dlqErrPublisherClosed, err)
+		}
+		return err
+	}
+	return nil
 }
 
-// dlqAwaitConfirm waits for the confirmation of one sequential publish. The
-// publish must be mandatory: a basic.return means the broker dropped an
-// unroutable message even though it confirmed the publish, so a return seen
-// before the matching confirmation is a failure.
+// dlqDrainReturns discards returns that were buffered before a publish.
+func dlqDrainReturns(returns <-chan amqp091.Return) {
+	for returns != nil {
+		select {
+		case _, ok := <-returns:
+			if !ok {
+				return
+			}
+		default:
+			return
+		}
+	}
+}
+
+// dlqAwaitConfirm waits for the confirmation of one sequential publish. An
+// empty correlation id accepts any return, as the legacy replay path does.
 func dlqAwaitConfirm(
 	ctx context.Context,
 	confirms <-chan amqp091.Confirmation,
 	returns <-chan amqp091.Return,
 	sequence uint64,
 	label string,
+) error {
+	return dlqAwaitPublishConfirm(ctx, confirms, returns, sequence, "", label, nil)
+}
+
+// dlqAwaitPublishConfirm waits for the confirmation of one publish and matches
+// mandatory returns to it by correlation id, so a return left behind by an
+// earlier publish is never attributed to this one. afterConfirm is a test seam
+// invoked after a matching ack and before pending returns are checked; it is
+// nil in production.
+func dlqAwaitPublishConfirm(
+	ctx context.Context,
+	confirms <-chan amqp091.Confirmation,
+	returns <-chan amqp091.Return,
+	sequence uint64,
+	correlationID string,
+	label string,
+	afterConfirm func(),
 ) error {
 	for {
 		select {
@@ -235,20 +301,32 @@ func dlqAwaitConfirm(
 			if !confirmation.Ack {
 				return fmt.Errorf("RabbitMQ rejected %s dead letter", label)
 			}
-			// RabbitMQ sends basic.return before basic.ack; prefer a pending return.
-			select {
-			case returned, ok := <-returns:
-				if !ok {
+			if afterConfirm != nil {
+				afterConfirm()
+			}
+			// RabbitMQ sends basic.return before basic.ack; prefer a pending
+			// matching return. Returns from earlier publishes are ignored.
+			for {
+				select {
+				case returned, ok := <-returns:
+					if !ok {
+						return nil
+					}
+					if dlqReturnMatches(returned, correlationID) {
+						return dlqUnroutableError(returned, label)
+					}
+				default:
 					return nil
 				}
-				return dlqUnroutableError(returned, label)
-			default:
-				return nil
 			}
 		case returned, ok := <-returns:
 			if !ok {
 				// The channel closed its return notifications; wait for the confirm.
 				returns = nil
+				continue
+			}
+			if !dlqReturnMatches(returned, correlationID) {
+				// Stale return from a publish that already completed.
 				continue
 			}
 			return dlqUnroutableError(returned, label)
@@ -258,9 +336,15 @@ func dlqAwaitConfirm(
 	}
 }
 
+// dlqReturnMatches reports whether a return belongs to the publish identified
+// by correlationID. An empty id accepts any return.
+func dlqReturnMatches(returned amqp091.Return, correlationID string) bool {
+	return correlationID == "" || returned.CorrelationId == correlationID
+}
+
 func dlqUnroutableError(returned amqp091.Return, label string) error {
 	return fmt.Errorf(
-		"%s dead letter unroutable: exchange %q routing key %q: %s",
-		label, returned.Exchange, returned.RoutingKey, returned.ReplyText,
+		"%w: %s dead letter exchange %q routing key %q: %s",
+		errDLQUnroutable, label, returned.Exchange, returned.RoutingKey, returned.ReplyText,
 	)
 }

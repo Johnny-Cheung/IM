@@ -277,8 +277,10 @@ func (j consumeDeliveryJob) deadLetterNow(ctx context.Context, reason string, ca
 // deadLetter publishes the original message and acks only after the broker
 // confirms. A publish failure is transient: the delivery stays unacked while
 // the publish is retried with backoff. A closed publishing channel cannot
-// recover in place, so it is returned to trigger a reconnect; the unacked
-// delivery is then redelivered by the broker.
+// recover in place, and an unroutable mandatory publish means the dead-letter
+// queue or binding is missing; both are returned to trigger a reconnect, whose
+// topology declaration recreates it. The unacked delivery is then redelivered
+// by the broker.
 func (j consumeDeliveryJob) deadLetter(ctx context.Context, reason string, cause error, attempts int, firstFailedAt time.Time) error {
 	if j.publisher == nil {
 		return fmt.Errorf("dead letter publisher is not configured for %s", j.kind)
@@ -305,11 +307,14 @@ func (j consumeDeliveryJob) deadLetter(ctx context.Context, reason string, cause
 		if ctx.Err() != nil {
 			return nil
 		}
-		if errors.Is(err, amqp091.ErrClosed) || errors.Is(err, dlqErrPublisherClosed) {
+		if errors.Is(err, amqp091.ErrClosed) || errors.Is(err, dlqErrPublisherClosed) || errors.Is(err, errDLQUnroutable) {
+			j.status.recordError(err, retry.now())
+			log.Printf("dead-letter %s returned to reconnect: %v", j.label, err)
 			return fmt.Errorf("dead-letter %s: %w", j.label, err)
 		}
 		j.status.recordError(err, retry.now())
 		j.status.recordTransientRetry()
+		log.Printf("retry dead-letter %s after %d attempt(s): %v", j.label, retryIndex+1, err)
 		if !retry.wait(ctx, j.status, retry.transientDelay(retryIndex)) {
 			return nil
 		}

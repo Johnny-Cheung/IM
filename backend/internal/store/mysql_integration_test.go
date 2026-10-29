@@ -15,7 +15,8 @@ package store
 //
 // Run with:
 //
-//	IM_TEST_MYSQL_DSN='im_app:secret@tcp(127.0.0.1:13307)/im' \
+//	IM_TEST_MYSQL_DSN='im_v07_verify@tcp(127.0.0.1:13307)/im_v07_verify' \
+//	  IM_TEST_MYSQL_PASSWORD_FILE=/opt/IM-Rebuild/canary-v07/mysql-app \
 //	  go test -race -count=1 -run TestMySQLReconcileIntegration ./internal/store/
 
 import (
@@ -366,6 +367,13 @@ func openIntegrationStore(t *testing.T) *Store {
 	base, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		t.Fatalf("parse IM_TEST_MYSQL_DSN: %v", err)
+	}
+	if path := os.Getenv("IM_TEST_MYSQL_PASSWORD_FILE"); path != "" {
+		secret, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read integration password file: %v", err)
+		}
+		base.Passwd = strings.TrimRight(string(secret), "\r\n")
 	}
 	schema, err := integrationSchemaName(base.DBName)
 	if err != nil {

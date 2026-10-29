@@ -314,6 +314,9 @@ func (r *Reconciler) reconcile(
 
 type reconcileDirectSuspect struct {
 	lowID, highID, counter uint64
+	// count and maxSeq are the MySQL stats the counter was compared against.
+	// They let the repair skip the already-proven prefix.
+	count, maxSeq uint64
 }
 
 // reconcileDirect pages the direct conversation stats and repairs at most
@@ -345,7 +348,8 @@ func (r *Reconciler) reconcileDirect(
 	for offset := 0; offset < len(suspects) && attempted < r.maxDetail; offset++ {
 		suspect := suspects[(start+offset)%len(suspects)]
 		attempted++
-		if err := r.repairDirectConversation(ctx, runAt, suspect.lowID, suspect.highID, suspect.counter, result); err != nil {
+		lowerBound := reconcileSeqLowerBound(suspect.count, suspect.maxSeq, suspect.counter)
+		if err := r.repairDirectConversation(ctx, runAt, suspect.lowID, suspect.highID, suspect.counter, lowerBound, result); err != nil {
 			return err
 		}
 		// Advance only after a completed attempt so an aborted run retries it.
@@ -392,6 +396,7 @@ func (r *Reconciler) scanDirectSuspects(
 			result.Mismatched++
 			suspects = append(suspects, reconcileDirectSuspect{
 				lowID: row.LowID, highID: row.HighID, counter: counter,
+				count: row.Count, maxSeq: row.MaxSeq,
 			})
 		}
 		last := rows[len(rows)-1]
@@ -437,7 +442,8 @@ func (r *Reconciler) reconcileGroups(
 	for offset := 0; offset < len(suspects) && attempted < r.maxDetail; offset++ {
 		suspect := suspects[(start+offset)%len(suspects)]
 		attempted++
-		if err := r.repairGroupConversation(ctx, runAt, suspect.groupID, suspect.counter, result); err != nil {
+		lowerBound := reconcileSeqLowerBound(suspect.count, suspect.maxSeq, suspect.counter)
+		if err := r.repairGroupConversation(ctx, runAt, suspect.groupID, suspect.counter, lowerBound, result); err != nil {
 			return err
 		}
 		// Advance only after a completed attempt so an aborted run retries it.
@@ -448,6 +454,7 @@ func (r *Reconciler) reconcileGroups(
 
 type reconcileGroupSuspect struct {
 	groupID, counter uint64
+	count, maxSeq    uint64
 }
 
 func (r *Reconciler) scanGroupSuspects(
@@ -488,6 +495,7 @@ func (r *Reconciler) scanGroupSuspects(
 			result.Mismatched++
 			suspects = append(suspects, reconcileGroupSuspect{
 				groupID: row.GroupID, counter: counter,
+				count: row.Count, maxSeq: row.MaxSeq,
 			})
 		}
 		afterGroupID = rows[len(rows)-1].GroupID
@@ -554,10 +562,29 @@ func reconcileCounterValue(command *redis.StringCmd) (uint64, error) {
 	return strconv.ParseUint(raw, 10, 64)
 }
 
+// reconcileSeqLowerBound returns the first seq that can be missing in MySQL.
+// Seqs start at 1 and are unique per conversation, so COUNT(*) == MAX(seq)
+// proves every seq in 1..MaxSeq is persisted and only the Redis tail above
+// MaxSeq can be missing. Any other count means the prefix is not proven: at
+// least one seq below MaxSeq is absent, or the counters disagree, so the walk
+// must start at the beginning. The stats row and the Redis counter are read at
+// different instants, but that drift is safe: the repair never deletes rows
+// and new accepts only extend the tail, so the prefix proven by the snapshot
+// stays proven. An external deletion after the snapshot shifts COUNT(*) away
+// from MAX(seq) and the next run scans the prefix again. Tail seqs accepted
+// after the snapshot are above MaxSeq and are exactly what the walk from
+// MaxSeq+1 covers.
+func reconcileSeqLowerBound(count, maxSeq, counter uint64) uint64 {
+	if counter > maxSeq && count == maxSeq {
+		return maxSeq + 1
+	}
+	return 1
+}
+
 func (r *Reconciler) repairDirectConversation(
 	ctx context.Context,
 	runAt time.Time,
-	lowID, highID, counter uint64,
+	lowID, highID, counter, lowerBound uint64,
 	result *ReconcileResult,
 ) error {
 	if counter > store.MaxSafeSeq {
@@ -569,7 +596,7 @@ func (r *Reconciler) repairDirectConversation(
 		return nil
 	}
 	key := reconcileSeqCursorKey{first: lowID, second: highID}
-	start := r.missingSeqStart(key, counter)
+	start := r.missingSeqStart(key, counter, lowerBound)
 	next, truncated, err := walkMissingSeqs(
 		ctx, start, counter, uint64(r.batch), reconcileMaxMissingPerConversation,
 		func(ctx context.Context, afterSeq uint64) ([]uint64, error) {
@@ -597,7 +624,7 @@ func (r *Reconciler) repairDirectConversation(
 func (r *Reconciler) repairGroupConversation(
 	ctx context.Context,
 	runAt time.Time,
-	groupID, counter uint64,
+	groupID, counter, lowerBound uint64,
 	result *ReconcileResult,
 ) error {
 	if counter > store.MaxSafeSeq {
@@ -607,7 +634,7 @@ func (r *Reconciler) repairGroupConversation(
 		return nil
 	}
 	key := reconcileSeqCursorKey{group: true, first: groupID}
-	start := r.missingSeqStart(key, counter)
+	start := r.missingSeqStart(key, counter, lowerBound)
 	next, truncated, err := walkMissingSeqs(
 		ctx, start, counter, uint64(r.batch), reconcileMaxMissingPerConversation,
 		func(ctx context.Context, afterSeq uint64) ([]uint64, error) {
@@ -813,12 +840,21 @@ type reconcileSeqCursorKey struct {
 	second uint64
 }
 
-func (r *Reconciler) missingSeqStart(key reconcileSeqCursorKey, counter uint64) uint64 {
+// missingSeqStart combines the resumed cursor with the lower bound proven by
+// the MySQL stats. A cursor below the bound (from a run where the prefix was
+// not proven) is ignored so the walk does not rescan it.
+func (r *Reconciler) missingSeqStart(key reconcileSeqCursorKey, counter, lowerBound uint64) uint64 {
+	if lowerBound < 1 {
+		lowerBound = 1
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	start := r.missingSeqs[key]
+	if start < lowerBound {
+		start = lowerBound
+	}
 	if start == 0 || start > counter {
-		return 1
+		return lowerBound
 	}
 	return start
 }
@@ -834,7 +870,8 @@ func (r *Reconciler) setMissingSeqCursor(key reconcileSeqCursorKey, next uint64,
 		next = 1
 	}
 	if _, exists := r.missingSeqs[key]; !exists && len(r.missingSeqs) >= reconcileLogKeyLimit {
-		// Bounded state: dropping the cursor only restarts the walk at 1.
+		// Bounded state: dropping the cursor only restarts the walk at its
+		// proven lower bound.
 		return
 	}
 	r.missingSeqs[key] = next
@@ -1060,7 +1097,7 @@ func (r *Reconciler) reconcileOrphanDirectCounters(
 			continue
 		}
 		attempted++
-		if err := r.repairDirectConversation(ctx, runAt, lowID, highID, counter, result); err != nil {
+		if err := r.repairDirectConversation(ctx, runAt, lowID, highID, counter, 1, result); err != nil {
 			return err
 		}
 	}
@@ -1118,7 +1155,7 @@ func (r *Reconciler) reconcileOrphanGroupCounters(
 			continue
 		}
 		attempted++
-		if err := r.repairGroupConversation(ctx, runAt, groupID, counter, result); err != nil {
+		if err := r.repairGroupConversation(ctx, runAt, groupID, counter, 1, result); err != nil {
 			return err
 		}
 	}

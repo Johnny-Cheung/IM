@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -639,6 +640,199 @@ func TestPipelineMonitorAMQPDeadLetterCounterReopensAfterProbeError(t *testing.T
 	}
 	if dials != 2 {
 		t.Fatalf("dial calls = %d, want a reopen after the probe error", dials)
+	}
+}
+
+// fakeMonitorAMQPConnection stands in for the dial result while the dial and
+// channel-open legs are held open by the test.
+type fakeMonitorAMQPConnection struct {
+	mu          sync.Mutex
+	closeCalls  int
+	release     chan struct{}
+	closedOnce  sync.Once
+	channelSeen chan struct{}
+	closedSeen  chan struct{}
+}
+
+func newFakeMonitorAMQPConnection() *fakeMonitorAMQPConnection {
+	return &fakeMonitorAMQPConnection{
+		release:     make(chan struct{}),
+		channelSeen: make(chan struct{}, 1),
+		closedSeen:  make(chan struct{}, 1),
+	}
+}
+
+func (f *fakeMonitorAMQPConnection) Channel() (*amqp091.Channel, error) {
+	select {
+	case f.channelSeen <- struct{}{}:
+	default:
+	}
+	<-f.release
+	return nil, errors.New("connection closed")
+}
+
+func (f *fakeMonitorAMQPConnection) CloseDeadline(time.Time) error {
+	f.mu.Lock()
+	f.closeCalls++
+	f.mu.Unlock()
+	f.closedOnce.Do(func() { close(f.release) })
+	select {
+	case f.closedSeen <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (f *fakeMonitorAMQPConnection) closes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closeCalls
+}
+
+func TestMonitorOpenAMQPLinkSkipsDialOnCanceledContext(t *testing.T) {
+	dials := 0
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	link, err := monitorOpenAMQPLink(
+		ctx,
+		func(config.RabbitMQConfig) (*amqp091.Connection, error) {
+			dials++
+			return nil, errors.New("must not dial")
+		},
+		config.RabbitMQConfig{},
+	)
+	if link != nil {
+		t.Fatalf("link = %#v, want nil", link)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+	if dials != 0 {
+		t.Fatalf("dial calls = %d, want none", dials)
+	}
+}
+
+func TestMonitorOpenChannelBoundsStuckChannelOpen(t *testing.T) {
+	connection := newFakeMonitorAMQPConnection()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-connection.channelSeen
+		cancel()
+	}()
+
+	type openResult struct {
+		channel *amqp091.Channel
+		err     error
+	}
+	done := make(chan openResult, 1)
+	go func() {
+		channel, err := monitorOpenChannel(ctx, connection)
+		done <- openResult{channel: channel, err: err}
+	}()
+	select {
+	case result := <-done:
+		if result.channel != nil {
+			t.Fatalf("channel = %v, want nil", result.channel)
+		}
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("error = %v, want context canceled", result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("monitorOpenChannel did not honor cancellation")
+	}
+	if connection.closes() != 1 {
+		t.Fatalf("connection closed %d times, want 1", connection.closes())
+	}
+}
+
+func TestMonitorOpenAMQPLinkBoundsStuckDial(t *testing.T) {
+	connection := newFakeMonitorAMQPConnection()
+	dialStarted := make(chan struct{})
+	dialRelease := make(chan struct{})
+	connect := func() (monitorAMQPConnector, error) {
+		close(dialStarted)
+		<-dialRelease
+		return connection, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-dialStarted
+		cancel()
+	}()
+
+	type linkResult struct {
+		link *monitorAMQPLink
+		err  error
+	}
+	done := make(chan linkResult, 1)
+	go func() {
+		link, err := monitorOpenAMQPLinkContext(ctx, connect)
+		done <- linkResult{link: link, err: err}
+	}()
+	select {
+	case result := <-done:
+		if result.link != nil {
+			t.Fatalf("link = %#v, want nil", result.link)
+		}
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("error = %v, want context canceled", result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("monitorOpenAMQPLinkContext did not honor cancellation")
+	}
+
+	close(dialRelease)
+	select {
+	case <-connection.closedSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a connection returned after cancellation was not closed")
+	}
+}
+
+func TestPipelineMonitorAMQPDeadLetterCounterCloseDoesNotWaitForOpen(t *testing.T) {
+	openStarted := make(chan struct{})
+	openRelease := make(chan struct{})
+	opened := &fakeMonitorAMQPProber{depth: 9}
+	counter := &monitorAMQPDeadLetterCounter{
+		open: func(context.Context) (monitorAMQPProber, error) {
+			close(openStarted)
+			<-openRelease
+			return opened, nil
+		},
+	}
+
+	results := make(chan error, 1)
+	go func() {
+		_, err := counter.CountDeadLetters(context.Background(), DeadLetterDirect)
+		results <- err
+	}()
+	<-openStarted
+
+	closed := make(chan struct{})
+	go func() {
+		counter.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close blocked behind an in-flight open")
+	}
+
+	close(openRelease)
+	select {
+	case err := <-results:
+		if !errors.Is(err, errMonitorDeadLetterClosed) {
+			t.Fatalf("error = %v, want the closed sentinel", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CountDeadLetters did not return after the open completed")
+	}
+	if opened.closed != 1 {
+		t.Fatalf("late prober closed %d times, want 1", opened.closed)
 	}
 }
 

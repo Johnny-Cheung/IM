@@ -184,12 +184,6 @@ func TestDLQAwaitConfirmClassifiesFailures(t *testing.T) {
 			returns:  returnsChan(returned),
 			wantText: "unroutable",
 		},
-		{
-			name:     "return buffered with confirm",
-			confirms: confirmationChan(5, true),
-			returns:  returnsChan(returned),
-			wantText: "unroutable",
-		},
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -287,12 +281,153 @@ func (f *dlqTestPublishChannel) PublishWithContext(
 		return f.publishErr
 	}
 	if f.returned != nil {
-		f.returns <- *f.returned
+		// A real broker returns the original message properties, including the
+		// correlation id used to attribute the return to its publish.
+		returned := *f.returned
+		returned.CorrelationId = msg.CorrelationId
+		f.returns <- returned
 	}
 	if f.ack {
 		f.confirms <- amqp091.Confirmation{DeliveryTag: f.nextSeq, Ack: true}
 	}
 	return nil
+}
+
+func TestDLQAwaitPublishConfirmDrainsReturnBufferedAfterConfirm(t *testing.T) {
+	returned := amqp091.Return{
+		ReplyCode:     312,
+		ReplyText:     "NO_ROUTE",
+		Exchange:      "im.messages.dead",
+		RoutingKey:    "direct.dead",
+		CorrelationId: "7",
+	}
+	// The seam queues the return after the matching confirmation is consumed,
+	// so the post-ack drain is exercised deterministically rather than through
+	// select randomness.
+	for iteration := 0; iteration < 50; iteration++ {
+		returns := make(chan amqp091.Return, 1)
+		err := dlqAwaitPublishConfirm(
+			context.Background(),
+			confirmationChan(5, true),
+			returns,
+			5,
+			"7",
+			"direct",
+			func() { returns <- returned },
+		)
+		if err == nil || !errors.Is(err, errDLQUnroutable) {
+			t.Fatalf("iteration %d: error = %v, want unroutable", iteration, err)
+		}
+	}
+}
+
+func TestDLQAwaitPublishConfirmIgnoresStaleReturn(t *testing.T) {
+	stale := amqp091.Return{
+		ReplyCode:     312,
+		ReplyText:     "NO_ROUTE",
+		Exchange:      "im.messages.dead",
+		RoutingKey:    "direct.dead",
+		CorrelationId: "6",
+	}
+	returns := returnsChan(stale)
+	confirms := confirmationChan(5, true)
+	if err := dlqAwaitPublishConfirm(context.Background(), confirms, returns, 5, "7", "direct", nil); err != nil {
+		t.Fatalf("error = %v, want nil: a return from an earlier publish must be ignored", err)
+	}
+	if len(returns) != 0 {
+		t.Fatalf("returns buffered = %d, want the stale return drained", len(returns))
+	}
+}
+
+func TestDLQAwaitPublishConfirmSkipsStaleConfirm(t *testing.T) {
+	confirms := confirmationsChan(
+		amqp091.Confirmation{DeliveryTag: 4, Ack: false},
+		amqp091.Confirmation{DeliveryTag: 5, Ack: true},
+	)
+	if err := dlqAwaitPublishConfirm(context.Background(), confirms, nil, 5, "7", "direct", nil); err != nil {
+		t.Fatalf("error = %v, want nil: the stale nack must be skipped", err)
+	}
+}
+
+func TestDLQAMQPPublisherRetiresAfterConfirmTimeout(t *testing.T) {
+	topology := DeadLetterTopology{
+		Kind:       DeadLetterDirect,
+		Exchange:   "im.messages.dead",
+		RoutingKey: "direct.dead",
+	}
+	fake := &dlqTestPublishChannel{nextSeq: 1}
+	publisher, err := newDLQAMQPPublisher(fake, topology)
+	if err != nil {
+		t.Fatalf("newDLQAMQPPublisher() error = %v", err)
+	}
+	publisher.timeout = 20 * time.Millisecond
+	message := dlqMessage{Kind: DeadLetterDirect, Body: []byte(`{}`), Reason: dlqReasonConflict}
+
+	err = publisher.PublishDeadLetter(context.Background(), message)
+	if !errors.Is(err, dlqErrPublisherClosed) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("PublishDeadLetter() error = %v, want publisher-closed and deadline", err)
+	}
+	if len(fake.published) != 1 || fake.published[0].CorrelationId == "" {
+		t.Fatalf("published = %#v, want one publish with a correlation id", fake.published)
+	}
+	// The late confirm or return for the timed-out publish must never be charged
+	// to a later message: the publisher refuses reuse.
+	err = publisher.PublishDeadLetter(context.Background(), message)
+	if !errors.Is(err, dlqErrPublisherClosed) {
+		t.Fatalf("second PublishDeadLetter() error = %v, want publisher-closed", err)
+	}
+	if len(fake.published) != 1 {
+		t.Fatalf("published after retire = %d, want 1", len(fake.published))
+	}
+}
+
+func TestDLQAMQPPublisherRetiresAfterInterruptedPublish(t *testing.T) {
+	topology := DeadLetterTopology{
+		Kind:       DeadLetterDirect,
+		Exchange:   "im.messages.dead",
+		RoutingKey: "direct.dead",
+	}
+	fake := &dlqTestPublishChannel{nextSeq: 1, publishErr: errors.New("connection write interrupted")}
+	publisher, err := newDLQAMQPPublisher(fake, topology)
+	if err != nil {
+		t.Fatalf("newDLQAMQPPublisher() error = %v", err)
+	}
+	message := dlqMessage{Kind: DeadLetterDirect, Body: []byte(`{}`), Reason: dlqReasonConflict}
+
+	err = publisher.PublishDeadLetter(context.Background(), message)
+	if !errors.Is(err, dlqErrPublisherClosed) {
+		t.Fatalf("PublishDeadLetter() error = %v, want publisher-closed", err)
+	}
+	if err := publisher.PublishDeadLetter(context.Background(), message); !errors.Is(err, dlqErrPublisherClosed) {
+		t.Fatalf("second PublishDeadLetter() error = %v, want publisher-closed", err)
+	}
+	if len(fake.published) != 1 {
+		t.Fatalf("published = %d, want the interrupted publish not retried on the same channel", len(fake.published))
+	}
+}
+
+func TestDLQAMQPPublisherDrainsStaleReturnBeforePublish(t *testing.T) {
+	topology := DeadLetterTopology{
+		Kind:       DeadLetterDirect,
+		Exchange:   "im.messages.dead",
+		RoutingKey: "direct.dead",
+	}
+	fake := &dlqTestPublishChannel{nextSeq: 1, ack: true}
+	publisher, err := newDLQAMQPPublisher(fake, topology)
+	if err != nil {
+		t.Fatalf("newDLQAMQPPublisher() error = %v", err)
+	}
+	fake.returns <- amqp091.Return{
+		ReplyCode:     312,
+		ReplyText:     "NO_ROUTE",
+		Exchange:      topology.Exchange,
+		RoutingKey:    topology.RoutingKey,
+		CorrelationId: "stale-publish",
+	}
+	message := dlqMessage{Kind: DeadLetterDirect, Body: []byte(`{}`), Reason: dlqReasonConflict}
+	if err := publisher.PublishDeadLetter(context.Background(), message); err != nil {
+		t.Fatalf("PublishDeadLetter() error = %v, want nil: the stale return belongs to an earlier publish", err)
+	}
 }
 
 func TestDLQAMQPPublisherRequiresRoutableMandatoryPublish(t *testing.T) {

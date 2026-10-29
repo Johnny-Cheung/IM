@@ -11,6 +11,26 @@ BASELINE="${ROOT}/baseline"
 UNIT=im-test
 PORT=8199
 VERIFY_MODE=0
+# Re-point every path derived by the wrapper at source time into the temporary
+# directory, so the real prepare functions never touch /opt.
+MYSQL_DATA="${ROOT}/mysql/data"
+MYSQL_SECRETS="${ROOT}/mysql/secrets"
+MYSQL_ROOT_SECRET="${MYSQL_SECRETS}/mysql-root"
+MYSQL_APP_SECRET="${MYSQL_SECRETS}/mysql-app"
+CONFIG_DIR="${ROOT}/config"
+BACKEND_APP_SECRET="${CONFIG_DIR}/mysql-app"
+INFRA_ROOT="${ROOT}/infra-v11"
+INFRA_SECRETS="${INFRA_ROOT}/secrets"
+INFRA_CONFIG_DIR="${CONFIG_DIR}/infra-v11"
+INFRA_REDIS_URL_FILE="${INFRA_CONFIG_DIR}/redis-url"
+INFRA_REDIS_PASSWORD_FILE="${INFRA_CONFIG_DIR}/redis-password"
+INFRA_RABBITMQ_URL_FILE="${INFRA_CONFIG_DIR}/rabbitmq-url"
+INFRA_RABBITMQ_PASSWORD_FILE="${INFRA_CONFIG_DIR}/rabbitmq-password"
+mkdir -p "${MYSQL_SECRETS}" "${INFRA_SECRETS}"
+printf 'mysql-app-secret\n' > "${MYSQL_APP_SECRET}"
+printf 'mysql-root-secret\n' > "${MYSQL_ROOT_SECRET}"
+printf 'redis-secret\n' > "${INFRA_SECRETS}/redis-password"
+printf 'rabbit-secret\n' > "${INFRA_SECRETS}/rabbitmq-password"
 mkdir -p "${APP_ROOT}/bin" "${APP_ROOT}/web"
 cat > "${APP_ROOT}/bin/im-server" <<SH
 #!/bin/sh
@@ -44,14 +64,25 @@ pgrep() {
     printf '%s\n' "${pid}"
   done
 }
-prepare_backend_config() {
-  if [ "${VERIFY_MODE}" = "1" ]; then
-    mkdir -p "${INFRA_CONFIG_DIR}"
-    printf '%s\n' redis > "${INFRA_REDIS_URL_FILE}"
-    printf '%s\n' redis-password > "${INFRA_REDIS_PASSWORD_FILE}"
-    printf '%s\n' rabbit > "${INFRA_RABBITMQ_URL_FILE}"
-    printf '%s\n' rabbit-password > "${INFRA_RABBITMQ_PASSWORD_FILE}"
-  fi
+# The wrapper runs as root in production; in the test it owns the temporary
+# files already, so ignore the ownership flags and copy.
+install() {
+  local source="" target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o|-g|-m) shift 2 ;;
+      -*) shift ;;
+      *)
+        if [ -z "${source}" ]; then
+          source="$1"
+        else
+          target="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+  command cp "${source}" "${target}"
 }
 curl() {
   local url="${*: -1}"
@@ -84,6 +115,8 @@ restart >/dev/null
 test "$(tr '\n' ' ' < "${TEST_DIR}/calls")" = 'dependencies create dependencies stop create '
 pass 'restart running backend recreates transient unit without stopping MySQL'
 VERIFY_MODE=1
+BACKEND_APP_SECRET="${APP_ROOT}/mysql-app"
+printf 'verify-mysql-app\n' > "${BACKEND_APP_SECRET}"
 INFRA_CONFIG_DIR="${APP_ROOT}/config/infra-v13-verify"
 INFRA_REDIS_URL_FILE="${INFRA_CONFIG_DIR}/redis-url"
 INFRA_REDIS_PASSWORD_FILE="${INFRA_CONFIG_DIR}/redis-password"
@@ -134,9 +167,11 @@ backfill_seq >/dev/null
 TEST_PROCESSES=""
 pass 'seq backfill ignores its own process'
 INFRA_REDIS_URL_FILE="${TEST_DIR}/missing-redis-url"
+INFRA_SECRETS="${TEST_DIR}/missing-infra-secrets"
 VERIFY_MODE=0
 if backfill_seq >/dev/null 2>&1; then exit 1; fi
 VERIFY_MODE=1
+INFRA_SECRETS="${INFRA_ROOT}/secrets"
 INFRA_REDIS_URL_FILE="${INFRA_CONFIG_DIR}/redis-url"
 pass 'seq backfill requires Redis configuration'
 if main backfill-read >/dev/null 2>&1; then exit 1; fi
@@ -201,10 +236,38 @@ if dlq_admin list --id abc >/dev/null 2>&1; then exit 1; fi
 if dlq_admin list --bogus >/dev/null 2>&1; then exit 1; fi
 if dlq_admin list --kind >/dev/null 2>&1; then exit 1; fi
 pass 'dlq commands reject invalid arguments'
+# dlq-* must not read or copy the MySQL app secret, and must not need the
+# Redis password. Run the real wrapper with both absent.
+mysql_app_secret_backup="${MYSQL_APP_SECRET}"
+backend_app_secret_backup="${BACKEND_APP_SECRET}"
+infra_secrets_backup="${INFRA_SECRETS}"
+rabbitmq_url_backup="${INFRA_RABBITMQ_URL_FILE}"
+rabbitmq_password_backup="${INFRA_RABBITMQ_PASSWORD_FILE}"
+INFRA_SECRETS="${TEST_DIR}/rabbit-only-secrets"
+mkdir -p "${INFRA_SECRETS}"
+printf 'rabbit-only\n' > "${INFRA_SECRETS}/rabbitmq-password"
+MYSQL_APP_SECRET="${TEST_DIR}/absent/mysql-app"
+BACKEND_APP_SECRET="${TEST_DIR}/absent/backend-mysql-app"
+rm -f "${INFRA_RABBITMQ_URL_FILE}" "${INFRA_RABBITMQ_PASSWORD_FILE}"
+rm -f "${INFRA_REDIS_URL_FILE}" "${INFRA_REDIS_PASSWORD_FILE}"
+VERIFY_MODE=1
+dlq_admin list >/dev/null
+test -s "${INFRA_RABBITMQ_URL_FILE}"
+test -s "${INFRA_RABBITMQ_PASSWORD_FILE}"
+test ! -e "${BACKEND_APP_SECRET}"
+test ! -e "${INFRA_REDIS_PASSWORD_FILE}"
+pass 'dlq commands use only the RabbitMQ secret'
+MYSQL_APP_SECRET="${mysql_app_secret_backup}"
+BACKEND_APP_SECRET="${backend_app_secret_backup}"
+INFRA_SECRETS="${infra_secrets_backup}"
+INFRA_RABBITMQ_URL_FILE="${rabbitmq_url_backup}"
+INFRA_RABBITMQ_PASSWORD_FILE="${rabbitmq_password_backup}"
 VERIFY_MODE=0
+INFRA_SECRETS="${TEST_DIR}/missing-infra-secrets"
 INFRA_RABBITMQ_URL_FILE="${TEST_DIR}/missing-rabbitmq-url"
 if dlq_admin list >/dev/null 2>&1; then exit 1; fi
 VERIFY_MODE=1
+INFRA_SECRETS="${INFRA_ROOT}/secrets"
 INFRA_RABBITMQ_URL_FILE="${INFRA_CONFIG_DIR}/rabbitmq-url"
 pass 'dlq commands require RabbitMQ configuration'
 if grep -q 'IM_REDIS_URL_FILE' "${SCRIPT_DIR}/imctl" \

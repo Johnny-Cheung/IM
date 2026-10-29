@@ -38,6 +38,8 @@ type fakeReconcileStore struct {
 	attempts        int
 	statsCalls      int
 	detailCalls     int
+	directSeqCalls  []fakeSeqCall
+	groupSeqCalls   []fakeSeqCall
 
 	firstCall  chan struct{}
 	signalOnce sync.Once
@@ -123,6 +125,9 @@ func (f *fakeReconcileStore) ListConversationSeqs(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.detailCalls++
+	f.directSeqCalls = append(f.directSeqCalls, fakeSeqCall{
+		lowID: lowID, highID: highID, upTo: upTo, afterSeq: afterSeq,
+	})
 	if f.seqsErr != nil {
 		return nil, f.seqsErr
 	}
@@ -137,10 +142,27 @@ func (f *fakeReconcileStore) ListGroupSeqs(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.detailCalls++
+	f.groupSeqCalls = append(f.groupSeqCalls, fakeSeqCall{
+		lowID: groupID, upTo: upTo, afterSeq: afterSeq,
+	})
 	if f.seqsErr != nil {
 		return nil, f.seqsErr
 	}
 	return filterSeqs(f.groupSeqs[groupID], upTo, afterSeq, limit), nil
+}
+
+// fakeSeqCall records one paged seq query so a test can prove where a walk
+// started and that it used cursors instead of rescanning from zero.
+type fakeSeqCall struct {
+	lowID, highID  uint64
+	upTo, afterSeq uint64
+}
+
+func (f *fakeReconcileStore) seqCalls() ([]fakeSeqCall, []fakeSeqCall) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeSeqCall(nil), f.directSeqCalls...),
+		append([]fakeSeqCall(nil), f.groupSeqCalls...)
 }
 
 func filterSeqs(stored []uint64, upTo, afterSeq uint64, limit int) []uint64 {
@@ -1085,6 +1107,210 @@ func TestReconcilerPagesLargeConversationGapWalk(t *testing.T) {
 	}
 	if detailCalls < 2 || detailCalls > 202 {
 		t.Fatalf("detail page calls = %d, want the conversation walked in pages of 1000", detailCalls)
+	}
+}
+
+// COUNT(*) == MAX(seq) proves every seq in 1..MaxSeq is persisted, so a pure
+// tail lag must be walked from MaxSeq+1, not by paging the whole conversation.
+func TestReconcilerPureTailLagStartsAfterProvenPrefix(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	const maxSeq uint64 = 200000
+	const counter = maxSeq + 1
+	setDirectSequence(t, client, 1, 2, counter)
+	seedReconcileDirectMessage(t, client, 1, 2, 900001, counter, now.Add(-10*time.Minute))
+
+	seqs := make([]uint64, 0, maxSeq)
+	for seq := uint64(1); seq <= maxSeq; seq++ {
+		seqs = append(seqs, seq)
+	}
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{{
+		LowID: 1, HighID: 2, Count: maxSeq, MaxSeq: maxSeq,
+	}}
+	fakeStore.directSeqs[[2]uint64{1, 2}] = seqs
+
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+	// A stale cursor below the proven prefix must not force a rescan of it.
+	reconciler.mu.Lock()
+	reconciler.missingSeqs[reconcileSeqCursorKey{first: 1, second: 2}] = 100
+	reconciler.mu.Unlock()
+
+	result, err := reconciler.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.Repaired != 1 || result.Unresolved != 0 {
+		t.Fatalf("result = %+v, want only the tail seq repaired", result)
+	}
+	persisted, _, _, _, _ := fakeStore.snapshot()
+	if len(persisted) != 1 || persisted[0].Seq != counter || persisted[0].ID != 900001 {
+		t.Fatalf("persisted = %+v, want only seq %d", persisted, counter)
+	}
+	directCalls, _ := fakeStore.seqCalls()
+	if len(directCalls) != 1 {
+		t.Fatalf("detail page calls = %d, want 1: %+v", len(directCalls), directCalls)
+	}
+	if directCalls[0].afterSeq != maxSeq {
+		t.Fatalf("first page afterSeq = %d, want %d (must not scan the proven prefix)", directCalls[0].afterSeq, maxSeq)
+	}
+	if directCalls[0].upTo != counter {
+		t.Fatalf("first page upTo = %d, want %d", directCalls[0].upTo, counter)
+	}
+}
+
+func TestReconcilerPureTailLagStartsAfterProvenPrefixGroup(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	const maxSeq uint64 = 200000
+	const counter = maxSeq + 1
+	setGroupSequence(t, client, 7, counter)
+	seedReconcileGroupMessage(t, client, 7, 900002, counter, now.Add(-10*time.Minute))
+
+	seqs := make([]uint64, 0, maxSeq)
+	for seq := uint64(1); seq <= maxSeq; seq++ {
+		seqs = append(seqs, seq)
+	}
+	fakeStore := newFakeReconcileStore()
+	fakeStore.groups = []store.GroupSeqStat{{GroupID: 7, Count: maxSeq, MaxSeq: maxSeq}}
+	fakeStore.groupSeqs[7] = seqs
+
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+	result, err := reconciler.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.Repaired != 1 || result.Unresolved != 0 {
+		t.Fatalf("result = %+v, want only the tail seq repaired", result)
+	}
+	_, persistedGroups, _, _, _ := fakeStore.snapshot()
+	if len(persistedGroups) != 1 || persistedGroups[0].Seq != counter || persistedGroups[0].ID != 900002 {
+		t.Fatalf("persisted groups = %+v, want only seq %d", persistedGroups, counter)
+	}
+	_, groupCalls := fakeStore.seqCalls()
+	if len(groupCalls) != 1 {
+		t.Fatalf("detail page calls = %d, want 1: %+v", len(groupCalls), groupCalls)
+	}
+	if groupCalls[0].afterSeq != maxSeq || groupCalls[0].lowID != 7 {
+		t.Fatalf("first group page = %+v, want group 7 after %d (no prefix scan)", groupCalls[0], maxSeq)
+	}
+}
+
+// A real hole below MAX(seq) makes COUNT(*) != MAX(seq), which proves nothing
+// about the prefix, so the walk must still start at seq 1 and page through it.
+func TestReconcilerMidGapStillWalksFromStart(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	const maxSeq uint64 = 20000
+	const gap uint64 = 10000
+	setDirectSequence(t, client, 1, 2, maxSeq)
+	seedReconcileDirectMessage(t, client, 1, 2, 900010, gap, now.Add(-10*time.Minute))
+
+	seqs := make([]uint64, 0, maxSeq-1)
+	for seq := uint64(1); seq <= maxSeq; seq++ {
+		if seq == gap {
+			continue
+		}
+		seqs = append(seqs, seq)
+	}
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{{
+		LowID: 1, HighID: 2, Count: maxSeq - 1, MaxSeq: maxSeq,
+	}}
+	fakeStore.directSeqs[[2]uint64{1, 2}] = seqs
+
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+	result, err := reconciler.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.Repaired != 1 || result.Unresolved != 0 {
+		t.Fatalf("result = %+v, want the mid gap repaired", result)
+	}
+	persisted, _, _, _, _ := fakeStore.snapshot()
+	if len(persisted) != 1 || persisted[0].Seq != gap || persisted[0].ID != 900010 {
+		t.Fatalf("persisted = %+v, want seq %d", persisted, gap)
+	}
+	directCalls, _ := fakeStore.seqCalls()
+	if len(directCalls) < 2 {
+		t.Fatalf("detail page calls = %d, want the prefix paged", len(directCalls))
+	}
+	if directCalls[0].afterSeq != 0 {
+		t.Fatalf("first page afterSeq = %d, want 0 when the prefix is unproven", directCalls[0].afterSeq)
+	}
+}
+
+// A hole and a tail can be missing at once. The count/max stats prove nothing
+// about the prefix, so the same walk must cover both ends.
+func TestReconcilerHoleAndTailAreBothRepaired(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	const maxSeq uint64 = 20000
+	const gap uint64 = 10000
+	const counter = maxSeq + 3
+	old := now.Add(-10 * time.Minute)
+	setDirectSequence(t, client, 1, 2, counter)
+	seedReconcileDirectMessage(t, client, 1, 2, 910000, gap, old)
+	for seq := maxSeq + 1; seq <= counter; seq++ {
+		seedReconcileDirectMessage(t, client, 1, 2, 900000+seq, seq, old)
+	}
+
+	seqs := make([]uint64, 0, maxSeq-1)
+	for seq := uint64(1); seq <= maxSeq; seq++ {
+		if seq == gap {
+			continue
+		}
+		seqs = append(seqs, seq)
+	}
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{{
+		LowID: 1, HighID: 2, Count: maxSeq - 1, MaxSeq: maxSeq,
+	}}
+	fakeStore.directSeqs[[2]uint64{1, 2}] = seqs
+
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+	result, err := reconciler.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.Repaired != 4 || result.Unresolved != 0 {
+		t.Fatalf("result = %+v, want the hole and all three tail seqs repaired", result)
+	}
+	persisted, _, _, _, _ := fakeStore.snapshot()
+	gotSeqs := make([]uint64, 0, len(persisted))
+	for _, message := range persisted {
+		gotSeqs = append(gotSeqs, message.Seq)
+	}
+	sort.Slice(gotSeqs, func(i, j int) bool { return gotSeqs[i] < gotSeqs[j] })
+	want := []uint64{gap, maxSeq + 1, maxSeq + 2, maxSeq + 3}
+	if fmt.Sprint(gotSeqs) != fmt.Sprint(want) {
+		t.Fatalf("repaired seqs = %v, want %v", gotSeqs, want)
+	}
+	directCalls, _ := fakeStore.seqCalls()
+	if len(directCalls) == 0 || directCalls[0].afterSeq != 0 {
+		t.Fatalf("first page = %+v, want a walk from 0 when the prefix is unproven", directCalls)
+	}
+}
+
+func TestReconcileSeqLowerBound(t *testing.T) {
+	cases := []struct {
+		name                   string
+		count, maxSeq, counter uint64
+		want                   uint64
+	}{
+		{"pure tail", 5, 5, 6, 6},
+		{"hole below max", 4, 5, 5, 1},
+		{"hole plus tail", 4, 5, 6, 1},
+		{"counter not ahead", 5, 5, 5, 1},
+		{"no numbered rows", 0, 0, 1, 1},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := reconcileSeqLowerBound(testCase.count, testCase.maxSeq, testCase.counter); got != testCase.want {
+				t.Fatalf("reconcileSeqLowerBound(%d, %d, %d) = %d, want %d",
+					testCase.count, testCase.maxSeq, testCase.counter, got, testCase.want)
+			}
+		})
 	}
 }
 
