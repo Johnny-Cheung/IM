@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成代码和两轮审查修复，待 8199 隔离验证。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、两轮审查修复和 8199 隔离验证（含真实 MySQL 测试与故障演练），同样暂不切换 8198。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -392,6 +392,28 @@ canary 的 Redis DB 1 与正式 `8198` 的 DB 0 在同一个 `im-v11-redis` 容�
 - 群成员变更（建群、邀请、踢人、退群、解散）在同一群内串行写 Redis 投影；失败时 `group:{G}:sync_required` 保持置位，由后台修复循环按 MySQL 快照重建，期间该群的发送、已读和未读返回 503。当前串行锁在进程内，多实例留到 v1.8。
 - 回滚应用文件仍使用切换前备份。v1.7 没有数据库迁移，v1.6 不读取新的 Redis 键；v1.7 写入 MySQL 的已读位置只增不减，回退后继续可用。
 - 验证实例 `8199` 已停止；验证库 64 个测试账号和 31 个测试群已清除，测试用 Redis 键已按清单删除。
+
+## v1.8.2 隔离验证结果（2026-10-29）
+
+候选发布包 `v1.8.2`（`210f203`）部署在 8199，正式 8198 继续运行 v1.7，共享的 MySQL、Redis、RabbitMQ 容器全程未停止或重建。
+
+```bash
+# 部署：备份现有 canary 文件，替换 bin/web/RELEASE/SHA256SUMS，只重启验证单元
+/opt/IM-Rebuild/imctl --verify stop
+# 复制 /opt/IM-Rebuild/incoming/im-v1.8.2-<commit>/ 下的文件
+/opt/IM-Rebuild/imctl --verify start
+/opt/IM-Rebuild/imctl --verify status
+curl -fsS http://127.0.0.1:8199/ops/infra   # 检查 pipeline 段
+```
+
+结果：
+
+- API smoke 114 项、浏览器 smoke 56 项、缓存 smoke 29 项通过；部署后再次运行 API smoke 114 项通过。
+- `/ops/infra.pipeline` 显示两条链路的 relay 和 consumer 已连接、Stream 和持久化队列为 0、死信数为 0、对账按 5 分钟运行。
+- 真实 MySQL 集成测试（`internal/store` 的 `TestMySQLReconcileIntegration`）在独立 schema `im_v07_verify_reconcile_test` 上通过。运行方式：交叉编译 `go test -c`，在开发机上设置 `IM_TEST_MYSQL_DSN`（不含密码）和 `IM_TEST_MYSQL_PASSWORD_FILE=/opt/IM-Rebuild/canary-v07/mysql-app`；测试用户只需临时获得该 schema 的权限，结束后撤销。
+- 真实基础设施演练（`TestV182PipelineLive`，104.7 秒）在独立命名空间 `im:v182-drill`、验证 vhost `im_v13_verify` 和独立 schema `im_v182_pipeline_test` 上通过，覆盖：手工 pending 恢复、关闭被捕获的 relay 连接后重连、对账修复与幂等、外键毒消息 6 次/31 秒后进死信并重放、删除死信绑定后 mandatory 返回触发重连重建、scoped 间隙锁 62 秒触发 1205 退避重试。演练测试默认跳过，只在 `IM_TEST_PIPELINE_LIVE=true` 时运行；它拒绝复用已有命名空间或已存在的 schema，结束时只删除自己创建的数据。
+- 清理：按 manifest 精确删除 16+10+2 个测试账号和 7+3 个群；验证库回到 0 行；验证命名空间只剩 `seq:ready`、`index:epoch` 和空 Stream；验证 vhost 的两个主队列为 0。临时授予的 schema 权限已撤销。
+- 未执行：停止或重启共享 Redis、RabbitMQ、MySQL 容器（会同时影响 8198，需要单独维护窗口）。
 
 ## 死信队列处理
 
