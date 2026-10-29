@@ -29,8 +29,12 @@ type ReconcileStore interface {
 		afterGroupID uint64,
 		limit int,
 	) ([]store.GroupSeqStat, error)
-	ListConversationSeqs(ctx context.Context, lowID, highID, upTo uint64) ([]uint64, error)
-	ListGroupSeqs(ctx context.Context, groupID, upTo uint64) ([]uint64, error)
+	ListConversationSeqs(
+		ctx context.Context,
+		lowID, highID, upTo, afterSeq uint64,
+		limit int,
+	) ([]uint64, error)
+	ListGroupSeqs(ctx context.Context, groupID, upTo, afterSeq uint64, limit int) ([]uint64, error)
 	PersistMessage(ctx context.Context, message store.Message) (bool, error)
 	PersistGroupMessage(ctx context.Context, message store.GroupMessage) (bool, error)
 }
@@ -46,7 +50,8 @@ type ReconcileOptions struct {
 	MinAge time.Duration
 	// Batch bounds one page of stats rows. Default 500.
 	Batch int
-	// MaxDetail bounds mismatched conversations repaired per run. Default 50.
+	// MaxDetail bounds mismatched conversations repaired per phase per run.
+	// Default 50.
 	MaxDetail int
 	Now       func() time.Time
 	// LogEvery bounds how often the same unresolved item is logged. Default 1h.
@@ -61,6 +66,9 @@ type ReconcileResult struct {
 	Unresolved uint64
 	// InFlight counts missing seqs whose entity is younger than MinAge.
 	InFlight uint64
+	// Deferred counts conversations whose per-run missing-seq cap was hit; the
+	// remainder is retried on the next run.
+	Deferred uint64
 	Duration time.Duration
 }
 
@@ -80,17 +88,22 @@ type ReconcileStatus struct {
 }
 
 const (
-	defaultReconcileInterval     = 5 * time.Minute
-	defaultReconcileMinAge       = 5 * time.Minute
-	defaultReconcileBatch        = 500
-	defaultReconcileMaxDetail    = 50
-	defaultReconcileLogEvery     = time.Hour
-	reconcileLogKeyLimit         = 2048
-	reconcileScanKeysPerRun      = 5000
-	reconcileScanCountHint       = 500
-	reconcileGatePollFloor       = time.Millisecond
-	reconcileGatePollCeiling     = time.Second
-	reconcileIncompleteEntityMsg = "entity is incomplete"
+	defaultReconcileInterval  = 5 * time.Minute
+	defaultReconcileMinAge    = 5 * time.Minute
+	defaultReconcileBatch     = 500
+	defaultReconcileMaxDetail = 50
+	defaultReconcileLogEvery  = time.Hour
+	reconcileLogKeyLimit      = 2048
+	reconcileMaxLogsPerRun    = 500
+	// reconcileMaxMissingPerConversation bounds the Redis lookups one damaged
+	// conversation can trigger in a run; the walk resumes from its cursor next
+	// run.
+	reconcileMaxMissingPerConversation = 1000
+	reconcileScanKeysPerRun            = 5000
+	reconcileScanCountHint             = 500
+	reconcileGatePollFloor             = time.Millisecond
+	reconcileGatePollCeiling           = time.Second
+	reconcileIncompleteEntityMsg       = "entity is incomplete"
 )
 
 // Reconciler compares Redis conversation counters with MySQL and repairs
@@ -109,11 +122,16 @@ type Reconciler struct {
 
 	runMu sync.Mutex
 
-	mu               sync.Mutex
-	status           ReconcileStatus
-	logged           map[string]time.Time
-	directScanCursor uint64
-	groupScanCursor  uint64
+	mu                sync.Mutex
+	status            ReconcileStatus
+	logged            map[string]time.Time
+	runLogs           int
+	runSuppressed     uint64
+	directScanCursor  uint64
+	groupScanCursor   uint64
+	directStatsCursor [2]uint64
+	groupStatsCursor  uint64
+	missingSeqs       map[reconcileSeqCursorKey]uint64
 }
 
 // NewReconciler builds a reconciler. Only the client and store are required.
@@ -141,17 +159,18 @@ func NewReconciler(
 		options.LogEvery = defaultReconcileLogEvery
 	}
 	return &Reconciler{
-		client:    client,
-		store:     dataStore,
-		keyspace:  options.Keyspace,
-		gate:      options.Gate,
-		interval:  options.Interval,
-		minAge:    options.MinAge,
-		logEvery:  options.LogEvery,
-		batch:     options.Batch,
-		maxDetail: options.MaxDetail,
-		now:       options.Now,
-		logged:    make(map[string]time.Time),
+		client:      client,
+		store:       dataStore,
+		keyspace:    options.Keyspace,
+		gate:        options.Gate,
+		interval:    options.Interval,
+		minAge:      options.MinAge,
+		logEvery:    options.LogEvery,
+		batch:       options.Batch,
+		maxDetail:   options.MaxDetail,
+		now:         options.Now,
+		logged:      make(map[string]time.Time),
+		missingSeqs: make(map[reconcileSeqCursorKey]uint64),
 	}
 }
 
@@ -225,9 +244,13 @@ func (r *Reconciler) RunOnce(ctx context.Context) (ReconcileResult, error) {
 		duration = 0
 	}
 	result.Duration = duration
+	r.mu.Lock()
+	suppressed := r.runSuppressed
+	r.mu.Unlock()
 	summary := fmt.Sprintf(
-		"scanned=%d mismatched=%d repaired=%d unresolved=%d in_flight=%d",
-		result.Scanned, result.Mismatched, result.Repaired, result.Unresolved, result.InFlight,
+		"scanned=%d mismatched=%d repaired=%d unresolved=%d in_flight=%d deferred=%d suppressed=%d",
+		result.Scanned, result.Mismatched, result.Repaired, result.Unresolved,
+		result.InFlight, result.Deferred, suppressed,
 	)
 
 	r.mu.Lock()
@@ -249,7 +272,7 @@ func (r *Reconciler) RunOnce(ctx context.Context) (ReconcileResult, error) {
 	}
 	r.mu.Unlock()
 
-	if result.Mismatched > 0 || result.Repaired > 0 {
+	if result.Mismatched > 0 || result.Repaired > 0 || result.Unresolved > 0 || suppressed > 0 {
 		log.Printf("reconcile run: %s duration=%s", summary, duration)
 	}
 	return result, err
@@ -270,45 +293,88 @@ func (r *Reconciler) reconcile(
 	runAt time.Time,
 ) (ReconcileResult, error) {
 	var result ReconcileResult
-	detail := 0
+	r.mu.Lock()
+	r.runLogs = 0
+	r.runSuppressed = 0
+	r.mu.Unlock()
 
 	seenPairs := make(map[[2]uint64]struct{})
-	if err := r.reconcileDirect(ctx, runAt, &result, seenPairs, &detail); err != nil {
+	if err := r.reconcileDirect(ctx, runAt, &result, seenPairs); err != nil {
 		return result, err
 	}
 	seenGroups := make(map[uint64]struct{})
-	if err := r.reconcileGroups(ctx, runAt, &result, seenGroups, &detail); err != nil {
+	if err := r.reconcileGroups(ctx, runAt, &result, seenGroups); err != nil {
 		return result, err
 	}
-	if err := r.reconcileOrphanDirectCounters(ctx, runAt, &result, seenPairs, &detail); err != nil {
+	if err := r.reconcileOrphanDirectCounters(ctx, runAt, &result, seenPairs); err != nil {
 		return result, err
 	}
-	return result, r.reconcileOrphanGroupCounters(ctx, runAt, &result, seenGroups, &detail)
+	return result, r.reconcileOrphanGroupCounters(ctx, runAt, &result, seenGroups)
 }
 
-// reconcileDirect pages the direct conversation stats and repairs mismatches.
+type reconcileDirectSuspect struct {
+	lowID, highID, counter uint64
+}
+
+// reconcileDirect pages the direct conversation stats and repairs at most
+// MaxDetail suspects, starting after the previous run's cursor so a fixed set
+// of permanently unresolved conversations cannot pin every run.
 func (r *Reconciler) reconcileDirect(
 	ctx context.Context,
 	runAt time.Time,
 	result *ReconcileResult,
 	seen map[[2]uint64]struct{},
-	detail *int,
 ) error {
+	suspects, err := r.scanDirectSuspects(ctx, result, seen)
+	if err != nil {
+		return err
+	}
+	if len(suspects) == 0 {
+		r.setDirectStatsCursor([2]uint64{})
+		return nil
+	}
+	cursor := r.directStatsStart()
+	start := 0
+	for index, suspect := range suspects {
+		if reconcilePairAfter([2]uint64{suspect.lowID, suspect.highID}, cursor) {
+			start = index
+			break
+		}
+	}
+	attempted := 0
+	for offset := 0; offset < len(suspects) && attempted < r.maxDetail; offset++ {
+		suspect := suspects[(start+offset)%len(suspects)]
+		attempted++
+		if err := r.repairDirectConversation(ctx, runAt, suspect.lowID, suspect.highID, suspect.counter, result); err != nil {
+			return err
+		}
+		// Advance only after a completed attempt so an aborted run retries it.
+		r.setDirectStatsCursor([2]uint64{suspect.lowID, suspect.highID})
+	}
+	return nil
+}
+
+func (r *Reconciler) scanDirectSuspects(
+	ctx context.Context,
+	result *ReconcileResult,
+	seen map[[2]uint64]struct{},
+) ([]reconcileDirectSuspect, error) {
 	afterLow, afterHigh := uint64(0), uint64(0)
+	var suspects []reconcileDirectSuspect
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		rows, err := r.store.ListConversationSeqStats(ctx, afterLow, afterHigh, r.batch)
 		if err != nil {
-			return fmt.Errorf("list conversation seq stats: %w", err)
+			return nil, fmt.Errorf("list conversation seq stats: %w", err)
 		}
 		if len(rows) == 0 {
-			return nil
+			return suspects, nil
 		}
 		counters, err := r.readDirectCounters(ctx, rows)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, row := range rows {
 			if row.LowID == 0 || row.HighID == 0 {
@@ -324,45 +390,87 @@ func (r *Reconciler) reconcileDirect(
 				continue
 			}
 			result.Mismatched++
-			if *detail >= r.maxDetail {
-				continue
-			}
-			*detail++
-			if err := r.repairDirectConversation(ctx, runAt, row.LowID, row.HighID, counter, result); err != nil {
-				return err
-			}
+			suspects = append(suspects, reconcileDirectSuspect{
+				lowID: row.LowID, highID: row.HighID, counter: counter,
+			})
 		}
 		last := rows[len(rows)-1]
 		afterLow, afterHigh = last.LowID, last.HighID
 		if len(rows) < r.batch {
-			return nil
+			return suspects, nil
 		}
 	}
 }
 
-// reconcileGroups pages the group stats and repairs mismatches.
+func reconcilePairAfter(pair, cursor [2]uint64) bool {
+	if pair[0] != cursor[0] {
+		return pair[0] > cursor[0]
+	}
+	return pair[1] > cursor[1]
+}
+
+// reconcileGroups pages the group stats and repairs at most MaxDetail
+// suspects, with its own budget and rotation separate from the direct phase.
 func (r *Reconciler) reconcileGroups(
 	ctx context.Context,
 	runAt time.Time,
 	result *ReconcileResult,
 	seen map[uint64]struct{},
-	detail *int,
 ) error {
+	suspects, err := r.scanGroupSuspects(ctx, result, seen)
+	if err != nil {
+		return err
+	}
+	if len(suspects) == 0 {
+		r.setGroupStatsCursor(0)
+		return nil
+	}
+	cursor := r.groupStatsStart()
+	start := 0
+	for index, suspect := range suspects {
+		if suspect.groupID > cursor {
+			start = index
+			break
+		}
+	}
+	attempted := 0
+	for offset := 0; offset < len(suspects) && attempted < r.maxDetail; offset++ {
+		suspect := suspects[(start+offset)%len(suspects)]
+		attempted++
+		if err := r.repairGroupConversation(ctx, runAt, suspect.groupID, suspect.counter, result); err != nil {
+			return err
+		}
+		// Advance only after a completed attempt so an aborted run retries it.
+		r.setGroupStatsCursor(suspect.groupID)
+	}
+	return nil
+}
+
+type reconcileGroupSuspect struct {
+	groupID, counter uint64
+}
+
+func (r *Reconciler) scanGroupSuspects(
+	ctx context.Context,
+	result *ReconcileResult,
+	seen map[uint64]struct{},
+) ([]reconcileGroupSuspect, error) {
 	afterGroupID := uint64(0)
+	var suspects []reconcileGroupSuspect
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		rows, err := r.store.ListGroupSeqStats(ctx, afterGroupID, r.batch)
 		if err != nil {
-			return fmt.Errorf("list group seq stats: %w", err)
+			return nil, fmt.Errorf("list group seq stats: %w", err)
 		}
 		if len(rows) == 0 {
-			return nil
+			return suspects, nil
 		}
 		counters, err := r.readGroupCounters(ctx, rows)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, row := range rows {
 			if row.GroupID == 0 {
@@ -378,17 +486,13 @@ func (r *Reconciler) reconcileGroups(
 				continue
 			}
 			result.Mismatched++
-			if *detail >= r.maxDetail {
-				continue
-			}
-			*detail++
-			if err := r.repairGroupConversation(ctx, runAt, row.GroupID, counter, result); err != nil {
-				return err
-			}
+			suspects = append(suspects, reconcileGroupSuspect{
+				groupID: row.GroupID, counter: counter,
+			})
 		}
 		afterGroupID = rows[len(rows)-1].GroupID
 		if len(rows) < r.batch {
-			return nil
+			return suspects, nil
 		}
 	}
 }
@@ -456,19 +560,36 @@ func (r *Reconciler) repairDirectConversation(
 	lowID, highID, counter uint64,
 	result *ReconcileResult,
 ) error {
-	seqs, err := r.store.ListConversationSeqs(ctx, lowID, highID, counter)
-	if err != nil {
-		return fmt.Errorf("list conversation seqs: %w", err)
+	if counter > store.MaxSafeSeq {
+		// SeqCalibrator only raises counters, so an out-of-range one is
+		// untrusted; walking it would mean billions of lookups.
+		r.logUnresolved(runAt, fmt.Sprintf("direct:%d:%d:counter", lowID, highID),
+			"sequence counter exceeds MaxSafeSeq")
+		result.Unresolved++
+		return nil
 	}
-	for _, seq := range reconcileMissingSeqs(seqs, counter) {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		outcome, err := r.repairDirectSeq(ctx, runAt, lowID, highID, seq)
-		if err != nil {
-			return err
-		}
-		result.add(outcome)
+	key := reconcileSeqCursorKey{first: lowID, second: highID}
+	start := r.missingSeqStart(key, counter)
+	next, truncated, err := walkMissingSeqs(
+		ctx, start, counter, uint64(r.batch), reconcileMaxMissingPerConversation,
+		func(ctx context.Context, afterSeq uint64) ([]uint64, error) {
+			return r.store.ListConversationSeqs(ctx, lowID, highID, counter, afterSeq, r.batch)
+		},
+		func(seq uint64) error {
+			outcome, err := r.repairDirectSeq(ctx, runAt, lowID, highID, seq)
+			if err != nil {
+				return err
+			}
+			result.add(outcome)
+			return nil
+		},
+	)
+	if err != nil {
+		return err
+	}
+	r.setMissingSeqCursor(key, next, truncated)
+	if truncated {
+		result.Deferred++
 	}
 	return nil
 }
@@ -479,19 +600,34 @@ func (r *Reconciler) repairGroupConversation(
 	groupID, counter uint64,
 	result *ReconcileResult,
 ) error {
-	seqs, err := r.store.ListGroupSeqs(ctx, groupID, counter)
-	if err != nil {
-		return fmt.Errorf("list group seqs: %w", err)
+	if counter > store.MaxSafeSeq {
+		r.logUnresolved(runAt, fmt.Sprintf("group:%d:counter", groupID),
+			"sequence counter exceeds MaxSafeSeq")
+		result.Unresolved++
+		return nil
 	}
-	for _, seq := range reconcileMissingSeqs(seqs, counter) {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		outcome, err := r.repairGroupSeq(ctx, runAt, groupID, seq)
-		if err != nil {
-			return err
-		}
-		result.add(outcome)
+	key := reconcileSeqCursorKey{group: true, first: groupID}
+	start := r.missingSeqStart(key, counter)
+	next, truncated, err := walkMissingSeqs(
+		ctx, start, counter, uint64(r.batch), reconcileMaxMissingPerConversation,
+		func(ctx context.Context, afterSeq uint64) ([]uint64, error) {
+			return r.store.ListGroupSeqs(ctx, groupID, counter, afterSeq, r.batch)
+		},
+		func(seq uint64) error {
+			outcome, err := r.repairGroupSeq(ctx, runAt, groupID, seq)
+			if err != nil {
+				return err
+			}
+			result.add(outcome)
+			return nil
+		},
+	)
+	if err != nil {
+		return err
+	}
+	r.setMissingSeqCursor(key, next, truncated)
+	if truncated {
+		result.Deferred++
 	}
 	return nil
 }
@@ -604,22 +740,104 @@ func (r *Reconciler) persistFailure(
 	return reconcileOutcome{unresolved: true}, nil
 }
 
-// reconcileMissingSeqs returns the seqs in 1..upTo absent from stored, ascending.
-func reconcileMissingSeqs(stored []uint64, upTo uint64) []uint64 {
-	present := make(map[uint64]struct{}, len(stored))
-	for _, seq := range stored {
-		present[seq] = struct{}{}
+// walkMissingSeqs emits the seqs in start..upTo absent from the ascending
+// pages returned by fetch. It never holds more than one page, stops after
+// maxMissing emissions, and returns the seq to resume from when it stopped
+// early so a damaged conversation cannot monopolize a run.
+func walkMissingSeqs(
+	ctx context.Context,
+	start, upTo, pageSize uint64,
+	maxMissing int,
+	fetch func(ctx context.Context, afterSeq uint64) ([]uint64, error),
+	emit func(seq uint64) error,
+) (next uint64, truncated bool, err error) {
+	if start < 1 {
+		start = 1
 	}
-	missing := make([]uint64, 0)
-	if upTo > uint64(len(stored)) {
-		missing = make([]uint64, 0, upTo-uint64(len(stored)))
+	if start > upTo {
+		return 0, false, nil
 	}
-	for seq := uint64(1); seq <= upTo; seq++ {
-		if _, ok := present[seq]; !ok {
-			missing = append(missing, seq)
+	expect := start
+	afterSeq := start - 1
+	emitted := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, false, err
 		}
+		page, err := fetch(ctx, afterSeq)
+		if err != nil {
+			return 0, false, err
+		}
+		for _, seq := range page {
+			if seq < expect {
+				continue
+			}
+			for expect < seq {
+				if emitted >= maxMissing {
+					return expect, true, nil
+				}
+				if err := emit(expect); err != nil {
+					return 0, false, err
+				}
+				emitted++
+				expect++
+			}
+			expect = seq + 1
+		}
+		if pageSize == 0 || uint64(len(page)) < pageSize {
+			break
+		}
+		last := page[len(page)-1]
+		if last >= upTo || last <= afterSeq {
+			break
+		}
+		afterSeq = last
 	}
-	return missing
+	for expect <= upTo {
+		if emitted >= maxMissing {
+			return expect, true, nil
+		}
+		if err := emit(expect); err != nil {
+			return 0, false, err
+		}
+		emitted++
+		expect++
+	}
+	return 0, false, nil
+}
+
+// reconcileSeqCursorKey identifies one conversation's resumable gap walk.
+type reconcileSeqCursorKey struct {
+	group  bool
+	first  uint64
+	second uint64
+}
+
+func (r *Reconciler) missingSeqStart(key reconcileSeqCursorKey, counter uint64) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	start := r.missingSeqs[key]
+	if start == 0 || start > counter {
+		return 1
+	}
+	return start
+}
+
+func (r *Reconciler) setMissingSeqCursor(key reconcileSeqCursorKey, next uint64, truncated bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !truncated {
+		delete(r.missingSeqs, key)
+		return
+	}
+	if next == 0 {
+		next = 1
+	}
+	if _, exists := r.missingSeqs[key]; !exists && len(r.missingSeqs) >= reconcileLogKeyLimit {
+		// Bounded state: dropping the cursor only restarts the walk at 1.
+		return
+	}
+	r.missingSeqs[key] = next
 }
 
 func (r *Reconciler) indexMember(
@@ -683,10 +901,13 @@ func reconcileDirectMessage(
 		return store.Message{}, err
 	}
 	clientMessageID := strings.TrimSpace(fields["client_message_id"])
+	body := fields["body"]
 	if id != messageID || entitySeq != seq {
 		return store.Message{}, errors.New("entity identity differs from the index")
 	}
-	if senderID == 0 || recipientID == 0 || clientMessageID == "" {
+	// An empty body would persist a wrong row that dead-letters the real one.
+	if senderID == 0 || recipientID == 0 || clientMessageID == "" ||
+		strings.TrimSpace(body) == "" {
 		return store.Message{}, errors.New(reconcileIncompleteEntityMsg)
 	}
 	pairLow, pairHigh := senderID, recipientID
@@ -706,7 +927,7 @@ func reconcileDirectMessage(
 		SenderID:        senderID,
 		RecipientID:     recipientID,
 		ClientMessageID: clientMessageID,
-		Body:            fields["body"],
+		Body:            body,
 		CreatedAt:       time.UnixMilli(createdAtMS).UTC(),
 	}, nil
 }
@@ -734,10 +955,14 @@ func reconcileGroupMessage(
 		return store.GroupMessage{}, err
 	}
 	clientMessageID := strings.TrimSpace(fields["client_message_id"])
+	body := fields["body"]
+	senderUsername := strings.TrimSpace(fields["sender_username"])
+	senderNickname := strings.TrimSpace(fields["sender_nickname"])
 	if id != messageID || entitySeq != seq || entityGroupID != groupID {
 		return store.GroupMessage{}, errors.New("entity identity differs from the index")
 	}
-	if senderID == 0 || clientMessageID == "" {
+	if senderID == 0 || clientMessageID == "" || strings.TrimSpace(body) == "" ||
+		senderUsername == "" || senderNickname == "" {
 		return store.GroupMessage{}, errors.New(reconcileIncompleteEntityMsg)
 	}
 	createdAtMS, err := reconcileEntityInt64(fields, "created_at_ms")
@@ -750,11 +975,11 @@ func reconcileGroupMessage(
 		GroupID:  groupID,
 		SenderID: senderID,
 		Sender: store.PublicUser{
-			Username: fields["sender_username"],
-			Nickname: fields["sender_nickname"],
+			Username: senderUsername,
+			Nickname: senderNickname,
 		},
 		ClientMessageID: clientMessageID,
-		Body:            fields["body"],
+		Body:            body,
 		CreatedAt:       time.UnixMilli(createdAtMS).UTC(),
 	}, nil
 }
@@ -791,7 +1016,6 @@ func (r *Reconciler) reconcileOrphanDirectCounters(
 	runAt time.Time,
 	result *ReconcileResult,
 	seen map[[2]uint64]struct{},
-	detail *int,
 ) error {
 	cursor, keys, err := r.scanCounterKeys(
 		ctx, r.keyspace.reconcileDirectCounterScanPattern(), r.directCursor(),
@@ -811,6 +1035,7 @@ func (r *Reconciler) reconcileOrphanDirectCounters(
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return fmt.Errorf("read scanned conversation counters: %w", err)
 	}
+	attempted := 0
 	for index, key := range keys {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -831,10 +1056,10 @@ func (r *Reconciler) reconcileOrphanDirectCounters(
 		}
 		result.Scanned++
 		result.Mismatched++
-		if *detail >= r.maxDetail {
+		if attempted >= r.maxDetail {
 			continue
 		}
-		*detail++
+		attempted++
 		if err := r.repairDirectConversation(ctx, runAt, lowID, highID, counter, result); err != nil {
 			return err
 		}
@@ -849,7 +1074,6 @@ func (r *Reconciler) reconcileOrphanGroupCounters(
 	runAt time.Time,
 	result *ReconcileResult,
 	seen map[uint64]struct{},
-	detail *int,
 ) error {
 	cursor, keys, err := r.scanCounterKeys(
 		ctx, r.keyspace.reconcileGroupCounterScanPattern(), r.groupCursor(),
@@ -869,6 +1093,7 @@ func (r *Reconciler) reconcileOrphanGroupCounters(
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return fmt.Errorf("read scanned group counters: %w", err)
 	}
+	attempted := 0
 	for index, key := range keys {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -889,10 +1114,10 @@ func (r *Reconciler) reconcileOrphanGroupCounters(
 		}
 		result.Scanned++
 		result.Mismatched++
-		if *detail >= r.maxDetail {
+		if attempted >= r.maxDetail {
 			continue
 		}
-		*detail++
+		attempted++
 		if err := r.repairGroupConversation(ctx, runAt, groupID, counter, result); err != nil {
 			return err
 		}
@@ -947,34 +1172,65 @@ func (r *Reconciler) setGroupCursor(cursor uint64) {
 	r.groupScanCursor = cursor
 }
 
-// logUnresolved logs one unresolved item at most once per LogEvery. The dedupe
-// map is bounded so an endless stream of distinct items cannot grow it.
+func (r *Reconciler) directStatsStart() [2]uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.directStatsCursor
+}
+
+func (r *Reconciler) setDirectStatsCursor(cursor [2]uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.directStatsCursor = cursor
+}
+
+func (r *Reconciler) groupStatsStart() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.groupStatsCursor
+}
+
+func (r *Reconciler) setGroupStatsCursor(cursor uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.groupStatsCursor = cursor
+}
+
+// logUnresolved logs one unresolved item at most once per LogEvery. Items are
+// suppressed rather than evicted when either the per-run cap or the key map is
+// full, so a burst cannot break the per-item throttle.
 func (r *Reconciler) logUnresolved(runAt time.Time, key, reason string) {
 	r.mu.Lock()
 	if when, ok := r.logged[key]; ok && runAt.Sub(when) < r.logEvery {
 		r.mu.Unlock()
 		return
 	}
-	if len(r.logged) >= reconcileLogKeyLimit {
-		r.evictLoggedLocked(runAt)
+	if r.runLogs >= reconcileMaxLogsPerRun {
+		r.runSuppressed++
+		r.mu.Unlock()
+		return
 	}
+	if len(r.logged) >= reconcileLogKeyLimit {
+		r.expireLoggedLocked(runAt)
+		if len(r.logged) >= reconcileLogKeyLimit {
+			r.runSuppressed++
+			r.mu.Unlock()
+			return
+		}
+	}
+	r.runLogs++
 	r.logged[key] = runAt
 	r.mu.Unlock()
 	log.Printf("reconcile unresolved %s: %s", key, reason)
 }
 
-func (r *Reconciler) evictLoggedLocked(now time.Time) {
+// expireLoggedLocked drops only entries whose LogEvery window elapsed. Fresh
+// entries stay, which keeps the once-per-item guarantee under load.
+func (r *Reconciler) expireLoggedLocked(now time.Time) {
 	for key, when := range r.logged {
 		if now.Sub(when) >= r.logEvery {
 			delete(r.logged, key)
 		}
-	}
-	target := reconcileLogKeyLimit / 2
-	for key := range r.logged {
-		if len(r.logged) <= target {
-			break
-		}
-		delete(r.logged, key)
 	}
 }
 

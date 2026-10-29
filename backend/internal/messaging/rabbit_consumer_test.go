@@ -11,6 +11,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/rabbitmq/amqp091-go"
 
+	"github.com/Johnny-Cheung/IM/backend/internal/config"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 )
 
@@ -352,5 +353,69 @@ func TestRabbitConsumerAckFailureIsReturned(t *testing.T) {
 	}
 	if consumer.Status().Persisted != 1 {
 		t.Fatalf("status = %#v", consumer.Status())
+	}
+}
+
+func TestRabbitConsumerRunBacksOffAndReportsReconnectErrors(t *testing.T) {
+	consumer := NewRabbitMessageConsumer(
+		config.RabbitMQConfig{},
+		nil,
+		&consumeFakeMessagePersister{},
+	)
+	attempts := 0
+	consumer.dialer = func(config.RabbitMQConfig) (*amqp091.Connection, error) {
+		attempts++
+		if attempts == 7 {
+			// A connection that persisted a message resets the reconnect delay.
+			consumer.status.recordPersisted(consumeTestNow)
+			return nil, errors.New("connection lost")
+		}
+		return nil, errors.New("dial failed")
+	}
+	var delays []time.Duration
+	consumer.wait = func(_ context.Context, delay time.Duration) bool {
+		delays = append(delays, delay)
+		return len(delays) < 9
+	}
+	var logs []string
+	consumer.logf = func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+
+	if err := consumer.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	status := consumer.Status()
+	const dialFailed = "dial RabbitMQ for message consumer: dial failed"
+	if status.LastError != dialFailed || status.LastErrorAt.IsZero() {
+		t.Fatalf("status error = %q at %v", status.LastError, status.LastErrorAt)
+	}
+	if status.Persisted != 1 {
+		t.Fatalf("persisted = %d, want 1", status.Persisted)
+	}
+	wantLogs := []string{
+		"direct message consumer reconnecting: " + dialFailed,
+		"direct message consumer reconnecting: dial RabbitMQ for message consumer: connection lost",
+		"direct message consumer reconnecting: " + dialFailed,
+	}
+	if !reflect.DeepEqual(logs, wantLogs) {
+		t.Fatalf("logs = %v, want %v", logs, wantLogs)
+	}
+	wantDelays := []time.Duration{
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		30 * time.Second,
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+	}
+	if !reflect.DeepEqual(delays, wantDelays) {
+		t.Fatalf("delays = %v, want %v", delays, wantDelays)
+	}
+	if attempts != len(wantDelays) {
+		t.Fatalf("attempts = %d, want %d", attempts, len(wantDelays))
 	}
 }

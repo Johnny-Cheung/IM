@@ -379,6 +379,83 @@ func TestPipelineMonitorSurvivesRedisFailure(t *testing.T) {
 	}
 }
 
+func TestPipelineMonitorAlertsOnStreamLengthWhenOldestLegFails(t *testing.T) {
+	env := newPipelineMonitorTestEnv(t, PipelineMonitorOptions{
+		BacklogLimit: 1000,
+		OldestLimit:  time.Hour,
+	})
+	stream := defaultKeyspace.messageStreamKey()
+	for index := int64(0); index < 5000; index++ {
+		env.addEntry(t, stream, index)
+	}
+	env.client.AddHook(&pipelineMonitorCommandFailer{commands: map[string]bool{"xrange": true}})
+
+	status := env.sample(t)
+
+	if status.Direct.Unrelayed != 5000 {
+		t.Fatalf("unrelayed = %d, want 5000 from a successful XLEN", status.Direct.Unrelayed)
+	}
+	if status.Direct.LastError == "" {
+		t.Fatal("last error = empty, want the XRANGE failure")
+	}
+	if !status.Direct.BacklogAlert {
+		t.Fatal("backlog alert = false, want true from the successful XLEN")
+	}
+	if len(env.logs) != 1 || !strings.Contains(env.logs[0], "stream backlog") {
+		t.Fatalf("logs = %v, want one stream backlog alert", env.logs)
+	}
+}
+
+func TestPipelineMonitorAlertsOnStreamLengthWhenPendingLegFails(t *testing.T) {
+	env := newPipelineMonitorTestEnv(t, PipelineMonitorOptions{
+		BacklogLimit: 2,
+		OldestLimit:  time.Hour,
+	})
+	stream := defaultKeyspace.messageStreamKey()
+	for index := int64(0); index < 3; index++ {
+		env.addEntry(t, stream, index*1000)
+	}
+	env.client.AddHook(&pipelineMonitorCommandFailer{commands: map[string]bool{"xpending": true}})
+
+	status := env.sample(t)
+
+	if !status.Direct.BacklogAlert {
+		t.Fatal("backlog alert = false, want true with a failed XPENDING")
+	}
+	if len(env.logs) != 1 || !strings.Contains(env.logs[0], "stream backlog") {
+		t.Fatalf("logs = %v, want one stream backlog alert", env.logs)
+	}
+}
+
+func TestPipelineMonitorKeepsBacklogAlertWhenAllStreamLegsFail(t *testing.T) {
+	env := newPipelineMonitorTestEnv(t, PipelineMonitorOptions{
+		BacklogLimit: 2,
+		OldestLimit:  time.Hour,
+	})
+	stream := defaultKeyspace.messageStreamKey()
+	for index := int64(0); index < 3; index++ {
+		env.addEntry(t, stream, index*1000)
+	}
+	if !env.sample(t).Direct.BacklogAlert {
+		t.Fatal("backlog alert = false before the command failures")
+	}
+	env.client.AddHook(&pipelineMonitorCommandFailer{commands: map[string]bool{
+		"xlen": true, "xrange": true, "xpending": true,
+	}})
+
+	status := env.sample(t)
+
+	if status.Direct.LastError == "" {
+		t.Fatal("last error = empty, want the injected failures")
+	}
+	if !status.Direct.BacklogAlert {
+		t.Fatal("backlog alert = false after every stream leg failed, want the previous decision")
+	}
+	if len(env.logs) != 1 {
+		t.Fatalf("logs = %v, want no fake recovery line", env.logs)
+	}
+}
+
 func TestPipelineMonitorReportsReconcileStatus(t *testing.T) {
 	env := newPipelineMonitorTestEnv(t, PipelineMonitorOptions{
 		Reconcile: func() ReconcileStatus {
@@ -463,4 +540,149 @@ func TestPipelineMonitorAMQPDeadLetterCounterWithoutBroker(t *testing.T) {
 	if _, err := counter.CountDeadLetters(context.Background(), DeadLetterDirect); err == nil {
 		t.Fatal("CountDeadLetters error = nil, want the dial failure")
 	}
+}
+
+func TestPipelineMonitorAMQPDeadLetterCounterSkipsDialOnCanceledContext(t *testing.T) {
+	dials := 0
+	counter := &monitorAMQPDeadLetterCounter{
+		open: func(context.Context) (monitorAMQPProber, error) {
+			dials++
+			return &fakeMonitorAMQPProber{}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := counter.CountDeadLetters(ctx, DeadLetterDirect); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+	if dials != 0 {
+		t.Fatalf("dial calls = %d, want none", dials)
+	}
+}
+
+func TestPipelineMonitorAMQPDeadLetterCounterReusesConnection(t *testing.T) {
+	prober := &fakeMonitorAMQPProber{depth: 7}
+	dials := 0
+	counter := &monitorAMQPDeadLetterCounter{
+		open: func(context.Context) (monitorAMQPProber, error) {
+			dials++
+			return prober, nil
+		},
+	}
+
+	for index := 0; index < 2; index++ {
+		depth, err := counter.CountDeadLetters(context.Background(), DeadLetterDirect)
+		if err != nil || depth != 7 {
+			t.Fatalf("sample %d: depth = %d, err = %v, want 7", index, depth, err)
+		}
+	}
+	if dials != 1 {
+		t.Fatalf("dial calls = %d, want one cached connection", dials)
+	}
+	if prober.closed != 0 {
+		t.Fatalf("cached connection closed %d times, want 0", prober.closed)
+	}
+
+	counter.Close()
+	if prober.closed != 1 {
+		t.Fatalf("cached connection closed %d times after Close, want 1", prober.closed)
+	}
+}
+
+func TestPipelineMonitorAMQPDeadLetterCounterBoundsProbe(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	prober := &fakeMonitorAMQPProber{depth: 3, block: release}
+	counter := &monitorAMQPDeadLetterCounter{
+		open: func(context.Context) (monitorAMQPProber, error) { return prober, nil },
+		// An already-canceled probe context exercises the deadline path
+		// without sleeping.
+		probeContext: func(context.Context) (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx, cancel
+		},
+	}
+
+	if _, err := counter.CountDeadLetters(context.Background(), DeadLetterDirect); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want the probe timeout", err)
+	}
+	if prober.closed != 1 {
+		t.Fatalf("connection closed %d times after a probe timeout, want 1", prober.closed)
+	}
+}
+
+func TestPipelineMonitorAMQPDeadLetterCounterReopensAfterProbeError(t *testing.T) {
+	failing := &fakeMonitorAMQPProber{err: errors.New("queue missing")}
+	healthy := &fakeMonitorAMQPProber{depth: 4}
+	probers := []monitorAMQPProber{failing, healthy}
+	dials := 0
+	counter := &monitorAMQPDeadLetterCounter{
+		open: func(context.Context) (monitorAMQPProber, error) {
+			prober := probers[dials]
+			dials++
+			return prober, nil
+		},
+	}
+
+	if _, err := counter.CountDeadLetters(context.Background(), DeadLetterDirect); err == nil {
+		t.Fatal("error = nil, want the probe failure")
+	}
+	if failing.closed != 1 {
+		t.Fatalf("failed connection closed %d times, want 1", failing.closed)
+	}
+
+	depth, err := counter.CountDeadLetters(context.Background(), DeadLetterDirect)
+	if err != nil || depth != 4 {
+		t.Fatalf("depth = %d, err = %v, want 4 after reopening", depth, err)
+	}
+	if dials != 2 {
+		t.Fatalf("dial calls = %d, want a reopen after the probe error", dials)
+	}
+}
+
+// pipelineMonitorCommandFailer injects Redis command failures while every
+// other command still reaches miniredis.
+type pipelineMonitorCommandFailer struct {
+	commands map[string]bool
+}
+
+func (f *pipelineMonitorCommandFailer) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (f *pipelineMonitorCommandFailer) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if f.commands[cmd.Name()] {
+			return fmt.Errorf("injected %s failure", cmd.Name())
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (f *pipelineMonitorCommandFailer) ProcessPipelineHook(
+	next redis.ProcessPipelineHook,
+) redis.ProcessPipelineHook {
+	return next
+}
+
+// fakeMonitorAMQPProber stands in for an AMQP connection and channel.
+type fakeMonitorAMQPProber struct {
+	depth  int64
+	err    error
+	block  <-chan struct{}
+	closed int
+}
+
+func (f *fakeMonitorAMQPProber) QueueDepth(string) (int64, error) {
+	if f.block != nil {
+		<-f.block
+	}
+	return f.depth, f.err
+}
+
+func (f *fakeMonitorAMQPProber) Close() error {
+	f.closed++
+	return nil
 }

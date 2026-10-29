@@ -37,12 +37,21 @@ var transientMySQLNumbers = map[uint16]bool{
 	1041: true, // out of memory
 	1053: true, // server shutdown in progress
 	1077: true, // server shutdown complete
+	1105: true, // unknown error
+	1152: true, // connection aborted
+	1153: true, // packets out of order
 	1205: true, // lock wait timeout exceeded
 	1213: true, // deadlock found, transaction rolled back
+	1290: true, // server in read-only mode
+	1317: true, // query execution interrupted
+	1836: true, // server in read-only mode
+	1927: true, // connection killed
 	2002: true, // cannot connect to server
 	2003: true, // cannot connect to server
 	2006: true, // server has gone away
 	2013: true, // lost connection during query
+	3024: true, // max execution time exceeded
+	4031: true, // client disconnected because of inactivity
 }
 
 // classifyPersistError maps a failed store write to the consumer reaction.
@@ -66,6 +75,8 @@ func isTransientPersistError(err error) bool {
 	}
 	if errors.Is(err, driver.ErrBadConn) ||
 		errors.Is(err, mysql.ErrInvalidConn) ||
+		errors.Is(err, mysql.ErrPktSync) ||
+		errors.Is(err, mysql.ErrMalformPkt) ||
 		errors.Is(err, sql.ErrConnDone) ||
 		errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||

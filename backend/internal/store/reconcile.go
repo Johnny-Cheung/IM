@@ -103,22 +103,24 @@ func (s *Store) ListGroupSeqStats(
 	return result, nil
 }
 
-// ListConversationSeqs returns the stored seqs of one private conversation up
-// to and including upTo, ascending.
+// ListConversationSeqs returns one ascending page of the stored seqs of a
+// private conversation, restricted to afterSeq < seq <= upTo.
 func (s *Store) ListConversationSeqs(
 	ctx context.Context,
-	lowID, highID, upTo uint64,
+	lowID, highID, upTo, afterSeq uint64,
+	limit int,
 ) ([]uint64, error) {
-	if upTo == 0 {
+	if upTo == 0 || limit <= 0 {
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT seq
 		 FROM messages
 		 WHERE conversation_low_id = ? AND conversation_high_id = ?
-		   AND seq IS NOT NULL AND seq <= ?
-		 ORDER BY seq`,
-		lowID, highID, upTo,
+		   AND seq IS NOT NULL AND seq <= ? AND seq > ?
+		 ORDER BY seq
+		 LIMIT ?`,
+		lowID, highID, upTo, afterSeq, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list conversation seqs: %w", err)
@@ -139,21 +141,23 @@ func (s *Store) ListConversationSeqs(
 	return result, nil
 }
 
-// ListGroupSeqs returns the stored seqs of one group up to and including upTo,
-// ascending.
+// ListGroupSeqs returns one ascending page of the stored seqs of one group,
+// restricted to afterSeq < seq <= upTo.
 func (s *Store) ListGroupSeqs(
 	ctx context.Context,
-	groupID, upTo uint64,
+	groupID, upTo, afterSeq uint64,
+	limit int,
 ) ([]uint64, error) {
-	if upTo == 0 {
+	if upTo == 0 || limit <= 0 {
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT seq
 		 FROM group_messages
-		 WHERE group_id = ? AND seq IS NOT NULL AND seq <= ?
-		 ORDER BY seq`,
-		groupID, upTo,
+		 WHERE group_id = ? AND seq IS NOT NULL AND seq <= ? AND seq > ?
+		 ORDER BY seq
+		 LIMIT ?`,
+		groupID, upTo, afterSeq, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list group seqs: %w", err)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"log"
 	"sort"
 	"strings"
@@ -116,7 +117,8 @@ func (f *fakeReconcileStore) ListGroupSeqStats(
 
 func (f *fakeReconcileStore) ListConversationSeqs(
 	_ context.Context,
-	lowID, highID, upTo uint64,
+	lowID, highID, upTo, afterSeq uint64,
+	limit int,
 ) ([]uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -124,12 +126,13 @@ func (f *fakeReconcileStore) ListConversationSeqs(
 	if f.seqsErr != nil {
 		return nil, f.seqsErr
 	}
-	return filterSeqs(f.directSeqs[[2]uint64{lowID, highID}], upTo), nil
+	return filterSeqs(f.directSeqs[[2]uint64{lowID, highID}], upTo, afterSeq, limit), nil
 }
 
 func (f *fakeReconcileStore) ListGroupSeqs(
 	_ context.Context,
-	groupID, upTo uint64,
+	groupID, upTo, afterSeq uint64,
+	limit int,
 ) ([]uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -137,16 +140,27 @@ func (f *fakeReconcileStore) ListGroupSeqs(
 	if f.seqsErr != nil {
 		return nil, f.seqsErr
 	}
-	return filterSeqs(f.groupSeqs[groupID], upTo), nil
+	return filterSeqs(f.groupSeqs[groupID], upTo, afterSeq, limit), nil
 }
 
-func filterSeqs(stored []uint64, upTo uint64) []uint64 {
-	seqs := append([]uint64(nil), stored...)
-	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
-	result := make([]uint64, 0, len(seqs))
-	for _, seq := range seqs {
-		if seq <= upTo {
-			result = append(result, seq)
+func filterSeqs(stored []uint64, upTo, afterSeq uint64, limit int) []uint64 {
+	if limit <= 0 {
+		return nil
+	}
+	seqs := stored
+	if !sort.SliceIsSorted(seqs, func(i, j int) bool { return seqs[i] < seqs[j] }) {
+		seqs = append([]uint64(nil), stored...)
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+	}
+	start := sort.Search(len(seqs), func(i int) bool { return seqs[i] > afterSeq })
+	result := make([]uint64, 0, limit)
+	for _, seq := range seqs[start:] {
+		if seq > upTo {
+			break
+		}
+		result = append(result, seq)
+		if len(result) == limit {
+			break
 		}
 	}
 	return result
@@ -823,15 +837,446 @@ func TestReconcileCounterKeyParsing(t *testing.T) {
 	}
 }
 
-func TestReconcileMissingSeqs(t *testing.T) {
-	missing := reconcileMissingSeqs([]uint64{1, 2, 5}, 5)
-	if len(missing) != 2 || missing[0] != 3 || missing[1] != 4 {
-		t.Fatalf("missing = %v, want [3 4]", missing)
+func TestWalkMissingSeqs(t *testing.T) {
+	stored := []uint64{1, 2, 5}
+	fetch := func(_ context.Context, after uint64) ([]uint64, error) {
+		return filterSeqs(stored, 5, after, 100), nil
 	}
-	if got := reconcileMissingSeqs([]uint64{1, 2, 3}, 3); len(got) != 0 {
-		t.Fatalf("missing = %v, want none", got)
+	var got []uint64
+	next, truncated, err := walkMissingSeqs(
+		context.Background(), 1, 5, 100, 100, fetch,
+		func(seq uint64) error {
+			got = append(got, seq)
+			return nil
+		},
+	)
+	if err != nil || truncated || next != 0 {
+		t.Fatalf("walk = (next %d, truncated %v, err %v), want complete", next, truncated, err)
 	}
-	if got := reconcileMissingSeqs(nil, 0); len(got) != 0 {
-		t.Fatalf("missing = %v, want none", got)
+	if len(got) != 2 || got[0] != 3 || got[1] != 4 {
+		t.Fatalf("missing = %v, want [3 4]", got)
+	}
+
+	got = nil
+	next, truncated, err = walkMissingSeqs(
+		context.Background(), 1, 5, 100, 1, fetch,
+		func(seq uint64) error {
+			got = append(got, seq)
+			return nil
+		},
+	)
+	if err != nil || !truncated || next != 4 {
+		t.Fatalf("capped walk = (next %d, truncated %v, err %v), want next 4", next, truncated, err)
+	}
+	if len(got) != 1 || got[0] != 3 {
+		t.Fatalf("capped missing = %v, want [3]", got)
+	}
+
+	empty := func(_ context.Context, _ uint64) ([]uint64, error) { return nil, nil }
+	next, truncated, err = walkMissingSeqs(
+		context.Background(), 1, 3, 100, 100, empty,
+		func(uint64) error { return nil },
+	)
+	if err != nil || truncated || next != 0 {
+		t.Fatalf("empty walk = (next %d, truncated %v, err %v), want complete", next, truncated, err)
+	}
+}
+
+func TestWalkMissingSeqsPagesWithBoundedCalls(t *testing.T) {
+	stored := make([]uint64, 0, 9)
+	for seq := uint64(1); seq <= 10; seq++ {
+		if seq == 5 {
+			continue
+		}
+		stored = append(stored, seq)
+	}
+	calls := 0
+	fetch := func(_ context.Context, after uint64) ([]uint64, error) {
+		calls++
+		return filterSeqs(stored, 10, after, 3), nil
+	}
+	var got []uint64
+	next, truncated, err := walkMissingSeqs(
+		context.Background(), 1, 10, 3, 100, fetch,
+		func(seq uint64) error {
+			got = append(got, seq)
+			return nil
+		},
+	)
+	if err != nil || truncated || next != 0 {
+		t.Fatalf("walk = (next %d, truncated %v, err %v), want complete", next, truncated, err)
+	}
+	if len(got) != 1 || got[0] != 5 {
+		t.Fatalf("missing = %v, want [5]", got)
+	}
+	if calls != 3 {
+		t.Fatalf("page calls = %d, want 3 (9 stored seqs in pages of 3)", calls)
+	}
+}
+
+// seedReconcileEntity writes an entity hash field by field so a test can omit
+// or blank a field.
+func seedReconcileEntity(t *testing.T, client redis.UniversalClient, key string, fields map[string]interface{}) {
+	t.Helper()
+	if err := client.HSet(context.Background(), key, fields).Err(); err != nil {
+		t.Fatalf("seed entity %s: %v", key, err)
+	}
+}
+
+func TestReconcilerPhasesHaveIndependentBudgets(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	old := now.Add(-10 * time.Minute)
+	logs := captureReconcileLog(t)
+
+	fakeStore := newFakeReconcileStore()
+	const suspects = 60
+	for index := 0; index < suspects; index++ {
+		lowID := uint64(2*index + 1)
+		highID := lowID + 1
+		setDirectSequence(t, client, lowID, highID, 2)
+		pair := [2]uint64{lowID, highID}
+		fakeStore.conversations = append(fakeStore.conversations, store.ConversationSeqStat{
+			LowID: lowID, HighID: highID, Count: 1, MaxSeq: 1,
+		})
+		fakeStore.directSeqs[pair] = []uint64{1}
+	}
+	setGroupSequence(t, client, 7, 2)
+	seedReconcileGroupMessage(t, client, 7, 202, 2, old)
+	fakeStore.groups = []store.GroupSeqStat{{GroupID: 7, Count: 1, MaxSeq: 1}}
+	fakeStore.groupSeqs[7] = []uint64{1}
+
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+	result, err := reconciler.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.Unresolved != 50 || result.Repaired != 1 {
+		t.Fatalf("result = %+v, want 50 unresolved direct suspects and the group repaired", result)
+	}
+	_, persistedGroups, _, _, _ := fakeStore.snapshot()
+	if len(persistedGroups) != 1 || persistedGroups[0].ID != 202 {
+		t.Fatalf("persisted groups = %+v, want group message 202 repaired despite the spent direct budget", persistedGroups)
+	}
+	lateMarker := "reconcile unresolved direct:119:120:2"
+	if strings.Contains(logs.String(), lateMarker) {
+		t.Fatalf("60th direct suspect was attempted in run 1: %s", logs.String())
+	}
+
+	if _, err := reconciler.RunOnce(context.Background()); err != nil {
+		t.Fatalf("second RunOnce() error = %v", err)
+	}
+	if !strings.Contains(logs.String(), lateMarker) {
+		t.Fatalf("60th direct suspect was not reached on the next run: %s", logs.String())
+	}
+}
+
+func TestReconcilerRotatesToLaterSuspect(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	old := now.Add(-10 * time.Minute)
+	setDirectSequence(t, client, 1, 2, 2)
+	setDirectSequence(t, client, 3, 4, 2)
+	setDirectSequence(t, client, 5, 6, 2)
+	seedReconcileDirectMessage(t, client, 5, 6, 106, 2, old)
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{
+		{LowID: 1, HighID: 2, Count: 1, MaxSeq: 1},
+		{LowID: 3, HighID: 4, Count: 1, MaxSeq: 1},
+		{LowID: 5, HighID: 6, Count: 1, MaxSeq: 1},
+	}
+	fakeStore.directSeqs[[2]uint64{1, 2}] = []uint64{1}
+	fakeStore.directSeqs[[2]uint64{3, 4}] = []uint64{1}
+	fakeStore.directSeqs[[2]uint64{5, 6}] = []uint64{1}
+
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{MaxDetail: 2})
+	result, err := reconciler.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.Unresolved != 2 || result.Repaired != 0 {
+		t.Fatalf("first result = %+v, want the two repair-less suspects attempted", result)
+	}
+	result, err = reconciler.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("second RunOnce() error = %v", err)
+	}
+	if result.Repaired != 1 {
+		t.Fatalf("second result = %+v, want the later repairable conversation reached", result)
+	}
+	persisted, _, _, _, _ := fakeStore.snapshot()
+	if len(persisted) != 1 || persisted[0].ID != 106 {
+		t.Fatalf("persisted = %+v, want message 106", persisted)
+	}
+}
+
+func TestReconcilerRejectsCounterAboveMaxSafeSeq(t *testing.T) {
+	cases := []struct {
+		name    string
+		counter uint64
+	}{
+		{"above max safe seq", store.MaxSafeSeq + 1},
+		{"max uint64", ^uint64(0)},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			client, _ := newReconcileTestClient(t)
+			setDirectSequence(t, client, 1, 2, testCase.counter)
+
+			fakeStore := newFakeReconcileStore()
+			fakeStore.conversations = []store.ConversationSeqStat{{LowID: 1, HighID: 2, Count: 1, MaxSeq: 1}}
+			fakeStore.directSeqs[[2]uint64{1, 2}] = []uint64{1}
+			logs := captureReconcileLog(t)
+
+			reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+			result, err := reconciler.RunOnce(context.Background())
+			if err != nil {
+				t.Fatalf("RunOnce() error = %v", err)
+			}
+			if result.Unresolved != 1 || result.Repaired != 0 {
+				t.Fatalf("result = %+v, want one unresolved and no repair", result)
+			}
+			_, _, attempts, _, detailCalls := fakeStore.snapshot()
+			if attempts != 0 || detailCalls != 0 {
+				t.Fatalf("attempts = %d detail calls = %d, want the counter rejected before any lookup", attempts, detailCalls)
+			}
+			if !strings.Contains(logs.String(), "exceeds MaxSafeSeq") {
+				t.Fatalf("log = %s, want the out-of-range counter reported", logs.String())
+			}
+		})
+	}
+}
+
+func TestReconcilerPagesLargeConversationGapWalk(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	const gap = 100001
+	const stored = 200000
+	const upTo = 200001
+	setDirectSequence(t, client, 1, 2, upTo)
+	seedReconcileDirectMessage(t, client, 1, 2, 900001, gap, now.Add(-10*time.Minute))
+
+	seqs := make([]uint64, 0, stored)
+	for seq := uint64(1); seq <= upTo; seq++ {
+		if seq == gap {
+			continue
+		}
+		seqs = append(seqs, seq)
+	}
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{{LowID: 1, HighID: 2, Count: stored, MaxSeq: upTo}}
+	fakeStore.directSeqs[[2]uint64{1, 2}] = seqs
+
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{Batch: 1000})
+	result, err := reconciler.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.Repaired != 1 || result.Unresolved != 0 {
+		t.Fatalf("result = %+v, want the single gap repaired", result)
+	}
+	persisted, _, attempts, _, detailCalls := fakeStore.snapshot()
+	if len(persisted) != 1 || persisted[0].Seq != gap || persisted[0].ID != 900001 {
+		t.Fatalf("persisted = %+v, want only seq %d", persisted, gap)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+	if detailCalls < 2 || detailCalls > 202 {
+		t.Fatalf("detail page calls = %d, want the conversation walked in pages of 1000", detailCalls)
+	}
+}
+
+func TestReconcilerCapsMissingSeqsPerConversationAndResumes(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	setDirectSequence(t, client, 1, 2, 1501)
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{{LowID: 1, HighID: 2, Count: 1, MaxSeq: 1}}
+	fakeStore.directSeqs[[2]uint64{1, 2}] = []uint64{1}
+
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+	result, err := reconciler.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.Unresolved != reconcileMaxMissingPerConversation || result.Deferred != 1 {
+		t.Fatalf("first result = %+v, want the per-conversation cap hit", result)
+	}
+	result, err = reconciler.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("second RunOnce() error = %v", err)
+	}
+	if result.Unresolved != 500 || result.Deferred != 0 {
+		t.Fatalf("second result = %+v, want the remaining 500 seqs retried", result)
+	}
+	if result.Unresolved+reconcileMaxMissingPerConversation != 1500 {
+		t.Fatalf("walked %d + %d seqs, want the whole 1500-seq range covered", reconcileMaxMissingPerConversation, result.Unresolved)
+	}
+}
+
+func TestReconcilerLogThrottleKeepsFreshEntries(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	setDirectSequence(t, client, 1, 2, 2)
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{{LowID: 1, HighID: 2, Count: 1, MaxSeq: 1}}
+	fakeStore.directSeqs[[2]uint64{1, 2}] = []uint64{1}
+	logs := captureReconcileLog(t)
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+
+	reconciler.mu.Lock()
+	for index := 0; index < reconcileLogKeyLimit; index++ {
+		reconciler.logged[fmt.Sprintf("pre:%d", index)] = now
+	}
+	reconciler.mu.Unlock()
+
+	if _, err := reconciler.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if strings.Contains(logs.String(), "reconcile unresolved direct:1:2:2") {
+		t.Fatalf("a new item was logged while the map was full of fresh entries: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "suppressed=1") {
+		t.Fatalf("summary = %s, want the suppressed item counted", logs.String())
+	}
+	reconciler.mu.Lock()
+	size := len(reconciler.logged)
+	_, kept := reconciler.logged["pre:0"]
+	reconciler.mu.Unlock()
+	if size != reconcileLogKeyLimit || !kept {
+		t.Fatalf("logged map = %d entries (pre:0 kept %v), want fresh entries kept", size, kept)
+	}
+}
+
+func TestReconcilerLogThrottleExpiresStaleEntries(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	now := reconcileTestNow()
+	setDirectSequence(t, client, 1, 2, 2)
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{{LowID: 1, HighID: 2, Count: 1, MaxSeq: 1}}
+	fakeStore.directSeqs[[2]uint64{1, 2}] = []uint64{1}
+	logs := captureReconcileLog(t)
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+
+	reconciler.mu.Lock()
+	for index := 0; index < reconcileLogKeyLimit; index++ {
+		reconciler.logged[fmt.Sprintf("stale:%d", index)] = now.Add(-2 * time.Hour)
+	}
+	reconciler.mu.Unlock()
+
+	if _, err := reconciler.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if !strings.Contains(logs.String(), "reconcile unresolved direct:1:2:2") {
+		t.Fatalf("log = %s, want the expired map to make room", logs.String())
+	}
+	if !strings.Contains(logs.String(), "suppressed=0") {
+		t.Fatalf("summary = %s, want nothing suppressed", logs.String())
+	}
+}
+
+func TestReconcilerLogPerRunCap(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	setDirectSequence(t, client, 1, 2, 1501)
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.conversations = []store.ConversationSeqStat{{LowID: 1, HighID: 2, Count: 1, MaxSeq: 1}}
+	fakeStore.directSeqs[[2]uint64{1, 2}] = []uint64{1}
+	logs := captureReconcileLog(t)
+
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+	if _, err := reconciler.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if got := strings.Count(logs.String(), "reconcile unresolved direct:1:2:"); got != reconcileMaxLogsPerRun {
+		t.Fatalf("unresolved detail lines = %d, want the per-run cap %d", got, reconcileMaxLogsPerRun)
+	}
+	if !strings.Contains(logs.String(), "suppressed=500") {
+		t.Fatalf("summary = %s, want 500 suppressed items reported", logs.String())
+	}
+}
+
+func TestReconcilerIncompleteEntityNotPersisted(t *testing.T) {
+	cases := []struct {
+		name   string
+		fields map[string]interface{}
+	}{
+		{
+			name: "missing body",
+			fields: map[string]interface{}{
+				"id": 102, "seq": 2, "sender_id": 1, "recipient_id": 2,
+				"client_message_id": "c-102", "created_at_ms": reconcileTestNow().Add(-10 * time.Minute).UnixMilli(),
+			},
+		},
+		{
+			name: "blank body",
+			fields: map[string]interface{}{
+				"id": 102, "seq": 2, "sender_id": 1, "recipient_id": 2,
+				"client_message_id": "c-102", "body": "   ",
+				"created_at_ms": reconcileTestNow().Add(-10 * time.Minute).UnixMilli(),
+			},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			client, _ := newReconcileTestClient(t)
+			setDirectSequence(t, client, 1, 2, 2)
+			seedReconcileDirectIndex(t, client, 1, 2, 102, 2)
+			seedReconcileEntity(t, client, defaultKeyspace.messageKey(102), testCase.fields)
+
+			fakeStore := newFakeReconcileStore()
+			fakeStore.conversations = []store.ConversationSeqStat{{LowID: 1, HighID: 2, Count: 1, MaxSeq: 1}}
+			fakeStore.directSeqs[[2]uint64{1, 2}] = []uint64{1}
+			logs := captureReconcileLog(t)
+
+			reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+			result, err := reconciler.RunOnce(context.Background())
+			if err != nil {
+				t.Fatalf("RunOnce() error = %v", err)
+			}
+			if result.Unresolved != 1 || result.Repaired != 0 {
+				t.Fatalf("result = %+v, want one unresolved and no repair", result)
+			}
+			_, _, attempts, _, _ := fakeStore.snapshot()
+			if attempts != 0 {
+				t.Fatalf("attempts = %d, want the incomplete entity rejected before PersistMessage", attempts)
+			}
+			if !strings.Contains(logs.String(), "entity is incomplete") {
+				t.Fatalf("log = %s, want the incomplete entity reported", logs.String())
+			}
+		})
+	}
+}
+
+func TestReconcilerIncompleteGroupEntityNotPersisted(t *testing.T) {
+	client, _ := newReconcileTestClient(t)
+	setGroupSequence(t, client, 7, 2)
+	seedReconcileGroupIndex(t, client, 7, 201, 2)
+	seedReconcileEntity(t, client, defaultKeyspace.groupMessageKey(201), map[string]interface{}{
+		"id": 201, "seq": 2, "group_id": 7, "sender_id": 42,
+		"client_message_id": "c-201", "body": "body-201",
+		"created_at_ms":   reconcileTestNow().Add(-10 * time.Minute).UnixMilli(),
+		"sender_username": "alice",
+	})
+
+	fakeStore := newFakeReconcileStore()
+	fakeStore.groups = []store.GroupSeqStat{{GroupID: 7, Count: 1, MaxSeq: 1}}
+	fakeStore.groupSeqs[7] = []uint64{1}
+
+	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
+	result, err := reconciler.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.Unresolved != 1 || result.Repaired != 0 {
+		t.Fatalf("result = %+v, want the missing sender snapshot reported", result)
+	}
+	_, persistedGroups, attempts, _, _ := fakeStore.snapshot()
+	if attempts != 0 || len(persistedGroups) != 0 {
+		t.Fatalf("attempts = %d groups = %+v, want the incomplete group entity rejected", attempts, persistedGroups)
 	}
 }

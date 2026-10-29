@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -97,6 +98,11 @@ func TestGroupRedisAcceptorAcceptsDeduplicatesAndRejects(t *testing.T) {
 }
 
 func TestGroupRedisAcceptorNeverTrimsMessageStream(t *testing.T) {
+	// A behavioral check with a few entries cannot prove trimming is off: any
+	// MAXLEN above three would still pass. Assert on the script text instead.
+	if strings.Contains(groupAcceptScriptSource, "MAXLEN") {
+		t.Fatalf("group_accept.lua trims the message stream:\n%s", groupAcceptScriptSource)
+	}
 	client, _ := newGroupAcceptTest(t)
 	ctx := context.Background()
 	seedGroupProjection(t, client, 9, []uint64{1, 2})

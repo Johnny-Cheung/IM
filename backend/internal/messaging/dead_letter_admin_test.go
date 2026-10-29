@@ -238,18 +238,44 @@ func TestListDeadLettersRequeuesOnError(t *testing.T) {
 	}
 }
 
-func TestListDeadLettersStopsWhenQueueWraps(t *testing.T) {
+func TestListDeadLettersFailsOnRepeatedDeliveryTag(t *testing.T) {
 	delivery := dlqAdminTestDirect(1, "1", 1, nil)
 	fake := &dlqAdminFakeChannel{deliveries: []amqp091.Delivery{delivery, delivery}}
 	entries, err := ListDeadLetters(context.Background(), fake, dlqAdminDirectTopology, 5)
-	if err != nil {
-		t.Fatalf("ListDeadLetters() error = %v", err)
+	if err == nil {
+		t.Fatal("ListDeadLetters() error = nil, want repeated delivery tag error")
+	}
+	if !strings.Contains(err.Error(), "delivery tag 1 repeated") {
+		t.Fatalf("error = %v, want repeated delivery tag", err)
 	}
 	if len(entries) != 1 || fake.calls != 2 {
 		t.Fatalf("entries/calls = %d/%d, want 1/2", len(entries), fake.calls)
 	}
 	if len(fake.nacked) != 2 {
 		t.Fatalf("nacked = %#v, want the entry and the repeated delivery", fake.nacked)
+	}
+	for _, nack := range fake.nacked {
+		if !nack.requeue {
+			t.Fatalf("nacked without requeue: %#v", nack)
+		}
+	}
+}
+
+func TestListDeadLettersProcessesDuplicateMessageIDs(t *testing.T) {
+	fake := &dlqAdminFakeChannel{deliveries: []amqp091.Delivery{
+		dlqAdminTestDirect(1, "101", 3, nil),
+		dlqAdminTestDirect(2, "101", 3, nil),
+		dlqAdminTestDirect(3, "102", 4, nil),
+	}}
+	entries, err := ListDeadLetters(context.Background(), fake, dlqAdminDirectTopology, 5)
+	if err != nil {
+		t.Fatalf("ListDeadLetters() error = %v", err)
+	}
+	if len(entries) != 3 || fake.calls != 4 {
+		t.Fatalf("entries/calls = %d/%d, want 3 entries and the empty probe", len(entries), fake.calls)
+	}
+	if entries[0].ID != 101 || entries[1].ID != 101 || entries[2].ID != 102 {
+		t.Fatalf("entries = %#v", entries)
 	}
 }
 
@@ -351,6 +377,38 @@ func TestReplayDeadLettersSkipsNonMatching(t *testing.T) {
 	}
 }
 
+func TestReplayDeadLettersReplaysDuplicateMessageIDs(t *testing.T) {
+	fake := &dlqAdminFakeChannel{deliveries: []amqp091.Delivery{
+		dlqAdminTestDirect(1, "101", 3, nil),
+		dlqAdminTestDirect(2, "101", 3, nil),
+	}}
+	result, err := ReplayDeadLetters(context.Background(), fake, dlqAdminDirectTopology, 0, 10)
+	if err != nil {
+		t.Fatalf("ReplayDeadLetters() error = %v", err)
+	}
+	if result.Scanned != 2 || result.Replayed != 2 || result.Skipped != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	if len(fake.published) != 2 || len(fake.acked) != 2 || len(fake.nacked) != 0 {
+		t.Fatalf("published=%d acked=%v nacked=%#v", len(fake.published), fake.acked, fake.nacked)
+	}
+}
+
+func TestReplayDeadLettersFailsOnRepeatedDeliveryTag(t *testing.T) {
+	delivery := dlqAdminTestDirect(1, "101", 3, nil)
+	fake := &dlqAdminFakeChannel{deliveries: []amqp091.Delivery{delivery, delivery}}
+	result, err := ReplayDeadLetters(context.Background(), fake, dlqAdminDirectTopology, 0, 10)
+	if err == nil {
+		t.Fatal("ReplayDeadLetters() error = nil, want repeated delivery tag error")
+	}
+	if result.Scanned != 1 || result.Replayed != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	if len(fake.nacked) != 1 || fake.nacked[0].tag != 1 || !fake.nacked[0].requeue {
+		t.Fatalf("nacked = %#v, want the repeated tag requeued", fake.nacked)
+	}
+}
+
 func TestReplayDeadLettersKeepsNonNumericMessageID(t *testing.T) {
 	delivery := dlqAdminTestDirect(1, "", 3, nil)
 	fake := &dlqAdminFakeChannel{deliveries: []amqp091.Delivery{delivery}}
@@ -360,6 +418,116 @@ func TestReplayDeadLettersKeepsNonNumericMessageID(t *testing.T) {
 	}
 	if result.Replayed != 1 || len(fake.published) != 1 || fake.published[0].MessageId != "" {
 		t.Fatalf("result=%#v published=%#v", result, fake.published)
+	}
+}
+
+// dlqReplayAMQPChannel is a broker-free dlqAdminAMQPChannel.
+type dlqReplayAMQPChannel struct {
+	confirms  chan amqp091.Confirmation
+	returns   chan amqp091.Return
+	nextSeq   uint64
+	delivered []amqp091.Delivery
+	next      int
+	mandatory []bool
+	returned  *amqp091.Return
+	acked     []uint64
+	nacked    []dlqAdminNack
+}
+
+func newDLQReplayAMQPChannel(deliveries ...amqp091.Delivery) *dlqReplayAMQPChannel {
+	return &dlqReplayAMQPChannel{
+		confirms:  make(chan amqp091.Confirmation, 1),
+		returns:   make(chan amqp091.Return, 1),
+		nextSeq:   1,
+		delivered: deliveries,
+	}
+}
+
+func (f *dlqReplayAMQPChannel) Confirm(bool) error {
+	return nil
+}
+
+func (f *dlqReplayAMQPChannel) NotifyPublish(c chan amqp091.Confirmation) chan amqp091.Confirmation {
+	f.confirms = c
+	return c
+}
+
+func (f *dlqReplayAMQPChannel) NotifyReturn(c chan amqp091.Return) chan amqp091.Return {
+	f.returns = c
+	return c
+}
+
+func (f *dlqReplayAMQPChannel) GetNextPublishSeqNo() uint64 {
+	return f.nextSeq
+}
+
+func (f *dlqReplayAMQPChannel) PublishWithContext(
+	ctx context.Context,
+	exchange, key string,
+	mandatory, immediate bool,
+	msg amqp091.Publishing,
+) error {
+	f.mandatory = append(f.mandatory, mandatory)
+	if f.returned != nil {
+		f.returns <- *f.returned
+	}
+	f.confirms <- amqp091.Confirmation{DeliveryTag: f.nextSeq, Ack: true}
+	return nil
+}
+
+func (f *dlqReplayAMQPChannel) Get(queue string, autoAck bool) (amqp091.Delivery, bool, error) {
+	if f.next >= len(f.delivered) {
+		return amqp091.Delivery{}, false, nil
+	}
+	delivery := f.delivered[f.next]
+	f.next++
+	return delivery, true, nil
+}
+
+func (f *dlqReplayAMQPChannel) Ack(deliveryTag uint64, multiple bool) error {
+	f.acked = append(f.acked, deliveryTag)
+	return nil
+}
+
+func (f *dlqReplayAMQPChannel) Nack(deliveryTag uint64, multiple, requeue bool) error {
+	f.nacked = append(f.nacked, dlqAdminNack{tag: deliveryTag, requeue: requeue})
+	return nil
+}
+
+func (f *dlqReplayAMQPChannel) QueueDeclarePassive(
+	name string,
+	durable, autoDelete, exclusive, noWait bool,
+	args amqp091.Table,
+) (amqp091.Queue, error) {
+	return amqp091.Queue{Name: name}, nil
+}
+
+func TestReplayDeadLettersFailsWhenReplayUnroutable(t *testing.T) {
+	fake := newDLQReplayAMQPChannel(dlqAdminTestDirect(1, "101", 3, nil))
+	fake.returned = &amqp091.Return{
+		ReplyCode:  312,
+		ReplyText:  "NO_ROUTE",
+		Exchange:   dlqAdminDirectTopology.SourceExchange,
+		RoutingKey: dlqAdminDirectTopology.SourceRoutingKey,
+	}
+	channel := &AMQPDeadLetterChannel{
+		channel:  fake,
+		confirms: fake.confirms,
+		returns:  fake.returns,
+		timeout:  10 * time.Millisecond,
+	}
+	result, err := ReplayDeadLetters(context.Background(), channel, dlqAdminDirectTopology, 0, 10)
+	if err == nil || !strings.Contains(err.Error(), "unroutable") {
+		t.Fatalf("ReplayDeadLetters() error = %v, want unroutable error", err)
+	}
+	if result.Replayed != 0 || len(fake.mandatory) != 1 || !fake.mandatory[0] {
+		t.Fatalf("result=%#v mandatory=%v, want mandatory publish and no replay", result, fake.mandatory)
+	}
+	if len(fake.acked) != 0 {
+		t.Fatalf("acked = %v, an unroutable replay must keep the dead letter", fake.acked)
+	}
+	if len(fake.nacked) != 1 || fake.nacked[0].tag != 1 || !fake.nacked[0].requeue {
+		t.Fatalf("nacked = %#v, want tag 1 requeued", fake.nacked)
 	}
 }
 
@@ -381,6 +549,20 @@ func TestDiscardDeadLettersAcksOnlyMatching(t *testing.T) {
 	}
 	if len(fake.nacked) != 2 || len(fake.published) != 0 {
 		t.Fatalf("nacked=%#v published=%#v", fake.nacked, fake.published)
+	}
+}
+
+func TestDiscardDeadLettersDiscardsDuplicateMessageIDs(t *testing.T) {
+	fake := &dlqAdminFakeChannel{deliveries: []amqp091.Delivery{
+		dlqAdminTestDirect(1, "101", 3, nil),
+		dlqAdminTestDirect(2, "101", 3, nil),
+	}}
+	discarded, err := DiscardDeadLetters(context.Background(), fake, dlqAdminDirectTopology, 0, 10)
+	if err != nil {
+		t.Fatalf("DiscardDeadLetters() error = %v", err)
+	}
+	if discarded != 2 || len(fake.acked) != 2 || len(fake.nacked) != 0 {
+		t.Fatalf("discarded=%d acked=%v nacked=%#v", discarded, fake.acked, fake.nacked)
 	}
 }
 

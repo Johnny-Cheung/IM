@@ -2,12 +2,17 @@ package messaging
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+	"github.com/rabbitmq/amqp091-go"
+
+	"github.com/Johnny-Cheung/IM/backend/internal/config"
 )
 
 func TestGroupConsumerDeadLettersMessageClassAfterSixAttempts(t *testing.T) {
@@ -105,5 +110,60 @@ func TestGroupConsumerMalformedBodyDeadLettersImmediately(t *testing.T) {
 	}
 	if delivery.acks != 1 || delivery.nacks != 0 {
 		t.Fatalf("acks/nacks = %d/%d, want 1/0", delivery.acks, delivery.nacks)
+	}
+}
+
+func TestGroupConsumerRunBacksOffAndReportsReconnectErrors(t *testing.T) {
+	consumer := NewGroupMessageConsumer(
+		config.RabbitMQConfig{},
+		nil,
+		&consumeFakeGroupPersister{},
+		DefaultNamespace(),
+	)
+	attempts := 0
+	consumer.dialer = func(config.RabbitMQConfig) (*amqp091.Connection, error) {
+		attempts++
+		if attempts == 3 {
+			// A connection that persisted a message resets the reconnect delay.
+			consumer.status.recordPersisted(consumeTestNow)
+			return nil, errors.New("connection lost")
+		}
+		return nil, errors.New("consume failed")
+	}
+	var delays []time.Duration
+	consumer.wait = func(_ context.Context, delay time.Duration) bool {
+		delays = append(delays, delay)
+		return len(delays) < 5
+	}
+	var logs []string
+	consumer.logf = func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+
+	if err := consumer.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	status := consumer.Status()
+	const dialFailed = "dial RabbitMQ for group message consumer: consume failed"
+	if status.LastError != dialFailed || status.LastErrorAt.IsZero() {
+		t.Fatalf("status error = %q at %v", status.LastError, status.LastErrorAt)
+	}
+	wantLogs := []string{
+		"group message consumer reconnecting: " + dialFailed,
+		"group message consumer reconnecting: dial RabbitMQ for group message consumer: connection lost",
+		"group message consumer reconnecting: " + dialFailed,
+	}
+	if !reflect.DeepEqual(logs, wantLogs) {
+		t.Fatalf("logs = %v, want %v", logs, wantLogs)
+	}
+	wantDelays := []time.Duration{
+		time.Second,
+		2 * time.Second,
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+	}
+	if !reflect.DeepEqual(delays, wantDelays) {
+		t.Fatalf("delays = %v, want %v", delays, wantDelays)
 	}
 }

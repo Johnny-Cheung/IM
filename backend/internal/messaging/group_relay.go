@@ -225,11 +225,15 @@ func (r *GroupStreamRelay) relayEntry(
 }
 
 func (r *GroupStreamRelay) ackAndDelete(ctx context.Context, entryID string) error {
-	if err := r.redis.XAck(ctx, r.keyspace.groupMessageStreamKey(), groupRelayName(r.namespace), entryID).Err(); err != nil {
-		return fmt.Errorf("ack group stream message %s: %w", entryID, err)
-	}
-	if err := r.redis.XDel(ctx, r.keyspace.groupMessageStreamKey(), entryID).Err(); err != nil {
-		return fmt.Errorf("delete group stream message %s: %w", entryID, err)
+	// Atomic ack+delete: a zero delete count (entry already gone) is still success.
+	if err := ackDeleteScript.Run(
+		ctx,
+		r.redis,
+		[]string{r.keyspace.groupMessageStreamKey()},
+		groupRelayName(r.namespace),
+		entryID,
+	).Err(); err != nil {
+		return fmt.Errorf("ack and delete group stream message %s: %w", entryID, err)
 	}
 	return nil
 }

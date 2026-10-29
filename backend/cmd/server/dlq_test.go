@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -220,5 +222,195 @@ func TestDLQQueueMissing(t *testing.T) {
 	}
 	if dlqQueueMissing(errors.New("connection refused")) {
 		t.Fatal("unrelated error recognized as missing queue")
+	}
+}
+
+// dlqTestChannel is a broker-free messaging.DeadLetterChannel. Deliveries are
+// generated on demand and carry unique delivery tags.
+type dlqTestChannel struct {
+	queued     int
+	total      int
+	next       int
+	idFor      func(index int) string
+	published  []amqp091.Publishing
+	acked      []uint64
+	nacked     []uint64
+	publishErr error
+}
+
+func (f *dlqTestChannel) Get(queue string, autoAck bool) (amqp091.Delivery, bool, error) {
+	if f.next >= f.total {
+		return amqp091.Delivery{}, false, nil
+	}
+	index := f.next
+	f.next++
+	messageID := ""
+	if f.idFor != nil {
+		messageID = f.idFor(index)
+	}
+	return amqp091.Delivery{
+		DeliveryTag: uint64(index + 1),
+		MessageId:   messageID,
+		Body:        []byte(`{"server_message_id":1}`),
+	}, true, nil
+}
+
+func (f *dlqTestChannel) PublishConfirmed(
+	ctx context.Context,
+	exchange, routingKey string,
+	message amqp091.Publishing,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if f.publishErr != nil {
+		return f.publishErr
+	}
+	f.published = append(f.published, message)
+	return nil
+}
+
+func (f *dlqTestChannel) Ack(deliveryTag uint64) error {
+	f.acked = append(f.acked, deliveryTag)
+	return nil
+}
+
+func (f *dlqTestChannel) Nack(deliveryTag uint64, multiple, requeue bool) error {
+	f.nacked = append(f.nacked, deliveryTag)
+	return nil
+}
+
+func (f *dlqTestChannel) QueueDeclarePassive(name string) (amqp091.Queue, error) {
+	return amqp091.Queue{Name: name, Messages: f.queued}, nil
+}
+
+func dlqTestTopology() messaging.DeadLetterTopology {
+	return messaging.DeadLetterTopology{
+		Kind:             messaging.DeadLetterDirect,
+		Exchange:         "im.messages.dead",
+		Queue:            "im.messages.dead",
+		RoutingKey:       "direct.dead",
+		SourceExchange:   "im.messages",
+		SourceRoutingKey: "direct.persist",
+	}
+}
+
+func TestDLQScanLimitWidensOnlyForSpecificID(t *testing.T) {
+	cases := []struct {
+		name    string
+		command dlqCommand
+		queued  int
+		want    int
+	}{
+		{"all messages keeps limit", dlqCommand{limit: 100}, 500, 100},
+		{"specific id widens to depth", dlqCommand{messageID: 7, limit: 100}, 500, 500},
+		{"specific id beyond max is capped", dlqCommand{messageID: 7, limit: 100}, 20000, dlqMaxLimit},
+		{"specific id within limit unchanged", dlqCommand{messageID: 7, limit: 500}, 500, 500},
+	}
+	for _, testCase := range cases {
+		if got := dlqScanLimit(testCase.command, testCase.queued); got != testCase.want {
+			t.Fatalf("%s: limit = %d, want %d", testCase.name, got, testCase.want)
+		}
+	}
+}
+
+func TestDLQRunKindReplayFindsIDBeyondDefaultLimit(t *testing.T) {
+	fake := &dlqTestChannel{
+		queued: 500,
+		total:  500,
+		idFor: func(index int) string {
+			if index == 299 {
+				return "77"
+			}
+			return strconv.Itoa(1000 + index)
+		},
+	}
+	var out strings.Builder
+	command := dlqCommand{mode: dlqModeReplay, messageID: 77, limit: 100}
+	var totals dlqTotals
+	if err := dlqRunKindChannel(
+		context.Background(), fake, command, dlqTestTopology(), &out, &totals,
+	); err != nil {
+		t.Fatalf("dlqRunKindChannel() error = %v\n%s", err, out.String())
+	}
+	if len(fake.published) != 1 || fake.published[0].MessageId != "77" {
+		t.Fatalf("published = %#v, want only id 77", fake.published)
+	}
+	if len(fake.acked) != 1 || fake.acked[0] != 300 {
+		t.Fatalf("acked = %v, want tag 300", fake.acked)
+	}
+	if totals.replayed != 1 || totals.scanned != 500 {
+		t.Fatalf("totals = %#v", totals)
+	}
+	if !strings.Contains(out.String(), "replayed=1") {
+		t.Fatalf("output = %q, want replayed=1", out.String())
+	}
+}
+
+func TestDLQRunKindReplayFailsWhenIDNotInWindow(t *testing.T) {
+	fake := &dlqTestChannel{
+		queued: 20000,
+		total:  dlqMaxLimit,
+		idFor:  func(index int) string { return strconv.Itoa(1000 + index) },
+	}
+	var out strings.Builder
+	command := dlqCommand{mode: dlqModeReplay, messageID: 999999, limit: 100}
+	var totals dlqTotals
+	err := dlqRunKindChannel(context.Background(), fake, command, dlqTestTopology(), &out, &totals)
+	if err == nil {
+		t.Fatal("dlqRunKindChannel() error = nil, want not-found error")
+	}
+	if !strings.Contains(err.Error(), "not found in the first 10000 of 20000") {
+		t.Fatalf("error = %v, want window detail", err)
+	}
+	if strings.Contains(out.String(), "replayed=") {
+		t.Fatalf("output = %q, must not report a successful replay", out.String())
+	}
+	if len(fake.published) != 0 || len(fake.acked) != 0 {
+		t.Fatalf("published=%d acked=%v, want nothing", len(fake.published), fake.acked)
+	}
+	if len(fake.nacked) != dlqMaxLimit {
+		t.Fatalf("nacked = %d, want every scanned message requeued", len(fake.nacked))
+	}
+}
+
+func TestDLQRunKindDiscardFailsWhenIDNotInWindow(t *testing.T) {
+	fake := &dlqTestChannel{
+		queued: 20000,
+		total:  dlqMaxLimit,
+		idFor:  func(index int) string { return strconv.Itoa(1000 + index) },
+	}
+	var out strings.Builder
+	command := dlqCommand{mode: dlqModeDiscard, messageID: 999999, limit: 100}
+	var totals dlqTotals
+	if err := dlqRunKindChannel(
+		context.Background(), fake, command, dlqTestTopology(), &out, &totals,
+	); err == nil {
+		t.Fatal("dlqRunKindChannel() error = nil, want not-found error")
+	}
+	if len(fake.acked) != 0 {
+		t.Fatalf("acked = %v, want nothing", fake.acked)
+	}
+}
+
+func TestDLQRunKindReplayAllKeepsLimitWindow(t *testing.T) {
+	fake := &dlqTestChannel{
+		queued: 500,
+		total:  500,
+		idFor:  func(index int) string { return strconv.Itoa(1000 + index) },
+	}
+	var out strings.Builder
+	command := dlqCommand{mode: dlqModeReplay, messageID: 0, limit: 100}
+	var totals dlqTotals
+	if err := dlqRunKindChannel(
+		context.Background(), fake, command, dlqTestTopology(), &out, &totals,
+	); err != nil {
+		t.Fatalf("dlqRunKindChannel() error = %v", err)
+	}
+	if totals.scanned != 100 || totals.replayed != 100 {
+		t.Fatalf("totals = %#v, want the 100-message window", totals)
+	}
+	if len(fake.nacked) != 0 {
+		t.Fatalf("nacked = %v, want every replayed message acked", fake.nacked)
 	}
 }

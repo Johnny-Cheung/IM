@@ -217,6 +217,53 @@ func relayPendingCount(t *testing.T, client *redis.Client, stream, group string)
 	return pending.Count
 }
 
+// xdelFailingClient makes only the standalone XDel command fail, modelling a
+// connection break at the point where the old two-command ackAndDelete issued
+// its second command. Scripts still reach Redis.
+type xdelFailingClient struct {
+	redis.UniversalClient
+}
+
+func (c xdelFailingClient) XDel(ctx context.Context, _ string, _ ...string) *redis.IntCmd {
+	cmd := redis.NewIntCmd(ctx, "xdel")
+	cmd.SetErr(errors.New("injected XDEL failure"))
+	return cmd
+}
+
+func TestStreamRelayAckAndDeleteIsAtomicWhenXDelFails(t *testing.T) {
+	env := newRelayTestEnv(t)
+	ctx := context.Background()
+	if err := ensureRelayGroup(ctx, env.client, defaultKeyspace, DefaultNamespace()); err != nil {
+		t.Fatalf("ensure relay group: %v", err)
+	}
+	relayAddDirectEntry(t, env.client, 501, 1)
+	// A previous run read the entry and stopped before acknowledging it.
+	if _, err := env.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    directRelayGroup(DefaultNamespace()),
+		Consumer: directConsumerName(DefaultNamespace()),
+		Streams:  []string{messageStreamKey(), ">"},
+		Count:    10,
+	}).Result(); err != nil {
+		t.Fatalf("seed pending entry: %v", err)
+	}
+
+	relay := newDirectRelayTest(env)
+	relay.redis = xdelFailingClient{UniversalClient: env.client}
+	publisher := newFakeRelayPublisher()
+	if err := relay.drainPending(ctx, publisher); err != nil {
+		t.Fatalf("drainPending() error = %v, want success: an ack must not leave the entry in the stream", err)
+	}
+	if got := len(publisher.snapshot()); got != 1 {
+		t.Fatalf("publishes = %d, want 1", got)
+	}
+	if got := env.client.XLen(ctx, messageStreamKey()).Val(); got != 0 {
+		t.Fatalf("stream length = %d, want 0: entry orphaned in the stream", got)
+	}
+	if got := relayPendingCount(t, env.client, messageStreamKey(), directRelayGroup(DefaultNamespace())); got != 0 {
+		t.Fatalf("pending = %d, want 0", got)
+	}
+}
+
 func TestStreamRelayRecoversPendingEntriesBeforeNewOnes(t *testing.T) {
 	env := newRelayTestEnv(t)
 	ctx := context.Background()

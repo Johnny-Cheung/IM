@@ -2,8 +2,6 @@ package messaging
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -19,7 +17,8 @@ const (
 )
 
 // DeadLetterChannel is the AMQP channel surface used by the dead-letter admin
-// commands. PublishConfirmed must publish and wait for a broker confirmation.
+// commands. PublishConfirmed must publish as mandatory and wait for a broker
+// confirmation, failing when the broker returns the message as unroutable.
 type DeadLetterChannel interface {
 	Get(queue string, autoAck bool) (amqp091.Delivery, bool, error)
 	PublishConfirmed(ctx context.Context, exchange, routingKey string, message amqp091.Publishing) error
@@ -28,12 +27,28 @@ type DeadLetterChannel interface {
 	QueueDeclarePassive(name string) (amqp091.Queue, error)
 }
 
+// dlqAdminAMQPChannel is the AMQP channel surface behind the admin channel.
+// The publish methods come from dlqPublishChannel so both dead-letter paths
+// share the same broker-free seam.
+type dlqAdminAMQPChannel interface {
+	dlqPublishChannel
+	Get(queue string, autoAck bool) (amqp091.Delivery, bool, error)
+	Ack(tag uint64, multiple bool) error
+	Nack(tag uint64, multiple, requeue bool) error
+	QueueDeclarePassive(
+		name string,
+		durable, autoDelete, exclusive, noWait bool,
+		args amqp091.Table,
+	) (amqp091.Queue, error)
+}
+
 // AMQPDeadLetterChannel implements DeadLetterChannel on a confirm-mode channel.
 // PublishConfirmed calls are sequential so each confirmation can be matched by
 // its delivery tag.
 type AMQPDeadLetterChannel struct {
-	channel  *amqp091.Channel
+	channel  dlqAdminAMQPChannel
 	confirms chan amqp091.Confirmation
+	returns  chan amqp091.Return
 	timeout  time.Duration
 }
 
@@ -49,6 +64,7 @@ func NewAMQPDeadLetterChannel(channel *amqp091.Channel) (*AMQPDeadLetterChannel,
 	return &AMQPDeadLetterChannel{
 		channel:  channel,
 		confirms: channel.NotifyPublish(make(chan amqp091.Confirmation, 1)),
+		returns:  channel.NotifyReturn(make(chan amqp091.Return, 1)),
 		timeout:  dlqAdminPublishTimeout,
 	}, nil
 }
@@ -85,33 +101,10 @@ func (c *AMQPDeadLetterChannel) PublishConfirmed(
 	defer cancel()
 
 	sequence := c.channel.GetNextPublishSeqNo()
-	if err := c.channel.PublishWithContext(publishCtx, exchange, routingKey, false, false, message); err != nil {
+	if err := c.channel.PublishWithContext(publishCtx, exchange, routingKey, true, false, message); err != nil {
 		return fmt.Errorf("publish replayed dead letter: %w", err)
 	}
-	for {
-		select {
-		case confirmation, ok := <-c.confirms:
-			if !ok {
-				return fmt.Errorf("publisher confirms closed while waiting for replay")
-			}
-			if confirmation.DeliveryTag < sequence {
-				// Confirmation for a publish that already timed out.
-				continue
-			}
-			if confirmation.DeliveryTag != sequence {
-				return fmt.Errorf(
-					"unexpected replay confirmation tag %d, want %d",
-					confirmation.DeliveryTag, sequence,
-				)
-			}
-			if !confirmation.Ack {
-				return fmt.Errorf("RabbitMQ rejected replayed dead letter")
-			}
-			return nil
-		case <-publishCtx.Done():
-			return fmt.Errorf("wait for replay confirmation: %w", publishCtx.Err())
-		}
-	}
+	return dlqAwaitConfirm(publishCtx, c.confirms, c.returns, sequence, "replay")
 }
 
 // DeadLetterEntry describes one message parked in a dead-letter queue. It
@@ -141,8 +134,8 @@ type ReplayResult struct {
 }
 
 // ListDeadLetters reads up to limit dead letters and requeues all of them.
-// The queue is inspected in a bounded window; requeued messages may change
-// position, so repeated runs are not a stable snapshot.
+// The queue is inspected in a bounded window from the head; requeued messages
+// return to the head, so repeated runs rescan the same window.
 func ListDeadLetters(
 	ctx context.Context,
 	channel DeadLetterChannel,
@@ -290,8 +283,10 @@ func dlqAdminPrepare(
 }
 
 // dlqAdminEach walks a bounded window of the queue. Deliveries are left
-// unacked so callers decide whether to ack or requeue them; seeing a message
-// twice means the queue wrapped and the walk stops instead of looping.
+// unacked so callers decide whether to ack or requeue them. basic.get never
+// returns the same delivery tag twice in one run, so a repeated tag is a
+// channel anomaly: the walk stops with an error instead of silently skipping
+// the rest of the queue.
 func dlqAdminEach(
 	ctx context.Context,
 	channel DeadLetterChannel,
@@ -299,7 +294,7 @@ func dlqAdminEach(
 	limit int,
 	visit func(amqp091.Delivery) (bool, error),
 ) (int, error) {
-	seen := make(map[string]struct{}, limit)
+	seenTags := make(map[uint64]struct{}, limit)
 	scanned := 0
 	for scanned < limit {
 		if err := ctx.Err(); err != nil {
@@ -313,14 +308,16 @@ func dlqAdminEach(
 			return scanned, nil
 		}
 		scanned++
-		key := dlqAdminDeliveryKey(delivery)
-		if _, duplicate := seen[key]; duplicate {
+		if _, duplicate := seenTags[delivery.DeliveryTag]; duplicate {
 			if err := channel.Nack(delivery.DeliveryTag, false, true); err != nil {
 				return scanned, fmt.Errorf("requeue %s dead letter: %w", topology.Kind, err)
 			}
-			return scanned, nil
+			return scanned, fmt.Errorf(
+				"read %s dead letter queue: delivery tag %d repeated after %d messages",
+				topology.Kind, delivery.DeliveryTag, scanned,
+			)
 		}
-		seen[key] = struct{}{}
+		seenTags[delivery.DeliveryTag] = struct{}{}
 		stop, err := visit(delivery)
 		if err != nil {
 			return scanned, err
@@ -336,14 +333,6 @@ func dlqAdminRequeue(channel DeadLetterChannel, tags []uint64) {
 	for _, tag := range tags {
 		_ = channel.Nack(tag, false, true)
 	}
-}
-
-func dlqAdminDeliveryKey(delivery amqp091.Delivery) string {
-	if id := strings.TrimSpace(delivery.MessageId); id != "" {
-		return "id:" + id
-	}
-	sum := sha256.Sum256(delivery.Body)
-	return "body:" + hex.EncodeToString(sum[:16])
 }
 
 func dlqAdminMatches(delivery amqp091.Delivery, messageID uint64) bool {

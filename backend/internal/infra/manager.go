@@ -231,7 +231,16 @@ func dialRabbit(config config.RabbitMQConfig) (*amqp091.Connection, error) {
 	return amqp091.DialConfig(rabbitURL, amqp091.Config{
 		Heartbeat: config.Heartbeat,
 		Dial: func(network, address string) (net.Conn, error) {
-			return net.DialTimeout(network, address, config.DialTimeout)
+			conn, err := net.DialTimeout(network, address, config.DialTimeout)
+			if err != nil {
+				return nil, err
+			}
+			// Bounds the AMQP handshake against a silent peer; amqp091 clears
+			// the deadline in openComplete for long-lived connections.
+			if config.DialTimeout > 0 {
+				_ = conn.SetDeadline(time.Now().Add(config.DialTimeout))
+			}
+			return conn, nil
 		},
 	})
 }

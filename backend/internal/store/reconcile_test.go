@@ -62,7 +62,7 @@ func TestListConversationSeqs(t *testing.T) {
 		rows:    [][]driver.Value{{int64(2)}, {int64(5)}},
 	})
 
-	seqs, err := store.ListConversationSeqs(context.Background(), 1, 2, 5)
+	seqs, err := store.ListConversationSeqs(context.Background(), 1, 2, 5, 1, 100)
 	if err != nil {
 		t.Fatalf("ListConversationSeqs() error = %v", err)
 	}
@@ -70,11 +70,14 @@ func TestListConversationSeqs(t *testing.T) {
 		t.Fatalf("seqs = %v, want [2 5]", seqs)
 	}
 	script.assertQueryContains(t, 0,
-		"conversation_low_id = ?", "conversation_high_id = ?", "seq <= ?", "ORDER BY seq",
+		"conversation_low_id = ?", "conversation_high_id = ?",
+		"seq <= ?", "seq > ?", "ORDER BY seq", "LIMIT ?",
 	)
 	script.assertArg(t, 0, 0, int64(1))
 	script.assertArg(t, 0, 1, int64(2))
 	script.assertArg(t, 0, 2, int64(5))
+	script.assertArg(t, 0, 3, int64(1))
+	script.assertArg(t, 0, 4, int64(100))
 	script.assertDone(t)
 }
 
@@ -85,16 +88,32 @@ func TestListGroupSeqs(t *testing.T) {
 		rows:    [][]driver.Value{{int64(1)}, {int64(4)}},
 	})
 
-	seqs, err := store.ListGroupSeqs(context.Background(), 7, 4)
+	seqs, err := store.ListGroupSeqs(context.Background(), 7, 4, 2, 100)
 	if err != nil {
 		t.Fatalf("ListGroupSeqs() error = %v", err)
 	}
 	if len(seqs) != 2 || seqs[0] != 1 || seqs[1] != 4 {
 		t.Fatalf("seqs = %v, want [1 4]", seqs)
 	}
-	script.assertQueryContains(t, 0, "group_id = ?", "seq <= ?", "ORDER BY seq")
+	script.assertQueryContains(t, 0, "group_id = ?", "seq <= ?", "seq > ?", "ORDER BY seq", "LIMIT ?")
 	script.assertArg(t, 0, 0, int64(7))
 	script.assertArg(t, 0, 1, int64(4))
+	script.assertArg(t, 0, 2, int64(2))
+	script.assertArg(t, 0, 3, int64(100))
+	script.assertDone(t)
+}
+
+func TestListSeqsZeroLimitSkipsQuery(t *testing.T) {
+	store, script := newScriptStore(t)
+
+	direct, err := store.ListConversationSeqs(context.Background(), 1, 2, 5, 0, 0)
+	if err != nil || len(direct) != 0 {
+		t.Fatalf("ListConversationSeqs() = (%v, %v), want empty", direct, err)
+	}
+	group, err := store.ListGroupSeqs(context.Background(), 7, 5, 0, 0)
+	if err != nil || len(group) != 0 {
+		t.Fatalf("ListGroupSeqs() = (%v, %v), want empty", group, err)
+	}
 	script.assertDone(t)
 }
 

@@ -2,10 +2,14 @@ package messaging
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/rabbitmq/amqp091-go"
 )
 
 func TestDeadLetterTopologyFor(t *testing.T) {
@@ -116,4 +120,243 @@ func TestDLQTruncateErrorKeepsValidUTF8(t *testing.T) {
 	if got := dlqTruncateError(short); got != short {
 		t.Fatalf("dlqTruncateError(short) = %q", got)
 	}
+}
+
+func TestDLQAwaitConfirmClassifiesFailures(t *testing.T) {
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	canceled, cancelCanceled := context.WithCancel(context.Background())
+	cancelCanceled()
+	closedConfirms := make(chan amqp091.Confirmation)
+	close(closedConfirms)
+
+	returned := amqp091.Return{
+		ReplyCode:  312,
+		ReplyText:  "NO_ROUTE",
+		Exchange:   "im.messages.dead",
+		RoutingKey: "direct.dead",
+	}
+	tests := []struct {
+		name     string
+		confirms chan amqp091.Confirmation
+		returns  chan amqp091.Return
+		ctx      context.Context
+		wantErr  error
+		wantText string
+	}{
+		{
+			name:     "matching ack",
+			confirms: confirmationChan(5, true),
+		},
+		{
+			name:     "stale tag skipped",
+			confirms: confirmationsChan(amqp091.Confirmation{DeliveryTag: 4, Ack: false}, amqp091.Confirmation{DeliveryTag: 5, Ack: true}),
+		},
+		{
+			name:     "unexpected tag",
+			confirms: confirmationChan(6, true),
+			wantText: "unexpected",
+		},
+		{
+			name:     "nack",
+			confirms: confirmationChan(5, false),
+			wantText: "rejected",
+		},
+		{
+			name:    "closed confirms",
+			wantErr: dlqErrPublisherClosed,
+		},
+		{
+			name:     "expired deadline",
+			confirms: make(chan amqp091.Confirmation),
+			ctx:      expired,
+			wantErr:  context.DeadlineExceeded,
+		},
+		{
+			name:     "canceled context",
+			confirms: make(chan amqp091.Confirmation),
+			ctx:      canceled,
+			wantErr:  context.Canceled,
+		},
+		{
+			name:     "return before confirm",
+			confirms: confirmationChan(5, true),
+			returns:  returnsChan(returned),
+			wantText: "unroutable",
+		},
+		{
+			name:     "return buffered with confirm",
+			confirms: confirmationChan(5, true),
+			returns:  returnsChan(returned),
+			wantText: "unroutable",
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := testCase.ctx
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			confirms := testCase.confirms
+			if confirms == nil {
+				confirms = closedConfirms
+			}
+			err := dlqAwaitConfirm(ctx, confirms, testCase.returns, 5, "direct")
+			if testCase.wantErr != nil {
+				if !errors.Is(err, testCase.wantErr) {
+					t.Fatalf("error = %v, want %v", err, testCase.wantErr)
+				}
+				return
+			}
+			if testCase.wantText != "" {
+				if err == nil || !strings.Contains(err.Error(), testCase.wantText) {
+					t.Fatalf("error = %v, want text %q", err, testCase.wantText)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func confirmationChan(tag uint64, ack bool) chan amqp091.Confirmation {
+	return confirmationsChan(amqp091.Confirmation{DeliveryTag: tag, Ack: ack})
+}
+
+func confirmationsChan(values ...amqp091.Confirmation) chan amqp091.Confirmation {
+	confirms := make(chan amqp091.Confirmation, len(values))
+	for _, value := range values {
+		confirms <- value
+	}
+	return confirms
+}
+
+func returnsChan(values ...amqp091.Return) chan amqp091.Return {
+	returns := make(chan amqp091.Return, len(values))
+	for _, value := range values {
+		returns <- value
+	}
+	return returns
+}
+
+// dlqTestPublishChannel is a broker-free dlqPublishChannel. It answers each
+// publish with the configured return and confirmation in wire order.
+type dlqTestPublishChannel struct {
+	confirms   chan amqp091.Confirmation
+	returns    chan amqp091.Return
+	nextSeq    uint64
+	ack        bool
+	returned   *amqp091.Return
+	publishErr error
+	mandatory  []bool
+	published  []amqp091.Publishing
+}
+
+func (f *dlqTestPublishChannel) Confirm(bool) error {
+	return nil
+}
+
+func (f *dlqTestPublishChannel) NotifyPublish(c chan amqp091.Confirmation) chan amqp091.Confirmation {
+	f.confirms = c
+	return c
+}
+
+func (f *dlqTestPublishChannel) NotifyReturn(c chan amqp091.Return) chan amqp091.Return {
+	f.returns = c
+	return c
+}
+
+func (f *dlqTestPublishChannel) GetNextPublishSeqNo() uint64 {
+	return f.nextSeq
+}
+
+func (f *dlqTestPublishChannel) PublishWithContext(
+	ctx context.Context,
+	exchange, key string,
+	mandatory, immediate bool,
+	msg amqp091.Publishing,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mandatory = append(f.mandatory, mandatory)
+	f.published = append(f.published, msg)
+	if f.publishErr != nil {
+		return f.publishErr
+	}
+	if f.returned != nil {
+		f.returns <- *f.returned
+	}
+	if f.ack {
+		f.confirms <- amqp091.Confirmation{DeliveryTag: f.nextSeq, Ack: true}
+	}
+	return nil
+}
+
+func TestDLQAMQPPublisherRequiresRoutableMandatoryPublish(t *testing.T) {
+	topology := DeadLetterTopology{
+		Kind:       DeadLetterDirect,
+		Exchange:   "im.messages.dead",
+		RoutingKey: "direct.dead",
+	}
+	message := dlqMessage{
+		Kind:      DeadLetterDirect,
+		Body:      []byte(`{"server_message_id":7}`),
+		MessageID: "7",
+		Reason:    dlqReasonConflict,
+	}
+
+	t.Run("routable publish succeeds", func(t *testing.T) {
+		fake := &dlqTestPublishChannel{nextSeq: 4, ack: true}
+		publisher, err := newDLQAMQPPublisher(fake, topology)
+		if err != nil {
+			t.Fatalf("newDLQAMQPPublisher() error = %v", err)
+		}
+		if err := publisher.PublishDeadLetter(context.Background(), message); err != nil {
+			t.Fatalf("PublishDeadLetter() error = %v", err)
+		}
+		if len(fake.mandatory) != 1 || !fake.mandatory[0] {
+			t.Fatalf("mandatory flags = %v, want [true]", fake.mandatory)
+		}
+		if len(fake.published) != 1 || fake.published[0].MessageId != "7" {
+			t.Fatalf("published = %#v", fake.published)
+		}
+	})
+
+	t.Run("unroutable publish fails before ack", func(t *testing.T) {
+		fake := &dlqTestPublishChannel{
+			nextSeq: 9,
+			ack:     true,
+			returned: &amqp091.Return{
+				ReplyCode:  312,
+				ReplyText:  "NO_ROUTE",
+				Exchange:   topology.Exchange,
+				RoutingKey: topology.RoutingKey,
+			},
+		}
+		publisher, err := newDLQAMQPPublisher(fake, topology)
+		if err != nil {
+			t.Fatalf("newDLQAMQPPublisher() error = %v", err)
+		}
+		err = publisher.PublishDeadLetter(context.Background(), message)
+		if err == nil || !strings.Contains(err.Error(), "unroutable") {
+			t.Fatalf("PublishDeadLetter() error = %v, want unroutable error", err)
+		}
+		if len(fake.mandatory) != 1 || !fake.mandatory[0] {
+			t.Fatalf("mandatory flags = %v, want [true]", fake.mandatory)
+		}
+	})
+
+	t.Run("publish error is returned", func(t *testing.T) {
+		fake := &dlqTestPublishChannel{nextSeq: 1, publishErr: errors.New("channel closed")}
+		publisher, err := newDLQAMQPPublisher(fake, topology)
+		if err != nil {
+			t.Fatalf("newDLQAMQPPublisher() error = %v", err)
+		}
+		if err := publisher.PublishDeadLetter(context.Background(), message); err == nil {
+			t.Fatal("PublishDeadLetter() error = nil, want publish error")
+		}
+	})
 }

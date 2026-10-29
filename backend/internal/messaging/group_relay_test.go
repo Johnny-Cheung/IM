@@ -52,6 +52,39 @@ func relayGroupPendingCount(t *testing.T, client *redis.Client) int64 {
 	return relayPendingCount(t, client, defaultKeyspace.groupMessageStreamKey(), groupRelayName(DefaultNamespace()))
 }
 
+func TestGroupStreamRelayAckAndDeleteIsAtomicWhenXDelFails(t *testing.T) {
+	env := newRelayTestEnv(t)
+	ctx := context.Background()
+	if err := ensureGroupRelayGroup(ctx, env.client, defaultKeyspace, DefaultNamespace()); err != nil {
+		t.Fatalf("ensure group relay group: %v", err)
+	}
+	relayAddGroupEntry(t, env.client, 408, 1)
+	if _, err := env.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    groupRelayName(DefaultNamespace()),
+		Consumer: groupConsumerName(DefaultNamespace()),
+		Streams:  []string{defaultKeyspace.groupMessageStreamKey(), ">"},
+		Count:    10,
+	}).Result(); err != nil {
+		t.Fatalf("seed pending entry: %v", err)
+	}
+
+	relay := newGroupRelayTest(env)
+	relay.redis = xdelFailingClient{UniversalClient: env.client}
+	publisher := newFakeRelayPublisher()
+	if err := relay.drainPending(ctx, publisher); err != nil {
+		t.Fatalf("drainPending() error = %v, want success: an ack must not leave the entry in the stream", err)
+	}
+	if got := len(publisher.snapshot()); got != 1 {
+		t.Fatalf("publishes = %d, want 1", got)
+	}
+	if got := env.client.XLen(ctx, defaultKeyspace.groupMessageStreamKey()).Val(); got != 0 {
+		t.Fatalf("stream length = %d, want 0: entry orphaned in the stream", got)
+	}
+	if got := relayGroupPendingCount(t, env.client); got != 0 {
+		t.Fatalf("pending = %d, want 0", got)
+	}
+}
+
 func TestGroupStreamRelayRecoversPendingEntriesBeforeNewOnes(t *testing.T) {
 	env := newRelayTestEnv(t)
 	ctx := context.Background()

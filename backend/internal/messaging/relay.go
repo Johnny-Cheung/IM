@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	_ "embed"
 	"errors"
 	"fmt"
 	"log"
@@ -13,6 +14,11 @@ import (
 	"github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 )
+
+//go:embed lua/ack_delete.lua
+var ackDeleteScriptSource string
+
+var ackDeleteScript = redis.NewScript(ackDeleteScriptSource)
 
 type RabbitDialer func(config.RabbitMQConfig) (*amqp091.Connection, error)
 
@@ -378,11 +384,15 @@ func (r *StreamRelay) relayEntry(
 }
 
 func (r *StreamRelay) ackAndDelete(ctx context.Context, entryID string) error {
-	if err := r.redis.XAck(ctx, r.keyspace.messageStreamKey(), directRelayGroup(r.namespace), entryID).Err(); err != nil {
-		return fmt.Errorf("ack stream message %s: %w", entryID, err)
-	}
-	if err := r.redis.XDel(ctx, r.keyspace.messageStreamKey(), entryID).Err(); err != nil {
-		return fmt.Errorf("delete stream message %s: %w", entryID, err)
+	// Atomic ack+delete: a zero delete count (entry already gone) is still success.
+	if err := ackDeleteScript.Run(
+		ctx,
+		r.redis,
+		[]string{r.keyspace.messageStreamKey()},
+		directRelayGroup(r.namespace),
+		entryID,
+	).Err(); err != nil {
+		return fmt.Errorf("ack and delete stream message %s: %w", entryID, err)
 	}
 	return nil
 }

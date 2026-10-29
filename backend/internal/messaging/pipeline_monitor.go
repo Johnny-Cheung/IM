@@ -10,15 +10,17 @@ import (
 	"time"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/config"
+	"github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 )
 
 const (
-	monitorDefaultInterval   = 10 * time.Second
-	monitorDefaultBacklog    = 1000
-	monitorDefaultOldestAge  = 60 * time.Second
-	monitorOldestEntryCount  = 1
-	monitorMissingGroupError = "NOGROUP"
+	monitorDefaultInterval        = 10 * time.Second
+	monitorDefaultBacklog         = 1000
+	monitorDefaultOldestAge       = 60 * time.Second
+	monitorOldestEntryCount       = 1
+	monitorMissingGroupError      = "NOGROUP"
+	monitorDeadLetterProbeTimeout = 5 * time.Second
 )
 
 // PipelineChainStatus is the stream side of one message chain. Counts are read
@@ -103,6 +105,9 @@ type PipelineMonitor struct {
 	alerts     map[DeadLetterKind]bool
 	deadTotals map[DeadLetterKind]int64
 
+	// amqpDeadLetters is owned here so Run can close its cached connection.
+	amqpDeadLetters *monitorAMQPDeadLetterCounter
+
 	mu     sync.Mutex
 	status PipelineStatus
 }
@@ -146,11 +151,13 @@ func NewPipelineMonitor(
 	if options.DeadLetters != nil {
 		monitor.deadLetters = options.DeadLetters
 	} else if dialer != nil {
-		monitor.deadLetters = monitorAMQPDeadLetterCounter{
+		counter := &monitorAMQPDeadLetterCounter{
 			config:    rabbitConfig,
 			dialer:    dialer,
 			namespace: options.Namespace,
 		}
+		monitor.deadLetters = counter
+		monitor.amqpDeadLetters = counter
 	}
 
 	monitor.chains = append(monitor.chains, monitorChain{
@@ -178,6 +185,7 @@ func (m *PipelineMonitor) Run(ctx context.Context) {
 	if m == nil || m.redis == nil {
 		return
 	}
+	defer m.closeAMQPDeadLetters()
 	ticker := time.NewTicker(m.interval)
 	defer ticker.Stop()
 	for {
@@ -187,6 +195,12 @@ func (m *PipelineMonitor) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
+	}
+}
+
+func (m *PipelineMonitor) closeAMQPDeadLetters() {
+	if m.amqpDeadLetters != nil {
+		m.amqpDeadLetters.Close()
 	}
 }
 
@@ -275,35 +289,46 @@ func (m *PipelineMonitor) sampleChain(ctx context.Context, chain monitorChain) P
 		Relay:    monitorRelayStatus(chain.relay),
 		Consumer: monitorConsumerStatus(chain.consumer),
 	}
-	sampleErr := error(nil)
-	oldestAge := time.Duration(0)
+	previous := m.previousChainStatus(chain.kind).BacklogAlert
+	var oldestAge time.Duration
+	var lengthRead, oldestRead bool
+	var sampleErr error
 	if m.redis == nil {
 		sampleErr = fmt.Errorf("redis client is not configured")
 	} else {
-		oldestAge, sampleErr = m.sampleStream(ctx, chain, &status)
+		oldestAge, lengthRead, oldestRead, sampleErr = m.sampleStream(ctx, chain, &status)
 	}
 	if sampleErr != nil {
 		status.LastError = sampleErr.Error()
-		// A Redis outage says nothing about the stream; keep the last alert
-		// decision so a transient error does not fake a recovery.
-		status.BacklogAlert = m.previousChainStatus(chain.kind).BacklogAlert
-	} else {
-		status.BacklogAlert = status.Unrelayed > m.backlog || oldestAge > m.oldest
 	}
+	// Each alert input keeps its own validity: a leg that failed inherits the
+	// previous decision while a leg that was read is evaluated fresh, so one
+	// broken command cannot suppress a backlog the others proved.
+	alert := false
+	if lengthRead {
+		alert = status.Unrelayed > m.backlog
+	} else {
+		alert = previous
+	}
+	if oldestRead {
+		alert = alert || oldestAge > m.oldest
+	} else {
+		alert = alert || previous
+	}
+	status.BacklogAlert = alert
 	m.sampleDeadLetters(ctx, chain, &status)
 	return status
 }
 
 // sampleStream reads the stream counters. Individual failures do not discard
-// the values read by the other commands. The oldest age is returned exactly
-// for the alert threshold while the status keeps whole seconds.
+// the values read by the other commands; the two alert inputs report whether
+// they were actually read. The oldest age is returned exactly for the alert
+// threshold while the status keeps whole seconds.
 func (m *PipelineMonitor) sampleStream(
 	ctx context.Context,
 	chain monitorChain,
 	status *PipelineChainStatus,
-) (time.Duration, error) {
-	var oldestAge time.Duration
-	var sampleErr error
+) (oldestAge time.Duration, lengthRead, oldestRead bool, sampleErr error) {
 	record := func(err error) {
 		if err != nil && sampleErr == nil {
 			sampleErr = err
@@ -314,6 +339,7 @@ func (m *PipelineMonitor) sampleStream(
 	if err != nil {
 		record(fmt.Errorf("read %s stream length: %w", chain.kind, err))
 	} else {
+		lengthRead = true
 		status.StreamLength = uint64(length)
 		// The relay deletes entries after acknowledging them, so the stream
 		// length is exactly what has not reached MySQL yet.
@@ -330,14 +356,17 @@ func (m *PipelineMonitor) sampleStream(
 	oldest, err := m.oldestEntryTime(ctx, chain.stream)
 	if err != nil {
 		record(fmt.Errorf("read oldest %s stream entry: %w", chain.kind, err))
-	} else if !oldest.IsZero() {
-		oldestAge = m.now().UTC().Sub(oldest)
-		if oldestAge < 0 {
-			oldestAge = 0
+	} else {
+		oldestRead = true
+		if !oldest.IsZero() {
+			oldestAge = m.now().UTC().Sub(oldest)
+			if oldestAge < 0 {
+				oldestAge = 0
+			}
+			status.OldestAgeSeconds = int64(oldestAge / time.Second)
 		}
-		status.OldestAgeSeconds = int64(oldestAge / time.Second)
 	}
-	return oldestAge, sampleErr
+	return oldestAge, lengthRead, oldestRead, sampleErr
 }
 
 func (m *PipelineMonitor) pendingCount(ctx context.Context, chain monitorChain) (uint64, error) {
@@ -432,34 +461,155 @@ func (m *PipelineMonitor) trackAlerts(sampled []monitorSample) {
 	}
 }
 
-// monitorAMQPDeadLetterCounter reads a queue depth with a passive declare on a
-// short-lived connection. A passive declare never creates topology.
+// monitorAMQPProber runs passive declares over one long-lived connection and
+// channel. A passive declare never creates topology.
+type monitorAMQPProber interface {
+	QueueDepth(queue string) (int64, error)
+	Close() error
+}
+
+// monitorAMQPLink is the amqp091-backed prober.
+type monitorAMQPLink struct {
+	connection *amqp091.Connection
+	channel    *amqp091.Channel
+}
+
+func monitorOpenAMQPLink(
+	ctx context.Context,
+	dialer RabbitDialer,
+	cfg config.RabbitMQConfig,
+) (*monitorAMQPLink, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	connection, err := dialer(cfg)
+	if err != nil {
+		return nil, err
+	}
+	channel, err := connection.Channel()
+	if err != nil {
+		_ = connection.CloseDeadline(time.Now().Add(monitorDeadLetterProbeTimeout))
+		return nil, err
+	}
+	return &monitorAMQPLink{connection: connection, channel: channel}, nil
+}
+
+func (l *monitorAMQPLink) QueueDepth(queue string) (int64, error) {
+	declared, err := l.channel.QueueDeclarePassive(queue, true, false, false, false, nil)
+	if err != nil {
+		return 0, err
+	}
+	return int64(declared.Messages), nil
+}
+
+// Close bounds the handshake so a wedged broker cannot stall shutdown.
+func (l *monitorAMQPLink) Close() error {
+	return l.connection.CloseDeadline(time.Now().Add(monitorDeadLetterProbeTimeout))
+}
+
+// monitorAMQPDeadLetterCounter reads queue depths over one connection held
+// across samples: opened on first use and reopened after a probe failure.
 type monitorAMQPDeadLetterCounter struct {
 	config    config.RabbitMQConfig
 	dialer    RabbitDialer
 	namespace Namespace
+
+	// open replaces the dialer in tests.
+	open func(context.Context) (monitorAMQPProber, error)
+	// probeContext bounds one declare; nil uses monitorDeadLetterProbeTimeout.
+	probeContext func(context.Context) (context.Context, context.CancelFunc)
+
+	mu     sync.Mutex
+	prober monitorAMQPProber
 }
 
-func (c monitorAMQPDeadLetterCounter) CountDeadLetters(
-	_ context.Context,
+func (c *monitorAMQPDeadLetterCounter) CountDeadLetters(
+	ctx context.Context,
 	kind DeadLetterKind,
 ) (int64, error) {
-	topology := DeadLetterTopologyFor(c.namespace, kind)
-	connection, err := c.dialer(c.config)
-	if err != nil {
-		return 0, fmt.Errorf("dial RabbitMQ for %s dead letter count: %w", kind, err)
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
-	defer connection.Close()
-
-	channel, err := connection.Channel()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prober, err := c.ensureProber(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("open RabbitMQ channel for %s dead letter count: %w", kind, err)
+		return 0, fmt.Errorf("open RabbitMQ connection for %s dead letter count: %w", kind, err)
 	}
-	defer channel.Close()
-
-	queue, err := channel.QueueDeclarePassive(topology.Queue, true, false, false, false, nil)
+	depth, err := c.probe(ctx, prober, DeadLetterTopologyFor(c.namespace, kind).Queue)
 	if err != nil {
+		// The channel is closed after a 404 or a timeout; redial next sample.
+		c.resetLocked()
 		return 0, fmt.Errorf("inspect %s dead letter queue: %w", kind, err)
 	}
-	return int64(queue.Messages), nil
+	return depth, nil
+}
+
+func (c *monitorAMQPDeadLetterCounter) ensureProber(ctx context.Context) (monitorAMQPProber, error) {
+	if c.prober != nil {
+		return c.prober, nil
+	}
+	open := c.open
+	if open == nil {
+		open = func(ctx context.Context) (monitorAMQPProber, error) {
+			return monitorOpenAMQPLink(ctx, c.dialer, c.config)
+		}
+	}
+	prober, err := open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.prober = prober
+	return prober, nil
+}
+
+// probe bounds the declare itself because amqp091 offers no per-call
+// deadline; a stuck probe is abandoned with its connection.
+func (c *monitorAMQPDeadLetterCounter) probe(
+	ctx context.Context,
+	prober monitorAMQPProber,
+	queue string,
+) (int64, error) {
+	probeCtx, cancel := c.newProbeContext(ctx)
+	defer cancel()
+
+	type probeResult struct {
+		depth int64
+		err   error
+	}
+	done := make(chan probeResult, 1)
+	go func() {
+		depth, err := prober.QueueDepth(queue)
+		done <- probeResult{depth: depth, err: err}
+	}()
+	select {
+	case result := <-done:
+		return result.depth, result.err
+	case <-probeCtx.Done():
+		return 0, probeCtx.Err()
+	}
+}
+
+func (c *monitorAMQPDeadLetterCounter) newProbeContext(
+	ctx context.Context,
+) (context.Context, context.CancelFunc) {
+	if c.probeContext != nil {
+		return c.probeContext(ctx)
+	}
+	return context.WithTimeout(ctx, monitorDeadLetterProbeTimeout)
+}
+
+func (c *monitorAMQPDeadLetterCounter) resetLocked() {
+	if c.prober == nil {
+		return
+	}
+	_ = c.prober.Close()
+	c.prober = nil
+}
+
+// Close releases the cached connection on monitor shutdown.
+func (c *monitorAMQPDeadLetterCounter) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.resetLocked()
 }

@@ -110,6 +110,17 @@ func dlqRunKind(
 	if err != nil {
 		return err
 	}
+	return dlqRunKindChannel(ctx, adminChannel, command, topology, out, totals)
+}
+
+func dlqRunKindChannel(
+	ctx context.Context,
+	adminChannel messaging.DeadLetterChannel,
+	command dlqCommand,
+	topology messaging.DeadLetterTopology,
+	out io.Writer,
+	totals *dlqTotals,
+) error {
 	queued, err := messaging.DeadLetterCount(ctx, adminChannel, topology)
 	if err != nil {
 		return err
@@ -128,30 +139,68 @@ func dlqRunKind(
 			return err
 		}
 	case dlqModeReplay:
+		limit := dlqScanLimit(command, queued)
 		result, err := messaging.ReplayDeadLetters(
-			ctx, adminChannel, topology, command.messageID, command.limit,
-		)
-		fmt.Fprintf(
-			out, "kind=%s scanned=%d replayed=%d skipped=%d\n",
-			topology.Kind, result.Scanned, result.Replayed, result.Skipped,
+			ctx, adminChannel, topology, command.messageID, limit,
 		)
 		totals.scanned += result.Scanned
 		totals.replayed += result.Replayed
 		totals.skipped += result.Skipped
+		if err == nil {
+			err = dlqCheckIDFound(command, topology, queued, limit, result.Replayed)
+		}
 		if err != nil {
 			return err
 		}
-	case dlqModeDiscard:
-		discarded, err := messaging.DiscardDeadLetters(
-			ctx, adminChannel, topology, command.messageID, command.limit,
+		fmt.Fprintf(
+			out, "kind=%s scanned=%d replayed=%d skipped=%d\n",
+			topology.Kind, result.Scanned, result.Replayed, result.Skipped,
 		)
-		fmt.Fprintf(out, "kind=%s discarded=%d\n", topology.Kind, discarded)
+	case dlqModeDiscard:
+		limit := dlqScanLimit(command, queued)
+		discarded, err := messaging.DiscardDeadLetters(
+			ctx, adminChannel, topology, command.messageID, limit,
+		)
 		totals.discarded += discarded
+		if err == nil {
+			err = dlqCheckIDFound(command, topology, queued, limit, discarded)
+		}
 		if err != nil {
 			return err
 		}
+		fmt.Fprintf(out, "kind=%s discarded=%d\n", topology.Kind, discarded)
 	}
 	return nil
+}
+
+// dlqScanLimit widens a single-id search to the whole queue when the default
+// window is smaller. basic.get requeues ahead, so a fixed head window can
+// never reach a message that sits behind it.
+func dlqScanLimit(command dlqCommand, queued int) int {
+	if command.messageID == 0 || queued <= command.limit {
+		return command.limit
+	}
+	if queued > dlqMaxLimit {
+		return dlqMaxLimit
+	}
+	return queued
+}
+
+// dlqCheckIDFound refuses to report success when a specific id was not seen in
+// a window that was cut short by the absolute limit. Without this the CLI
+// prints replayed=0 and exits 0 while the target may sit beyond the window.
+func dlqCheckIDFound(
+	command dlqCommand,
+	topology messaging.DeadLetterTopology,
+	queued, limit, matched int,
+) error {
+	if command.messageID == 0 || matched > 0 || queued <= limit {
+		return nil
+	}
+	return fmt.Errorf(
+		"dead letter id %d not found in the first %d of %d queued %s messages; raise -dlq-limit (max %d) or drain the head first",
+		command.messageID, limit, queued, topology.Kind, dlqMaxLimit,
+	)
 }
 
 func dlqPrintTotals(out io.Writer, mode dlqMode, totals dlqTotals) {

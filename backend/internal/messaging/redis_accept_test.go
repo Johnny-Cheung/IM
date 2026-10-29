@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -109,6 +110,11 @@ func TestRedisAcceptorAcceptsAndDeduplicates(t *testing.T) {
 }
 
 func TestRedisAcceptorNeverTrimsMessageStream(t *testing.T) {
+	// A behavioral check with a few entries cannot prove trimming is off: any
+	// MAXLEN above three would still pass. Assert on the script text instead.
+	if strings.Contains(acceptScriptSource, "MAXLEN") {
+		t.Fatalf("accept.lua trims the message stream:\n%s", acceptScriptSource)
+	}
 	client, _ := newAcceptTest(t)
 	ctx := context.Background()
 	if err := client.SAdd(ctx, friendshipKey(1), 2).Err(); err != nil {

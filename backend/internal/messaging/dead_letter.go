@@ -141,17 +141,33 @@ type consumeDeadLetterPublisher interface {
 	PublishDeadLetter(context.Context, dlqMessage) error
 }
 
+// dlqPublishChannel is the AMQP channel surface the publisher uses. It is an
+// interface so the publish/confirm sequence can be tested without a broker.
+type dlqPublishChannel interface {
+	Confirm(noWait bool) error
+	NotifyPublish(chan amqp091.Confirmation) chan amqp091.Confirmation
+	NotifyReturn(chan amqp091.Return) chan amqp091.Return
+	GetNextPublishSeqNo() uint64
+	PublishWithContext(
+		ctx context.Context,
+		exchange, key string,
+		mandatory, immediate bool,
+		msg amqp091.Publishing,
+	) error
+}
+
 // dlqAMQPPublisher publishes dead letters on a confirm-mode channel. Publish
 // calls are sequential, so the confirmation for one publish can be matched by
 // its delivery tag.
 type dlqAMQPPublisher struct {
-	channel  *amqp091.Channel
+	channel  dlqPublishChannel
 	topology DeadLetterTopology
 	confirms chan amqp091.Confirmation
+	returns  chan amqp091.Return
 	timeout  time.Duration
 }
 
-func newDLQAMQPPublisher(channel *amqp091.Channel, topology DeadLetterTopology) (*dlqAMQPPublisher, error) {
+func newDLQAMQPPublisher(channel dlqPublishChannel, topology DeadLetterTopology) (*dlqAMQPPublisher, error) {
 	if channel == nil {
 		return nil, fmt.Errorf("open %s dead letter publisher: channel is nil", topology.Kind)
 	}
@@ -162,6 +178,7 @@ func newDLQAMQPPublisher(channel *amqp091.Channel, topology DeadLetterTopology) 
 		channel:  channel,
 		topology: topology,
 		confirms: channel.NotifyPublish(make(chan amqp091.Confirmation, 1)),
+		returns:  channel.NotifyReturn(make(chan amqp091.Return, 1)),
 		timeout:  dlqPublishTimeout,
 	}, nil
 }
@@ -178,7 +195,7 @@ func (p *dlqAMQPPublisher) PublishDeadLetter(ctx context.Context, message dlqMes
 	defer cancel()
 
 	sequence := p.channel.GetNextPublishSeqNo()
-	err := p.channel.PublishWithContext(publishCtx, p.topology.Exchange, p.topology.RoutingKey, false, false, amqp091.Publishing{
+	err := p.channel.PublishWithContext(publishCtx, p.topology.Exchange, p.topology.RoutingKey, true, false, amqp091.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp091.Persistent,
 		MessageId:    message.MessageID,
@@ -188,25 +205,62 @@ func (p *dlqAMQPPublisher) PublishDeadLetter(ctx context.Context, message dlqMes
 	if err != nil {
 		return fmt.Errorf("publish %s dead letter: %w", message.Kind, err)
 	}
+	return dlqAwaitConfirm(publishCtx, p.confirms, p.returns, sequence, string(message.Kind))
+}
+
+// dlqAwaitConfirm waits for the confirmation of one sequential publish. The
+// publish must be mandatory: a basic.return means the broker dropped an
+// unroutable message even though it confirmed the publish, so a return seen
+// before the matching confirmation is a failure.
+func dlqAwaitConfirm(
+	ctx context.Context,
+	confirms <-chan amqp091.Confirmation,
+	returns <-chan amqp091.Return,
+	sequence uint64,
+	label string,
+) error {
 	for {
 		select {
-		case confirmation, ok := <-p.confirms:
+		case confirmation, ok := <-confirms:
 			if !ok {
-				return fmt.Errorf("%w while waiting for %s confirmation", dlqErrPublisherClosed, message.Kind)
+				return fmt.Errorf("%w while waiting for %s confirmation", dlqErrPublisherClosed, label)
 			}
 			if confirmation.DeliveryTag < sequence {
 				// Stale confirmation from a publish that already timed out.
 				continue
 			}
 			if confirmation.DeliveryTag != sequence {
-				return fmt.Errorf("unexpected %s dead letter confirmation tag %d, want %d", message.Kind, confirmation.DeliveryTag, sequence)
+				return fmt.Errorf("unexpected %s dead letter confirmation tag %d, want %d", label, confirmation.DeliveryTag, sequence)
 			}
 			if !confirmation.Ack {
-				return fmt.Errorf("RabbitMQ rejected %s dead letter", message.Kind)
+				return fmt.Errorf("RabbitMQ rejected %s dead letter", label)
 			}
-			return nil
-		case <-publishCtx.Done():
-			return fmt.Errorf("wait for %s dead letter confirmation: %w", message.Kind, publishCtx.Err())
+			// RabbitMQ sends basic.return before basic.ack; prefer a pending return.
+			select {
+			case returned, ok := <-returns:
+				if !ok {
+					return nil
+				}
+				return dlqUnroutableError(returned, label)
+			default:
+				return nil
+			}
+		case returned, ok := <-returns:
+			if !ok {
+				// The channel closed its return notifications; wait for the confirm.
+				returns = nil
+				continue
+			}
+			return dlqUnroutableError(returned, label)
+		case <-ctx.Done():
+			return fmt.Errorf("wait for %s dead letter confirmation: %w", label, ctx.Err())
 		}
 	}
+}
+
+func dlqUnroutableError(returned amqp091.Return, label string) error {
+	return fmt.Errorf(
+		"%s dead letter unroutable: exchange %q routing key %q: %s",
+		label, returned.Exchange, returned.RoutingKey, returned.ReplyText,
+	)
 }

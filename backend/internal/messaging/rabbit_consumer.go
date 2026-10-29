@@ -23,6 +23,13 @@ type RabbitMessageConsumer struct {
 	namespace Namespace
 	retry     consumeRetryPolicy
 	status    consumeStatusState
+
+	backoff *relayBackoff
+	// wait pauses between reconnect attempts; tests replace it.
+	wait func(context.Context, time.Duration) bool
+	logf func(string, ...any)
+	// lastLoggedError suppresses repeated log lines for the same failure.
+	lastLoggedError string
 }
 
 func NewRabbitMessageConsumer(
@@ -62,7 +69,9 @@ func (c *RabbitMessageConsumer) Run(ctx context.Context) error {
 	if c == nil || c.dialer == nil || c.persister == nil {
 		return ErrMessageServiceUnavailable
 	}
+	c.ensureDefaults()
 	for {
+		persistedBefore := c.status.snapshot().Persisted
 		err := c.runConnection(ctx)
 		if ctx.Err() != nil {
 			return nil
@@ -70,9 +79,30 @@ func (c *RabbitMessageConsumer) Run(ctx context.Context) error {
 		if err == nil {
 			err = fmt.Errorf("RabbitMQ message consumer stopped")
 		}
-		if !waitMessaging(ctx, time.Second) {
+		if c.status.snapshot().Persisted > persistedBefore {
+			c.backoff.reset()
+		}
+		c.status.recordError(err, time.Now())
+		if err.Error() != c.lastLoggedError {
+			c.logf("direct message consumer reconnecting: %v", err)
+			c.lastLoggedError = err.Error()
+		}
+		if !c.wait(ctx, c.backoff.next()) {
 			return nil
 		}
+	}
+}
+
+// ensureDefaults fills collaborators omitted by a zero-value consumer.
+func (c *RabbitMessageConsumer) ensureDefaults() {
+	if c.backoff == nil {
+		c.backoff = newRelayBackoff(relayDefaultBackoff, relayDefaultMaxBackoff)
+	}
+	if c.wait == nil {
+		c.wait = waitMessaging
+	}
+	if c.logf == nil {
+		c.logf = log.Printf
 	}
 }
 
