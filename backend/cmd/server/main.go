@@ -492,6 +492,7 @@ func run(options serverOptions) error {
 	if groupReadTracker != nil {
 		apiOptions = append(apiOptions, httpapi.WithGroupReadTracker(groupReadTracker))
 	}
+	apiOptions = append(apiOptions, httpapi.WithMomentStore(dataStore))
 	api := httpapi.New(dataStore, apiOptions...)
 	api.Register(router)
 	api.Start()

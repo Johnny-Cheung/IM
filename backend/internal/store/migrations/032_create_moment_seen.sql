@@ -1,0 +1,7 @@
+CREATE TABLE IF NOT EXISTS moment_seen (
+    user_id BIGINT UNSIGNED NOT NULL,
+    last_seen_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    updated_at DATETIME(3) NOT NULL,
+    PRIMARY KEY (user_id),
+    CONSTRAINT fk_moment_seen_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;

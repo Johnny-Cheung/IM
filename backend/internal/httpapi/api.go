@@ -218,6 +218,7 @@ type API struct {
 	groupSequenceReader GroupSequenceReader
 	groupProjector      GroupProjector
 	groupReads          GroupReadTracker
+	moments             MomentStore
 	implicitReads       *implicitRead
 	groupRepairs        *groupRepair
 	groupWrites         groupWrites
@@ -340,6 +341,18 @@ func (a *API) Register(router *gin.Engine) {
 	authed.GET("/groups/:id/messages", a.listGroupMessages)
 	authed.POST("/groups/:id/messages", a.sendGroupMessage)
 	authed.GET("/groups/:id/read-stats", a.groupReadStats)
+	authed.GET("/moments", a.listMoments)
+	authed.POST("/moments", a.createMoment)
+	authed.GET("/moments/unread", a.momentUnread)
+	authed.POST("/moments/seen", a.momentSeen)
+	authed.GET("/moments/:id", a.getMoment)
+	authed.DELETE("/moments/:id", a.deleteMoment)
+	authed.PUT("/moments/:id/like", a.likeMoment)
+	authed.DELETE("/moments/:id/like", a.unlikeMoment)
+	authed.GET("/moments/:id/likes", a.listMomentLikes)
+	authed.GET("/moments/:id/comments", a.listMomentComments)
+	authed.POST("/moments/:id/comments", a.createMomentComment)
+	authed.DELETE("/moments/:id/comments/:commentId", a.deleteMomentComment)
 	authed.GET("/ws", a.websocket)
 }
 

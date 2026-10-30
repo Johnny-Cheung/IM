@@ -3,6 +3,7 @@ import { AuthProvider, GuestOnly, RequireAuth } from "./auth";
 import { ChatPage } from "./pages/ChatPage";
 import { FriendsPage } from "./pages/FriendsPage";
 import { LoginPage } from "./pages/LoginPage";
+import { MomentsPage } from "./pages/MomentsPage";
 import { RegisterPage } from "./pages/RegisterPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
@@ -38,6 +39,10 @@ export function App() {
           <Route
             path="/friends"
             element={<RequireAuth><FriendsPage /></RequireAuth>}
+          />
+          <Route
+            path="/moments"
+            element={<RequireAuth><MomentsPage /></RequireAuth>}
           />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

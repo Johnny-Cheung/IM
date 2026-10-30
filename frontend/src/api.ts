@@ -139,6 +139,73 @@ export type GroupReadStats = {
   all_read: boolean;
 };
 
+export type MomentVisibility = "friends" | "private";
+
+export type MomentComment = {
+  id: number;
+  author: PublicUser;
+  body: string;
+  created_at: string;
+};
+
+export type Moment = {
+  id: number;
+  author: PublicUser;
+  body: string;
+  visibility: MomentVisibility;
+  created_at: string;
+  like_count: number;
+  comment_count: number;
+  liked_by_me: boolean;
+  mine: boolean;
+  comments_preview: MomentComment[];
+};
+
+export type MomentFeedResponse = {
+  moments: Moment[];
+  has_more: boolean;
+  next_before_id: number;
+};
+
+export type MomentLike = {
+  id: number;
+  user: PublicUser;
+  created_at: string;
+};
+
+export type MomentDetailResponse = {
+  moment: Moment;
+  comments: MomentComment[];
+  comments_has_more: boolean;
+  likers: MomentLike[];
+};
+
+export type MomentCommentPageResponse = {
+  comments: MomentComment[];
+  has_more: boolean;
+  next_before_id: number;
+};
+
+export type MomentLikePageResponse = {
+  likers: MomentLike[];
+  has_more: boolean;
+  next_before_id: number;
+};
+
+export type MomentLikeResult = {
+  like_count: number;
+  liked_by_me: boolean;
+};
+
+export type MomentUnread = {
+  has_new: boolean;
+  last_seen_id: number;
+};
+
+export type MomentSeen = {
+  last_seen_id: number;
+};
+
 export type ConversationListResponse = {
   conversations: Conversation[];
 };
@@ -457,6 +524,74 @@ export const api = {
         }),
       },
     ),
+
+  listMoments: (beforeID = 0, limit = 20) => {
+    const params = new URLSearchParams();
+    params.set("limit", String(limit));
+    if (beforeID > 0) {
+      params.set("before_id", String(beforeID));
+    }
+    return request<MomentFeedResponse>(`/api/moments?${params.toString()}`);
+  },
+
+  createMoment: (body: string, visibility: MomentVisibility) =>
+    request<Moment>("/api/moments", {
+      method: "POST",
+      body: JSON.stringify({ body, visibility }),
+    }),
+
+  getMoment: (momentID: number) =>
+    request<MomentDetailResponse>(`/api/moments/${momentID}`),
+
+  deleteMoment: (momentID: number) =>
+    request<void>(`/api/moments/${momentID}`, { method: "DELETE" }),
+
+  likeMoment: (momentID: number) =>
+    request<MomentLikeResult>(`/api/moments/${momentID}/like`, { method: "PUT" }),
+
+  unlikeMoment: (momentID: number) =>
+    request<MomentLikeResult>(`/api/moments/${momentID}/like`, { method: "DELETE" }),
+
+  listMomentLikes: (momentID: number, beforeID = 0, limit = 50) => {
+    const params = new URLSearchParams();
+    params.set("limit", String(limit));
+    if (beforeID > 0) {
+      params.set("before_id", String(beforeID));
+    }
+    return request<MomentLikePageResponse>(
+      `/api/moments/${momentID}/likes?${params.toString()}`,
+    );
+  },
+
+  listMomentComments: (momentID: number, beforeID = 0, limit = 20) => {
+    const params = new URLSearchParams();
+    params.set("limit", String(limit));
+    if (beforeID > 0) {
+      params.set("before_id", String(beforeID));
+    }
+    return request<MomentCommentPageResponse>(
+      `/api/moments/${momentID}/comments?${params.toString()}`,
+    );
+  },
+
+  createMomentComment: (momentID: number, body: string) =>
+    request<MomentComment>(`/api/moments/${momentID}/comments`, {
+      method: "POST",
+      body: JSON.stringify({ body }),
+    }),
+
+  deleteMomentComment: (momentID: number, commentID: number) =>
+    request<void>(`/api/moments/${momentID}/comments/${commentID}`, {
+      method: "DELETE",
+    }),
+
+  momentUnread: () => request<MomentUnread>("/api/moments/unread"),
+
+  markMomentsSeen: (lastSeenID: number) =>
+    request<MomentSeen>("/api/moments/seen", {
+      method: "POST",
+      body: JSON.stringify({ last_seen_id: lastSeenID }),
+    }),
 };
 
 export function websocketURL(): string {

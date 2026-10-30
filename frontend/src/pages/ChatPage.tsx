@@ -646,6 +646,20 @@ export function ChatPage() {
   const { user, logout, invalidate, bootstrap, status } = useAuth();
   const coldOffline = status === "offline";
   const [networkOnline, setNetworkOnline] = useState(() => navigator.onLine);
+  const [momentsHasNew, setMomentsHasNew] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    api.momentUnread().then((result) => {
+      if (!cancelled) {
+        setMomentsHasNew(result.has_new);
+      }
+    }).catch(() => {
+      // The chat workspace must not fail because the Moments badge is down.
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.username]);
   const offline = coldOffline || !networkOnline;
   const offlineRef = useRef(offline);
   const bootConversations = bootstrap !== null
@@ -2234,6 +2248,8 @@ export function ChatPage() {
           if (readEvent) {
             handleGroupRead(readEvent);
           }
+        } else if (data?.type === "moment.created") {
+          setMomentsHasNew(true);
         }
       } catch {
         // Ignore malformed websocket events.
@@ -2803,6 +2819,14 @@ export function ChatPage() {
           <Brand />
           <nav className="chat-nav" aria-label="主导航">
             <Link className="text-link" to="/friends">好友管理</Link>
+            <Link
+              aria-label={momentsHasNew ? "朋友圈，有新的动态" : undefined}
+              className="text-link"
+              to="/moments"
+            >
+              朋友圈
+              {momentsHasNew && <span aria-hidden="true" className="nav-dot" />}
+            </Link>
             <Link className="text-link" to="/settings">账号设置</Link>
             <button
               className="text-link text-link--button"

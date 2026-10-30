@@ -9,6 +9,7 @@ const list = (who) => run.request(who, "GET", "/api/conversations");
 const bootstrapOf = (who) => run.request(who, "POST", "/api/bootstrap", {});
 const sendGroup = (who, id, body, key = randomUUID()) => run.request(who, "POST", `/api/groups/${id}/messages`, { body, client_message_id: key });
 const directPath = (who) => `/api/conversations/${run.users.get(who).username}`;
+const momentsPath = "/api/moments";
 const readStats = (who, id, seq) => run.request(who, "GET", `/api/groups/${id}/read-stats?seq=${seq}`);
 const seqsOf = (messages) => messages.map((message) => message.seq);
 const contiguous = (seqs, first) => seqs.length > 0
@@ -52,6 +53,110 @@ async function main() {
   await run.request("d", "POST", `/api/friend-requests/${pending.incoming[0].id}/reject`);
   const rejected = await run.request("a", "GET", "/api/friend-requests");
   run.check("rejected outgoing request retained", rejected.history.some((item) => item.status === "rejected"));
+
+  const friendsMoment = await run.request("a", "POST", momentsPath, {
+    body: "朋友圈第一条\n第二行",
+    visibility: "friends",
+  });
+  run.check(
+    "friends moment is created with text and visibility",
+    friendsMoment.visibility === "friends"
+      && friendsMoment.mine === true
+      && friendsMoment.body.includes("第二行"),
+  );
+  const privateMoment = await run.request("a", "POST", momentsPath, {
+    body: "仅自己可见",
+    visibility: "private",
+  });
+  const momentsForB = await run.request("b", "GET", `${momentsPath}?limit=20`);
+  run.check(
+    "friend sees friends moment",
+    momentsForB.moments.some((moment) => moment.id === friendsMoment.id),
+  );
+  run.check(
+    "friend does not see private moment",
+    !momentsForB.moments.some((moment) => moment.id === privateMoment.id),
+  );
+  const momentsForD = await run.request("d", "GET", `${momentsPath}?limit=20`);
+  run.check(
+    "non-friend does not see moment",
+    !momentsForD.moments.some((moment) => moment.id === friendsMoment.id),
+  );
+  await run.expectError(
+    "non-friend cannot read moment detail",
+    "d", "GET", `${momentsPath}/${friendsMoment.id}`, undefined, 403, "not_friend",
+  );
+  await run.expectError(
+    "friend cannot read a private moment",
+    "b", "GET", `${momentsPath}/${privateMoment.id}`, undefined, 403, "not_friend",
+  );
+  const likeOnce = await run.request("b", "PUT", `${momentsPath}/${friendsMoment.id}/like`);
+  const likeTwice = await run.request("b", "PUT", `${momentsPath}/${friendsMoment.id}/like`);
+  run.check(
+    "moment like is idempotent",
+    likeOnce.like_count === 1 && likeTwice.like_count === 1 && likeTwice.liked_by_me === true,
+  );
+  const momentComment = await run.request("b", "POST", `${momentsPath}/${friendsMoment.id}/comments`, {
+    body: "说得好",
+  });
+  const momentDetail = await run.request("a", "GET", `${momentsPath}/${friendsMoment.id}`);
+  run.check(
+    "moment detail carries like and comment",
+    momentDetail.moment.like_count === 1
+      && momentDetail.comments.some((comment) => comment.id === momentComment.id),
+  );
+  await run.request("b", "DELETE", `${momentsPath}/${friendsMoment.id}/comments/${momentComment.id}`);
+  const momentDetailAfterDelete = await run.request("a", "GET", `${momentsPath}/${friendsMoment.id}`);
+  run.check(
+    "comment delete updates the count",
+    !momentDetailAfterDelete.comments.some((comment) => comment.id === momentComment.id)
+      && momentDetailAfterDelete.moment.comment_count === 0,
+  );
+  await run.expectError(
+    "friend cannot delete another user's moment",
+    "b", "DELETE", `${momentsPath}/${friendsMoment.id}`, undefined, 403, "forbidden",
+  );
+  const seen = await run.request("b", "POST", `${momentsPath}/seen`, {
+    last_seen_id: friendsMoment.id,
+  });
+  const newerMoment = await run.request("a", "POST", momentsPath, {
+    body: "红点新动态",
+    visibility: "friends",
+  });
+  const momentUnread = await run.request("b", "GET", `${momentsPath}/unread`);
+  run.check(
+    "new friend moment sets the unread dot",
+    momentUnread.has_new === true && momentUnread.last_seen_id === seen.last_seen_id,
+  );
+  await run.request("b", "POST", `${momentsPath}/seen`, { last_seen_id: newerMoment.id });
+  const momentUnreadAfter = await run.request("b", "GET", `${momentsPath}/unread`);
+  run.check("seen clears the unread dot", momentUnreadAfter.has_new === false);
+
+  for (let index = 0; index < 21; index += 1) {
+    await run.request("a", "POST", momentsPath, {
+      body: `分页动态 ${index}`,
+      visibility: "friends",
+    });
+  }
+  const momentsPageOne = await run.request("b", "GET", `${momentsPath}?limit=20`);
+  run.check(
+    "moment feed reports more pages",
+    momentsPageOne.has_more === true && momentsPageOne.moments.length === 20,
+  );
+  const momentsPageTwo = await run.request(
+    "b", "GET", `${momentsPath}?limit=20&before_id=${momentsPageOne.next_before_id}`,
+  );
+  const pageOneIDs = new Set(momentsPageOne.moments.map((moment) => moment.id));
+  run.check(
+    "moment pages do not overlap and move backwards",
+    momentsPageTwo.moments.every((moment) => !pageOneIDs.has(moment.id))
+      && momentsPageTwo.moments.every((moment) => moment.id < momentsPageOne.next_before_id),
+  );
+  await run.request("a", "DELETE", `${momentsPath}/${friendsMoment.id}`);
+  await run.expectError(
+    "deleted moment is gone",
+    "b", "GET", `${momentsPath}/${friendsMoment.id}`, undefined, 404, "moment_not_found",
+  );
 
   const directID = randomUUID();
   const aSocket = await run.openSocket("a");
