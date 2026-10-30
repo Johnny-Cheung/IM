@@ -2886,11 +2886,9 @@ export function ChatPage() {
           <aside className="conversation-pane" aria-label="会话列表">
             <div className="conversation-pane-header">
               <div>
-                <p className="eyebrow">消息</p>
                 <h1>聊天</h1>
               </div>
               <div className="conversation-pane-actions">
-                <span className="count-badge">{conversations.length}</span>
                 <button
                   className="button button--compact button--secondary"
                   id="new-group-button"

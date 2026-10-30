@@ -739,14 +739,11 @@ a:focus-visible {
 
 .conversation-pane-header {
   align-items: flex-end;
+  border-bottom: 1px solid var(--line);
   display: flex;
   gap: 12px;
   justify-content: space-between;
-  padding: 18px 18px 10px;
-}
-
-.conversation-pane-header .eyebrow {
-  margin: 0 0 4px;
+  padding: 18px 18px 12px;
 }
 
 .conversation-pane-header h1 {
