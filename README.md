@@ -26,15 +26,15 @@ IM 是一个单体 Web IM：React 前端负责界面与本地缓存，Go 后端�
 
 - **账号与会话**：注册、登录、退出、昵称修改和密码修改。密码使用 bcrypt 哈希；登录后使用有效期 7 天的服务端会话，浏览器只保存 HttpOnly、SameSite=Lax 的会话 Cookie。
 - **好友关系**：通过用户名精确查找用户，发送、接受或拒绝好友申请，删除好友。只有好友之间可以私聊；删除好友后不能继续发送新消息，历史保留。
-- **私聊**：WebSocket 实时收发、服务端接纳后确认、`client_message_id` 重试去重、历史消息分页、未读与已读、断线重连。
+- **私聊**：HTTP 发送、WebSocket 实时接收，服务端接纳后确认、`client_message_id` 重试去重、历史消息分页、未读与已读、断线重连。
 - **群聊**：邀请好友建群，成员上限 100 人（含群主）；成员可邀请自己的好友、退出群聊；群主可改名、移出成员，群主退出时群解散。支持群消息历史与群已读人数。
-- **已读**：进入会话或停留在前台聊天窗口时，通过 WebSocket `focus` 隐式推进已读水位；后台页面收到消息不自动已读。群聊返回发送者可见的已读人数，不提供逐条回执或成员名单。
+- **已读**：进入会话或停留在前台聊天窗口时，通过 WebSocket `focus` 隐式推进已读水位；后台页面收到消息不自动已读。群聊返回发送者可见的已读人数，不提供逐条回执或成员名单。完整已读能力需要 Redis 和 RabbitMQ。
 - **Web 缓存与增量同步**：浏览器使用 IndexedDB，按账号隔离；冷启动通过 `POST /api/bootstrap` 一次拉齐会话、好友和增量；支持离线只读查看缓存。每个会话保留最近 200 条、全账号最多 10000 条，服务端始终是权威。
 - **可靠投递**：会话内连续 `seq`、Redis Lua 原子接纳、客户端幂等、Stream → RabbitMQ → MySQL 异步幂等落库、失败重试与死信、Redis/MySQL 双向对账和 Redis 重建。
 - **朋友圈（文字版）**：发布 1–1000 字纯文字动态，选择“好友可见”或“仅自己可见”；按时间倒序分页浏览；点赞/取消点赞；单层评论；删除自己的评论或动态；好友发布非私密动态时导航显示红点。
 - **响应式 Web**：桌面和手机浏览器共用同一套页面，不提供桌面或移动客户端。
 
-**当前范围之外：** 图片、音视频、文件和头像上传；消息撤回、删除和搜索；拉黑、群主转让；朋友圈图片/相册、隐私名单、评论回复和通知中心；多实例高可用。v1.9 的容量治理与压测也尚未完成。
+**当前范围之外：** 图片、音视频、文件和头像上传；消息撤回、删除和搜索；拉黑、群主转让；朋友圈图片/相册、隐私名单、评论回复和通知中心；多实例高可用。
 
 ## 技术栈
 
@@ -90,12 +90,12 @@ Redis 7.2        Stream → relay →       MySQL 8.4
 ```text
 IM/
 ├── backend/
-│   ├── cmd/server/              # 启动入口与 -backfill-seq / -rebuild-redis / -dlq-* 子命令
+│   ├── cmd/server/              # 启动入口与 -backfill-seq / -rebuild-redis / -dlq-* 参数
 │   ├── internal/
 │   │   ├── auth/                # 用户名、密码、会话令牌
 │   │   ├── config/              # MySQL / Redis / RabbitMQ / 命名空间配置
 │   │   ├── httpapi/             # REST、WebSocket 与业务处理器
-│   │   ├── infra/               # MySQL、Redis、RabbitMQ 连接
+│   │   ├── infra/               # Redis、RabbitMQ 连接（MySQL 由 store 打开）
 │   │   ├── messaging/           # 接纳、读模型、relay、consumer、对账与重建
 │   │   └── store/               # MySQL 模型、查询与内嵌迁移
 │   │       └── migrations/
@@ -143,7 +143,7 @@ CREATE USER 'im_app'@'%' IDENTIFIED BY '<your-password>';
 GRANT ALL PRIVILEGES ON im.* TO 'im_app'@'%';
 ```
 
-不要把自己的真实密码写进仓库或命令历史。
+不要把自己的真实密码写进仓库或命令历史。示例使用 `'%'` 主机；实际部署可按来源收紧到具体地址。
 
 ### 2. 启动后端
 
@@ -165,6 +165,8 @@ export IM_MYSQL_PASSWORD_FILE="$HOME/.config/im/mysql-app"
 
 ### 3. 启动前端开发服务器
 
+开发时用 Vite 代理后端；第 3 步和第 4 步是两种运行方式，按需二选一。
+
 ```bash
 cd frontend
 npm ci
@@ -184,9 +186,9 @@ npm run dev
 
 ### 启用完整消息链路（可选）
 
-只配置 MySQL 时是本地模式：发送、历史和会话列表可用，会话消息号在 MySQL 事务中分配，但已读、`focus` 和未读统计不可用。
+只配置 MySQL 时是本地模式：发送、历史和会话列表可用，会话消息号在 MySQL 事务中分配；已读回执、`focus` 和群已读人数不可用，未读数仍会从 MySQL 计算并显示，但不会随阅读清零。
 
-完整链路需要同时配置 Redis 和 RabbitMQ，并设置 `IM_GROUP_MESSAGING_ENABLED=true`、`IM_MESSAGING_REQUIRED=true` 以及 `IM_MESSAGING_NAMESPACE`。首次启动前，如果 Redis 中还没有 `seq:ready`，需要先执行一次：
+完整链路需要配置 Redis 和 RabbitMQ：设置 `IM_REDIS_URL(_FILE)`、`IM_RABBITMQ_URL(_FILE)` 及对应密码文件，设置 `IM_GROUP_MESSAGING_ENABLED=true` 开启群聊链路；`IM_MESSAGING_REQUIRED=true` 可选，用于基础设施缺失时直接启动失败；`IM_MESSAGING_NAMESPACE` 默认 `im:v12`。首次启动前，如果 Redis 中还没有 `seq:ready`，需要先执行一次：
 
 ```bash
 (cd backend && go run ./cmd/server -backfill-seq)
@@ -222,7 +224,7 @@ scripts/build-release.sh v2.0 /tmp/im-v2.0
 (cd backend && IM_TEST_MYSQL_DSN='<dsn>' go test -race ./internal/store)
 ```
 
-运行实例的 smoke 需要先构建并托管前端，再显式指定 `BASE_URL`：
+运行实例的 smoke 需要先构建并托管前端。下面的 `8199` 是 v2.0 验证实例；不设置 `BASE_URL` 时 smoke 默认也打 8199，建议仍然显式指定目标地址：
 
 ```bash
 BASE_URL=http://127.0.0.1:8199 node scripts/smoke.mjs
@@ -230,7 +232,7 @@ BASE_URL=http://127.0.0.1:8199 node scripts/browser-smoke.mjs
 BASE_URL=http://127.0.0.1:8199 node scripts/cache-smoke.mjs
 ```
 
-浏览器 smoke 默认使用 macOS 上的 Google Chrome，可用 `CHROME_PATH` 指定其他 Chrome/Chromium。smoke 会创建测试账号和数据，必须按运行时的 manifest 精确清理，不要使用宽泛的用户名通配符。
+浏览器 smoke 默认使用 macOS 上的 Google Chrome，可用 `CHROME_PATH` 指定其他 Chrome/Chromium。smoke 会在输出目录写入 `manifest.json`，记录本轮创建的测试账号和群；清理时使用 `scripts/cleanup-test-data.mjs` 按 manifest 精确处理，不要使用宽泛的用户名通配符。
 
 ## 版本状态
 
@@ -296,4 +298,4 @@ BASE_URL=http://127.0.0.1:8199 node scripts/cache-smoke.mjs
 - **Redis 不是备份。** Redis 使用 AOF `appendfsync everysec`，整机掉电时最多约 1 秒内已确认的消息可能丢失；Redis 数据不进入备份，丢失后从 MySQL 重建，重建期间发送和已读不可用。
 - **未做容量治理。** 消息和朋友圈没有自动清理或 TTL；v1.9 的容量验证、压测和调优尚未完成。
 - **当前不开放公网。** 现有部署不修改防火墙和 Nginx，也没有设计公网域名、TLS、反向代理和访问控制。
-- **未容器化。** 当前交付物是 Linux 发布包和 `imctl`，没有 Dockerfile 或 Compose。
+- **应用未容器化。** 当前应用交付物是 Linux 发布包和 `imctl`，没有应用镜像或 Compose 编排；MySQL、Redis、RabbitMQ 仍由 `imctl`/`infractl` 放在私有 Docker 中运行。
