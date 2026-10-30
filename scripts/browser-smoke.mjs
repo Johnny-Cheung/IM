@@ -524,6 +524,66 @@ async function main() {
     }
   });
 
+  await scenario("moments feed, like, comment and unread dot", async () => {
+    const friendMoment = await run.request("b", "POST", "/api/moments", {
+      body: "浏览器里的朋友圈",
+      visibility: "friends",
+    });
+    await run.request("b", "POST", "/api/moments", {
+      body: "浏览器私密动态",
+      visibility: "private",
+    });
+    await tab.waitFor("!!document.querySelector('.nav-dot')");
+    run.check("a new friend moment shows the nav dot", true);
+
+    await tab.goto("/moments");
+    await tab.waitFor("!!document.querySelector('.moments-card')");
+    await tab.waitFor("document.body.innerText.includes('浏览器里的朋友圈')");
+    run.check("moments page renders the friend moment", true);
+    run.check(
+      "moments page hides a friend's private moment",
+      !(await tab.evaluate("document.body.innerText.includes('浏览器私密动态')")),
+    );
+
+    await tab.evaluate(`(() => {
+      const card = [...document.querySelectorAll('.moment-card')]
+        .find((el) => el.innerText.includes('浏览器里的朋友圈'));
+      if (!card) throw new Error('moment card not found');
+      [...card.querySelectorAll('.moment-action')]
+        .find((button) => button.textContent.trim().startsWith('赞')).click();
+    })()`);
+    await tab.waitFor(`(() => {
+      const card = [...document.querySelectorAll('.moment-card')]
+        .find((el) => el.innerText.includes('浏览器里的朋友圈'));
+      return !!card && card.innerText.includes('取消赞');
+    })()`);
+    run.check("moments like toggles in the UI", true);
+
+    await tab.evaluate(`(() => {
+      const card = [...document.querySelectorAll('.moment-card')]
+        .find((el) => el.innerText.includes('浏览器里的朋友圈'));
+      [...card.querySelectorAll('.moment-action')]
+        .find((button) => button.textContent.trim().startsWith('评论')).click();
+    })()`);
+    await tab.waitFor("!!document.querySelector('.moment-comment-form input')");
+    await tab.setValue(".moment-comment-form input", "浏览器评论");
+    await tab.evaluate("document.querySelector('.moment-comment-form button[type=submit]').click()");
+    await tab.waitFor("document.body.innerText.includes('浏览器评论')");
+    run.check("moments comment appears in the UI", true);
+
+    const detail = await run.request("b", "GET", `/api/moments/${friendMoment.id}`);
+    run.check(
+      "moment like and comment persist",
+      detail.moment.like_count === 1
+        && detail.comments.some((comment) => comment.body === "浏览器评论"),
+    );
+
+    await tab.goto("/");
+    await tab.waitFor("!!document.querySelector('#conversation-list .conversation-item')");
+    await tab.waitFor("!document.querySelector('.nav-dot')");
+    run.check("returning to chat clears the moments dot", true);
+  });
+
   await scenario("same-session new window replaces old chat connection", async () => {
     await tab.select(directSelector("b"), `/chat/${name("b")}`);
     await tab.waitFor("document.querySelectorAll('#message-list .message-row').length > 0");
