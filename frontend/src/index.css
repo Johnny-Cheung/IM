@@ -738,12 +738,11 @@ a:focus-visible {
 }
 
 .conversation-pane-header {
-  align-items: flex-end;
-  border-bottom: 1px solid var(--line);
+  align-items: center;
   display: flex;
   gap: 12px;
   justify-content: space-between;
-  padding: 18px 18px 12px;
+  padding: 18px 18px 10px;
 }
 
 .conversation-pane-header h1 {
