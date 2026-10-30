@@ -11,7 +11,7 @@
 
 ## 构建发布包
 
-在 Mac 的仓库根目录确认工作区干净且位于 `refactor/im`：
+在 Mac 的仓库根目录确认工作区干净且位于 `main`：
 
 ```bash
 git status --short
@@ -22,7 +22,7 @@ scripts/build-release.sh v0.7 /tmp/im-v0.7
 scripts/build-release.sh v1.8.1 /tmp/im-v1.8.1
 ```
 
-脚本不会自动切换分支或推送。工作区不干净、分支不是 `refactor/im` 或输出目录已存在时会直接失败。产物目录包含：
+脚本不会自动切换分支或推送。工作区不干净、分支不是 `main` 或输出目录已存在时会直接失败。产物目录包含：
 
 ```text
 bin/im-server
@@ -139,7 +139,7 @@ if [ ! -e "$PRE" ]; then
   cp -p /opt/IM-Rebuild/imctl "$PRE"
 fi
 grep -q 'backfill-group-read' "$PRE" \
-  || { echo "错误：$PRE 不是 v1.7 控制脚本，回滚将无法执行；请从 refactor/im 的 v1.7 提交取回 deploy/imctl" >&2; exit 1; }
+  || { echo "错误：$PRE 不是 v1.7 控制脚本，回滚将无法执行；请从 old 分支的 v1.7 提交取回 deploy/imctl" >&2; exit 1; }
 ```
 
 本块只执行一次。副本已存在时不会覆盖；`imctl.pre-v1.8.1` 必须是旧脚本，新脚本没有 `backfill-read`/`backfill-group-read`。

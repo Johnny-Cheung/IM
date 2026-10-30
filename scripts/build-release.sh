@@ -3,7 +3,7 @@
 #
 # Usage: scripts/build-release.sh [VERSION] [OUTPUT_DIR]
 #
-# The source must be a clean, committed checkout of refactor/im. The script does
+# The source must be a clean, committed checkout of main. The script does
 # not switch branches. It builds the frontend with the committed npm lockfile and
 # a Linux amd64 Go binary (CGO disabled), then writes bin/im-server, web/,
 # RELEASE and SHA256SUMS to a new directory outside the repository.
@@ -23,7 +23,7 @@ Usage: scripts/build-release.sh [VERSION] [OUTPUT_DIR]
   OUTPUT_DIR  new output directory outside the repository
               (default: a unique scratch directory under $TMPDIR)
 
-Requires a clean committed refactor/im checkout plus git, go, node, npm and
+Requires a clean committed main checkout plus git, go, node, npm and
 either sha256sum or shasum. The script never checks out or pushes anything.
 EOF
 }
@@ -129,10 +129,11 @@ TOPLEVEL="$(cd "$TOPLEVEL" && pwd -P)"
   || die "script must be run from the repository checkout at $ROOT"
 
 BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" \
-  || die "HEAD is detached; check out refactor/im manually before building"
-if [ "$BRANCH" != "refactor/im" ]; then
-  die "current branch is '$BRANCH'; check out refactor/im manually before building"
-fi
+  || die "HEAD is detached; check out main manually before building"
+case "$BRANCH" in
+  main|refactor/im) ;;
+  *) die "current branch is '$BRANCH'; check out main manually before building" ;;
+esac
 
 if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
   printf 'Dirty files:\n' >&2
