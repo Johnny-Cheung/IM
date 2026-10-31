@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 const (
@@ -15,6 +17,35 @@ const (
 )
 
 var ErrSessionNotFound = errors.New("session not found")
+
+const (
+	// sessionDeadlockRetries bounds how many times an insert retries after
+	// InnoDB rolls the transaction back with error 1213.
+	sessionDeadlockRetries = 3
+	// sessionRetryBackoff is the first retry delay; each further attempt doubles it.
+	sessionRetryBackoff = 5 * time.Millisecond
+	// mysqlErrDeadlock is ER_LOCK_DEADLOCK.
+	mysqlErrDeadlock = 1213
+)
+
+// isMySQLDeadlock reports whether err is an InnoDB deadlock rollback. Those are
+// expected under concurrency and worth retrying; every other error is not.
+func isMySQLDeadlock(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlErrDeadlock
+}
+
+// sleepContext waits for delay unless the context ends first.
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
 // SessionUser combines a session with the user it belongs to.
 type SessionUser struct {
@@ -28,7 +59,57 @@ type SessionUser struct {
 
 // CreateSession revokes the user's current active session and inserts a new
 // one in a single transaction. Locking the user row serializes concurrent logins.
+//
+// Deadlocks here are expected under concurrent *registration* and are only
+// partially mitigated, not fixed. The mechanism, confirmed by reproduction
+// against MySQL 8.4 (REPEATABLE READ):
+//
+// The revoke UPDATE matches no row for a brand-new user, and under REPEATABLE
+// READ a non-matching equality search still takes a gap lock — specifically on
+// the supremum pseudo-record at the end of idx_sessions_user_active. Since a
+// new user's id is always the current maximum, every concurrent registration
+// lands in that same gap: two transactions each hold the supremum gap lock
+// (gap locks are mutually compatible) and then each wait for the other's gap
+// lock before its INSERT can take an insert intention lock. InnoDB breaks the
+// cycle by rolling one back with error 1213.
+//
+// Because CreateUser commits before this call, a rolled-back transaction
+// surfaces to the caller as a failure even though the user row already exists.
+//
+// The retry below only narrows the window: with no jitter, goroutines that
+// collided once tend to wake together and collide again (observed: all 3
+// retries deadlocked). The root fix is to run this transaction under READ
+// COMMITTED, where the UPDATE takes no gap lock at all — same-user
+// serialization is still guaranteed by the SELECT ... FOR UPDATE above.
+// That change is deliberately not applied yet; see bench/README.md.
 func (s *Store) CreateSession(
+	ctx context.Context,
+	userID uint64,
+	tokenHash []byte,
+	createdAt, expiresAt time.Time,
+) error {
+	var lastErr error
+	for attempt := 0; attempt <= sessionDeadlockRetries; attempt++ {
+		if attempt > 0 {
+			// Back off so the retry does not collide with the transaction
+			// that just won the lock. Without jitter this is weak: peers that
+			// collided together wake together and can collide again. Callers
+			// that need stronger guarantees add their own jittered retry
+			// (see bench/cmd/register).
+			if err := sleepContext(ctx, sessionRetryBackoff<<(attempt-1)); err != nil {
+				return err
+			}
+		}
+		lastErr = s.createSessionOnce(ctx, userID, tokenHash, createdAt, expiresAt)
+		if !isMySQLDeadlock(lastErr) {
+			return lastErr
+		}
+	}
+	return fmt.Errorf("create session after %d retries: %w", sessionDeadlockRetries, lastErr)
+}
+
+// createSessionOnce runs one attempt of the session transaction.
+func (s *Store) createSessionOnce(
 	ctx context.Context,
 	userID uint64,
 	tokenHash []byte,
