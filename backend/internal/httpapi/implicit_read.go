@@ -167,9 +167,9 @@ func (r *implicitRead) nextDelay() (time.Duration, bool) {
 }
 
 func (r *implicitRead) flushDue() {
+	r.mu.Lock()
 	now := time.Now()
 	due := make([]*implicitReadBatch, 0, len(r.pending))
-	r.mu.Lock()
 	for key, batch := range r.pending {
 		if now.Sub(batch.queuedAt) >= implicitReadWindow {
 			delete(r.pending, key)
