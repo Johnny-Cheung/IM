@@ -5,7 +5,7 @@
 | 阶段 | 测什么 | 状态 |
 | --- | --- | --- |
 | **一、WS 长连接** | 服务端能维持多少条并发长连接 | ✅ 已完成，跑到 **20 万连接** |
-| **二、消息 QPS 与端到端投递** | 私聊消息的接纳吞吐、异步链路能否跟上、有没有丢/重 | ⏳ 定标完成，**发现异步链路瓶颈，待修** |
+| **二、消息 QPS 与端到端投递** | 私聊消息的接纳吞吐、异步链路能否跟上、有没有丢/重 | 🛠️ 批量化已实现，**待真实压测验证** |
 
 ## 为什么不用 k6
 
@@ -173,7 +173,7 @@ docker exec im-local-mysql-1 mysql -uroot -proot123 --default-character-set=utf8
 
 **与旧基线对比**（2026-07-05，旧代码走 WS 发消息）：10 连接时旧版 29,532 QPS、P50 0.23ms，本次 9,319 QPS、P50 1.00ms。低约 3 倍，**主要差异是传输方式**（HTTP/1.1 往返 vs WS 帧），且代码与路径都已变化，**不能据此判断"性能退化了"**。
 
-## 已知服务端问题：异步投递链路吞吐不足（待修）
+## 已知服务端问题：异步投递链路吞吐不足（代码已优化，待压测验证）
 
 **这是第二阶段压测最重要的发现，旧压测完全没覆盖**——旧版只测到「MQ publish」为止，没有 Stream → RabbitMQ → MySQL 这一段。
 
@@ -183,12 +183,22 @@ docker exec im-local-mysql-1 mysql -uroot -proot123 --default-character-set=utf8
 
 ### 根因：两段都是「单条串行等 IO」
 
-| 环节 | 现状 | 实测上限 | 根因 |
+| 环节 | 改造前 | 实测上限 | 根因 |
 | --- | --- | --- | --- |
 | **relay** | 逐条 `Publish` → 等 broker 确认 → 再 ack | **386/s** | 持久化消息每条要 fsync 落盘，单条 **2.59 ms** |
 | **consumer** | `Qos(1)` + 每条一个 MySQL 事务 | **198/s** | 一次只有 1 条在途，且每条一次 commit |
 
-`relay.go:337-384` 是逐条的（`for … { Publish; AwaitConfirm; ackAndDelete }`），`rabbit_consumer.go:147` 是 `channel.Qos(1, 0, false)`，消费循环也是单 goroutine 逐条处理。
+改造前 `relay.go` 是逐条的（`for … { Publish; AwaitConfirm; ackAndDelete }`），`rabbit_consumer.go` 是 `channel.Qos(1, 0, false)`，消费循环也是单 goroutine 逐条处理。
+
+### 当前实现状态（2026-11-01）
+
+代码改造已经完成，但**下面的 386/s、198/s 等数字仍是改造前基线**；真实链路压测尚未重跑，不能把微基准数字当作当前吞吐。
+
+- **relay**：`XReadGroup` 批量读取最多 100 条，整批发布后才等待 `DeferredConfirmation`，全部确认成功后用一个 Lua 脚本批量 `XACK + XDEL`；任何一条失败整批不 ack，保留 pending 等待重投。确认等待有 30 秒超时。direct 和 group 都使用同一套批量逻辑。
+- **consumer**：每个队列一个 worker，`Qos(100)`，最多 100 条或 10ms 攒批，一个 MySQL 事务多行 `INSERT ... ON DUPLICATE KEY UPDATE id = id`。只有 `RowsAffected == len(messages)` 才 commit；重复、冲突或参数异常回滚并回落现有逐条幂等路径。direct 和 group 同步改造。
+- **未启用 consumer 并发**：先保持单 worker，等真实压测确认批量单 worker 是否已经覆盖接纳能力，再决定是否按会话分片增加 worker。
+- **已验证**：后端 `go test ./...`、`go test -race ./internal/messaging ./internal/store`、`go vet ./...` 通过；新增了 relay 批量确认、consumer 批量/回落/取消和 store 批量 SQL 测试。
+- **未验证**：真实 MySQL/RabbitMQ 端到端、`qpsload` 重跑、故障注入和群聊批量压测。压测完成后在本文件补充新数字和日期。
 
 ### 实测优化空间
 
@@ -198,7 +208,7 @@ docker exec im-local-mysql-1 mysql -uroot -proot123 --default-character-set=utf8
 
 | 方式 | 吞吐 | 相对逐条 |
 | --- | --- | --- |
-| 逐条等确认（现状） | 386/s | 1× |
+| 逐条等确认（改造前） | 386/s | 1× |
 | 流水线 10 条 | 5,077/s | 13× |
 | 流水线 50 条 | 12,188/s | 32× |
 | **流水线 100 条** | **41,832/s** | **108×** |
@@ -208,7 +218,7 @@ docker exec im-local-mysql-1 mysql -uroot -proot123 --default-character-set=utf8
 
 | 方式 | 吞吐 | 相对现状 |
 | --- | --- | --- |
-| 并发1 × 批量1（现状） | 351/s | 1× |
+| 并发1 × 批量1（改造前） | 351/s | 1× |
 | 并发30 × 批量1 | 4,705/s | 13× |
 | 并发1 × 批量100 | 15,999/s | 46× |
 | 并发8 × 批量100 | **59,489/s** | 169× |
@@ -218,20 +228,22 @@ docker exec im-local-mysql-1 mysql -uroot -proot123 --default-character-set=utf8
 
 ### 优化方案
 
-**consumer 优先**（收益大、风险低），因为它是**最终瓶颈**——即使 relay 提到 40,000/s，落库还是 198/s：
+以下方案在 2026-11-01 已落地 relay 批量和 consumer 单 worker 批量；consumer 并发暂未启用，等待真实压测结果决定。下面的吞吐数字是拆开压对应资源的微基准预期，不是当前端到端实测。
 
-1. `Qos(1)` → `Qos(100)`，并把逐条处理改为有限并发 → 351/s ≈ **5,000/s**
-2. 多行批量 `INSERT`（按会话分组）→ 再叠加到 **~15,000/s**
+**consumer 优先**（收益大、风险低），因为改造前它是**最终瓶颈**——即使 relay 提到 40,000/s，落库仍只有 198/s：
+
+1. `Qos(1)` → `Qos(100)`，先使用单 worker 批量事务；若端到端仍不足，再叠加有限并发 → 微基准约 **5,000/s**
+2. 多行批量 `INSERT`（按会话分组）→ 再叠加到微基准约 **~15,000/s**
 
 **relay 其次**（语义要保持，实现要小心）：
 
-3. `Count: 10` → 100，逐条 `Publish+AwaitConfirm` → 批量 `Publish` + 批量等确认 + 整批 ack → 386/s ≈ **12,000–40,000/s**
+3. `Count: 10` → 100，逐条 `Publish+AwaitConfirm` → 批量 `Publish` + 批量等确认 + 整批 ack → 微基准约 **12,000–40,000/s**
 
 **实现注意点**：
 
 - **投递语义可以不变**。当前保证是「未确认绝不 ack」（至少一次投递）。批量化后仍可保持：整批发 → 收齐确认 → **全部成功才批量 ack**；任何一条失败则整批不 ack，交给 `drainPending` 重投。**不做部分 ack**。代价是可能重复投递，但 consumer 的 `ON DUPLICATE KEY UPDATE` 幂等，**重复安全**。
-- **`NotifyPublish` 的缓冲只有 1**（`relay.go:123`）。改成流水线却不同步读取这个 channel，会让 `confirms.confirm()` 在 `l <- confirmation` 处阻塞 RabbitMQ 的读取协程，**卡死整条连接**。改用 `PublishWithContext` 返回的 `DeferredConfirmation.WaitContext` 可绕开。
-- **`relayStreams` 被两处复用**（新消息与 `drainPending` 重投，`relay.go:306,331`），批量路径要同时服务这两种场景。
+- **`NotifyPublish` 的缓冲只有 1**（`relay.go:123`）。改成流水线却不同步读取这个 channel，会让 `confirms.confirm()` 在 `l <- confirmation` 处阻塞 RabbitMQ 的读取协程，**卡死整条连接**。改用 `PublishWithDeferredConfirmWithContext` 返回的 `DeferredConfirmation.WaitContext` 可绕开；当前实现已经移除 `NotifyPublish` listener，使用 deferred confirmation。
+- **`relayStreams` 被两处复用**（新消息与 `drainPending` 重投），批量路径要同时服务这两种场景；当前实现两边都走同一批量函数。
 - **consumer 并发会失去「同会话按 seq 顺序落库」**。目前单 goroutine 逐条处理天然保证顺序。最终一致性不受影响（幂等 + `seq` 唯一键），但若有依赖落库顺序的逻辑需先确认。
 - **按需优化即可**：同步路径只有 9,300/s 的产出，异步链路优化到 15,000/s 已足够，不必拉满到 85,000/s。
 
