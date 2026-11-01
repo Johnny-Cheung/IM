@@ -23,9 +23,11 @@ var ackDeleteScript = redis.NewScript(ackDeleteScriptSource)
 type RabbitDialer func(config.RabbitMQConfig) (*amqp091.Connection, error)
 
 const (
-	relayDefaultBackoff    = time.Second
-	relayDefaultMaxBackoff = 30 * time.Second
-	relayDefaultBlock      = 2 * time.Second
+	relayDefaultBackoff        = time.Second
+	relayDefaultMaxBackoff     = 30 * time.Second
+	relayDefaultBlock          = 2 * time.Second
+	relayDefaultBatchSize      = 100
+	relayDefaultConfirmTimeout = 30 * time.Second
 )
 
 // RelayStatus is a snapshot of a stream relay for /ops/infra.
@@ -103,57 +105,78 @@ func (b *relayBackoff) reset() {
 	b.current = b.initial
 }
 
-// relayPublisher publishes one message and waits for the broker confirmation.
+// relayPublishReceipt represents a publish whose broker confirmation is still
+// pending. A relay publishes a whole batch before waiting on any receipt.
+type relayPublishReceipt interface {
+	Wait(ctx context.Context) error
+}
+
+// relayPublisher starts one publish and returns a receipt for its confirmation.
 type relayPublisher interface {
-	Publish(ctx context.Context, exchange, routingKey, messageID string, payload []byte) error
+	Publish(ctx context.Context, exchange, routingKey, messageID string, payload []byte) (relayPublishReceipt, error)
 }
 
 // amqpRelayPublisher publishes over one confirmed channel.
 type amqpRelayPublisher struct {
-	channel  *amqp091.Channel
-	confirms <-chan amqp091.Confirmation
+	channel *amqp091.Channel
 }
 
 func newAMQPRelayPublisher(channel *amqp091.Channel) (*amqpRelayPublisher, error) {
 	if err := channel.Confirm(false); err != nil {
 		return nil, fmt.Errorf("enable RabbitMQ publisher confirms: %w", err)
 	}
-	return &amqpRelayPublisher{
-		channel:  channel,
-		confirms: channel.NotifyPublish(make(chan amqp091.Confirmation, 1)),
-	}, nil
+	return &amqpRelayPublisher{channel: channel}, nil
 }
 
 func (p *amqpRelayPublisher) Publish(
 	ctx context.Context,
 	exchange, routingKey, messageID string,
 	payload []byte,
-) error {
-	if err := p.channel.PublishWithContext(ctx, exchange, routingKey, false, false, amqp091.Publishing{
-		ContentType:  "application/json",
-		DeliveryMode: amqp091.Persistent,
-		MessageId:    messageID,
-		Body:         payload,
-	}); err != nil {
-		return fmt.Errorf("publish message %s: %w", messageID, err)
+) (relayPublishReceipt, error) {
+	confirmation, err := p.channel.PublishWithDeferredConfirmWithContext(
+		ctx,
+		exchange,
+		routingKey,
+		false,
+		false,
+		amqp091.Publishing{
+			ContentType:  "application/json",
+			DeliveryMode: amqp091.Persistent,
+			MessageId:    messageID,
+			Body:         payload,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("publish message %s: %w", messageID, err)
 	}
-	return relayAwaitConfirm(ctx, p.confirms, messageID)
+	if confirmation == nil {
+		return nil, fmt.Errorf("publisher confirms are not enabled for message %s", messageID)
+	}
+	return relayDeferredReceipt{confirmation: confirmation, messageID: messageID}, nil
 }
 
-// relayAwaitConfirm treats a nack and a closed confirm channel as failures.
-func relayAwaitConfirm(ctx context.Context, confirms <-chan amqp091.Confirmation, messageID string) error {
-	select {
-	case confirmation, ok := <-confirms:
-		if !ok {
-			return fmt.Errorf("publisher confirm channel closed for message %s", messageID)
-		}
-		if !confirmation.Ack {
-			return fmt.Errorf("RabbitMQ rejected message %s", messageID)
-		}
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+type relayDeferredReceipt struct {
+	confirmation relayConfirmation
+	messageID    string
+}
+
+// relayConfirmation is implemented by amqp091.DeferredConfirmation; tests
+// provide a fake so the nack/closed/error cases are exercised without a broker.
+type relayConfirmation interface {
+	WaitContext(context.Context) (bool, error)
+}
+
+// Wait treats a nack, a closed confirm channel and a timeout as failures. The
+// caller must not acknowledge the Redis Stream entry in any of those cases.
+func (r relayDeferredReceipt) Wait(ctx context.Context) error {
+	acknowledged, err := r.confirmation.WaitContext(ctx)
+	if err != nil {
+		return err
 	}
+	if !acknowledged {
+		return fmt.Errorf("RabbitMQ rejected message %s", r.messageID)
+	}
+	return nil
 }
 
 // StreamRelay moves accepted Redis Stream messages into RabbitMQ.
@@ -167,6 +190,9 @@ type StreamRelay struct {
 	status  *relayStatusTracker
 	backoff *relayBackoff
 	block   time.Duration
+	batch   int
+	// confirmTimeout bounds waiting for the whole batch's publisher confirms.
+	confirmTimeout time.Duration
 	// connect runs one connection attempt; tests replace it.
 	connect func(context.Context) error
 	// wait pauses between reconnect attempts; tests replace it.
@@ -189,15 +215,17 @@ func NewStreamRelayWithNamespace(
 	namespace Namespace,
 ) *StreamRelay {
 	relay := &StreamRelay{
-		redis:     client,
-		config:    rabbitConfig,
-		dialer:    dialer,
-		keyspace:  keyspace,
-		namespace: namespace,
-		status:    &relayStatusTracker{},
-		backoff:   newRelayBackoff(relayDefaultBackoff, relayDefaultMaxBackoff),
-		block:     relayDefaultBlock,
-		wait:      waitMessaging,
+		redis:          client,
+		config:         rabbitConfig,
+		dialer:         dialer,
+		keyspace:       keyspace,
+		namespace:      namespace,
+		status:         &relayStatusTracker{},
+		backoff:        newRelayBackoff(relayDefaultBackoff, relayDefaultMaxBackoff),
+		block:          relayDefaultBlock,
+		batch:          relayDefaultBatchSize,
+		confirmTimeout: relayDefaultConfirmTimeout,
+		wait:           waitMessaging,
 	}
 	relay.connect = relay.runConnection
 	return relay
@@ -240,6 +268,12 @@ func (r *StreamRelay) ensureDefaults() {
 	}
 	if r.block <= 0 {
 		r.block = relayDefaultBlock
+	}
+	if r.batch <= 0 {
+		r.batch = relayDefaultBatchSize
+	}
+	if r.confirmTimeout <= 0 {
+		r.confirmTimeout = relayDefaultConfirmTimeout
 	}
 	if r.connect == nil {
 		r.connect = r.runConnection
@@ -294,7 +328,7 @@ func (r *StreamRelay) runPublisher(ctx context.Context, publisher relayPublisher
 			Group:    directRelayGroup(r.namespace),
 			Consumer: directConsumerName(r.namespace),
 			Streams:  []string{r.keyspace.messageStreamKey(), ">"},
-			Count:    10,
+			Count:    int64(r.batch),
 			Block:    r.block,
 		}).Result()
 		if errors.Is(err, redis.Nil) {
@@ -317,7 +351,7 @@ func (r *StreamRelay) drainPending(ctx context.Context, publisher relayPublisher
 			Group:    directRelayGroup(r.namespace),
 			Consumer: directConsumerName(r.namespace),
 			Streams:  []string{r.keyspace.messageStreamKey(), "0"},
-			Count:    100,
+			Count:    int64(r.batch),
 		}).Result()
 		if errors.Is(err, redis.Nil) {
 			return nil
@@ -340,59 +374,116 @@ func (r *StreamRelay) relayStreams(
 	streams []redis.XStream,
 	recovered bool,
 ) error {
+	entries := make([]relayStreamEntry, 0, relayStreamCount(streams))
 	for _, stream := range streams {
 		for _, entry := range stream.Messages {
-			if err := r.relayEntry(ctx, publisher, entry, recovered); err != nil {
+			message, err := streamMessage(entry.Values)
+			if err != nil {
+				// Entries are produced by our own Lua script. A malformed entry
+				// cannot be retried successfully, so remove it with the batch.
+				log.Printf("drop malformed direct stream entry %s: %v", entry.ID, err)
+				entries = append(entries, relayStreamEntry{entryID: entry.ID})
+				continue
+			}
+			payload, err := encodeDirectMessage(message)
+			if err != nil {
 				return err
 			}
+			entries = append(entries, relayStreamEntry{
+				entryID:   entry.ID,
+				messageID: fmt.Sprintf("%d", message.ID),
+				payload:   payload,
+				valid:     true,
+			})
+		}
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+
+	receipts := make([]relayPublishReceipt, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.valid {
+			continue
+		}
+		receipt, err := publisher.Publish(
+			ctx,
+			directExchangeName(r.namespace),
+			directRoutingKey,
+			entry.messageID,
+			entry.payload,
+		)
+		if err != nil {
+			// Shutdown while awaiting the confirm: return without ack so the next
+			// connection recovers the entry.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("relay message %s: %w", entry.messageID, err)
+		}
+		if receipt == nil {
+			return fmt.Errorf("relay message %s returned no confirmation receipt", entry.messageID)
+		}
+		receipts = append(receipts, receipt)
+	}
+
+	// Publish the whole batch before waiting for any confirmation. The channel
+	// is dedicated to this relay and confirms are correlated per message.
+	confirmTimeout := r.confirmTimeout
+	if confirmTimeout <= 0 {
+		confirmTimeout = relayDefaultConfirmTimeout
+	}
+	waitCtx, cancelWait := context.WithTimeout(ctx, confirmTimeout)
+	defer cancelWait()
+	for _, receipt := range receipts {
+		if err := receipt.Wait(waitCtx); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("await relay confirm: %w", err)
+		}
+	}
+
+	entryIDs := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		entryIDs = append(entryIDs, entry.entryID)
+	}
+	if err := r.ackAndDeleteMany(ctx, entryIDs); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.valid {
+			r.status.recordRelayed(recovered)
 		}
 	}
 	return nil
 }
 
-func (r *StreamRelay) relayEntry(
-	ctx context.Context,
-	publisher relayPublisher,
-	entry redis.XMessage,
-	recovered bool,
-) error {
-	message, err := streamMessage(entry.Values)
-	if err != nil {
-		// Entries are produced by our own Lua script. A malformed entry cannot
-		// be retried successfully, so acknowledge and remove it after logging.
-		log.Printf("drop malformed direct stream entry %s: %v", entry.ID, err)
-		return r.ackAndDelete(ctx, entry.ID)
-	}
-	payload, err := encodeDirectMessage(message)
-	if err != nil {
-		return err
-	}
-	err = publisher.Publish(ctx, directExchangeName(r.namespace), directRoutingKey, fmt.Sprintf("%d", message.ID), payload)
-	if err != nil {
-		// Shutdown while awaiting the confirm: return without ack so the next
-		// connection recovers the entry.
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("relay message %d: %w", message.ID, err)
-	}
-	if err := r.ackAndDelete(ctx, entry.ID); err != nil {
-		return err
-	}
-	r.status.recordRelayed(recovered)
-	return nil
+type relayStreamEntry struct {
+	entryID   string
+	messageID string
+	payload   []byte
+	valid     bool
 }
 
-func (r *StreamRelay) ackAndDelete(ctx context.Context, entryID string) error {
-	// Atomic ack+delete: a zero delete count (entry already gone) is still success.
+func (r *StreamRelay) ackAndDeleteMany(ctx context.Context, entryIDs []string) error {
+	if len(entryIDs) == 0 {
+		return nil
+	}
+	args := make([]interface{}, 0, len(entryIDs)+1)
+	args = append(args, directRelayGroup(r.namespace))
+	for _, entryID := range entryIDs {
+		args = append(args, entryID)
+	}
+	// Atomic ack+delete for the whole batch: a zero delete count (entry already
+	// gone) is still success.
 	if err := ackDeleteScript.Run(
 		ctx,
 		r.redis,
 		[]string{r.keyspace.messageStreamKey()},
-		directRelayGroup(r.namespace),
-		entryID,
+		args...,
 	).Err(); err != nil {
-		return fmt.Errorf("ack and delete stream message %s: %w", entryID, err)
+		return fmt.Errorf("ack and delete stream messages: %w", err)
 	}
 	return nil
 }

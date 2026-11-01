@@ -24,6 +24,9 @@ type GroupStreamRelay struct {
 	status  *relayStatusTracker
 	backoff *relayBackoff
 	block   time.Duration
+	batch   int
+	// confirmTimeout bounds waiting for the whole batch's publisher confirms.
+	confirmTimeout time.Duration
 	// connect runs one connection attempt; tests replace it.
 	connect func(context.Context) error
 	// wait pauses between reconnect attempts; tests replace it.
@@ -38,15 +41,17 @@ func NewGroupStreamRelay(
 	namespace Namespace,
 ) *GroupStreamRelay {
 	relay := &GroupStreamRelay{
-		redis:     client,
-		config:    rabbitConfig,
-		dialer:    dialer,
-		keyspace:  keyspace,
-		namespace: namespace,
-		status:    &relayStatusTracker{},
-		backoff:   newRelayBackoff(relayDefaultBackoff, relayDefaultMaxBackoff),
-		block:     relayDefaultBlock,
-		wait:      waitMessaging,
+		redis:          client,
+		config:         rabbitConfig,
+		dialer:         dialer,
+		keyspace:       keyspace,
+		namespace:      namespace,
+		status:         &relayStatusTracker{},
+		backoff:        newRelayBackoff(relayDefaultBackoff, relayDefaultMaxBackoff),
+		block:          relayDefaultBlock,
+		batch:          relayDefaultBatchSize,
+		confirmTimeout: relayDefaultConfirmTimeout,
+		wait:           waitMessaging,
 	}
 	relay.connect = relay.runConnection
 	return relay
@@ -88,6 +93,12 @@ func (r *GroupStreamRelay) ensureDefaults() {
 	}
 	if r.block <= 0 {
 		r.block = relayDefaultBlock
+	}
+	if r.batch <= 0 {
+		r.batch = relayDefaultBatchSize
+	}
+	if r.confirmTimeout <= 0 {
+		r.confirmTimeout = relayDefaultConfirmTimeout
 	}
 	if r.connect == nil {
 		r.connect = r.runConnection
@@ -141,7 +152,7 @@ func (r *GroupStreamRelay) runPublisher(ctx context.Context, publisher relayPubl
 			Group:    groupRelayName(r.namespace),
 			Consumer: groupConsumerName(r.namespace),
 			Streams:  []string{r.keyspace.groupMessageStreamKey(), ">"},
-			Count:    10,
+			Count:    int64(r.batch),
 			Block:    r.block,
 		}).Result()
 		if errors.Is(err, redis.Nil) {
@@ -162,7 +173,7 @@ func (r *GroupStreamRelay) drainPending(ctx context.Context, publisher relayPubl
 			Group:    groupRelayName(r.namespace),
 			Consumer: groupConsumerName(r.namespace),
 			Streams:  []string{r.keyspace.groupMessageStreamKey(), "0"},
-			Count:    100,
+			Count:    int64(r.batch),
 		}).Result()
 		if errors.Is(err, redis.Nil) {
 			return nil
@@ -185,55 +196,103 @@ func (r *GroupStreamRelay) relayStreams(
 	streams []redis.XStream,
 	recovered bool,
 ) error {
+	entries := make([]relayStreamEntry, 0, relayStreamCount(streams))
 	for _, stream := range streams {
 		for _, entry := range stream.Messages {
-			if err := r.relayEntry(ctx, publisher, entry, recovered); err != nil {
+			message, err := groupStreamMessage(entry.Values)
+			if err != nil {
+				log.Printf("drop malformed group stream entry %s: %v", entry.ID, err)
+				entries = append(entries, relayStreamEntry{entryID: entry.ID})
+				continue
+			}
+			payload, err := encodeGroupMessage(message)
+			if err != nil {
 				return err
 			}
+			entries = append(entries, relayStreamEntry{
+				entryID:   entry.ID,
+				messageID: groupMessageIDString(message.ID),
+				payload:   payload,
+				valid:     true,
+			})
+		}
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+
+	receipts := make([]relayPublishReceipt, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.valid {
+			continue
+		}
+		receipt, err := publisher.Publish(
+			ctx,
+			groupExchangeName(r.namespace),
+			groupRoutingKey(),
+			entry.messageID,
+			entry.payload,
+		)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("relay group message %s: %w", entry.messageID, err)
+		}
+		if receipt == nil {
+			return fmt.Errorf("relay group message %s returned no confirmation receipt", entry.messageID)
+		}
+		receipts = append(receipts, receipt)
+	}
+
+	confirmTimeout := r.confirmTimeout
+	if confirmTimeout <= 0 {
+		confirmTimeout = relayDefaultConfirmTimeout
+	}
+	waitCtx, cancelWait := context.WithTimeout(ctx, confirmTimeout)
+	defer cancelWait()
+	for _, receipt := range receipts {
+		if err := receipt.Wait(waitCtx); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("await group relay confirm: %w", err)
+		}
+	}
+
+	entryIDs := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		entryIDs = append(entryIDs, entry.entryID)
+	}
+	if err := r.ackAndDeleteMany(ctx, entryIDs); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.valid {
+			r.status.recordRelayed(recovered)
 		}
 	}
 	return nil
 }
 
-func (r *GroupStreamRelay) relayEntry(
-	ctx context.Context,
-	publisher relayPublisher,
-	entry redis.XMessage,
-	recovered bool,
-) error {
-	message, err := groupStreamMessage(entry.Values)
-	if err != nil {
-		log.Printf("drop malformed group stream entry %s: %v", entry.ID, err)
-		return r.ackAndDelete(ctx, entry.ID)
+func (r *GroupStreamRelay) ackAndDeleteMany(ctx context.Context, entryIDs []string) error {
+	if len(entryIDs) == 0 {
+		return nil
 	}
-	payload, err := encodeGroupMessage(message)
-	if err != nil {
-		return err
+	args := make([]interface{}, 0, len(entryIDs)+1)
+	args = append(args, groupRelayName(r.namespace))
+	for _, entryID := range entryIDs {
+		args = append(args, entryID)
 	}
-	err = publisher.Publish(ctx, groupExchangeName(r.namespace), groupRoutingKey(), groupMessageIDString(message.ID), payload)
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("relay group message %d: %w", message.ID, err)
-	}
-	if err := r.ackAndDelete(ctx, entry.ID); err != nil {
-		return err
-	}
-	r.status.recordRelayed(recovered)
-	return nil
-}
-
-func (r *GroupStreamRelay) ackAndDelete(ctx context.Context, entryID string) error {
-	// Atomic ack+delete: a zero delete count (entry already gone) is still success.
+	// Atomic ack+delete for the whole batch: a zero delete count (entry already
+	// gone) is still success.
 	if err := ackDeleteScript.Run(
 		ctx,
 		r.redis,
 		[]string{r.keyspace.groupMessageStreamKey()},
-		groupRelayName(r.namespace),
-		entryID,
+		args...,
 	).Err(); err != nil {
-		return fmt.Errorf("ack and delete group stream message %s: %w", entryID, err)
+		return fmt.Errorf("ack and delete group stream messages: %w", err)
 	}
 	return nil
 }

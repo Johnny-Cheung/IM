@@ -69,11 +69,39 @@ type relayPublishCall struct {
 	payload    []byte
 }
 
+// relayTestReceipt lets tests decide when a publish confirmation succeeds,
+// fails or blocks.
+type relayTestReceipt struct {
+	err  error
+	wait func(context.Context) error
+}
+
+func (r relayTestReceipt) Wait(ctx context.Context) error {
+	if r.wait != nil {
+		return r.wait(ctx)
+	}
+	return r.err
+}
+
+// relayFakeConfirmation exercises relayDeferredReceipt without a broker.
+type relayFakeConfirmation struct {
+	acknowledged bool
+	err          error
+}
+
+func (c relayFakeConfirmation) WaitContext(context.Context) (bool, error) {
+	return c.acknowledged, c.err
+}
+
 type fakeRelayPublisher struct {
-	mu       sync.Mutex
-	calls    []relayPublishCall
-	errs     []error
-	notified chan struct{}
+	mu          sync.Mutex
+	calls       []relayPublishCall
+	attempts    int
+	failAt      int
+	failErr     error
+	errs        []error
+	receiptErrs []error
+	notified    chan struct{}
 }
 
 func newFakeRelayPublisher() *fakeRelayPublisher {
@@ -87,17 +115,38 @@ func (f *fakeRelayPublisher) failWith(err error) {
 	f.errs = append(f.errs, err)
 }
 
+// failWaitWith queues one confirmation failure for the next Publish call.
+func (f *fakeRelayPublisher) failWaitWith(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.receiptErrs = append(f.receiptErrs, err)
+}
+
+// failOnCall makes the nth Publish invocation fail without recording a call.
+func (f *fakeRelayPublisher) failOnCall(n int, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failAt = n
+	f.failErr = err
+}
+
 func (f *fakeRelayPublisher) Publish(
 	_ context.Context,
 	exchange, routingKey, messageID string,
 	payload []byte,
-) error {
+) (relayPublishReceipt, error) {
 	f.mu.Lock()
+	f.attempts++
+	if f.failAt > 0 && f.attempts == f.failAt {
+		err := f.failErr
+		f.mu.Unlock()
+		return nil, err
+	}
 	if len(f.errs) > 0 {
 		err := f.errs[0]
 		f.errs = f.errs[1:]
 		f.mu.Unlock()
-		return err
+		return nil, err
 	}
 	f.calls = append(f.calls, relayPublishCall{
 		exchange:   exchange,
@@ -105,12 +154,17 @@ func (f *fakeRelayPublisher) Publish(
 		messageID:  messageID,
 		payload:    append([]byte(nil), payload...),
 	})
+	var receiptErr error
+	if len(f.receiptErrs) > 0 {
+		receiptErr = f.receiptErrs[0]
+		f.receiptErrs = f.receiptErrs[1:]
+	}
 	f.mu.Unlock()
 	select {
 	case f.notified <- struct{}{}:
 	default:
 	}
-	return nil
+	return relayTestReceipt{err: receiptErr}, nil
 }
 
 func (f *fakeRelayPublisher) snapshot() []relayPublishCall {
@@ -135,26 +189,15 @@ func (p *blockingRelayPublisher) Publish(
 	ctx context.Context,
 	_, _, _ string,
 	_ []byte,
-) error {
+) (relayPublishReceipt, error) {
 	select {
 	case p.started <- struct{}{}:
 	default:
 	}
-	<-ctx.Done()
-	return ctx.Err()
-}
-
-// confirmRelayPublisher drives the real confirm handling over a test channel.
-type confirmRelayPublisher struct {
-	confirms chan amqp091.Confirmation
-}
-
-func (p *confirmRelayPublisher) Publish(
-	ctx context.Context,
-	_, _, messageID string,
-	_ []byte,
-) error {
-	return relayAwaitConfirm(ctx, p.confirms, messageID)
+	return relayTestReceipt{wait: func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}, nil
 }
 
 // runRelayUntil runs the relay loop until it published want entries and the
@@ -486,10 +529,10 @@ func TestStreamRelayKeepsEntryPendingOnNack(t *testing.T) {
 	}
 	relayAddDirectEntry(t, env.client, 202, 1)
 
-	confirms := make(chan amqp091.Confirmation, 1)
-	confirms <- amqp091.Confirmation{DeliveryTag: 1, Ack: false}
 	relay := newDirectRelayTest(env)
-	err := relay.runPublisher(ctx, &confirmRelayPublisher{confirms: confirms})
+	publisher := newFakeRelayPublisher()
+	publisher.failWaitWith(errors.New("RabbitMQ rejected message 202"))
+	err := relay.runPublisher(ctx, publisher)
 	if err == nil || !strings.Contains(err.Error(), "rejected") {
 		t.Fatalf("runPublisher() error = %v, want rejection", err)
 	}
@@ -509,10 +552,10 @@ func TestStreamRelayKeepsEntryPendingOnClosedConfirmChannel(t *testing.T) {
 	}
 	relayAddDirectEntry(t, env.client, 203, 1)
 
-	confirms := make(chan amqp091.Confirmation)
-	close(confirms)
 	relay := newDirectRelayTest(env)
-	err := relay.runPublisher(ctx, &confirmRelayPublisher{confirms: confirms})
+	publisher := newFakeRelayPublisher()
+	publisher.failWaitWith(errors.New("publisher confirm channel closed for message 203"))
+	err := relay.runPublisher(ctx, publisher)
 	if err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("runPublisher() error = %v, want closed confirm channel", err)
 	}
@@ -595,28 +638,217 @@ func TestStreamRelayDropsMalformedPendingEntry(t *testing.T) {
 	}
 }
 
-func TestAwaitRelayConfirmClassifiesFailures(t *testing.T) {
-	acknowledged := make(chan amqp091.Confirmation, 1)
-	acknowledged <- amqp091.Confirmation{Ack: true}
-	if err := relayAwaitConfirm(context.Background(), acknowledged, "1"); err != nil {
+func relayTakeDirect(t *testing.T, client *redis.Client, count int64) []redis.XStream {
+	t.Helper()
+	streams, err := client.XReadGroup(context.Background(), &redis.XReadGroupArgs{
+		Group:    directRelayGroup(DefaultNamespace()),
+		Consumer: directConsumerName(DefaultNamespace()),
+		Streams:  []string{messageStreamKey(), ">"},
+		Count:    count,
+	}).Result()
+	if err != nil {
+		t.Fatalf("read direct stream: %v", err)
+	}
+	return streams
+}
+
+type orderedRelayPublisher struct {
+	published            int
+	publishedAtFirstWait int
+}
+
+func (p *orderedRelayPublisher) Publish(
+	_ context.Context,
+	_, _, _ string,
+	_ []byte,
+) (relayPublishReceipt, error) {
+	p.published++
+	return relayTestReceipt{wait: func(context.Context) error {
+		if p.publishedAtFirstWait == 0 {
+			p.publishedAtFirstWait = p.published
+		}
+		return nil
+	}}, nil
+}
+
+func TestStreamRelayPublishesWholeBatchBeforeWaiting(t *testing.T) {
+	env := newRelayTestEnv(t)
+	ctx := context.Background()
+	if err := ensureRelayGroup(ctx, env.client, defaultKeyspace, DefaultNamespace()); err != nil {
+		t.Fatalf("ensure relay group: %v", err)
+	}
+	for index := uint64(1); index <= 3; index++ {
+		relayAddDirectEntry(t, env.client, 600+index, index)
+	}
+	relay := newDirectRelayTest(env)
+	publisher := &orderedRelayPublisher{}
+
+	if err := relay.relayStreams(ctx, publisher, relayTakeDirect(t, env.client, 10), false); err != nil {
+		t.Fatalf("relayStreams() error = %v", err)
+	}
+	if publisher.published != 3 || publisher.publishedAtFirstWait != 3 {
+		t.Fatalf(
+			"published/published at first wait = %d/%d, want 3/3",
+			publisher.published,
+			publisher.publishedAtFirstWait,
+		)
+	}
+	if got := env.client.XLen(ctx, messageStreamKey()).Val(); got != 0 {
+		t.Fatalf("stream length = %d, want 0", got)
+	}
+	if got := relayPendingCount(t, env.client, messageStreamKey(), directRelayGroup(DefaultNamespace())); got != 0 {
+		t.Fatalf("pending = %d, want 0", got)
+	}
+	if got := relay.Status().Relayed; got != 3 {
+		t.Fatalf("relayed = %d, want 3", got)
+	}
+}
+
+func TestStreamRelayKeepsWholeBatchPendingWhenOneConfirmationFails(t *testing.T) {
+	env := newRelayTestEnv(t)
+	ctx := context.Background()
+	if err := ensureRelayGroup(ctx, env.client, defaultKeyspace, DefaultNamespace()); err != nil {
+		t.Fatalf("ensure relay group: %v", err)
+	}
+	for index := uint64(1); index <= 3; index++ {
+		relayAddDirectEntry(t, env.client, 610+index, index)
+	}
+	relay := newDirectRelayTest(env)
+	publisher := newFakeRelayPublisher()
+	publisher.failWaitWith(errors.New("RabbitMQ rejected message 611"))
+
+	err := relay.relayStreams(ctx, publisher, relayTakeDirect(t, env.client, 10), false)
+	if err == nil || !strings.Contains(err.Error(), "rejected") {
+		t.Fatalf("relayStreams() error = %v, want rejection", err)
+	}
+	if got := len(publisher.snapshot()); got != 3 {
+		t.Fatalf("publishes = %d, want 3: the whole batch must be published before confirms are checked", got)
+	}
+	if got := env.client.XLen(ctx, messageStreamKey()).Val(); got != 3 {
+		t.Fatalf("stream length = %d, want 3", got)
+	}
+	if got := relayPendingCount(t, env.client, messageStreamKey(), directRelayGroup(DefaultNamespace())); got != 3 {
+		t.Fatalf("pending = %d, want 3", got)
+	}
+	if got := relay.Status().Relayed; got != 0 {
+		t.Fatalf("relayed = %d, want 0", got)
+	}
+}
+
+func TestStreamRelayKeepsWholeBatchPendingWhenPublishFailsMidBatch(t *testing.T) {
+	env := newRelayTestEnv(t)
+	ctx := context.Background()
+	if err := ensureRelayGroup(ctx, env.client, defaultKeyspace, DefaultNamespace()); err != nil {
+		t.Fatalf("ensure relay group: %v", err)
+	}
+	for index := uint64(1); index <= 3; index++ {
+		relayAddDirectEntry(t, env.client, 620+index, index)
+	}
+	relay := newDirectRelayTest(env)
+	publisher := newFakeRelayPublisher()
+	publisher.failOnCall(2, errors.New("broker unavailable"))
+
+	err := relay.relayStreams(ctx, publisher, relayTakeDirect(t, env.client, 10), false)
+	if err == nil {
+		t.Fatal("relayStreams() error = nil, want publish failure")
+	}
+	if got := len(publisher.snapshot()); got != 1 {
+		t.Fatalf("publishes = %d, want 1 before the failure", got)
+	}
+	if got := env.client.XLen(ctx, messageStreamKey()).Val(); got != 3 {
+		t.Fatalf("stream length = %d, want 3", got)
+	}
+	if got := relayPendingCount(t, env.client, messageStreamKey(), directRelayGroup(DefaultNamespace())); got != 3 {
+		t.Fatalf("pending = %d, want 3", got)
+	}
+}
+
+func TestStreamRelayDropsMalformedEntryAlongsideValidBatch(t *testing.T) {
+	env := newRelayTestEnv(t)
+	ctx := context.Background()
+	if err := ensureRelayGroup(ctx, env.client, defaultKeyspace, DefaultNamespace()); err != nil {
+		t.Fatalf("ensure relay group: %v", err)
+	}
+	relayAddDirectEntry(t, env.client, 631, 1)
+	if _, err := env.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: messageStreamKey(),
+		Values: map[string]interface{}{"id": "broken"},
+	}).Result(); err != nil {
+		t.Fatalf("add malformed entry: %v", err)
+	}
+	relay := newDirectRelayTest(env)
+	publisher := newFakeRelayPublisher()
+
+	if err := relay.relayStreams(ctx, publisher, relayTakeDirect(t, env.client, 10), false); err != nil {
+		t.Fatalf("relayStreams() error = %v", err)
+	}
+	calls := publisher.snapshot()
+	if len(calls) != 1 || calls[0].messageID != "631" {
+		t.Fatalf("publishes = %#v, want only message 631", calls)
+	}
+	if got := env.client.XLen(ctx, messageStreamKey()).Val(); got != 0 {
+		t.Fatalf("stream length = %d, want 0", got)
+	}
+	if got := relayPendingCount(t, env.client, messageStreamKey(), directRelayGroup(DefaultNamespace())); got != 0 {
+		t.Fatalf("pending = %d, want 0", got)
+	}
+	if got := relay.Status().Relayed; got != 1 {
+		t.Fatalf("relayed = %d, want 1", got)
+	}
+}
+
+func TestStreamRelayConfirmTimeoutKeepsBatchPending(t *testing.T) {
+	env := newRelayTestEnv(t)
+	ctx := context.Background()
+	if err := ensureRelayGroup(ctx, env.client, defaultKeyspace, DefaultNamespace()); err != nil {
+		t.Fatalf("ensure relay group: %v", err)
+	}
+	relayAddDirectEntry(t, env.client, 641, 1)
+	relay := newDirectRelayTest(env)
+	relay.confirmTimeout = 10 * time.Millisecond
+	publisher := newBlockingRelayPublisher()
+
+	err := relay.relayStreams(ctx, publisher, relayTakeDirect(t, env.client, 10), false)
+	if err == nil || !errors.Is(errors.Unwrap(err), context.DeadlineExceeded) {
+		t.Fatalf("relayStreams() error = %v, want confirmation timeout", err)
+	}
+	if got := env.client.XLen(ctx, messageStreamKey()).Val(); got != 1 {
+		t.Fatalf("stream length = %d, want 1", got)
+	}
+	if got := relayPendingCount(t, env.client, messageStreamKey(), directRelayGroup(DefaultNamespace())); got != 1 {
+		t.Fatalf("pending = %d, want 1", got)
+	}
+}
+
+func TestRelayDeferredReceiptClassifiesFailures(t *testing.T) {
+	ctx := context.Background()
+	if err := (relayDeferredReceipt{
+		confirmation: relayFakeConfirmation{acknowledged: true},
+		messageID:    "1",
+	}).Wait(ctx); err != nil {
 		t.Fatalf("ack error = %v", err)
 	}
 
-	nacked := make(chan amqp091.Confirmation, 1)
-	nacked <- amqp091.Confirmation{Ack: false}
-	if err := relayAwaitConfirm(context.Background(), nacked, "2"); err == nil {
+	if err := (relayDeferredReceipt{
+		confirmation: relayFakeConfirmation{acknowledged: false},
+		messageID:    "2",
+	}).Wait(ctx); err == nil {
 		t.Fatal("nack error = nil, want failure")
 	}
 
-	closed := make(chan amqp091.Confirmation)
-	close(closed)
-	if err := relayAwaitConfirm(context.Background(), closed, "3"); err == nil {
+	if err := (relayDeferredReceipt{
+		confirmation: relayFakeConfirmation{err: errors.New("confirm channel closed")},
+		messageID:    "3",
+	}).Wait(ctx); err == nil {
 		t.Fatal("closed channel error = nil, want failure")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := relayAwaitConfirm(ctx, make(chan amqp091.Confirmation), "4"); !errors.Is(err, context.Canceled) {
+	if err := (relayDeferredReceipt{
+		confirmation: relayFakeConfirmation{err: context.Canceled},
+		messageID:    "4",
+	}).Wait(canceled); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled context error = %v, want context.Canceled", err)
 	}
 }

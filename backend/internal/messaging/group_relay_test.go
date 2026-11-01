@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/config"
@@ -182,10 +181,10 @@ func TestGroupStreamRelayKeepsEntryPendingOnNack(t *testing.T) {
 	}
 	relayAddGroupEntry(t, env.client, 405, 1)
 
-	confirms := make(chan amqp091.Confirmation, 1)
-	confirms <- amqp091.Confirmation{DeliveryTag: 1, Ack: false}
 	relay := newGroupRelayTest(env)
-	err := relay.runPublisher(ctx, &confirmRelayPublisher{confirms: confirms})
+	publisher := newFakeRelayPublisher()
+	publisher.failWaitWith(errors.New("RabbitMQ rejected message 405"))
+	err := relay.runPublisher(ctx, publisher)
 	if err == nil || !strings.Contains(err.Error(), "rejected") {
 		t.Fatalf("runPublisher() error = %v, want rejection", err)
 	}
@@ -265,5 +264,83 @@ func TestGroupStreamRelayDropsMalformedPendingEntry(t *testing.T) {
 	}
 	if got := relayGroupPendingCount(t, env.client); got != 0 {
 		t.Fatalf("pending = %d, want 0", got)
+	}
+}
+
+func relayTakeGroup(t *testing.T, client *redis.Client, count int64) []redis.XStream {
+	t.Helper()
+	streams, err := client.XReadGroup(context.Background(), &redis.XReadGroupArgs{
+		Group:    groupRelayName(DefaultNamespace()),
+		Consumer: groupConsumerName(DefaultNamespace()),
+		Streams:  []string{defaultKeyspace.groupMessageStreamKey(), ">"},
+		Count:    count,
+	}).Result()
+	if err != nil {
+		t.Fatalf("read group stream: %v", err)
+	}
+	return streams
+}
+
+func TestGroupStreamRelayPublishesWholeBatchBeforeWaiting(t *testing.T) {
+	env := newRelayTestEnv(t)
+	ctx := context.Background()
+	if err := ensureGroupRelayGroup(ctx, env.client, defaultKeyspace, DefaultNamespace()); err != nil {
+		t.Fatalf("ensure group relay group: %v", err)
+	}
+	for index := uint64(1); index <= 3; index++ {
+		relayAddGroupEntry(t, env.client, 700+index, index)
+	}
+	relay := newGroupRelayTest(env)
+	publisher := &orderedRelayPublisher{}
+
+	if err := relay.relayStreams(ctx, publisher, relayTakeGroup(t, env.client, 10), false); err != nil {
+		t.Fatalf("relayStreams() error = %v", err)
+	}
+	if publisher.published != 3 || publisher.publishedAtFirstWait != 3 {
+		t.Fatalf(
+			"published/published at first wait = %d/%d, want 3/3",
+			publisher.published,
+			publisher.publishedAtFirstWait,
+		)
+	}
+	if got := env.client.XLen(ctx, defaultKeyspace.groupMessageStreamKey()).Val(); got != 0 {
+		t.Fatalf("stream length = %d, want 0", got)
+	}
+	if got := relayGroupPendingCount(t, env.client); got != 0 {
+		t.Fatalf("pending = %d, want 0", got)
+	}
+	if got := relay.Status().Relayed; got != 3 {
+		t.Fatalf("relayed = %d, want 3", got)
+	}
+}
+
+func TestGroupStreamRelayKeepsWholeBatchPendingWhenConfirmationFails(t *testing.T) {
+	env := newRelayTestEnv(t)
+	ctx := context.Background()
+	if err := ensureGroupRelayGroup(ctx, env.client, defaultKeyspace, DefaultNamespace()); err != nil {
+		t.Fatalf("ensure group relay group: %v", err)
+	}
+	for index := uint64(1); index <= 3; index++ {
+		relayAddGroupEntry(t, env.client, 710+index, index)
+	}
+	relay := newGroupRelayTest(env)
+	publisher := newFakeRelayPublisher()
+	publisher.failWaitWith(errors.New("RabbitMQ rejected message 711"))
+
+	err := relay.relayStreams(ctx, publisher, relayTakeGroup(t, env.client, 10), false)
+	if err == nil || !strings.Contains(err.Error(), "rejected") {
+		t.Fatalf("relayStreams() error = %v, want rejection", err)
+	}
+	if got := len(publisher.snapshot()); got != 3 {
+		t.Fatalf("publishes = %d, want 3: the whole batch must be published before confirms are checked", got)
+	}
+	if got := env.client.XLen(ctx, defaultKeyspace.groupMessageStreamKey()).Val(); got != 3 {
+		t.Fatalf("stream length = %d, want 3", got)
+	}
+	if got := relayGroupPendingCount(t, env.client); got != 3 {
+		t.Fatalf("pending = %d, want 3", got)
+	}
+	if got := relay.Status().Relayed; got != 0 {
+		t.Fatalf("relayed = %d, want 0", got)
 	}
 }
