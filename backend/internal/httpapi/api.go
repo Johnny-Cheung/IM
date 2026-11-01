@@ -209,6 +209,8 @@ type GroupProjector interface {
 type API struct {
 	store               Store
 	hub                 *Hub
+	sessions            *sessionCache
+	users               *userCache
 	directAcceptor      DirectMessageAcceptor
 	directReader        DirectMessageReader
 	directReads         DirectReadTracker
@@ -281,7 +283,12 @@ func WithGroupReadTracker(tracker GroupReadTracker) Option {
 }
 
 func New(dataStore Store, options ...Option) *API {
-	api := &API{store: dataStore, hub: NewHub()}
+	api := &API{
+		store:    dataStore,
+		hub:      NewHub(),
+		sessions: newSessionCache(),
+		users:    newUserCache(),
+	}
 	for _, option := range options {
 		option(api)
 	}
@@ -449,11 +456,12 @@ func (a *API) register(c *gin.Context) {
 		return
 	}
 
-	if err := a.startSession(c, user.ID); err != nil {
+	if err := a.startSession(c, user); err != nil {
 		log.Printf("create session after register: %v", err)
 		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
 		return
 	}
+	a.rememberUser(user)
 
 	c.JSON(http.StatusCreated, userResponse{
 		Username: user.Username,
@@ -474,6 +482,7 @@ func (a *API) login(c *gin.Context) {
 		return
 	}
 
+	userLookupStart := a.users.queryStart()
 	user, err := a.store.GetUserByUsernameKey(c.Request.Context(), usernameKey)
 	if errors.Is(err, store.ErrUserNotFound) {
 		auth.SpendDummyPasswordCheck(request.Password)
@@ -489,8 +498,9 @@ func (a *API) login(c *gin.Context) {
 		writeError(c, http.StatusUnauthorized, "invalid_credentials", "用户名或密码错误")
 		return
 	}
+	a.users.put(usernameKey, user, userLookupStart, time.Now().UTC())
 
-	if err := a.startSession(c, user.ID); err != nil {
+	if err := a.startSession(c, user); err != nil {
 		log.Printf("create login session: %v", err)
 		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
 		return
@@ -505,16 +515,40 @@ func (a *API) login(c *gin.Context) {
 func (a *API) logout(c *gin.Context) {
 	if token, err := c.Cookie(sessionCookieName); err == nil && token != "" {
 		tokenHash := auth.HashSessionToken(token)
-		if session, err := a.store.GetSessionWithUser(c.Request.Context(), tokenHash); err == nil {
-			a.hub.CloseUserWith(session.User.ID, wsCloseSession, "session_revoked")
+		key, hasCacheKey := sessionCacheKeyFor(tokenHash)
+		now := time.Now().UTC()
+
+		var userID uint64
+		cacheHit := false
+		if hasCacheKey {
+			session, hit := a.sessions.get(key, now)
+			if hit {
+				userID = session.User.ID
+				cacheHit = true
+			}
 		}
+		if !cacheHit {
+			if session, err := a.store.GetSessionWithUser(c.Request.Context(), tokenHash); err == nil {
+				userID = session.User.ID
+			}
+		}
+		if userID != 0 {
+			a.hub.CloseUserWith(userID, wsCloseSession, "session_revoked")
+		}
+
 		if err := a.store.RevokeSession(
 			c.Request.Context(),
 			tokenHash,
 			store.RevokeReasonLogout,
-			time.Now().UTC(),
+			now,
 		); err != nil {
 			log.Printf("revoke session on logout: %v", err)
+		}
+		if hasCacheKey {
+			a.sessions.delete(key)
+		}
+		if userID != 0 {
+			a.sessions.markMutation(userID)
 		}
 	}
 	clearSessionCookie(c)
@@ -556,6 +590,12 @@ func (a *API) updateMe(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
 		return
 	}
+	a.sessions.markMutation(user.ID)
+	a.rememberUser(store.User{
+		ID:       user.ID,
+		Username: user.Username,
+		Nickname: nickname,
+	})
 	c.JSON(http.StatusOK, userResponse{
 		Username: user.Username,
 		Nickname: nickname,
@@ -612,6 +652,7 @@ func (a *API) updatePassword(c *gin.Context) {
 	}
 
 	a.hub.CloseUserWith(user.ID, wsCloseSession, "session_password_changed")
+	a.sessions.markMutation(user.ID)
 	clearSessionCookie(c)
 	c.Status(http.StatusNoContent)
 }
@@ -644,10 +685,23 @@ func (a *API) requireUser(c *gin.Context) {
 		return
 	}
 
-	session, err := a.store.GetSessionWithUser(
-		c.Request.Context(),
-		auth.HashSessionToken(token),
-	)
+	tokenHash := auth.HashSessionToken(token)
+	key, cacheable := sessionCacheKeyFor(tokenHash)
+	now := time.Now().UTC()
+	if cacheable {
+		if session, ok := a.sessions.get(key, now); ok {
+			c.Set("currentUser", session.User)
+			c.Set("sessionExpiresAt", session.ExpiresAt)
+			c.Next()
+			return
+		}
+	}
+
+	var queryStart uint64
+	if cacheable {
+		queryStart = a.sessions.queryStart()
+	}
+	session, err := a.store.GetSessionWithUser(c.Request.Context(), tokenHash)
 	if errors.Is(err, store.ErrSessionNotFound) {
 		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
 		return
@@ -669,9 +723,13 @@ func (a *API) requireUser(c *gin.Context) {
 		}
 		return
 	}
-	if !session.ExpiresAt.After(time.Now().UTC()) {
+	now = time.Now().UTC()
+	if !session.ExpiresAt.After(now) {
 		writeError(c, http.StatusUnauthorized, "session_expired", "登录已过期，请重新登录")
 		return
+	}
+	if cacheable {
+		a.sessions.put(key, session, queryStart, now)
 	}
 
 	c.Set("currentUser", session.User)
@@ -679,24 +737,47 @@ func (a *API) requireUser(c *gin.Context) {
 	c.Next()
 }
 
-func (a *API) startSession(c *gin.Context, userID uint64) error {
+func (a *API) startSession(c *gin.Context, user store.User) error {
 	token, tokenHash, err := auth.NewSessionToken()
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
+	expiresAt := now.Add(auth.SessionTTL)
 	if err := a.store.CreateSession(
 		c.Request.Context(),
-		userID,
+		user.ID,
 		tokenHash,
 		now,
-		now.Add(auth.SessionTTL),
+		expiresAt,
 	); err != nil {
 		return err
 	}
-	a.hub.CloseUserWith(userID, wsCloseSession, "session_replaced")
+
+	mutation := a.sessions.markMutation(user.ID)
+	if key, ok := sessionCacheKeyFor(tokenHash); ok {
+		cached := user
+		cached.PasswordHash = ""
+		a.sessions.putFresh(key, store.SessionUser{
+			UserID:    user.ID,
+			ExpiresAt: expiresAt,
+			User:      cached,
+		}, mutation, now)
+	}
+	a.hub.CloseUserWith(user.ID, wsCloseSession, "session_replaced")
 	setSessionCookie(c, token)
 	return nil
+}
+
+// rememberUser refreshes the username directory after a write that changes
+// the user's public profile.
+func (a *API) rememberUser(user store.User) {
+	usernameKey := auth.UsernameKey(user.Username)
+	if usernameKey == "" {
+		return
+	}
+	mutation := a.users.markMutation(usernameKey)
+	a.users.putFresh(usernameKey, user, mutation, time.Now().UTC())
 }
 
 func setSessionCookie(c *gin.Context, token string) {

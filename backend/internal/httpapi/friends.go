@@ -309,6 +309,12 @@ func (a *API) findUser(c *gin.Context, username string) (store.User, bool) {
 		return store.User{}, false
 	}
 
+	now := time.Now().UTC()
+	if user, ok := a.users.get(usernameKey, now); ok {
+		return user, true
+	}
+
+	queryStart := a.users.queryStart()
 	user, err := a.store.GetUserByUsernameKey(c.Request.Context(), usernameKey)
 	if errors.Is(err, store.ErrUserNotFound) {
 		writeError(c, http.StatusNotFound, "user_not_found", "未找到该用户")
@@ -319,6 +325,7 @@ func (a *API) findUser(c *gin.Context, username string) (store.User, bool) {
 		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
 		return store.User{}, false
 	}
+	a.users.put(usernameKey, user, queryStart, time.Now().UTC())
 	return user, true
 }
 

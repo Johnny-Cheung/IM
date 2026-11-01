@@ -643,26 +643,28 @@ func (a *API) sendGroupMessage(c *gin.Context) {
 	c.JSON(status, sendGroupMessageResponse{Message: response})
 }
 
-// groupMessageRecipients prefers MySQL and falls back to the Redis member set,
-// which the group acceptance path already required to exist. A MySQL blip must
-// not suppress delivery of an accepted message.
+// groupMessageRecipients prefers the Redis member set the acceptance Lua already
+// validated, and falls back to MySQL only when the projection is unavailable.
 func (a *API) groupMessageRecipients(ctx context.Context, groupID uint64) []uint64 {
-	memberIDs, err := a.store.ListGroupMemberIDs(ctx, groupID)
+	lookupCtx, cancel := groupCommitContext(ctx)
+	defer cancel()
+
+	if a.groupReads != nil {
+		memberIDs, err := a.groupReads.MemberIDs(lookupCtx, groupID)
+		if err == nil && len(memberIDs) > 0 {
+			return memberIDs
+		}
+		if err != nil {
+			log.Printf("list group message recipients from redis group=%d: %v", groupID, err)
+		}
+	}
+
+	memberIDs, err := a.store.ListGroupMemberIDs(lookupCtx, groupID)
 	if err == nil {
 		return memberIDs
 	}
 	log.Printf("list group message recipients group=%d: %v", groupID, err)
-	if a.groupReads == nil {
-		return nil
-	}
-	fallbackCtx, cancel := groupCommitContext(ctx)
-	defer cancel()
-	memberIDs, err = a.groupReads.MemberIDs(fallbackCtx, groupID)
-	if err != nil {
-		log.Printf("list group message recipients from redis group=%d: %v", groupID, err)
-		return nil
-	}
-	return memberIDs
+	return nil
 }
 
 // publishGroupReadFromRedis broadcasts a group read signal from the Redis

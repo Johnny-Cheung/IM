@@ -182,6 +182,10 @@ type fakeStore struct {
 		reason    string
 		at        time.Time
 	}
+
+	sessionLookups     int
+	userLookups        int
+	groupMemberLookups int
 }
 
 func (f *fakeStore) CreateUser(
@@ -201,6 +205,7 @@ func (f *fakeStore) CreateUser(
 }
 
 func (f *fakeStore) GetUserByUsernameKey(_ context.Context, usernameKey string) (store.User, error) {
+	f.userLookups++
 	if f.userErr != nil {
 		return store.User{}, f.userErr
 	}
@@ -427,6 +432,7 @@ func (f *fakeStore) LeaveGroup(context.Context, uint64, uint64, time.Time) (bool
 }
 
 func (f *fakeStore) ListGroupMemberIDs(context.Context, uint64) ([]uint64, error) {
+	f.groupMemberLookups++
 	if f.groupMemberIDsErr != nil {
 		return nil, f.groupMemberIDsErr
 	}
@@ -534,6 +540,7 @@ func (f *fakeStore) CreateSession(
 }
 
 func (f *fakeStore) GetSessionWithUser(_ context.Context, tokenHash []byte) (store.SessionUser, error) {
+	f.sessionLookups++
 	if f.sessionErr != nil {
 		return store.SessionUser{}, f.sessionErr
 	}
