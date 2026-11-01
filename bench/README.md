@@ -5,7 +5,7 @@
 | 阶段 | 测什么 | 状态 |
 | --- | --- | --- |
 | **一、WS 长连接** | 服务端能维持多少条并发长连接 | ✅ 已完成，跑到 **20 万连接** |
-| **二、消息 QPS 与端到端投递** | 私聊消息的接纳吞吐、异步链路能否跟上、有没有丢/重 | 🛠️ 批量化已实现，**待真实压测验证** |
+| **二、消息 QPS 与端到端投递** | 私聊消息的接纳吞吐、异步链路能否跟上、有没有丢/重 | ✅ 已完成，异步链路瓶颈已修复并验证（~12,000–14,800/s） |
 
 ## 为什么不用 k6
 
@@ -98,6 +98,52 @@ go run ./cmd/wsload \
 
 **注意**：QPS 压测**不需要**多源 IP——它只开几条连接反复复用，单 IP 足够。多源 IP 是长连接为了绕开端口上限才必需的。
 
+## 清理测试数据
+
+```bash
+DSN='im_app:<口令>@tcp(127.0.0.1:13308)/im'
+go run ./cmd/cleanup -dsn "$DSN" -prefix <前缀>
+```
+
+按外键依赖从叶子到根删 12 张表（含 `messages`、`friendships`、`friend_requests`），删完自校验，删不干净会以非零码退出。
+
+**优先用 `-start`/`-count` 按编号区间清理**，而不是只给 `-prefix`。因为 `-prefix bench` 会匹配 `bench_3`、`bench_30`、`bench_300`…… 任何以 `bench_` 开头的账号——如果库里同时有 `bench_0..199999` 的正式数据和试跑留下的 `bench_300000+`，前缀清理会把不该删的一起删掉。编号区间与 `register`/`warmup` 的 `-start`/`-count` 语义一致，精确且不会误伤。同理 `-prefix ratetest` 会连 `ratetest2_*` 一起匹配掉（实测踩过）。
+
+先用 `-dry-run` 看清会匹配到多少个再动手。
+
+### 顺序有个坑：必须等异步链路排空再删账号
+
+**实测踩到过，症状是 consumer 被卡死。**
+
+`messages` 对 `users` 有 `ON DELETE CASCADE` 外键。如果在**异步链路还没排空**（队列里还有消息）时就删掉账号，那些消息落库时会因 `fk_messages_sender` 找不到用户而失败：
+
+```
+dead-letter direct message id=... after 6 attempts:
+  persist message: Error 1452 (23000): Cannot add or update a child row:
+  a foreign key constraint fails (im.messages, CONSTRAINT fk_messages_sender)
+```
+
+后果是**队列里每一条孤儿消息都要重试 6 次才进死信**，而改造前的 consumer 是 `Qos(1)` 串行的——于是整条消费链路被这些注定失败的消息**堵住**（实测卡了 5 分钟以上，队列积压 26,284 条）。
+
+**正确顺序**：
+
+```bash
+# 1. 先确认异步链路排空。注意 /ops/infra 的 unrelayed 只反映 Redis Stream，
+#    还要单独看 RabbitMQ 队列深度
+curl -s http://127.0.0.1:8080/ops/infra | grep -o '"unrelayed":[0-9]*'
+docker exec im-local-rabbitmq-1 rabbitmqctl list_queues name messages \
+  | grep -E "persist|dead"      # persist 队列必须是 0
+
+# 2. 再清理账号
+go run ./cmd/cleanup -dsn "$DSN" -prefix <前缀>
+
+# 若已经产生了孤儿消息，直接清空队列：
+docker exec im-local-rabbitmq-1 rabbitmqctl purge_queue im.v12.messages.persist
+docker exec im-local-rabbitmq-1 rabbitmqctl purge_queue im.v12.messages.dead
+```
+
+> v1.9 批量化后异步链路排空快得多（实测 ~12,000–14,800/s），压测产生的积压通常在清理前就已消化，这个坑不容易再触发；但顺序仍应按上面来——尤其在大规模压测后。
+
 ## 消息 QPS 与端到端投递（第二阶段）
 
 ### 链路与压测位置
@@ -162,22 +208,34 @@ docker exec im-local-mysql-1 mysql -uroot -proot123 --default-character-set=utf8
 
 ### 实测结果（100 账号 / 50 对好友）
 
+**改造前**（异步链路只有 198/s，会严重积压）：
+
 | 连接数 | QPS(201) | P50 | P95 | P99 | 失败 | 去重 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | 1,461 | 0.76 ms | 1.01 ms | 1.25 ms | 0 | 0 |
 | 10 | 9,319 | 1.00 ms | 1.65 ms | 2.12 ms | 0 | 0 |
 
-**端到端一致性**（等链路完全排空后核对）：累计接纳 100,507 条 → Redis Stream `unrelayed=0`、**MySQL 恰好 100,507 行**、10 个会话对 **seq 零空洞**、死信 0。**零丢失、零重复**。
+端到端一致性（排空后核对）：累计接纳 100,507 条 → MySQL 恰好 **100,507 行**、10 个会话对 **seq 零空洞**、死信 0。**零丢失、零重复**。但**排空花了约 4 分钟**——这就是当时发现的瓶颈，见下节。
 
-> 这次核对是在**异步链路完全排空之后**做的——顺序很重要，见下文「清理顺序有个坑」。
+**改造后**（v1.9 批量链路，异步已不再是瓶颈）：
 
-**与旧基线对比**（2026-07-05，旧代码走 WS 发消息）：10 连接时旧版 29,532 QPS、P50 0.23ms，本次 9,319 QPS、P50 1.00ms。低约 3 倍，**主要差异是传输方式**（HTTP/1.1 往返 vs WS 帧），且代码与路径都已变化，**不能据此判断"性能退化了"**。
+| 连接数 | QPS(201) | P50 | P99 | 失败 | 去重 |
+| --- | --- | --- | --- | --- | --- |
+| 10 | 8,045 | 1.14 ms | 2.61 ms | 0 | 0 |
+| 50 | 9,897 | 4.85 ms | 9.65 ms | 0 | 0 |
+| 200 | 11,798 | 16.43 ms | 24.56 ms | 0 | 0 |
 
-## 已知服务端问题：异步投递链路吞吐不足（代码已优化，待压测验证）
+**异步链路在压测结束时就已排空**（不再需要额外等待），详情见下节。
+
+> 核对必须在**异步链路完全排空之后**做——顺序很重要，见下文「清理顺序有个坑」。
+
+**与旧基线对比**（2026-07-05，旧代码走 WS 发消息）：10 连接时旧版 29,532 QPS、P50 0.23ms，本轮 8,045–9,319 QPS、P50 1.00–1.14ms。低约 3 倍，**主要差异是传输方式**（HTTP/1.1 往返 vs WS 帧），且代码与路径都已变化，**不能据此判断"性能退化了"**。
+
+## 已修复：异步投递链路吞吐不足（v1.9，已实测验证）
 
 **这是第二阶段压测最重要的发现，旧压测完全没覆盖**——旧版只测到「MQ publish」为止，没有 Stream → RabbitMQ → MySQL 这一段。
 
-### 现象
+### 改造前的现象
 
 同步接纳能到 9,300/s，异步链路只能处理 ~200/s，**相差约 47 倍**。压测 10 秒堆积 82,380 条在 Stream（`backlog_alert=true`），之后花约 4 分钟才排空。
 
@@ -190,17 +248,47 @@ docker exec im-local-mysql-1 mysql -uroot -proot123 --default-character-set=utf8
 
 改造前 `relay.go` 是逐条的（`for … { Publish; AwaitConfirm; ackAndDelete }`），`rabbit_consumer.go` 是 `channel.Qos(1, 0, false)`，消费循环也是单 goroutine 逐条处理。
 
-### 当前实现状态（2026-11-01）
-
-代码改造已经完成，但**下面的 386/s、198/s 等数字仍是改造前基线**；真实链路压测尚未重跑，不能把微基准数字当作当前吞吐。
+### 改造方案（v1.9 已实现）
 
 - **relay**：`XReadGroup` 批量读取最多 100 条，整批发布后才等待 `DeferredConfirmation`，全部确认成功后用一个 Lua 脚本批量 `XACK + XDEL`；任何一条失败整批不 ack，保留 pending 等待重投。确认等待有 30 秒超时。direct 和 group 都使用同一套批量逻辑。
 - **consumer**：每个队列一个 worker，`Qos(100)`，最多 100 条或 10ms 攒批，一个 MySQL 事务多行 `INSERT ... ON DUPLICATE KEY UPDATE id = id`。只有 `RowsAffected == len(messages)` 才 commit；重复、冲突或参数异常回滚并回落现有逐条幂等路径。direct 和 group 同步改造。
-- **未启用 consumer 并发**：先保持单 worker，等真实压测确认批量单 worker 是否已经覆盖接纳能力，再决定是否按会话分片增加 worker。
-- **已验证**：后端 `go test ./...`、`go test -race ./internal/messaging ./internal/store`、`go vet ./...` 通过；新增了 relay 批量确认、consumer 批量/回落/取消和 store 批量 SQL 测试。
-- **未验证**：真实 MySQL/RabbitMQ 端到端、`qpsload` 重跑、故障注入和群聊批量压测。压测完成后在本文件补充新数字和日期。
+- **未启用 consumer 并发**：保持单 worker，靠批量化解决，不按会话分片加 worker。
 
-### 实测优化空间
+### 验证结果（2026-11-01，真实链路）
+
+环境：本机裸机服务端（v1.9 二进制）+ 容器化 MySQL 8.4 / Redis / RabbitMQ；100 账号 / 50 对好友。
+
+| 连接数 | 接纳 QPS | P50 | P99 | 失败 | 去重 |
+| --- | --- | --- | --- | --- | --- |
+| 10 | 8,045 | 1.14 ms | 2.61 ms | 0 | 0 |
+| 50 | 9,897 | 4.85 ms | 9.65 ms | 0 | 0 |
+| 200 | 11,798 | 16.43 ms | 24.56 ms | 0 | 0 |
+
+**异步链路排空速率**：约 **12,000–14,800/s**（改造前 198/s，**提升约 60–75 倍**）。
+
+最直观的对比是**排空耗时**：
+
+| 场景 | 改造前 | 改造后 |
+| --- | --- | --- |
+| 10 连接压测产生的 8 万条积压 | 约 **4 分钟** | **压测结束时已排空（0 秒）** |
+| 50 连接压测产生的 14.8 万条 | — | **约 12 秒** |
+| 200 连接压测产生的 17.7 万条 | — | **约 12 秒** |
+
+**端到端一致性**（每轮都在排空后核对）：累计接纳 **406,049** 条 → MySQL 恰好 **406,049 行**，10 个会话对 **seq 零空洞**，`unrelayed=0 pending=0 in_flight=0`，**死信 0**，RabbitMQ 队列为空。**零丢失、零重复。**
+
+**服务端资源**：200 连接时 CPU 约 32%、RSS 约 48 MB——异步链路不再是瓶颈。
+
+### 结论
+
+批量化把异步持久化从 198/s 提到 ~12,000–14,800/s，**已经超过同步接纳的 9,300–11,800/s**，两者不再有数量级落差。**consumer 单 worker 批量化已经够用，无需增加并发 worker**（这也回避了并发落库会失去「同会话按 seq 顺序落库」的问题）。
+
+### 待补
+
+- 群聊（group）链路的同规模压测——本轮只验证了 direct 链路。
+- 故障注入（broker 中断、consumer 崩溃）下的批量 ack 语义。
+- 更大规模：1 万账号 / 数千对好友。
+
+### 实测优化空间（改造前的微基准，留作参考）
 
 各环节单独拆开测（基准脚本直接压对应资源，不经完整链路）：
 
@@ -247,11 +335,13 @@ docker exec im-local-mysql-1 mysql -uroot -proot123 --default-character-set=utf8
 - **consumer 并发会失去「同会话按 seq 顺序落库」**。目前单 goroutine 逐条处理天然保证顺序。最终一致性不受影响（幂等 + `seq` 唯一键），但若有依赖落库顺序的逻辑需先确认。
 - **按需优化即可**：同步路径只有 9,300/s 的产出，异步链路优化到 15,000/s 已足够，不必拉满到 85,000/s。
 
-### 并发落库不会踩间隙锁死锁（已实测）
+### 批量落库不会踩间隙锁死锁（已实测）
 
-仓库里 `sessions` 和 `friend_requests` 两处会因「无匹配的 UPDATE/INSERT 落在索引末端 supremum 间隙」而死锁（见下文）。**consumer 落库不会**，已实测：30 并发单条 INSERT（6,200 行）、多行批量 INSERT（20,000 行）均 **0 死锁**。
+仓库里 `sessions` 和 `friend_requests` 两处会因「无匹配的 UPDATE/INSERT 落在索引末端 supremum 间隙」而死锁（见下文）。**consumer 批量落库不会**，已实测：30 并发单条 INSERT（6,200 行）、多行批量 INSERT（20,000 行）均 **0 死锁**。
 
-原因：那两处是**多语句交叉加锁**（`FOR UPDATE` + `INSERT` 混在一个事务里）才成环；consumer 每事务只有一条 INSERT，纯插入事务之间只会串行等待，不会互相等待成环。
+原因：那两处是**多语句交叉加锁**（`FOR UPDATE` + `INSERT` 混在一个事务里）才成环；consumer 每事务只有一条或多行 INSERT，纯插入事务之间只会串行等待，不会互相等待成环。
+
+v1.9 最终采用**单 worker + 批量**而非多 worker 并发，所以这个问题在实现里也不存在。
 
 ## 复现 20 万连接
 
