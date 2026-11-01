@@ -508,3 +508,255 @@ func TestRabbitConsumerCountsInFlightDeliveries(t *testing.T) {
 		t.Fatalf("in flight after a canceled delivery = %d, want 0", inFlight)
 	}
 }
+
+func TestRabbitConsumerBatchPersistsAndAcksAll(t *testing.T) {
+	deliveries := []consumeDelivery{
+		&consumeFakeDelivery{body: consumeTestDirectBodyWith(1, 1), messageID: "1"},
+		&consumeFakeDelivery{body: consumeTestDirectBodyWith(2, 2), messageID: "2"},
+		&consumeFakeDelivery{body: consumeTestDirectBodyWith(3, 3), messageID: "3"},
+	}
+	persister := &consumeFakeBatchMessagePersister{}
+	publisher := &consumeFakePublisher{}
+	consumer := &RabbitMessageConsumer{
+		persister:      persister,
+		batchPersister: persister,
+		retry:          consumeTestRetryPolicy(&consumeFakeClock{}, consumeTestNow),
+	}
+
+	if err := consumer.handleBatch(context.Background(), deliveries, publisher); err != nil {
+		t.Fatalf("handleBatch() error = %v", err)
+	}
+	if len(persister.batchCalls) != 1 || len(persister.batchCalls[0]) != 3 {
+		t.Fatalf("batch calls = %#v, want one call with three messages", persister.batchCalls)
+	}
+	if persister.calls != 0 {
+		t.Fatalf("single persist calls = %d, want 0", persister.calls)
+	}
+	for index, delivery := range deliveries {
+		fake := delivery.(*consumeFakeDelivery)
+		if fake.acks != 1 || fake.nacks != 0 {
+			t.Fatalf("delivery %d acks/nacks = %d/%d, want 1/0", index, fake.acks, fake.nacks)
+		}
+	}
+	if status := consumer.Status(); status.Persisted != 3 || status.DeadLettered != 0 {
+		t.Fatalf("status = %#v, want persisted 3", status)
+	}
+}
+
+func TestRabbitConsumerBatchFallsBackAndIsolatesConflict(t *testing.T) {
+	deliveries := []consumeDelivery{
+		&consumeFakeDelivery{body: consumeTestDirectBodyWith(11, 1), messageID: "11"},
+		&consumeFakeDelivery{body: consumeTestDirectBodyWith(12, 2), messageID: "12"},
+		&consumeFakeDelivery{body: consumeTestDirectBodyWith(13, 3), messageID: "13"},
+	}
+	persister := &consumeFakeBatchMessagePersister{}
+	persister.batchFail = func(int) error { return store.ErrBatchFallback }
+	persister.fail = func(call int) error {
+		if call == 2 {
+			return store.ErrSeqConflict
+		}
+		return nil
+	}
+	publisher := &consumeFakePublisher{}
+	consumer := &RabbitMessageConsumer{
+		persister:      persister,
+		batchPersister: persister,
+		retry:          consumeTestRetryPolicy(&consumeFakeClock{}, consumeTestNow),
+	}
+
+	if err := consumer.handleBatch(context.Background(), deliveries, publisher); err != nil {
+		t.Fatalf("handleBatch() error = %v", err)
+	}
+	if len(persister.batchCalls) != 1 || persister.calls != 3 {
+		t.Fatalf("batch calls/single calls = %d/%d, want 1/3", len(persister.batchCalls), persister.calls)
+	}
+	if len(publisher.published) != 1 || publisher.published[0].Reason != dlqReasonSeqConflict {
+		t.Fatalf("dead letters = %#v, want one seq conflict", publisher.published)
+	}
+	for index, delivery := range deliveries {
+		fake := delivery.(*consumeFakeDelivery)
+		if fake.acks != 1 || fake.nacks != 0 {
+			t.Fatalf("delivery %d acks/nacks = %d/%d, want 1/0", index, fake.acks, fake.nacks)
+		}
+	}
+	if status := consumer.Status(); status.Persisted != 2 || status.DeadLettered != 1 {
+		t.Fatalf("status = %#v, want persisted 2/dead-lettered 1", status)
+	}
+}
+
+func TestRabbitConsumerBatchRetriesTransientFailure(t *testing.T) {
+	deliveries := []consumeDelivery{
+		&consumeFakeDelivery{body: consumeTestDirectBodyWith(21, 1), messageID: "21"},
+		&consumeFakeDelivery{body: consumeTestDirectBodyWith(22, 2), messageID: "22"},
+	}
+	persister := &consumeFakeBatchMessagePersister{}
+	persister.batchFail = func(call int) error {
+		if call == 1 {
+			return mysql.ErrInvalidConn
+		}
+		return nil
+	}
+	publisher := &consumeFakePublisher{}
+	clock := &consumeFakeClock{}
+	consumer := &RabbitMessageConsumer{
+		persister:      persister,
+		batchPersister: persister,
+		retry:          consumeTestRetryPolicy(clock, consumeTestNow),
+	}
+
+	if err := consumer.handleBatch(context.Background(), deliveries, publisher); err != nil {
+		t.Fatalf("handleBatch() error = %v", err)
+	}
+	if len(persister.batchCalls) != 2 || persister.calls != 0 {
+		t.Fatalf("batch/single calls = %d/%d, want 2/0", len(persister.batchCalls), persister.calls)
+	}
+	if want := []time.Duration{time.Second}; !reflect.DeepEqual(clock.sleeps, want) {
+		t.Fatalf("sleeps = %v, want %v", clock.sleeps, want)
+	}
+	for index, delivery := range deliveries {
+		fake := delivery.(*consumeFakeDelivery)
+		if fake.acks != 1 {
+			t.Fatalf("delivery %d acks = %d, want 1", index, fake.acks)
+		}
+	}
+	if status := consumer.Status(); status.Persisted != 2 || status.TransientRetries != 2 {
+		t.Fatalf("status = %#v, want persisted 2/transient retries 2", status)
+	}
+}
+
+func TestRabbitConsumerBatchDeadLettersMalformedOnly(t *testing.T) {
+	deliveries := []consumeDelivery{
+		&consumeFakeDelivery{body: []byte("not json"), messageID: "bad"},
+		&consumeFakeDelivery{body: consumeTestDirectBodyWith(31, 1), messageID: "31"},
+	}
+	persister := &consumeFakeBatchMessagePersister{}
+	publisher := &consumeFakePublisher{}
+	consumer := &RabbitMessageConsumer{
+		persister:      persister,
+		batchPersister: persister,
+		retry:          consumeTestRetryPolicy(&consumeFakeClock{}, consumeTestNow),
+	}
+
+	if err := consumer.handleBatch(context.Background(), deliveries, publisher); err != nil {
+		t.Fatalf("handleBatch() error = %v", err)
+	}
+	if len(persister.batchCalls) != 1 || len(persister.batchCalls[0]) != 1 {
+		t.Fatalf("batch calls = %#v, want one message", persister.batchCalls)
+	}
+	if len(publisher.published) != 1 || publisher.published[0].Reason != dlqReasonMalformed {
+		t.Fatalf("dead letters = %#v, want one malformed", publisher.published)
+	}
+	for index, delivery := range deliveries {
+		fake := delivery.(*consumeFakeDelivery)
+		if fake.acks != 1 {
+			t.Fatalf("delivery %d acks = %d, want 1", index, fake.acks)
+		}
+	}
+	if status := consumer.Status(); status.Persisted != 1 || status.DeadLettered != 1 {
+		t.Fatalf("status = %#v, want persisted 1/dead-lettered 1", status)
+	}
+}
+
+func TestRabbitConsumerBatchLoopFlushesOnLingerAndTracksInFlight(t *testing.T) {
+	persister := &consumeFakeBatchMessagePersister{}
+	publisher := &consumeFakePublisher{}
+	consumer := &RabbitMessageConsumer{
+		persister:      persister,
+		batchPersister: persister,
+		batchSize:      100,
+		batchWait:      5 * time.Millisecond,
+		retry:          consumeTestRetryPolicy(&consumeFakeClock{}, consumeTestNow),
+	}
+	persisted := make(chan int, 1)
+	persister.onBatch = func() {
+		persisted <- consumer.Status().InFlight
+	}
+	deliveries := make(chan amqp091.Delivery, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- consumer.consumeBatches(ctx, deliveries, publisher) }()
+
+	acknowledgers := make([]*consumeFakeAcknowledger, 0, 3)
+	for index := uint64(1); index <= 3; index++ {
+		delivery, acknowledger := consumeTestAMQPDelivery(consumeTestDirectBodyWith(index, index), index)
+		acknowledgers = append(acknowledgers, acknowledger)
+		deliveries <- delivery
+	}
+
+	select {
+	case inFlight := <-persisted:
+		if inFlight != 3 {
+			t.Fatalf("in flight during batch persist = %d, want 3", inFlight)
+		}
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("batch did not flush on the linger timer")
+	}
+	deadline := time.Now().Add(time.Second)
+	for consumer.Status().InFlight != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := consumer.Status().InFlight; got != 0 {
+		cancel()
+		t.Fatalf("in flight after batch = %d, want 0", got)
+	}
+	if len(persister.batchCalls) != 1 || len(persister.batchCalls[0]) != 3 {
+		cancel()
+		t.Fatalf("batch calls = %#v, want one call with three messages", persister.batchCalls)
+	}
+	for index, acknowledger := range acknowledgers {
+		acks, nacks := acknowledger.counts()
+		if acks != 1 || nacks != 0 {
+			cancel()
+			t.Fatalf("delivery %d acks/nacks = %d/%d, want 1/0", index, acks, nacks)
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("consumeBatches did not stop after cancel")
+	}
+}
+
+func TestRabbitConsumerBatchLoopShutdownLeavesPendingUnacked(t *testing.T) {
+	persister := &consumeFakeBatchMessagePersister{}
+	consumer := &RabbitMessageConsumer{
+		persister:      persister,
+		batchPersister: persister,
+		batchSize:      100,
+		batchWait:      time.Second,
+		retry:          consumeTestRetryPolicy(&consumeFakeClock{}, consumeTestNow),
+	}
+	deliveries := make(chan amqp091.Delivery, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- consumer.consumeBatches(ctx, deliveries, &consumeFakePublisher{}) }()
+
+	delivery, acknowledger := consumeTestAMQPDelivery(consumeTestDirectBodyWith(1, 1), 1)
+	deliveries <- delivery
+	deadline := time.Now().Add(time.Second)
+	for consumer.Status().InFlight != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := consumer.Status().InFlight; got != 1 {
+		cancel()
+		t.Fatalf("in flight before shutdown = %d, want 1", got)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("consumeBatches did not stop after cancel")
+	}
+	if got := consumer.Status().InFlight; got != 0 {
+		t.Fatalf("in flight after shutdown = %d, want 0", got)
+	}
+	if acks, nacks := acknowledger.counts(); acks != 0 || nacks != 0 {
+		t.Fatalf("acks/nacks after shutdown = %d/%d, want 0/0", acks, nacks)
+	}
+	if len(persister.batchCalls) != 0 {
+		t.Fatalf("batch calls after shutdown = %d, want 0", len(persister.batchCalls))
+	}
+}

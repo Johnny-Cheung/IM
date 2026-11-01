@@ -178,6 +178,20 @@ func (p *livePersister) PersistGroupMessage(ctx context.Context, message store.G
 	return p.store.PersistGroupMessage(ctx, message)
 }
 
+func (p *livePersister) PersistMessages(ctx context.Context, messages []store.Message) error {
+	if p.simulating() {
+		return driver.ErrBadConn
+	}
+	return p.store.PersistMessages(ctx, messages)
+}
+
+func (p *livePersister) PersistGroupMessages(ctx context.Context, messages []store.GroupMessage) error {
+	if p.simulating() {
+		return driver.ErrBadConn
+	}
+	return p.store.PersistGroupMessages(ctx, messages)
+}
+
 func (p *livePersister) simulateFor(duration time.Duration) {
 	p.mu.Lock()
 	p.simulateUntil = time.Now().Add(duration)

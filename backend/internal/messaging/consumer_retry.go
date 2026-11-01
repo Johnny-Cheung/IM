@@ -69,22 +69,32 @@ func (s *consumeStatusState) recordError(err error, at time.Time) {
 }
 
 func (s *consumeStatusState) recordPersisted(at time.Time) {
-	if s == nil {
+	s.recordPersistedN(1, at)
+}
+
+// recordPersistedN counts a successfully committed batch by its message count,
+// so queue drain and /ops/infra keep reporting deliveries rather than batches.
+func (s *consumeStatusState) recordPersistedN(count int, at time.Time) {
+	if s == nil || count <= 0 {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persisted++
+	s.persisted += uint64(count)
 	s.lastPersistedAt = at.UTC()
 }
 
 func (s *consumeStatusState) recordTransientRetry() {
-	if s == nil {
+	s.recordTransientRetryN(1)
+}
+
+func (s *consumeStatusState) recordTransientRetryN(count int) {
+	if s == nil || count <= 0 {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.transientRetries++
+	s.transientRetries += uint64(count)
 }
 
 func (s *consumeStatusState) recordMessageRetry() {

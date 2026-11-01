@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/rabbitmq/amqp091-go"
 
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 )
@@ -88,6 +91,30 @@ func (p *consumeFakeMessagePersister) PersistMessage(context.Context, store.Mess
 	return true, nil
 }
 
+// consumeFakeBatchMessagePersister implements both the single and batch
+// interfaces so fallback tests can observe which path was used.
+type consumeFakeBatchMessagePersister struct {
+	consumeFakeMessagePersister
+	batchCalls [][]store.Message
+	batchFail  func(call int) error
+	onBatch    func()
+}
+
+func (p *consumeFakeBatchMessagePersister) PersistMessages(
+	_ context.Context, messages []store.Message,
+) error {
+	p.batchCalls = append(p.batchCalls, append([]store.Message(nil), messages...))
+	if p.onBatch != nil {
+		p.onBatch()
+	}
+	if p.batchFail != nil {
+		if err := p.batchFail(len(p.batchCalls)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // consumeMessagePersisterFunc lets a test observe consumer state from inside a
 // persist call.
 type consumeMessagePersisterFunc func(context.Context, store.Message) (bool, error)
@@ -143,6 +170,69 @@ func (p *consumeFakeGroupPersister) PersistGroupMessage(context.Context, store.G
 	return true, nil
 }
 
+type consumeFakeBatchGroupPersister struct {
+	consumeFakeGroupPersister
+	batchCalls [][]store.GroupMessage
+	batchFail  func(call int) error
+	onBatch    func()
+}
+
+func (p *consumeFakeBatchGroupPersister) PersistGroupMessages(
+	_ context.Context, messages []store.GroupMessage,
+) error {
+	p.batchCalls = append(p.batchCalls, append([]store.GroupMessage(nil), messages...))
+	if p.onBatch != nil {
+		p.onBatch()
+	}
+	if p.batchFail != nil {
+		if err := p.batchFail(len(p.batchCalls)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// consumeFakeAcknowledger lets tests drive amqp091.Delivery through the real
+// consumeAMQPDelivery wrapper without a broker.
+type consumeFakeAcknowledger struct {
+	mu     sync.Mutex
+	acks   int
+	nacks  int
+	ackErr error
+}
+
+func (a *consumeFakeAcknowledger) Ack(uint64, bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.acks++
+	return a.ackErr
+}
+
+func (a *consumeFakeAcknowledger) Nack(uint64, bool, bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.nacks++
+	return nil
+}
+
+func (a *consumeFakeAcknowledger) Reject(uint64, bool) error { return nil }
+
+func (a *consumeFakeAcknowledger) counts() (acks, nacks int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.acks, a.nacks
+}
+
+func consumeTestAMQPDelivery(body []byte, tag uint64) (amqp091.Delivery, *consumeFakeAcknowledger) {
+	acknowledger := &consumeFakeAcknowledger{}
+	return amqp091.Delivery{
+		Acknowledger: acknowledger,
+		DeliveryTag:  tag,
+		MessageId:    fmt.Sprintf("%d", tag),
+		Body:         body,
+	}, acknowledger
+}
+
 func consumeAlwaysFail(err error) func(int) error {
 	return func(int) error { return err }
 }
@@ -156,34 +246,42 @@ func consumeTestRetryPolicy(clock *consumeFakeClock, at time.Time) consumeRetryP
 
 func consumeTestDirectBody(t *testing.T) []byte {
 	t.Helper()
+	return consumeTestDirectBodyWith(42, 7)
+}
+
+func consumeTestDirectBodyWith(id, seq uint64) []byte {
 	payload, err := encodeDirectMessage(store.Message{
-		ID:              42,
-		Seq:             7,
+		ID:              id,
+		Seq:             seq,
 		SenderID:        1,
 		RecipientID:     2,
-		ClientMessageID: "client-direct-1",
+		ClientMessageID: fmt.Sprintf("client-direct-%d", id),
 		Body:            "hello",
 		CreatedAt:       time.UnixMilli(1700000000123).UTC(),
 	})
 	if err != nil {
-		t.Fatalf("encodeDirectMessage() error = %v", err)
+		panic(err)
 	}
 	return payload
 }
 
 func consumeTestGroupBody(t *testing.T) []byte {
 	t.Helper()
+	return consumeTestGroupBodyWith(7, 3)
+}
+
+func consumeTestGroupBodyWith(id, seq uint64) []byte {
 	payload, err := encodeGroupMessage(store.GroupMessage{
-		ID:              7,
-		Seq:             3,
+		ID:              id,
+		Seq:             seq,
 		GroupID:         9,
 		SenderID:        1,
-		ClientMessageID: "client-group-1",
-		Body:            "hi",
+		ClientMessageID: fmt.Sprintf("client-group-%d", id),
+		Body:            "hello",
 		CreatedAt:       time.UnixMilli(1700000000123).UTC(),
 	})
 	if err != nil {
-		t.Fatalf("encodeGroupMessage() error = %v", err)
+		panic(err)
 	}
 	return payload
 }

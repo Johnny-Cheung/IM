@@ -250,3 +250,172 @@ func TestGroupConsumerCountsInFlightDeliveries(t *testing.T) {
 		t.Fatalf("in flight after a canceled delivery = %d, want 0", inFlight)
 	}
 }
+
+func TestGroupConsumerBatchPersistsAndAcksAll(t *testing.T) {
+	deliveries := []consumeDelivery{
+		&consumeFakeDelivery{body: consumeTestGroupBodyWith(1, 1), messageID: "1"},
+		&consumeFakeDelivery{body: consumeTestGroupBodyWith(2, 2), messageID: "2"},
+	}
+	persister := &consumeFakeBatchGroupPersister{}
+	publisher := &consumeFakePublisher{}
+	consumer := &GroupMessageConsumer{
+		persister:      persister,
+		batchPersister: persister,
+		retry:          consumeTestRetryPolicy(&consumeFakeClock{}, consumeTestNow),
+	}
+
+	if err := consumer.handleBatch(context.Background(), deliveries, publisher); err != nil {
+		t.Fatalf("handleBatch() error = %v", err)
+	}
+	if len(persister.batchCalls) != 1 || len(persister.batchCalls[0]) != 2 {
+		t.Fatalf("batch calls = %#v, want one call with two messages", persister.batchCalls)
+	}
+	if persister.calls != 0 {
+		t.Fatalf("single persist calls = %d, want 0", persister.calls)
+	}
+	for index, delivery := range deliveries {
+		fake := delivery.(*consumeFakeDelivery)
+		if fake.acks != 1 || fake.nacks != 0 {
+			t.Fatalf("delivery %d acks/nacks = %d/%d, want 1/0", index, fake.acks, fake.nacks)
+		}
+	}
+	if status := consumer.Status(); status.Persisted != 2 || status.DeadLettered != 0 {
+		t.Fatalf("status = %#v, want persisted 2", status)
+	}
+}
+
+func TestGroupConsumerBatchFallsBackAndIsolatesConflict(t *testing.T) {
+	deliveries := []consumeDelivery{
+		&consumeFakeDelivery{body: consumeTestGroupBodyWith(11, 1), messageID: "11"},
+		&consumeFakeDelivery{body: consumeTestGroupBodyWith(12, 2), messageID: "12"},
+	}
+	persister := &consumeFakeBatchGroupPersister{}
+	persister.batchFail = func(int) error { return store.ErrBatchFallback }
+	persister.fail = func(call int) error {
+		if call == 1 {
+			return store.ErrSeqConflict
+		}
+		return nil
+	}
+	publisher := &consumeFakePublisher{}
+	consumer := &GroupMessageConsumer{
+		persister:      persister,
+		batchPersister: persister,
+		retry:          consumeTestRetryPolicy(&consumeFakeClock{}, consumeTestNow),
+	}
+
+	if err := consumer.handleBatch(context.Background(), deliveries, publisher); err != nil {
+		t.Fatalf("handleBatch() error = %v", err)
+	}
+	if len(persister.batchCalls) != 1 || persister.calls != 2 {
+		t.Fatalf("batch calls/single calls = %d/%d, want 1/2", len(persister.batchCalls), persister.calls)
+	}
+	if len(publisher.published) != 1 || publisher.published[0].Kind != DeadLetterGroup {
+		t.Fatalf("dead letters = %#v, want one group dead letter", publisher.published)
+	}
+	for index, delivery := range deliveries {
+		fake := delivery.(*consumeFakeDelivery)
+		if fake.acks != 1 || fake.nacks != 0 {
+			t.Fatalf("delivery %d acks/nacks = %d/%d, want 1/0", index, fake.acks, fake.nacks)
+		}
+	}
+	if status := consumer.Status(); status.Persisted != 1 || status.DeadLettered != 1 {
+		t.Fatalf("status = %#v, want persisted 1/dead-lettered 1", status)
+	}
+}
+
+func TestGroupConsumerBatchDeadLettersMalformedOnly(t *testing.T) {
+	deliveries := []consumeDelivery{
+		&consumeFakeDelivery{body: []byte("not json"), messageID: "bad"},
+		&consumeFakeDelivery{body: consumeTestGroupBodyWith(31, 1), messageID: "31"},
+	}
+	persister := &consumeFakeBatchGroupPersister{}
+	publisher := &consumeFakePublisher{}
+	consumer := &GroupMessageConsumer{
+		persister:      persister,
+		batchPersister: persister,
+		retry:          consumeTestRetryPolicy(&consumeFakeClock{}, consumeTestNow),
+	}
+
+	if err := consumer.handleBatch(context.Background(), deliveries, publisher); err != nil {
+		t.Fatalf("handleBatch() error = %v", err)
+	}
+	if len(persister.batchCalls) != 1 || len(persister.batchCalls[0]) != 1 {
+		t.Fatalf("batch calls = %#v, want one message", persister.batchCalls)
+	}
+	if len(publisher.published) != 1 || publisher.published[0].Reason != dlqReasonMalformed {
+		t.Fatalf("dead letters = %#v, want one malformed", publisher.published)
+	}
+	for index, delivery := range deliveries {
+		fake := delivery.(*consumeFakeDelivery)
+		if fake.acks != 1 {
+			t.Fatalf("delivery %d acks = %d, want 1", index, fake.acks)
+		}
+	}
+	if status := consumer.Status(); status.Persisted != 1 || status.DeadLettered != 1 {
+		t.Fatalf("status = %#v, want persisted 1/dead-lettered 1", status)
+	}
+}
+
+func TestGroupConsumerBatchLoopFlushesOnLingerAndTracksInFlight(t *testing.T) {
+	persister := &consumeFakeBatchGroupPersister{}
+	publisher := &consumeFakePublisher{}
+	consumer := &GroupMessageConsumer{
+		persister:      persister,
+		batchPersister: persister,
+		batchSize:      100,
+		batchWait:      5 * time.Millisecond,
+		retry:          consumeTestRetryPolicy(&consumeFakeClock{}, consumeTestNow),
+	}
+	persisted := make(chan int, 1)
+	persister.onBatch = func() {
+		persisted <- consumer.Status().InFlight
+	}
+	deliveries := make(chan amqp091.Delivery, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- consumer.consumeBatches(ctx, deliveries, publisher) }()
+
+	acknowledgers := make([]*consumeFakeAcknowledger, 0, 2)
+	for index := uint64(1); index <= 2; index++ {
+		delivery, acknowledger := consumeTestAMQPDelivery(consumeTestGroupBodyWith(index, index), index)
+		acknowledgers = append(acknowledgers, acknowledger)
+		deliveries <- delivery
+	}
+
+	select {
+	case inFlight := <-persisted:
+		if inFlight != 2 {
+			t.Fatalf("in flight during batch persist = %d, want 2", inFlight)
+		}
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("batch did not flush on the linger timer")
+	}
+	deadline := time.Now().Add(time.Second)
+	for consumer.Status().InFlight != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := consumer.Status().InFlight; got != 0 {
+		cancel()
+		t.Fatalf("in flight after batch = %d, want 0", got)
+	}
+	if len(persister.batchCalls) != 1 || len(persister.batchCalls[0]) != 2 {
+		cancel()
+		t.Fatalf("batch calls = %#v, want one call with two messages", persister.batchCalls)
+	}
+	for index, acknowledger := range acknowledgers {
+		acks, nacks := acknowledger.counts()
+		if acks != 1 || nacks != 0 {
+			cancel()
+			t.Fatalf("delivery %d acks/nacks = %d/%d, want 1/0", index, acks, nacks)
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("consumeBatches did not stop after cancel")
+	}
+}
