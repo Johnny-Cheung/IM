@@ -49,6 +49,7 @@ IM 是一个单体 Web IM：React 前端负责界面与本地缓存，Go 后端�
 | 异步投递 | RabbitMQ 3.13 | Stream relay、持久化队列、重试与死信 |
 | 测试 | Go test · Vitest · Node smoke | 单元/集成、前端、API/浏览器/缓存 smoke |
 | 交付 | Linux 发布包 · `imctl`/`infractl` · systemd-run | 构建、部署、备份、重建与回滚 |
+| 本机运行 | Dockerfile · Compose | 单机拉起应用与 MySQL/Redis/RabbitMQ，不参与正式交付 |
 
 ## 架构
 
@@ -206,7 +207,19 @@ scripts/build-release.sh v2.0 /tmp/im-v2.0
 
 产物包含 `bin/im-server`、`web/`、`RELEASE` 和 `SHA256SUMS`。上传到 Linux 机器后，由 `deploy/imctl` 负责启停、健康检查、备份、`backfill-seq`、`rebuild-redis` 和死信操作；基础设施由 `deploy/infractl` 管理。完整步骤、正式/验证实例隔离和回滚规则见 [运行与发布操作](docs/operations.md)。
 
-当前仓库尚未提供 Dockerfile 或 Compose；Docker 打包不在现有交付路径中。
+### 本机 Docker 运行
+
+`Dockerfile` 和 `compose.yaml` 只服务本机自托管：一条命令拉起应用和 MySQL / Redis / RabbitMQ，不参与上面的正式交付路径。这不是正式部署方式，`imctl`/`infractl` 仍是发布和运维的入口。
+
+```bash
+docker compose up -d mysql redis rabbitmq
+docker compose run --rm backfill-seq   # 全新数据卷上只需执行一次
+docker compose up -d app
+```
+
+浏览器打开 `http://127.0.0.1:8080/`。首次启动前必须执行 `backfill-seq`：后端在 Redis 缺少 `seq:ready` 时会拒绝启动，`backfill-seq` 会写入它。端口刻意错开（`8080` / `13308` / `16380` / `5674`、管理端 `15674`），便于与已有实例并存；`compose.yaml` 里的密码是仅本机可达的开发占位值，超出 localhost 的场景必须换成真实密钥。
+
+构建时的 `GOPROXY` 默认指向 `https://goproxy.cn,direct`，因为 BuildKit 不会继承宿主 shell 的代理设置。需要其他镜像源时用 `--build-arg GOPROXY=...` 覆盖。
 
 ## 测试与验证
 
@@ -298,4 +311,4 @@ BASE_URL=http://127.0.0.1:8199 node scripts/cache-smoke.mjs
 - **Redis 不是备份。** Redis 使用 AOF `appendfsync everysec`，整机掉电时最多约 1 秒内已确认的消息可能丢失；Redis 数据不进入备份，丢失后从 MySQL 重建，重建期间发送和已读不可用。
 - **未做容量治理。** 消息和朋友圈没有自动清理或 TTL；v1.9 的容量验证、压测和调优尚未完成。
 - **当前不开放公网。** 现有部署不修改防火墙和 Nginx，也没有设计公网域名、TLS、反向代理和访问控制。
-- **应用未容器化。** 当前应用交付物是 Linux 发布包和 `imctl`，没有应用镜像或 Compose 编排；MySQL、Redis、RabbitMQ 仍由 `imctl`/`infractl` 放在私有 Docker 中运行。
+- **正式交付未容器化。** 应用交付物是 Linux 发布包和 `imctl`；`Dockerfile`/`compose.yaml` 仅供本机自托管，不是发布路径。MySQL、Redis、RabbitMQ 仍由 `imctl`/`infractl` 放在私有 Docker 中运行。

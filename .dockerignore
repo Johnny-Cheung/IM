@@ -1,0 +1,13 @@
+# Keep the build context small: only backend/, frontend/ and this file are read.
+.git
+.gitignore
+.claude
+deploy
+docs
+scripts
+README.md
+frontend/node_modules
+frontend/dist
+frontend/*.tsbuildinfo
+backend/bin
+*.log

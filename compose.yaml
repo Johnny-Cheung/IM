@@ -1,0 +1,129 @@
+# Local, single-machine stack: builds the app image from this checkout and runs
+# it against fresh MySQL / Redis / RabbitMQ. Everything here is bound to
+# loopback on non-default ports so an older IM stack can keep running beside it.
+#
+#   docker compose up -d mysql redis rabbitmq
+#   docker compose run --rm backfill-seq      # once, on a brand-new stack
+#   docker compose up -d app
+#
+# Then open http://127.0.0.1:8080/
+#
+# The credentials below are local-development placeholders: they are only
+# reachable from this host. Anything beyond localhost needs real secrets,
+# supplied through IM_* environment variables or a password file instead.
+name: im-local
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${IM_MYSQL_ROOT_PASSWORD:-root123}
+      MYSQL_DATABASE: ${IM_MYSQL_DB:-im}
+      MYSQL_USER: ${IM_MYSQL_USER:-im_app}
+      MYSQL_PASSWORD: ${IM_MYSQL_APP_PASSWORD:-im_app123}
+    # The app reads utf8mb4_0900_ai_ci, so match the server collation to the
+    # migrations instead of the image default (utf8mb4_unicode_ci).
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    ports:
+      - "${IM_MYSQL_PORT:-13308}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    # Durability matches the deployment baseline: AOF with a one-second window.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "${IM_REDIS_PORT:-16380}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    restart: unless-stopped
+    hostname: im-local-rabbit
+    environment:
+      RABBITMQ_DEFAULT_USER: ${IM_RABBITMQ_USER:-im_local}
+      RABBITMQ_DEFAULT_PASS: ${IM_RABBITMQ_PASSWORD:-im_local123}
+    ports:
+      - "${IM_RABBITMQ_AMQP_PORT:-5674}:5672"
+      - "${IM_RABBITMQ_MANAGEMENT_PORT:-15674}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: im-local-app:latest
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      IM_MYSQL_DSN: "${IM_MYSQL_USER:-im_app}:${IM_MYSQL_APP_PASSWORD:-im_app123}@tcp(mysql:3306)/${IM_MYSQL_DB:-im}?charset=utf8mb4&parseTime=true&loc=UTC"
+      IM_REDIS_URL: redis://redis:6379
+      IM_RABBITMQ_URL: amqp://${IM_RABBITMQ_USER:-im_local}:${IM_RABBITMQ_PASSWORD:-im_local123}@rabbitmq:5672/
+      IM_GROUP_MESSAGING_ENABLED: "true"
+      IM_MESSAGING_NAMESPACE: ${IM_MESSAGING_NAMESPACE:-im:v12}
+    ports:
+      - "${IM_APP_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # One-shot: numbers conversation history and writes seq:ready. The backend
+  # refuses to start without it, so run this once before the first `up app`.
+  # Kept behind a profile so a later `docker compose up` never re-runs it while
+  # the app is holding port 8080.
+  backfill-seq:
+    profiles: ["ops"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: im-local-app:latest
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      IM_MYSQL_DSN: "${IM_MYSQL_USER:-im_app}:${IM_MYSQL_APP_PASSWORD:-im_app123}@tcp(mysql:3306)/${IM_MYSQL_DB:-im}?charset=utf8mb4&parseTime=true&loc=UTC"
+      IM_REDIS_URL: redis://redis:6379
+      IM_MESSAGING_NAMESPACE: ${IM_MESSAGING_NAMESPACE:-im:v12}
+    entrypoint: ["/usr/local/bin/im-server"]
+    command: ["-backfill-seq"]
+    restart: "no"
+
+volumes:
+  mysql_data:
+  redis_data:
+  rabbitmq_data:
