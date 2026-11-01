@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -895,6 +896,68 @@ func (s *Store) PersistGroupMessage(ctx context.Context, message GroupMessage) (
 		return false, fmt.Errorf("commit duplicate persisted group message: %w", err)
 	}
 	return false, nil
+}
+
+// PersistGroupMessages inserts a batch of accepted group messages in one
+// transaction. Like PersistMessages, it is only a fast path: any duplicate,
+// conflict or validation failure rolls the batch back and asks the caller to
+// use PersistGroupMessage for individual classification.
+func (s *Store) PersistGroupMessages(ctx context.Context, messages []GroupMessage) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	for _, message := range messages {
+		if message.ID == 0 || message.ID > MaxSafeMessageID {
+			return ErrBatchFallback
+		}
+		if message.Seq == 0 || message.Seq > MaxSafeSeq {
+			return ErrBatchFallback
+		}
+	}
+
+	var query strings.Builder
+	query.WriteString(`INSERT INTO group_messages
+		   (server_message_id, seq, group_id, sender_id, client_message_id, body, created_at)
+		 VALUES `)
+	args := make([]interface{}, 0, len(messages)*7)
+	for index, message := range messages {
+		if index > 0 {
+			query.WriteString(", ")
+		}
+		query.WriteString("(?, ?, ?, ?, ?, ?, ?)")
+		args = append(args,
+			message.ID,
+			message.Seq,
+			message.GroupID,
+			message.SenderID,
+			message.ClientMessageID,
+			message.Body,
+			message.CreatedAt,
+		)
+	}
+	query.WriteString("\n\t\t ON DUPLICATE KEY UPDATE id = id")
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin persist group message batch transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, query.String(), args...)
+	if err != nil {
+		return fmt.Errorf("persist group message batch: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read persist group message batch result: %w", err)
+	}
+	if rows != int64(len(messages)) {
+		return ErrBatchFallback
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit persisted group message batch: %w", err)
+	}
+	return nil
 }
 
 func sameGroupMessage(left, right GroupMessage) bool {

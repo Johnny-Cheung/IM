@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -68,5 +69,15 @@ func TestOpenRejectsInvalidDSN(t *testing.T) {
 
 	if _, err := Open(ctx, "not-a-valid-dsn"); err == nil {
 		t.Fatal("Open() error = nil, want connection error")
+	}
+}
+
+func TestOpenRejectsClientFoundRows(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := Open(ctx, "user:pass@tcp(127.0.0.1:3306)/im?clientFoundRows=true")
+	if err == nil || !strings.Contains(err.Error(), "clientFoundRows") {
+		t.Fatalf("Open() error = %v, want clientFoundRows rejection", err)
 	}
 }

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 //go:embed migrations/*.sql
@@ -22,6 +22,17 @@ type Store struct {
 
 // Open creates a MySQL connection pool and verifies it with a ping.
 func Open(ctx context.Context, dsn string) (*Store, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse MySQL DSN: %w", err)
+	}
+	// Both PersistMessage and the batch writer rely on RowsAffected()==0 for a
+	// duplicate no-op. clientFoundRows turns that into 1 and can hide seq or
+	// client-message conflicts, so reject it instead of silently weakening the
+	// idempotency checks.
+	if cfg.ClientFoundRows {
+		return nil, fmt.Errorf("MySQL DSN must not enable clientFoundRows")
+	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open MySQL: %w", err)

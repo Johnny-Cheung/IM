@@ -845,6 +845,108 @@ func TestCreateGroupMembersStartAtSeqZero(t *testing.T) {
 	script.assertDone(t)
 }
 
+func TestPersistMessagesBatchFastPath(t *testing.T) {
+	now := seqTestTime()
+	store, script := newScriptStore(t,
+		scriptStep{match: "INSERT INTO messages", affected: 2},
+	)
+	messages := []Message{
+		{ID: 101, Seq: 1, SenderID: 1, RecipientID: 2, ClientMessageID: "c1", Body: "one", CreatedAt: now},
+		{ID: 102, Seq: 2, SenderID: 2, RecipientID: 3, ClientMessageID: "c2", Body: "two", CreatedAt: now},
+	}
+
+	if err := store.PersistMessages(context.Background(), messages); err != nil {
+		t.Fatalf("PersistMessages() error = %v", err)
+	}
+	script.assertQueryContains(
+		t, 0,
+		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"ON DUPLICATE KEY UPDATE id = id",
+	)
+	script.assertArg(t, 0, 0, int64(101))
+	script.assertArg(t, 0, 1, int64(1))
+	script.assertArg(t, 0, 2, int64(2))
+	script.assertArg(t, 0, 9, int64(102))
+	script.assertDone(t)
+}
+
+func TestPersistMessagesBatchFallsBackOnDuplicate(t *testing.T) {
+	now := seqTestTime()
+	store, script := newScriptStore(t,
+		scriptStep{match: "INSERT INTO messages", affected: 1},
+	)
+	messages := []Message{
+		{ID: 111, Seq: 1, SenderID: 1, RecipientID: 2, ClientMessageID: "c1", Body: "one", CreatedAt: now},
+		{ID: 112, Seq: 2, SenderID: 1, RecipientID: 2, ClientMessageID: "c2", Body: "two", CreatedAt: now},
+	}
+
+	err := store.PersistMessages(context.Background(), messages)
+	if !errors.Is(err, ErrBatchFallback) {
+		t.Fatalf("PersistMessages() error = %v, want ErrBatchFallback", err)
+	}
+	script.assertDone(t)
+}
+
+func TestPersistMessagesBatchRejectsInvalidItemWithoutSQL(t *testing.T) {
+	store, script := newScriptStore(t)
+	err := store.PersistMessages(context.Background(), []Message{
+		{ID: 0, Seq: 1, SenderID: 1, RecipientID: 2, ClientMessageID: "c1"},
+	})
+	if !errors.Is(err, ErrBatchFallback) {
+		t.Fatalf("PersistMessages() error = %v, want ErrBatchFallback", err)
+	}
+	script.assertDone(t)
+}
+
+func TestPersistMessagesBatchEmptyIsNoop(t *testing.T) {
+	store, script := newScriptStore(t)
+	if err := store.PersistMessages(context.Background(), nil); err != nil {
+		t.Fatalf("PersistMessages(nil) error = %v", err)
+	}
+	script.assertDone(t)
+}
+
+func TestPersistGroupMessagesBatchFastPath(t *testing.T) {
+	now := seqTestTime()
+	store, script := newScriptStore(t,
+		scriptStep{match: "INSERT INTO group_messages", affected: 2},
+	)
+	messages := []GroupMessage{
+		{ID: 201, Seq: 1, GroupID: 7, SenderID: 1, ClientMessageID: "g1", Body: "one", CreatedAt: now},
+		{ID: 202, Seq: 2, GroupID: 7, SenderID: 2, ClientMessageID: "g2", Body: "two", CreatedAt: now},
+	}
+
+	if err := store.PersistGroupMessages(context.Background(), messages); err != nil {
+		t.Fatalf("PersistGroupMessages() error = %v", err)
+	}
+	script.assertQueryContains(
+		t, 0,
+		"VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?)",
+		"ON DUPLICATE KEY UPDATE id = id",
+	)
+	script.assertQueryContains(t, 0, "server_message_id", "seq", "group_id", "sender_id")
+	script.assertArg(t, 0, 0, int64(201))
+	script.assertArg(t, 0, 7, int64(202))
+	script.assertDone(t)
+}
+
+func TestPersistGroupMessagesBatchFallsBackOnDuplicate(t *testing.T) {
+	now := seqTestTime()
+	store, script := newScriptStore(t,
+		scriptStep{match: "INSERT INTO group_messages", affected: 1},
+	)
+	messages := []GroupMessage{
+		{ID: 211, Seq: 1, GroupID: 7, SenderID: 1, ClientMessageID: "g1", Body: "one", CreatedAt: now},
+		{ID: 212, Seq: 2, GroupID: 7, SenderID: 1, ClientMessageID: "g2", Body: "two", CreatedAt: now},
+	}
+
+	err := store.PersistGroupMessages(context.Background(), messages)
+	if !errors.Is(err, ErrBatchFallback) {
+		t.Fatalf("PersistGroupMessages() error = %v, want ErrBatchFallback", err)
+	}
+	script.assertDone(t)
+}
+
 func TestInviteGroupMembersBaselineUsesSeq(t *testing.T) {
 	now := seqTestTime()
 	store, script := newScriptStore(t,

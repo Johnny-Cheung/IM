@@ -24,6 +24,11 @@ var (
 	ErrSeqConflict        = errors.New("message seq conflict")
 	ErrSeqExhausted       = errors.New("message seq exhausted")
 	ErrSeqInvalid         = errors.New("message seq invalid")
+	// ErrBatchFallback tells the consumer that the fast multi-row insert could
+	// not prove every row was newly inserted. The caller must retry the batch
+	// through the per-message path, where the three idempotency keys are
+	// classified individually.
+	ErrBatchFallback = errors.New("message batch requires individual persistence")
 )
 
 // Message is a persisted one-to-one chat message. ID is the public server
@@ -662,6 +667,74 @@ func (s *Store) PersistMessage(ctx context.Context, message Message) (bool, erro
 		return false, fmt.Errorf("commit duplicate persisted message: %w", err)
 	}
 	return false, nil
+}
+
+// PersistMessages inserts a batch of accepted messages in one transaction.
+//
+// It is deliberately a fast path only: if any row is not proven newly inserted
+// (RowsAffected != len(messages)), it rolls the whole batch back and returns
+// ErrBatchFallback. The caller then uses PersistMessage for each item, which
+// retains the existing server-id/client-id/conversation-seq conflict rules.
+func (s *Store) PersistMessages(ctx context.Context, messages []Message) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	for _, message := range messages {
+		if message.ID == 0 || message.ID > MaxSafeMessageID {
+			return ErrBatchFallback
+		}
+		if message.Seq == 0 || message.Seq > MaxSafeSeq {
+			return ErrBatchFallback
+		}
+	}
+
+	var query strings.Builder
+	query.WriteString(`INSERT INTO messages
+		   (server_message_id, conversation_low_id, conversation_high_id, seq,
+		    sender_id, recipient_id, client_message_id, body, created_at)
+		 VALUES `)
+	args := make([]interface{}, 0, len(messages)*9)
+	for index, message := range messages {
+		if index > 0 {
+			query.WriteString(", ")
+		}
+		query.WriteString("(?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		lowID, highID := directConversationPair(message.SenderID, message.RecipientID)
+		args = append(args,
+			message.ID,
+			lowID,
+			highID,
+			message.Seq,
+			message.SenderID,
+			message.RecipientID,
+			message.ClientMessageID,
+			message.Body,
+			message.CreatedAt,
+		)
+	}
+	query.WriteString("\n\t\t ON DUPLICATE KEY UPDATE id = id")
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin persist message batch transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, query.String(), args...)
+	if err != nil {
+		return fmt.Errorf("persist message batch: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read persist message batch result: %w", err)
+	}
+	if rows != int64(len(messages)) {
+		return ErrBatchFallback
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit persisted message batch: %w", err)
+	}
+	return nil
 }
 
 func sameMessage(left, right Message) bool {
