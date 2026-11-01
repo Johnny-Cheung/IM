@@ -265,6 +265,10 @@ BASE_URL=http://127.0.0.1:8199 node scripts/cache-smoke.mjs
 - [路线图](docs/roadmap.md)
 - [运行与发布操作](docs/operations.md)
 
+### 压测
+
+- [bench 压测工具与容量结论](bench/README.md) — WebSocket 长连接压测（已跑到 20 万连接）
+
 ### v2.x 社交功能
 
 - [v2.x 总览](docs/versions/v2.md)
