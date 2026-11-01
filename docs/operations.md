@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、审查修复和 8199 隔离验证；v1.8.3 Redis 重建与双向一致性检查已完成开发、审查修复和 8199 隔离验证；v2.0 朋友圈（文字版）已完成开发、审查修复和 8199 隔离验证。四者同样暂不切换 8198。v1.9 的 relay 流水线投递和 consumer 单 worker 批量落库已完成代码与单元测试，尚未在真实 MySQL/RabbitMQ 环境压测或部署。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、审查修复和 8199 隔离验证；v1.8.3 Redis 重建与双向一致性检查已完成开发、审查修复和 8199 隔离验证；v2.0 朋友圈（文字版）已完成开发、审查修复和 8199 隔离验证。四者同样暂不切换 8198。v1.9 的 relay 流水线投递、consumer 单 worker 批量落库和发送路径 session/用户缓存已完成代码与单元测试，尚未在真实 MySQL/RabbitMQ 环境压测或部署。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -146,6 +146,7 @@ grep -q 'backfill-group-read' "$PRE" \
 
 - `imctl queue-status` 读取正式 vhost 的 `im.v12.messages.persist` 和 `im.v12.group.messages.persist`，`ready` 与 `unacknowledged` 都为 0 才算排空；`--verify` 形式检查验证 vhost `im_v13_verify`，不会碰正式队列。
 - v1.9 起 consumer 使用 `Qos(100)` 和单 worker 批量落库；正常消费时 `unacknowledged` 可能短暂非 0，排空判据不变，重建前应等待其归零。批量事务提交成功后才 ack，失败批次会回落到逐条幂等路径。
+- v1.9 起发送路径使用进程内 session/用户缓存，稳态消息请求不再查询 MySQL 的 session 和 users。缓存随进程重启清空，首次访问或未命中会回源 MySQL；session 缓存 TTL 5 分钟，用于外部直接改库的撤销兜底。当前只适用于单实例，多实例需改为 Redis 共享缓存。
 - 新 `deploy/imctl` 提供 `backfill-seq` 和 `queue-status`；切换前用 relay 上传并安装为 `/opt/IM-Rebuild/imctl`，旧脚本已复制为 `imctl.pre-v1.8.1`。`imctl` 不在发布包里，也不在 `backup` 中，必须单独保留旧副本。
 - `imctl backup` 只包含 MySQL 和应用文件，不含 Redis。`seq` 计数器、`dm:pair`、`seq:ready` 不备份，靠 `backfill-seq` 从 MySQL 重建。
 - 保留 `imctl.pre-v1.8.1` 是因为新脚本删除了 `backfill-read`/`backfill-group-read`，回滚只能由旧脚本发起。该副本只生成一次；重复执行上面的块不会把已安装的新脚本复制覆盖它。
