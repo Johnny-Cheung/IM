@@ -136,11 +136,34 @@ var ErrUsernameTaken = fmt.Errorf("username taken")
 //
 // 压测本身要占用大量临时端口，登录/注册的连接如果不能立即释放，会和压测
 // 连接争抢同一个端口池。禁用复用让每个请求用完即关。
+//
+// 这只适用于长连接类压测（建连本身就是被测对象）。QPS 类压测要测的是消息
+// 吞吐而不是 TCP 握手，必须用 NewKeepAliveClient，否则会严重低估。
 func NewClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			DisableKeepAlives:   true,
 			MaxIdleConnsPerHost: 1,
+		},
+		Timeout: timeout,
+	}
+}
+
+// NewKeepAliveClient 返回一个复用连接的 HTTP 客户端，用于吞吐（QPS）压测。
+//
+// 每个 goroutine 持有自己的 client，于是各自拥有一条到服务端的 keep-alive
+// 连接：请求之间只付一次 TCP 握手，测到的才是消息处理吞吐。MaxIdleConns
+// 调到并发量级，避免连接被提前回收。
+func NewKeepAliveClient(timeout time.Duration, maxConns int) *http.Client {
+	if maxConns < 1 {
+		maxConns = 1
+	}
+	return &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        maxConns,
+			MaxIdleConnsPerHost: maxConns,
+			MaxConnsPerHost:     maxConns,
+			IdleConnTimeout:     5 * time.Minute,
 		},
 		Timeout: timeout,
 	}
@@ -162,4 +185,175 @@ func VerifyCookie(client *http.Client, base, cookie string) bool {
 		_ = resp.Body.Close()
 	}()
 	return resp.StatusCode == http.StatusOK
+}
+
+// doJSON 发一个带 cookie 的 JSON 请求，返回状态码与响应体。
+// 调用方负责解读状态码；只有传输层错误才返回 err。
+func doJSON(
+	client *http.Client, method, url, cookie string, payload any,
+) (int, []byte, error) {
+	var reader io.Reader
+	if payload != nil {
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return 0, nil, err
+		}
+		reader = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, url, reader)
+	if err != nil {
+		return 0, nil, err
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return resp.StatusCode, nil, err
+	}
+	return resp.StatusCode, body, nil
+}
+
+// SendFriendRequest 让 cookie 对应的用户向 toUsername 发起好友申请。
+//
+// 服务端在 201 响应里直接给出 request_id（对端执行接受时要用），不需要再查
+// 一次列表。若双方此前已有反向的待处理申请，服务端会直接建立好友关系并返回
+// 200 + status=accepted，此时 requestID 为 0 —— 调用方据此判断是否需要接受。
+func SendFriendRequest(
+	client *http.Client, base, cookie, toUsername string,
+) (requestID uint64, accepted bool, err error) {
+	status, body, err := doJSON(client, http.MethodPost, base+"/api/friend-requests",
+		cookie, map[string]string{"username": toUsername})
+	if err != nil {
+		return 0, false, err
+	}
+	switch status {
+	case http.StatusOK: // 反向申请已存在，直接成为好友
+		return 0, true, nil
+	case http.StatusCreated:
+		var payload struct {
+			Status    string `json:"status"`
+			RequestID uint64 `json:"request_id"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			return 0, false, fmt.Errorf("解析好友申请响应: %w", err)
+		}
+		return payload.RequestID, false, nil
+	default:
+		return 0, false, &HTTPError{Op: "发起好友申请", Status: status}
+	}
+}
+
+// AcceptFriendRequest 接受一条好友申请。
+func AcceptFriendRequest(client *http.Client, base, cookie string, requestID uint64) error {
+	url := fmt.Sprintf("%s/api/friend-requests/%d/accept", base, requestID)
+	status, _, err := doJSON(client, http.MethodPost, url, cookie, nil)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return &HTTPError{Op: "接受好友申请", Status: status}
+	}
+	return nil
+}
+
+// AreFriends 报告 cookie 对应的用户与 username 是否已是好友。
+//
+// 并发配对时服务端事务可能死锁回滚（friend_requests 索引末端间隙锁），表现为
+// 500；但同一事务里可能已经建好关系。用它做幂等校验，避免把"其实成功了"当成
+// 失败、重复发起申请。
+func AreFriends(client *http.Client, base, cookie, username string) (bool, error) {
+	status, body, err := doJSON(client, http.MethodGet, base+"/api/friends", cookie, nil)
+	if err != nil {
+		return false, err
+	}
+	if status != http.StatusOK {
+		return false, &HTTPError{Op: "查询好友列表", Status: status}
+	}
+	var payload struct {
+		Friends []struct {
+			Username string `json:"username"`
+		} `json:"friends"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false, fmt.Errorf("解析好友列表: %w", err)
+	}
+	for _, f := range payload.Friends {
+		if f.Username == username {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// PendingRequestID 查找 cookie 用户发给 toUsername 的待处理好友申请编号。
+// 没有待处理申请时返回 0。
+func PendingRequestID(client *http.Client, base, cookie, toUsername string) (uint64, error) {
+	status, body, err := doJSON(client, http.MethodGet, base+"/api/friend-requests", cookie, nil)
+	if err != nil {
+		return 0, err
+	}
+	if status != http.StatusOK {
+		return 0, &HTTPError{Op: "查询好友申请", Status: status}
+	}
+	var payload struct {
+		Outgoing []struct {
+			ID   uint64 `json:"id"`
+			User struct {
+				Username string `json:"username"`
+			} `json:"user"`
+		} `json:"outgoing"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, fmt.Errorf("解析好友申请列表: %w", err)
+	}
+	for _, r := range payload.Outgoing {
+		if r.User.Username == toUsername {
+			return r.ID, nil
+		}
+	}
+	return 0, nil
+}
+
+// SendMessage 发一条私聊消息，返回服务端受理后的会话内序号。
+//
+// 重要：clientMessageID 必须在整个压测中唯一。服务端按它去重——同 ID 同内容
+// 算 duplicate（不新建，返回 200），同 ID 不同内容算 conflict（409）。复用 ID
+// 会让吞吐数字虚高，因为大量请求走了去重分支而没有真正建消息。
+//
+// 返回的 created 表示本次是否真的新建了消息（false 即命中去重）。
+func SendMessage(
+	client *http.Client, base, cookie, toUsername, clientMessageID, body string,
+) (seq uint64, created bool, err error) {
+	url := fmt.Sprintf("%s/api/conversations/%s/messages", base, toUsername)
+	status, respBody, err := doJSON(client, http.MethodPost, url, cookie, map[string]string{
+		"body":              body,
+		"client_message_id": clientMessageID,
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	switch status {
+	case http.StatusCreated, http.StatusOK:
+		var payload struct {
+			Message struct {
+				Seq uint64 `json:"seq"`
+			} `json:"message"`
+		}
+		if err := json.Unmarshal(respBody, &payload); err != nil {
+			return 0, false, fmt.Errorf("解析发送消息响应: %w", err)
+		}
+		return payload.Message.Seq, status == http.StatusCreated, nil
+	default:
+		return 0, false, &HTTPError{Op: "发送消息", Status: status}
+	}
 }

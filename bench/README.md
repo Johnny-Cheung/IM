@@ -1,8 +1,11 @@
-# bench — WebSocket 长连接压测
+# bench — 压测工具集
 
-独立于后端模块的压测工具集（自己的 `go.mod`），用于验证服务端维持 WebSocket 长连接的容量。
+独立于后端模块的压测工具（自己的 `go.mod`），覆盖两类负载：
 
-**当前进度**：仅完成 **WS 长连接**一项。QPS、端到端投递与持久化链路的压测留到后续。
+| 阶段 | 测什么 | 状态 |
+| --- | --- | --- |
+| **一、WS 长连接** | 服务端能维持多少条并发长连接 | ✅ 已完成，跑到 **20 万连接** |
+| **二、消息 QPS 与端到端投递** | 私聊消息的接纳吞吐、异步链路能否跟上、有没有丢/重 | ⏳ 定标完成，**发现异步链路瓶颈，待修** |
 
 ## 为什么不用 k6
 
@@ -16,15 +19,17 @@ Go 的 goroutine 每连接只需约 **21 KiB**，同样规模内存需求低一�
 bench/
 ├── go.mod                 独立模块，不参与后端构建
 ├── internal/bench/
-│   └── client.go          共用的 HTTP 登录/注册/会话校验
+│   └── client.go          共用的登录/注册/会话/好友/发消息原语
 └── cmd/
     ├── register/          批量注册压测账号（-start/-count，可重入）
     ├── warmup/            批量预登录，把 cookie 写入文件
+    ├── pair/              账号两两配对成好友（消息压测的前置）
     ├── wsload/            WS 长连接压测主体
+    ├── qpsload/           消息 QPS 压测主体
     └── cleanup/           按前缀或编号区间清理账号及关联数据（含自校验）
 ```
 
-四个命令都支持 `-base`（默认 `http://127.0.0.1:8080`）与 `-prefix`（默认 `bench`），账号名统一为 `<prefix>_<编号>`。
+各命令都支持 `-base`（默认 `http://127.0.0.1:8080`）与 `-prefix`（默认 `bench`），账号名统一为 `<prefix>_<编号>`。
 
 ## 前置条件
 
@@ -42,6 +47,10 @@ GOPROXY=https://goproxy.cn,direct go build ./...
 ```
 
 ## 用法
+
+两部分共用 `register`（造账号）。下按阶段分述。
+
+## 第一阶段：WS 长连接
 
 ### 1. 注册账号
 
@@ -87,18 +96,150 @@ go run ./cmd/wsload \
 
 **为什么必须多源 IP**：单个源 IP 的临时端口上限是 64,512，一个源 IP 超过这个数就连不上了。`127.0.0.0/8` 整个回环网段可用（约 1600 万个地址），每个源 IP 有独立的端口空间，所以单机可以建立远超 64,512 的连接。
 
-### 4. 清理
+**注意**：QPS 压测**不需要**多源 IP——它只开几条连接反复复用，单 IP 足够。多源 IP 是长连接为了绕开端口上限才必需的。
 
-```bash
-DSN='im_app:<口令>@tcp(127.0.0.1:13308)/im'
-go run ./cmd/cleanup -dsn "$DSN" -prefix bench -start 300000 -count 1460
+## 消息 QPS 与端到端投递（第二阶段）
+
+### 链路与压测位置
+
+发消息的同步路径与异步路径是分开的，压测只压前半段，后半段靠观测：
+
+```text
+客户端 ──POST /api/conversations/:username/messages──▶ Redis Lua 原子接纳 ──▶ 201 返回
+                                                              │
+                                                     （同步到此为止）
+                                                              ▼
+                                          Redis Stream ──relay──▶ RabbitMQ ──consumer──▶ MySQL
+                                          └──────────── 异步，需要单独观测 ────────────┘
 ```
 
-按外键依赖从叶子到根删 12 张表，删完自校验，删不干净会以非零码退出。
+**关键**：`201` 只表示消息被 Redis **接纳**，此时还没落库。所以 `qpsload` 测出的是**接纳吞吐**，不等于持久化吞吐。跑完必须查 `/ops/infra` 确认异步链路排空，否则测到的只是一段积压。
 
-**优先用 `-start`/`-count` 按编号区间清理**，而不是只给 `-prefix`。因为 `-prefix bench` 会匹配 `bench_3`、`bench_30`、`bench_300`…… 任何以 `bench_` 开头的账号——如果库里同时有 `bench_0..199999` 的正式数据和试跑留下的 `bench_300000+`，前缀清理会把不该删的一起删掉。编号区间与 `register`/`warmup` 的 `-start`/`-count` 语义一致，精确且不会误伤。
+**为什么走 HTTP 而不是 WS**：当前发消息入口是 HTTP；WebSocket 只承载 `focus`/`blur` 等已读信号，不再接受发消息（旧版压测走 WS，路径已变，两者的 QPS **不可直接对比**）。
 
-先用 `-dry-run` 看清会匹配到多少个再动手。
+### 用法
+
+```bash
+# 1. 注册账号、配好友（好友关系会投影进 Redis，Lua 靠它做 not_friends 校验）
+go run ./cmd/register -count 100 -prefix qps -concurrency 10
+go run ./cmd/pair -pairs 50 -prefix qps -out /tmp/qps-pairs.txt
+
+# 2. 压测
+go run ./cmd/qpsload -conns 10 -duration 15s -pairs /tmp/qps-pairs.txt -prefix qps
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `-conns` | 并发连接数，每条是一条 keep-alive HTTP 连接 |
+| `-duration` | 压测时长 |
+| `-pairs` | 好友对文件：`发送方序号<TAB>接收方序号` |
+| `-timeout` | 单请求超时 |
+
+**每个连接走 `NewKeepAliveClient`**（与长连接压测相反）。QPS 压测要测消息吞吐，如果每条请求都新建 TCP，测的就是握手开销了。
+
+**`client_message_id` 每条唯一**：服务端按它去重，同 ID 同内容算 duplicate（返回 200 且不新建）。复用 ID 会让 QPS 虚高——工具会把去重命中数单独列出，非零即报错（此时数字不可信）。
+
+### 异步链路验收（必做）
+
+压测结束后用 `/ops/infra` 确认，三项都要归零：
+
+| 指标 | 含义 | 期望 |
+| --- | --- | --- |
+| `pipeline.direct.unrelayed` | Stream 里还没转发给 RabbitMQ 的条数 | **0** |
+| `pipeline.direct.pending` | relay 读了但没 ack 的条数 | **0** |
+| `pipeline.direct.dead_letter_count` | 死信数 | **0** |
+
+再加一层数据核对（`unrelayed=0` 只说明转发出去了，不代表落库）：
+
+```bash
+# 接纳数（压测输出）应等于 MySQL 行数
+docker exec im-local-mysql-1 mysql -uroot -proot123 --default-character-set=utf8mb4 -N -B \
+  -e "SELECT COUNT(*) FROM im.messages;"
+
+# seq 连续性：按会话对分组，每个会话的 seq 应从 1 连续无空洞
+# （注意 seq 是会话内双向共享的，要 LEAST/GREATEST 合并两个方向再判断）
+```
+
+### 实测结果（100 账号 / 50 对好友）
+
+| 连接数 | QPS(201) | P50 | P95 | P99 | 失败 | 去重 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1,461 | 0.76 ms | 1.01 ms | 1.25 ms | 0 | 0 |
+| 10 | 9,319 | 1.00 ms | 1.65 ms | 2.12 ms | 0 | 0 |
+
+**端到端一致性**（等链路完全排空后核对）：累计接纳 100,507 条 → Redis Stream `unrelayed=0`、**MySQL 恰好 100,507 行**、10 个会话对 **seq 零空洞**、死信 0。**零丢失、零重复**。
+
+> 这次核对是在**异步链路完全排空之后**做的——顺序很重要，见下文「清理顺序有个坑」。
+
+**与旧基线对比**（2026-07-05，旧代码走 WS 发消息）：10 连接时旧版 29,532 QPS、P50 0.23ms，本次 9,319 QPS、P50 1.00ms。低约 3 倍，**主要差异是传输方式**（HTTP/1.1 往返 vs WS 帧），且代码与路径都已变化，**不能据此判断"性能退化了"**。
+
+## 已知服务端问题：异步投递链路吞吐不足（待修）
+
+**这是第二阶段压测最重要的发现，旧压测完全没覆盖**——旧版只测到「MQ publish」为止，没有 Stream → RabbitMQ → MySQL 这一段。
+
+### 现象
+
+同步接纳能到 9,300/s，异步链路只能处理 ~200/s，**相差约 47 倍**。压测 10 秒堆积 82,380 条在 Stream（`backlog_alert=true`），之后花约 4 分钟才排空。
+
+### 根因：两段都是「单条串行等 IO」
+
+| 环节 | 现状 | 实测上限 | 根因 |
+| --- | --- | --- | --- |
+| **relay** | 逐条 `Publish` → 等 broker 确认 → 再 ack | **386/s** | 持久化消息每条要 fsync 落盘，单条 **2.59 ms** |
+| **consumer** | `Qos(1)` + 每条一个 MySQL 事务 | **198/s** | 一次只有 1 条在途，且每条一次 commit |
+
+`relay.go:337-384` 是逐条的（`for … { Publish; AwaitConfirm; ackAndDelete }`），`rabbit_consumer.go:147` 是 `channel.Qos(1, 0, false)`，消费循环也是单 goroutine 逐条处理。
+
+### 实测优化空间
+
+各环节单独拆开测（基准脚本直接压对应资源，不经完整链路）：
+
+**RabbitMQ 持久化确认**（持久队列 + `DeliveryMode: Persistent`）：
+
+| 方式 | 吞吐 | 相对逐条 |
+| --- | --- | --- |
+| 逐条等确认（现状） | 386/s | 1× |
+| 流水线 10 条 | 5,077/s | 13× |
+| 流水线 50 条 | 12,188/s | 32× |
+| **流水线 100 条** | **41,832/s** | **108×** |
+| 流水线 500 条 | 63,411/s | 164× |
+
+**MySQL 落库**（`messages` 表，含 `ON DUPLICATE KEY UPDATE`）：
+
+| 方式 | 吞吐 | 相对现状 |
+| --- | --- | --- |
+| 并发1 × 批量1（现状） | 351/s | 1× |
+| 并发30 × 批量1 | 4,705/s | 13× |
+| 并发1 × 批量100 | 15,999/s | 46× |
+| 并发8 × 批量100 | **59,489/s** | 169× |
+| 并发8 × 批量500 | 97,217/s | 277× |
+
+**批量和并发是两个独立维度、可以叠加**：批量省「每次 IO 的固定开销」，并发省「等待时间」，二者相乘（46× × 13× ≈ 169×）。这两种方式都要先确认瓶颈在哪一环——最初误以为 relay 逐条确认是主因，实测发现 RabbitMQ 确认只要 48µs，真正的大头是**持久化消息落盘**。
+
+### 优化方案
+
+**consumer 优先**（收益大、风险低），因为它是**最终瓶颈**——即使 relay 提到 40,000/s，落库还是 198/s：
+
+1. `Qos(1)` → `Qos(100)`，并把逐条处理改为有限并发 → 351/s ≈ **5,000/s**
+2. 多行批量 `INSERT`（按会话分组）→ 再叠加到 **~15,000/s**
+
+**relay 其次**（语义要保持，实现要小心）：
+
+3. `Count: 10` → 100，逐条 `Publish+AwaitConfirm` → 批量 `Publish` + 批量等确认 + 整批 ack → 386/s ≈ **12,000–40,000/s**
+
+**实现注意点**：
+
+- **投递语义可以不变**。当前保证是「未确认绝不 ack」（至少一次投递）。批量化后仍可保持：整批发 → 收齐确认 → **全部成功才批量 ack**；任何一条失败则整批不 ack，交给 `drainPending` 重投。**不做部分 ack**。代价是可能重复投递，但 consumer 的 `ON DUPLICATE KEY UPDATE` 幂等，**重复安全**。
+- **`NotifyPublish` 的缓冲只有 1**（`relay.go:123`）。改成流水线却不同步读取这个 channel，会让 `confirms.confirm()` 在 `l <- confirmation` 处阻塞 RabbitMQ 的读取协程，**卡死整条连接**。改用 `PublishWithContext` 返回的 `DeferredConfirmation.WaitContext` 可绕开。
+- **`relayStreams` 被两处复用**（新消息与 `drainPending` 重投，`relay.go:306,331`），批量路径要同时服务这两种场景。
+- **consumer 并发会失去「同会话按 seq 顺序落库」**。目前单 goroutine 逐条处理天然保证顺序。最终一致性不受影响（幂等 + `seq` 唯一键），但若有依赖落库顺序的逻辑需先确认。
+- **按需优化即可**：同步路径只有 9,300/s 的产出，异步链路优化到 15,000/s 已足够，不必拉满到 85,000/s。
+
+### 并发落库不会踩间隙锁死锁（已实测）
+
+仓库里 `sessions` 和 `friend_requests` 两处会因「无匹配的 UPDATE/INSERT 落在索引末端 supremum 间隙」而死锁（见下文）。**consumer 落库不会**，已实测：30 并发单条 INSERT（6,200 行）、多行批量 INSERT（20,000 行）均 **0 死锁**。
+
+原因：那两处是**多语句交叉加锁**（`FOR UPDATE` + `INSERT` 混在一个事务里）才成环；consumer 每事务只有一条 INSERT，纯插入事务之间只会串行等待，不会互相等待成环。
 
 ## 复现 20 万连接
 
@@ -171,9 +312,18 @@ TCP 拨号失败: 0
 - **假象「SYN 风暴导致拨号失败」**：19 万连接时出现 5,934 个拨号失败，一度归因于 SYN 风暴。真实原因是**服务端被 OOM Killer 杀了**（`journalctl -k`：`Out of memory: Killed process (im-server-bare) total-vm:7533224kB, anon-rss:6193896kB`）。建连速率远超实际处理能力时，最后一批连接会集中爆发——改成全局限速器逐个放行后消失。
 - **误判 `somaxconn` 限制**：一度以为 `somaxconn=4096` 卡住了建连，但自建的计数器显示 `ListenOverflows=0`，并非这个原因。
 
-## 已知服务端问题：并发注册全新账号会死锁
+## 已知服务端问题：并发建关系会死锁（两处，同一根因）
 
-**这不是压测工具的缺陷，是服务端 `CreateSession` 在 REPEATABLE READ 下的固有行为**，这里如实记录，因为它是这轮压测发现的问题之一。
+**这不是压测工具的缺陷，是服务端在 REPEATABLE READ 下的固有行为**，这里如实记录，因为它是这轮压测发现的问题。
+
+**两处已发现，同一类根因，但在不同表**：
+
+| 触发路径 | 表 / 索引 | 发现于 |
+| --- | --- | --- |
+| 并发**注册**全新账号 | `sessions` / `idx_sessions_user_active` | WS 长连接阶段压测数据准备时 |
+| 并发**加好友** | `friend_requests` / `idx_friend_requests_to` | 消息 QPS 阶段配对好友时 |
+
+> **不要以为只有这两处。** 仓库里有 **21 处** `BeginTx(ctx, nil)`（`moments` 5、`groups` 6、`friends` 3、`seq` 2 等），其余未逐一分析。同样的「多语句交叉加锁 + 新行落在索引末端间隙」组合可能还在别处。
 
 ### 现象
 
@@ -215,21 +365,42 @@ index idx_sessions_user_active of table `im`.`sessions`
 
 对照实验：**已有活跃会话的相邻用户重新登录不会死锁**（UPDATE 匹配到行，只锁该行，不加 gap 锁）。所以这只在**注册**和**从未登录过的账号首次登录**路径上出现。
 
+### 第二处：并发加好友（`friend_requests`）
+
+配好友时同样偶发 500：
+
+```
+friend operation: insert friend request: Error 1213 (40001): Deadlock found ...
+```
+
+成因是**同一类**，只是换了表：`CreateFriendRequest`（`store/friends.go:258`）在事务里先 `lockUsers` 锁 users 行，再连续做两条 `SELECT ... FOR UPDATE` 查 `friend_requests`，最后 INSERT。而**两条 FOR UPDATE 查询都走 `idx_friend_requests_to`**（`EXPLAIN` 确认），新插入的行又落在该索引**末尾 supremum 间隙**——于是两个事务各持 gap 锁、各等对方的 insert intention 锁。
+
+死锁现场与第一处同构：
+
+```
+index idx_friend_requests_to of table `im`.`friend_requests`
+  双方均 lock_mode X on "hex 73757072656d756d; asc supremum;;"
+  双方均 lock_mode X insert intention waiting
+```
+
+实测：50 对好友 / 8 并发，**9 对失败（18%）**——比注册那处更容易触发，因为配对是「申请 + 接受」两段事务，窗口更长。
+
 ### 严重性
 
 `CreateUser` 是单条 autocommit INSERT，先于 `startSession` 提交。所以 500 响应背后，**users 行其实已经落库**——表现为「账号已存在，但没有 session」。压测时 10 并发下约 8% 概率命中。
 
 ### 服务端侧根治方案（尚未实施）
 
-把 `CreateSession` 的事务改为 **READ COMMITTED**：
+对**两处**都适用：把事务改为 **READ COMMITTED**。
 
 ```go
+// CreateSession（store/sessions.go）
 tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 ```
 
-RC 下 UPDATE 不加 gap 锁，根源消失；而「同一用户并发登录要串行」的语义仍由事务开头的 `SELECT ... FOR UPDATE` 锁 users 行保证，不受影响。已实测验证：同一并发序列在 RC 下**无任何锁等待**，两条都插入成功。
+RC 下 UPDATE **和** `SELECT ... FOR UPDATE` 都不加 gap 锁，根源消失；而「同一用户并发登录要串行」「同一对用户并发加好友要串行」的语义仍由事务开头的 `SELECT ... FOR UPDATE` 锁 users 行保证，不受影响。已实测验证：`CreateSession` 的同一并发序列在 RC 下**无任何锁等待**，两条都插入成功。
 
-**当前决定是暂不改动服务端**，只是在 `cmd/register` 侧做幂等规避（见下）。
+**当前决定是暂不改动服务端**，只在压测工具侧做幂等规避（见下）——服务端的修复留到正式流程中处理。
 
 ### 压测工具侧的规避
 
@@ -239,3 +410,5 @@ RC 下 UPDATE 不加 gap 锁，根源消失；而「同一用户并发登录要�
 - 登录失败 → 真正失败，带**随机抖动**重试（固定退避没用：并发全部撞在同一次死锁上时会同时醒来再撞）
 
 实测效果：400 个全新账号并发 10 注册，**确实触发了死锁**（InnoDB 记录时间落在运行窗口内、签名一致），但脚本报 **0 失败**。
+
+`cmd/pair` 用同样的策略：收到 5xx 后查好友列表确认关系是否已建立（计入「500 后证实已建」）；若服务端返回 409「已有待处理申请」，则把那条申请找出来补一次接受，而不是新建。实测：50 对 / 8 并发，首轮 9 失败；**重跑后 41 对识别为已存在、9 对补齐、0 失败**，且配对文件无残留。
