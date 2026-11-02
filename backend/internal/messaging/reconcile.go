@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,12 +41,11 @@ type ReconcileStore interface {
 	// watermarks that back them.
 	ListMessagesBySeqRange(ctx context.Context, lowID, highID, afterSeq uint64, limit int) ([]store.Message, error)
 	ListGroupMessagesBySeqRange(ctx context.Context, groupID, afterSeq uint64, limit int) ([]store.GroupMessage, error)
-	CountMessagesInvolvingUser(ctx context.Context, userID uint64) (uint64, error)
 	ListUserIDs(ctx context.Context, afterID uint64, limit int) ([]uint64, error)
 	ListConversationReadStates(ctx context.Context, afterUserID, afterPeerID uint64, limit int) ([]store.ConversationReadState, error)
 	ListGroupMemberReadStates(ctx context.Context, afterGroupID, afterUserID uint64, limit int) ([]store.GroupMemberReadState, error)
-	// ListConversationBasics enumerates the peers a user has messages with,
-	// which is how the feed audit finds the rows to restore.
+	// ListConversationBasics enumerates the peers a user has conversations
+	// with, which is how the preview audit finds the rows to restore.
 	ListConversationBasics(ctx context.Context, userID uint64) ([]store.Conversation, error)
 	// MaxServerMessageID is the durable high-water mark of the global message
 	// ID counter, used to detect and raise a lost messages:next_id.
@@ -75,7 +73,7 @@ type ProjectionRepairer interface {
 // ProjectionIndexRepairer is the optional index-only extension of
 // ProjectionRepairer. When the configured repairer implements it, a message
 // entity that already exists and matches MySQL gets its conversation index,
-// feed entries, preview and counter restored without rewriting the entity body.
+// preview and counter restored without rewriting the entity body.
 // The reconciler falls back to WriteDirectBatch/WriteGroupBatch when it is not
 // implemented, but only for entities it has proved match MySQL.
 type ProjectionIndexRepairer interface {
@@ -117,13 +115,13 @@ type ReconcileOptions struct {
 	NeedsRebuildRatio float64
 	// RepairMinMessages is the absolute floor for the ratio rule. Default 20.
 	RepairMinMessages int
-	// DeepAuditInterval between entity and feed samples. Default 1h.
+	// DeepAuditInterval between entity and preview samples. Default 1h.
 	DeepAuditInterval time.Duration
 	// DeepAuditBoundary is how many oldest and newest messages of each audited
 	// conversation are compared. Default 2.
 	DeepAuditBoundary int
-	// DeepAuditUsers is how many users are sampled for feed parity per audit.
-	// Default 50.
+	// DeepAuditUsers is how many users are sampled for conversation-preview
+	// parity per audit. Default 50.
 	DeepAuditUsers int
 }
 
@@ -142,14 +140,12 @@ type ReconcileResult struct {
 	// CountersRaised counts Redis conversation counters raised from MySQL.
 	CountersRaised uint64
 	// RedisMissing counts Redis-side defects detected: missing counters, index
-	// members, entities, feed entries and read watermarks.
+	// members, entities and read watermarks.
 	RedisMissing uint64
 	// RedisRepaired counts Redis items written back: messages and counters.
 	RedisRepaired uint64
 	// WatermarksRaised counts read positions moved to the MySQL value.
 	WatermarksRaised uint64
-	// FeedRepairs counts dm:feed entries restored by the deep audit.
-	FeedRepairs uint64
 	// NeedsRebuild counts conversations, users and unreadable watermark keys
 	// flagged this run.
 	NeedsRebuild uint64
@@ -172,7 +168,6 @@ type ReconcileStatus struct {
 	RedisMissing     uint64    `json:"redis_missing"`
 	RedisRepaired    uint64    `json:"redis_repaired"`
 	WatermarksRaised uint64    `json:"watermarks_raised"`
-	FeedRepairs      uint64    `json:"feed_repairs"`
 	NeedsRebuild     uint64    `json:"needs_rebuild"`
 	LastDeepAuditAt  time.Time `json:"last_deep_audit_at,omitempty"`
 	DeepAuditError   string    `json:"deep_audit_error,omitempty"`
@@ -207,8 +202,6 @@ const (
 	reconcileDeepAuditPerRun     = 50
 	reconcileMaxReverseScan      = 5000
 	reconcileReadStatesPerRun    = 2000
-	reconcileFeedChecksPerUser   = 2000
-	reconcileFeedWriteBatch      = 50
 	// reconcileDeepRetryLimit bounds how many hourly audits retry the same
 	// deferred row before it is reported as needing a rebuild and skipped, so a
 	// permanently failing item cannot pin the deep-audit cursor forever.
@@ -258,7 +251,6 @@ type Reconciler struct {
 	groupStatsCursor  uint64
 	missingSeqs       map[reconcileSeqCursorKey]uint64
 	reverseSeqs       map[reconcileSeqCursorKey]uint64
-	feedCursors       map[uint64]reconcileFeedCursor
 	directReadCursor  [2]uint64
 	groupReadCursor   [2]uint64
 	directDeepCursor  [2]uint64
@@ -345,7 +337,6 @@ func NewReconciler(
 		logged:                make(map[string]time.Time),
 		missingSeqs:           make(map[reconcileSeqCursorKey]uint64),
 		reverseSeqs:           make(map[reconcileSeqCursorKey]uint64),
-		feedCursors:           make(map[uint64]reconcileFeedCursor),
 		deepSeqs:              make(map[reconcileSeqCursorKey]uint64),
 		deepRetries:           make(map[reconcileSeqCursorKey]int),
 		userDeepRetries:       make(map[uint64]int),
@@ -429,10 +420,10 @@ func (r *Reconciler) RunOnce(ctx context.Context) (ReconcileResult, error) {
 	r.mu.Unlock()
 	summary := fmt.Sprintf(
 		"scanned=%d mismatched=%d repaired=%d unresolved=%d in_flight=%d deferred=%d "+
-			"redis_missing=%d redis_repaired=%d counters=%d watermarks=%d feed_repairs=%d needs_rebuild=%d suppressed=%d",
+			"redis_missing=%d redis_repaired=%d counters=%d watermarks=%d needs_rebuild=%d suppressed=%d",
 		result.Scanned, result.Mismatched, result.Repaired, result.Unresolved,
 		result.InFlight, result.Deferred, result.RedisMissing, result.RedisRepaired,
-		result.CountersRaised, result.WatermarksRaised, result.FeedRepairs,
+		result.CountersRaised, result.WatermarksRaised,
 		result.NeedsRebuild, suppressed,
 	)
 
@@ -449,7 +440,6 @@ func (r *Reconciler) RunOnce(ctx context.Context) (ReconcileResult, error) {
 	r.status.RedisMissing = result.RedisMissing
 	r.status.RedisRepaired = result.RedisRepaired
 	r.status.WatermarksRaised = result.WatermarksRaised
-	r.status.FeedRepairs = result.FeedRepairs
 	r.status.NeedsRebuild = result.NeedsRebuild
 	r.status.LastResultSummary = summary
 	// A cancelled context is a shutdown, not a reconciliation failure.
@@ -462,7 +452,7 @@ func (r *Reconciler) RunOnce(ctx context.Context) (ReconcileResult, error) {
 
 	if result.Mismatched > 0 || result.Repaired > 0 || result.Unresolved > 0 ||
 		result.RedisMissing > 0 || result.RedisRepaired > 0 ||
-		result.WatermarksRaised > 0 || result.FeedRepairs > 0 ||
+		result.WatermarksRaised > 0 ||
 		result.NeedsRebuild > 0 || suppressed > 0 {
 		log.Printf("reconcile run: %s duration=%s", summary, duration)
 	}
@@ -2128,10 +2118,10 @@ func (r *Reconciler) writeDirectRepairs(
 }
 
 // repairDirectEntities applies the shared absent/match/diverged policy to a
-// batch of messages. The reverse index-gap repair, the feed repair and the
-// conversation-preview repair all use it, so none of them can overwrite an
-// entity that already exists and differs from MySQL. It returns the number of
-// messages written and whether any entity diverged.
+// batch of messages. The reverse index-gap repair and the conversation-preview
+// repair both use it, so neither can overwrite an entity that already exists
+// and differs from MySQL. It returns the number of messages written and
+// whether any entity diverged.
 func (r *Reconciler) repairDirectEntities(
 	ctx context.Context,
 	runAt time.Time,
@@ -2190,8 +2180,8 @@ func (r *Reconciler) repairDirectEntities(
 	return written, diverged, nil
 }
 
-// repairDirectIndexOnly restores the pair and feed entries of entities that are
-// already present and equal to MySQL. It falls back to a full write, which
+// repairDirectIndexOnly restores the pair index and preview of entities that
+// are already present and equal to MySQL. It falls back to a full write, which
 // converges the entity to the same bytes, only when the repairer offers no
 // index-only method.
 func (r *Reconciler) repairDirectIndexOnly(
@@ -2747,8 +2737,8 @@ func (r *Reconciler) recordDeepAudit(runAt time.Time, err error) {
 }
 
 // deepAudit rotates through a bounded window of conversations and users and
-// compares sampled entities and feed sizes with MySQL. It never deletes or
-// overwrites existing data.
+// compares sampled entities, conversation previews and counters with MySQL. It
+// never deletes or overwrites existing data.
 func (r *Reconciler) deepAudit(
 	ctx context.Context,
 	runAt time.Time,
@@ -2761,7 +2751,7 @@ func (r *Reconciler) deepAudit(
 	if err := r.deepAuditGroupEntities(ctx, runAt, result, budget); err != nil {
 		return err
 	}
-	return r.deepAuditFeeds(ctx, runAt, result, budget)
+	return r.deepAuditUserPreviews(ctx, runAt, result, budget)
 }
 
 func (r *Reconciler) deepAuditDirectEntities(
@@ -3324,7 +3314,7 @@ func groupEntityMatches(message store.GroupMessage, fields map[string]string) bo
 		fields["body"] == message.Body
 }
 
-func (r *Reconciler) deepAuditFeeds(
+func (r *Reconciler) deepAuditUserPreviews(
 	ctx context.Context,
 	runAt time.Time,
 	result *ReconcileResult,
@@ -3339,14 +3329,14 @@ func (r *Reconciler) deepAuditFeeds(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		complete, err := r.auditUserFeed(ctx, runAt, userID, result, budget)
+		complete, err := r.auditUserConversationLast(ctx, runAt, userID, result, budget)
 		if err != nil {
 			return err
 		}
 		if !complete {
 			if r.bumpUserDeepRetry(userID) < reconcileDeepRetryLimit {
 				// Keep the cursor before this user so the next hourly audit
-				// retries the deferred feed/preview repairs.
+				// retries the deferred preview repairs.
 				if index > 0 {
 					r.setUserDeepCursor(ids[index-1])
 				}
@@ -3355,7 +3345,7 @@ func (r *Reconciler) deepAuditFeeds(
 			r.clearUserDeepRetry(userID)
 			result.NeedsRebuild++
 			r.logThrottled(runAt, "needs-rebuild",
-				fmt.Sprintf("user:%d:feed", userID),
+				fmt.Sprintf("user:%d:conv-last", userID),
 				"sampled repair deferred across audits")
 			continue
 		}
@@ -3367,79 +3357,6 @@ func (r *Reconciler) deepAuditFeeds(
 		r.setUserDeepCursor(ids[len(ids)-1])
 	}
 	return nil
-}
-
-// auditUserFeed samples one user's feed size, conversation previews and, when
-// the feed is short, the missing feed entries. It returns false when a repair
-// was deferred by the budget or failed.
-func (r *Reconciler) auditUserFeed(
-	ctx context.Context,
-	runAt time.Time,
-	userID uint64,
-	result *ReconcileResult,
-	budget *reconcileRepairBudget,
-) (bool, error) {
-	previewsComplete, err := r.auditUserConversationLast(ctx, runAt, userID, result, budget)
-	if err != nil {
-		return false, err
-	}
-	count, err := r.store.CountMessagesInvolvingUser(ctx, userID)
-	if err != nil {
-		return false, fmt.Errorf("count messages involving user: %w", err)
-	}
-	if count == 0 {
-		return previewsComplete, nil
-	}
-	key := r.keyspace.directFeedKey(userID)
-	card, err := r.client.ZCard(ctx, key).Result()
-	if err != nil {
-		return false, fmt.Errorf("read direct feed size: %w", err)
-	}
-	if card >= int64(count) {
-		return previewsComplete, nil
-	}
-	gap := count - uint64(card)
-	result.RedisMissing += gap
-	if gap > uint64(r.repairPerConversation) {
-		result.NeedsRebuild++
-		r.logThrottled(runAt, "needs-rebuild",
-			fmt.Sprintf("user:%d:feed", userID),
-			fmt.Sprintf("direct feed gap %d exceeds repair budget", gap))
-		return previewsComplete, nil
-	}
-	if r.repair == nil {
-		return previewsComplete, nil
-	}
-	limit := int(gap)
-	if remaining := budget.remaining(); remaining < limit {
-		limit = remaining
-	}
-	if limit <= 0 {
-		return false, nil
-	}
-	missing, err := r.missingFeedMessages(ctx, userID, limit)
-	if err != nil {
-		return false, err
-	}
-	written := 0
-	for _, chunk := range reconcileChunks(len(missing), reconcileFeedWriteBatch) {
-		batch := missing[chunk[0]:chunk[1]]
-		count, _, err := r.repairDirectEntities(
-			ctx, runAt, fmt.Sprintf("user:%d:feed", userID), batch, budget, result,
-		)
-		if err != nil {
-			r.logThrottled(runAt, "repair-error", fmt.Sprintf("user:%d:feed", userID),
-				err.Error())
-			r.setFeedCursor(userID, reconcileFeedCursor{}, false)
-			return false, nil
-		}
-		written += count
-	}
-	result.FeedRepairs += uint64(written)
-	// Complete only when the detected gap was fully covered. A budget or
-	// check-cap truncation keeps the user cursor so the next audit retries it
-	// instead of waiting for a full user rotation.
-	return previewsComplete && limit == int(gap) && len(missing) == limit, nil
 }
 
 // auditUserConversationLast compares each conversation preview with the newest
@@ -3506,7 +3423,7 @@ func (r *Reconciler) auditUserConversationLast(
 	}
 	if r.repair != nil && len(repairs) > 0 {
 		// A present entity is only re-indexed; a diverged one is reported, never
-		// overwritten, exactly like the index-gap and feed repairs.
+		// overwritten, exactly like the index-gap repair.
 		if _, _, err := r.repairDirectEntities(
 			ctx, runAt, fmt.Sprintf("user:%d:conv-last", userID), repairs, budget, result,
 		); err != nil {
@@ -3524,148 +3441,6 @@ func reconcilePreviewValue(raw string) uint64 {
 		return 0
 	}
 	return value
-}
-
-// reconcileFeedCursor resumes a capped feed scan at one conversation's seq.
-type reconcileFeedCursor struct {
-	peer uint64
-	seq  uint64
-}
-
-func (r *Reconciler) feedCursorStart(userID uint64) reconcileFeedCursor {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.feedCursors[userID]
-}
-
-func (r *Reconciler) setFeedCursor(userID uint64, cursor reconcileFeedCursor, keep bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !keep {
-		delete(r.feedCursors, userID)
-		return
-	}
-	if _, exists := r.feedCursors[userID]; !exists && len(r.feedCursors) >= reconcileLogKeyLimit {
-		return
-	}
-	r.feedCursors[userID] = cursor
-}
-
-// missingFeedMessages walks the user's conversations in MySQL and returns the
-// rows absent from dm:feed, resuming from the previous run's cursor when its
-// check budget was exhausted.
-func (r *Reconciler) missingFeedMessages(
-	ctx context.Context,
-	userID uint64,
-	limit int,
-) ([]store.Message, error) {
-	conversations, err := r.store.ListConversationBasics(ctx, userID)
-	if err != nil {
-		return nil, fmt.Errorf("list user conversations: %w", err)
-	}
-	// ListConversationBasics is ordered by latest message, not by peer. The
-	// resume cursor below is peer-ordered, so sort a copy to make paging
-	// monotonic and independent of recency.
-	sort.SliceStable(conversations, func(i, j int) bool {
-		return conversations[i].UserID < conversations[j].UserID
-	})
-	cursor := r.feedCursorStart(userID)
-	start := 0
-	if cursor.peer != 0 {
-		start = sort.Search(len(conversations), func(index int) bool {
-			return conversations[index].UserID >= cursor.peer
-		})
-		if start == len(conversations) {
-			// The cursor peer no longer exists: restart the walk so a gap in
-			// an earlier conversation is not skipped forever.
-			start = 0
-			cursor = reconcileFeedCursor{}
-			r.setFeedCursor(userID, reconcileFeedCursor{}, false)
-		}
-	}
-	key := r.keyspace.directFeedKey(userID)
-	missing := make([]store.Message, 0, limit)
-	checks := 0
-	for index := start; index < len(conversations); index++ {
-		peerID := conversations[index].UserID
-		if peerID == 0 || peerID == userID {
-			continue
-		}
-		lowID, highID := sortedPair(userID, peerID)
-		afterSeq := uint64(0)
-		if peerID == cursor.peer {
-			afterSeq = cursor.seq
-		}
-		for len(missing) < limit && checks < reconcileFeedChecksPerUser {
-			pageSize := r.batch
-			if remaining := reconcileFeedChecksPerUser - checks; pageSize > remaining {
-				pageSize = remaining
-			}
-			page, err := r.store.ListMessagesBySeqRange(ctx, lowID, highID, afterSeq, pageSize)
-			if err != nil {
-				return nil, fmt.Errorf("list messages for feed audit: %w", err)
-			}
-			if len(page) == 0 {
-				break
-			}
-			present, err := r.feedMemberships(ctx, key, page)
-			if err != nil {
-				return nil, err
-			}
-			for pageIndex, message := range page {
-				if present[pageIndex] {
-					continue
-				}
-				missing = append(missing, message)
-				if len(missing) >= limit {
-					break
-				}
-			}
-			checks += len(page)
-			afterSeq = page[len(page)-1].Seq
-			if len(page) < pageSize {
-				break
-			}
-		}
-		if len(missing) >= limit {
-			// The detected gap is covered; a later audit finds anything left.
-			r.setFeedCursor(userID, reconcileFeedCursor{}, false)
-			return missing, nil
-		}
-		if checks >= reconcileFeedChecksPerUser {
-			r.setFeedCursor(userID, reconcileFeedCursor{peer: peerID, seq: afterSeq}, true)
-			return missing, nil
-		}
-	}
-	r.setFeedCursor(userID, reconcileFeedCursor{}, false)
-	return missing, nil
-}
-
-func (r *Reconciler) feedMemberships(
-	ctx context.Context,
-	key string,
-	messages []store.Message,
-) ([]bool, error) {
-	pipe := r.client.Pipeline()
-	commands := make([]*redis.FloatCmd, len(messages))
-	for index, message := range messages {
-		commands[index] = pipe.ZScore(ctx, key, strconv.FormatUint(message.ID, 10))
-	}
-	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
-		return nil, fmt.Errorf("read direct feed scores: %w", err)
-	}
-	present := make([]bool, len(messages))
-	for index := range messages {
-		score, err := commands[index].Result()
-		if errors.Is(err, redis.Nil) {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read direct feed score: %w", err)
-		}
-		present[index] = score == float64(messages[index].ID)
-	}
-	return present, nil
 }
 
 func reconcileWait(ctx context.Context, delay time.Duration) bool {

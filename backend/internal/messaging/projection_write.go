@@ -100,9 +100,9 @@ func messageDedupTTL(
 	return remaining, true
 }
 
-// WriteDirectBatch writes direct message entities, the conversation index, both
-// feeds, both previews, the conversation counter and the dedup records. It
-// returns the number of messages written.
+// WriteDirectBatch writes direct message entities, the conversation index,
+// both previews, the conversation counter and the dedup records. It returns
+// the number of messages written.
 func (w *ProjectionWriter) WriteDirectBatch(
 	ctx context.Context,
 	messages []store.Message,
@@ -159,10 +159,6 @@ func (w *ProjectionWriter) WriteDirectBatch(
 
 		pipe.ZAdd(ctx, w.keyspace.directPairKey(message.SenderID, message.RecipientID),
 			redis.Z{Score: float64(message.Seq), Member: idValue})
-		pipe.ZAdd(ctx, w.keyspace.directFeedKey(message.SenderID),
-			redis.Z{Score: float64(message.ID), Member: idValue})
-		pipe.ZAdd(ctx, w.keyspace.directFeedKey(message.RecipientID),
-			redis.Z{Score: float64(message.ID), Member: idValue})
 		pipe.Eval(ctx, convLastAdvanceScriptSource,
 			[]string{w.keyspace.directConversationLastKey(message.SenderID)},
 			recipientValue, idValue,
@@ -192,11 +188,11 @@ func (w *ProjectionWriter) WriteDirectBatch(
 	return written, nil
 }
 
-// WriteDirectIndexBatch restores only the conversation index, both feeds, both
-// previews and the counter of direct messages whose entity already exists and
-// matches MySQL. It never writes an entity hash or a dedup record, so the
-// reconciler's index-gap repair cannot overwrite a diverged entity. It returns
-// the number of messages handled.
+// WriteDirectIndexBatch restores only the conversation index, both previews
+// and the counter of direct messages whose entity already exists and matches
+// MySQL. It never writes an entity hash or a dedup record, so the reconciler's
+// index-gap repair cannot overwrite a diverged entity. It returns the number
+// of messages handled.
 func (w *ProjectionWriter) WriteDirectIndexBatch(
 	ctx context.Context,
 	messages []store.Message,
@@ -224,10 +220,6 @@ func (w *ProjectionWriter) WriteDirectIndexBatch(
 
 		pipe.ZAdd(ctx, w.keyspace.directPairKey(message.SenderID, message.RecipientID),
 			redis.Z{Score: float64(message.Seq), Member: idValue})
-		pipe.ZAdd(ctx, w.keyspace.directFeedKey(message.SenderID),
-			redis.Z{Score: float64(message.ID), Member: idValue})
-		pipe.ZAdd(ctx, w.keyspace.directFeedKey(message.RecipientID),
-			redis.Z{Score: float64(message.ID), Member: idValue})
 		pipe.Eval(ctx, convLastAdvanceScriptSource,
 			[]string{w.keyspace.directConversationLastKey(message.SenderID)},
 			recipientValue, idValue,

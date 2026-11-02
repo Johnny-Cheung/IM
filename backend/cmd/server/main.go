@@ -210,12 +210,6 @@ func run(options serverOptions) error {
 			)
 		}
 
-		indexEpoch, err := messaging.EnsureIndexEpoch(
-			startupCtx, infraManager.Redis(), keyspace, seedFloor,
-		)
-		if err != nil {
-			return fmt.Errorf("prepare index epoch: %w", err)
-		}
 		gate := messaging.NewSeqGate()
 		gate.Close()
 		friendshipProjector = messaging.NewFriendshipProjectionWithKeyspace(infraManager.Redis(), keyspace)
@@ -230,7 +224,7 @@ func run(options serverOptions) error {
 			infraManager.Redis(),
 			messaging.RedisAcceptorOptions{SeedFloor: seedFloor, Keyspace: keyspace, Gate: gate},
 		)
-		directReader = messaging.NewRedisMessageReaderWithKeyspace(infraManager.Redis(), keyspace, indexEpoch)
+		directReader = messaging.NewRedisMessageReaderWithKeyspace(infraManager.Redis(), keyspace)
 		directReadTracker = messaging.NewDirectReadTracker(
 			infraManager.Redis(),
 			messaging.DirectReadTrackerOptions{Keyspace: keyspace, Gate: gate},
@@ -611,7 +605,7 @@ type unnumberedMessageCounter func(context.Context) (uint64, uint64, error)
 // waiting to be numbered need the seq backfill, while a namespace with no
 // unnumbered rows lost its projection and must be rebuilt. A backfill only
 // numbers rows and writes counters, indexes and seq:ready; on a wiped namespace
-// it would certify a read model with no message entities, feeds, conversation
+// it would certify a read model with no message entities, conversation
 // previews or dedup.
 func sequenceNotReadyError(
 	ctx context.Context,

@@ -52,22 +52,21 @@ type maxServerMessageIDSource interface {
 }
 
 // projectionMarkerKeys are the keys the message pipeline writes as soon as it
-// serves traffic: the global message counter and the feed index epoch. A
-// namespace that ever accepted persisted messages has both, so a namespace with
-// neither was wiped. The names mirror internal/messaging/keys.go.
+// serves traffic. The global message counter is the surviving marker: a
+// namespace that ever accepted persisted messages has it. The name mirrors
+// internal/messaging/keys.go.
 func projectionMarkerKeys(namespace messaging.Namespace) []string {
 	prefix := namespace.RedisPrefix()
-	return []string{prefix + "messages:next_id", prefix + "index:epoch"}
+	return []string{prefix + "messages:next_id"}
 }
 
 // refuseMissingProjection stops a seq backfill on a namespace whose Redis
 // projection was wiped. A backfill numbers MySQL rows and writes counters,
 // pair/inbox indexes and seq:ready only, so certifying a wiped namespace would
-// leave every history read on the MySQL fallback and the feed and conversation
-// previews empty until a full rebuild. MySQL holding numbered rows while both
-// projection markers are absent is the total-loss signature; an empty database
-// is a legitimate first backfill and a single surviving marker is partial loss,
-// which the audit repairs.
+// leave every history read on the MySQL fallback and the conversation previews
+// empty until a full rebuild. MySQL holding numbered rows while the global
+// counter is absent is the total-loss signature; an empty database is a
+// legitimate first backfill and partial loss is repaired by the audit.
 func refuseMissingProjection(
 	ctx context.Context,
 	client redis.UniversalClient,
@@ -91,10 +90,10 @@ func refuseMissingProjection(
 	}
 	if missing == 0 {
 		return fmt.Errorf(
-			"the Redis message projection is missing (neither %s nor %s exists) while "+
+			"the Redis message projection is missing (no %s) while "+
 				"MySQL holds messages up to %d; run `imctl rebuild-redis` "+
 				"before -backfill-seq",
-			markers[0], markers[1], maxID,
+			markers[0], maxID,
 		)
 	}
 	return nil

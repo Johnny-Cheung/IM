@@ -59,7 +59,6 @@ type fakeReconcileStore struct {
 	detailCalls      int
 	rangeCalls       int
 	directRangeCount int
-	userCountCalls   []uint64
 	directSeqCalls   []fakeSeqCall
 	groupSeqCalls    []fakeSeqCall
 	rangeQueries     []fakeRangeQuery
@@ -365,27 +364,6 @@ func (f *fakeReconcileStore) ListGroupMessagesBySeqRange(
 	return result, nil
 }
 
-func (f *fakeReconcileStore) CountMessagesInvolvingUser(
-	_ context.Context,
-	userID uint64,
-) (uint64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.userCountCalls = append(f.userCountCalls, userID)
-	if f.seqsErr != nil {
-		return 0, f.seqsErr
-	}
-	var count uint64
-	for _, messages := range f.directMessages {
-		for _, message := range messages {
-			if message.SenderID == userID || message.RecipientID == userID {
-				count++
-			}
-		}
-	}
-	return count, nil
-}
-
 func (f *fakeReconcileStore) ListUserIDs(
 	_ context.Context,
 	afterID uint64,
@@ -528,12 +506,6 @@ func (f *fakeReconcileStore) directRangeCalls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.directRangeCount
-}
-
-func (f *fakeReconcileStore) userCountCallsSnapshot() []uint64 {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]uint64(nil), f.userCountCalls...)
 }
 
 // reconcileTestGlobalCounter is the messages:next_id value every test starts
@@ -1853,72 +1825,6 @@ func TestReconcilerIncompleteGroupEntityNotPersisted(t *testing.T) {
 // The feed audit's resume cursor is peer-ordered, but the store returns
 // conversations by latest message. Paging must sort by peer, otherwise the walk
 // oscillates between the newest conversations and never reaches a quiet one.
-func TestReconcilerFeedCursorFollowsPeerOrderNotRecency(t *testing.T) {
-	client, _ := newReconcileTestClient(t)
-	ctx := context.Background()
-
-	fakeStore := newFakeReconcileStore()
-	// Recency order: peer 500 is first, peer 100 second.
-	fakeStore.userPeers[1] = []uint64{500, 100}
-	fakeStore.peerOrder = map[uint64][]uint64{1: {500, 100}}
-
-	const (
-		firstPeerMessages  = 2000
-		secondPeerMessages = 3000
-		missingSeq         = 2500
-	)
-	missingID := uint64(700000 + missingSeq)
-	feedMembers := make([]redis.Z, 0, firstPeerMessages+secondPeerMessages-1)
-	for seq := uint64(1); seq <= firstPeerMessages; seq++ {
-		message := store.Message{
-			ID: uint64(100000 + seq), Seq: seq, SenderID: 1, RecipientID: 500,
-			ClientMessageID: fmt.Sprintf("a-%d", seq), Body: fmt.Sprintf("a-%d", seq),
-		}
-		fakeStore.directMessages[[2]uint64{1, 500}] = append(fakeStore.directMessages[[2]uint64{1, 500}], message)
-		feedMembers = append(feedMembers, redis.Z{Score: float64(message.ID), Member: strconvUint(message.ID)})
-	}
-	for seq := uint64(1); seq <= secondPeerMessages; seq++ {
-		message := store.Message{
-			ID: uint64(700000 + seq), Seq: seq, SenderID: 1, RecipientID: 100,
-			ClientMessageID: fmt.Sprintf("b-%d", seq), Body: fmt.Sprintf("b-%d", seq),
-		}
-		fakeStore.directMessages[[2]uint64{1, 100}] = append(fakeStore.directMessages[[2]uint64{1, 100}], message)
-		if seq != missingSeq {
-			feedMembers = append(feedMembers, redis.Z{Score: float64(message.ID), Member: strconvUint(message.ID)})
-		}
-	}
-	if err := client.ZAdd(ctx, defaultKeyspace.directFeedKey(1), feedMembers...).Err(); err != nil {
-		t.Fatalf("seed feed: %v", err)
-	}
-
-	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{})
-	missing, err := reconciler.missingFeedMessages(ctx, 1, 1)
-	if err != nil {
-		t.Fatalf("first missingFeedMessages() error = %v", err)
-	}
-	if len(missing) != 0 {
-		t.Fatalf("first missing = %+v, want none in the first 2000 checks", missing)
-	}
-	if cursor := reconciler.feedCursorStart(1); cursor.peer != 100 || cursor.seq != firstPeerMessages {
-		t.Fatalf("first cursor = %+v, want the peer-ordered second conversation at seq %d", cursor, firstPeerMessages)
-	}
-
-	missing, err = reconciler.missingFeedMessages(ctx, 1, 1)
-	if err != nil {
-		t.Fatalf("second missingFeedMessages() error = %v", err)
-	}
-	if len(missing) != 1 || missing[0].ID != missingID {
-		t.Fatalf("second missing = %+v, want message %d found by resuming", missing, missingID)
-	}
-	if cursor := reconciler.feedCursorStart(1); cursor.peer != 0 {
-		t.Fatalf("second cursor = %+v, want it cleared after the gap was covered", cursor)
-	}
-	for _, query := range fakeStore.rangeQuerySnapshot() {
-		if query.lowID == 1 && query.highID == 500 && query.afterSeq == 0 {
-			t.Fatalf("recency-first conversation was rescanned from seq 0: %+v", query)
-		}
-	}
-}
 
 // needs-rebuild and repair-error for the same conversation must both reach the
 // log inside one throttling window.

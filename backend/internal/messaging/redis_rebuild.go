@@ -151,7 +151,6 @@ func insertDedupSample(
 type rebuildStats struct {
 	maxSeqByPair   map[[2]uint64]uint64
 	maxSeqByGroup  map[uint64]uint64
-	feedCounts     map[uint64]uint64
 	groupPositions map[uint64]map[uint64]uint64
 	dedupExpected  uint64
 	// dedupExpiries counts expected dedup records per absolute expiry second.
@@ -169,7 +168,6 @@ func newRebuildStats() *rebuildStats {
 	return &rebuildStats{
 		maxSeqByPair:   make(map[[2]uint64]uint64),
 		maxSeqByGroup:  make(map[uint64]uint64),
-		feedCounts:     make(map[uint64]uint64),
 		groupPositions: make(map[uint64]map[uint64]uint64),
 		dedupExpiries:  make(map[int64]uint64),
 		convLast:       make(map[uint64]map[uint64]uint64),
@@ -361,28 +359,11 @@ func (r *RedisRebuilder) Run(ctx context.Context) (result RedisRebuildResult, er
 		return result, err
 	}
 
-	// index:epoch claims the feed is complete, so it may only exist for a
-	// verified namespace; withdraw it again if anything later fails.
-	epochSet := false
-	readySet := false
-	defer func() {
-		if !epochSet || readySet || err == nil {
-			return
-		}
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), rebuildCleanupTimeout)
-		defer cancel()
-		if delErr := r.client.Del(cleanupCtx, keyspace.indexEpochKey()).Err(); delErr != nil {
-			r.logf("rebuild: withdraw index epoch: %v", delErr)
-		}
-	}()
-	if err := r.client.Set(ctx, keyspace.indexEpochKey(), "0", 0).Err(); err != nil {
-		return result, fmt.Errorf("reset index epoch: %w", err)
-	}
-	epochSet = true
+	// index:epoch was retired with dm:feed; only seq:ready certifies the
+	// rebuilt namespace.
 	if err := r.client.Set(ctx, keyspace.sequenceReadyKey(), "1", 0).Err(); err != nil {
 		return result, fmt.Errorf("mark sequence ready: %w", err)
 	}
-	readySet = true
 	// The namespace is complete once seq:ready exists, so a failed marker
 	// delete must not report failure: that would leave an operator believing
 	// the rebuild did not commit while a stale marker blocks backfill-seq.
@@ -472,10 +453,6 @@ func (r *RedisRebuilder) rebuildDirectPass(
 			pair[0], pair[1] = sortedPair(message.SenderID, message.RecipientID)
 			if message.Seq > stats.maxSeqByPair[pair] {
 				stats.maxSeqByPair[pair] = message.Seq
-			}
-			stats.feedCounts[message.SenderID]++
-			if message.RecipientID != message.SenderID {
-				stats.feedCounts[message.RecipientID]++
 			}
 			stats.noteConversationLast(message.SenderID, message.RecipientID, message.ID)
 			stats.noteConversationLast(message.RecipientID, message.SenderID, message.ID)
@@ -672,9 +649,6 @@ func (r *RedisRebuilder) verify(ctx context.Context, stats *rebuildStats) error 
 		return err
 	}
 	if err := r.verifyGroups(ctx, stats); err != nil {
-		return err
-	}
-	if err := r.verifyFeeds(ctx, stats); err != nil {
 		return err
 	}
 	if err := r.verifyDedup(ctx, stats); err != nil {
@@ -1005,35 +979,6 @@ func matchGroupEntity(values []interface{}, row store.GroupMessage) error {
 	return nil
 }
 
-func (r *RedisRebuilder) verifyFeeds(ctx context.Context, stats *rebuildStats) error {
-	keyspace := r.options.Keyspace
-	userIDs := make([]uint64, 0, len(stats.feedCounts))
-	for userID := range stats.feedCounts {
-		if userID != 0 {
-			userIDs = append(userIDs, userID)
-		}
-	}
-	sort.Slice(userIDs, func(i, j int) bool { return userIDs[i] < userIDs[j] })
-	for _, userID := range userIDs {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		card, err := r.client.ZCard(ctx, keyspace.directFeedKey(userID)).Result()
-		if err != nil {
-			return fmt.Errorf("count user %d feed: %w", userID, err)
-		}
-		if uint64(card) != stats.feedCounts[userID] {
-			return fmt.Errorf(
-				"user %d feed has %d entries, want %d",
-				userID, card, stats.feedCounts[userID],
-			)
-		}
-	}
-	return nil
-}
-
-// verifyDedup compares the rebuilt dedup layer with the messages the passes
-// found inside the dedup window, then reads back both ends of the window.
 func (r *RedisRebuilder) verifyDedup(
 	ctx context.Context,
 	stats *rebuildStats,
@@ -1355,8 +1300,10 @@ func ClearNamespace(
 	}
 	// Readiness is invalidated before anything is destroyed: an interrupted
 	// clear must never leave a namespace that still claims to be complete.
+	// index:epoch is a retired v1.9 key; delete it explicitly because the dm:*
+	// pattern does not cover it.
 	removed, err := client.Del(
-		ctx, keyspace.sequenceReadyKey(), keyspace.indexEpochKey(),
+		ctx, keyspace.sequenceReadyKey(), prefix+"index:epoch",
 	).Result()
 	if err != nil {
 		return 0, fmt.Errorf("delete rebuild readiness markers: %w", err)

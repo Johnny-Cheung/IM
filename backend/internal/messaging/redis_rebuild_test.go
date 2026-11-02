@@ -423,11 +423,13 @@ func TestRedisRebuildHappyPath(t *testing.T) {
 	expectZCard(t, client, directPairKey(2, 3), 2)
 	expectZCard(t, client, defaultKeyspace.groupInboxKey(7), 2)
 	expectZCard(t, client, defaultKeyspace.groupInboxKey(8), 1)
-	expectZCard(t, client, directFeedKey(1), 3)
-	expectZCard(t, client, directFeedKey(2), 5)
-	expectZCard(t, client, directFeedKey(3), 2)
 	expectString(t, client, defaultKeyspace.counterKey(), "8")
-	expectString(t, client, defaultKeyspace.indexEpochKey(), "0")
+	if exists := client.Exists(ctx,
+		defaultKeyspace.prefixOrDefault()+"dm:feed:1",
+		defaultKeyspace.prefixOrDefault()+"index:epoch",
+	).Val(); exists != 0 {
+		t.Fatalf("retired feed/epoch keys survived the rebuild")
+	}
 	expectString(t, client, sequenceReadyKey(), "1")
 
 	for _, pair := range [][2]uint64{{1, 2}, {2, 1}, {2, 3}, {3, 2}} {
@@ -542,10 +544,14 @@ func TestRedisRebuildPagesWithBatchOne(t *testing.T) {
 	}
 	expectZCard(t, client, directPairKey(1, 2), 3)
 	expectZCard(t, client, defaultKeyspace.groupInboxKey(7), 2)
-	expectZCard(t, client, directFeedKey(2), 5)
 	expectString(t, client, directSequenceKey(1, 2), "3")
 	expectString(t, client, defaultKeyspace.counterKey(), "8")
-	expectString(t, client, defaultKeyspace.indexEpochKey(), "0")
+	if exists := client.Exists(ctx,
+		defaultKeyspace.prefixOrDefault()+"dm:feed:1",
+		defaultKeyspace.prefixOrDefault()+"index:epoch",
+	).Val(); exists != 0 {
+		t.Fatalf("retired feed/epoch keys survived the rebuild")
+	}
 	expectString(t, client, sequenceReadyKey(), "1")
 	if got := client.HGet(ctx, directReadKey(1), "2").Val(); got != "2" {
 		t.Fatalf("dm:read:1 peer 2 = %q, want 2", got)
@@ -676,9 +682,6 @@ func TestRedisRebuildVerifyFailureDoesNotWriteReady(t *testing.T) {
 	if exists := client.Exists(context.Background(), sequenceReadyKey()).Val(); exists != 0 {
 		t.Fatalf("seq:ready was written after a failed verification")
 	}
-	if exists := client.Exists(context.Background(), defaultKeyspace.indexEpochKey()).Val(); exists != 0 {
-		t.Fatalf("index:epoch was written before verification passed")
-	}
 	if exists := client.Exists(context.Background(), RebuildPendingKey(defaultKeyspace)).Val(); exists != 1 {
 		t.Fatalf("rebuild:pending was cleared although the rebuild failed")
 	}
@@ -714,7 +717,7 @@ func TestClearNamespaceKeepsLocksAndUnknownKeys(t *testing.T) {
 	known := []string{
 		messageKey(1),
 		defaultKeyspace.groupMessageKey(2),
-		directFeedKey(3),
+		defaultKeyspace.prefixOrDefault() + "dm:feed:3",
 		directSequenceKey(1, 2),
 		defaultKeyspace.groupInboxKey(7),
 		friendshipKey(1),
@@ -725,7 +728,7 @@ func TestClearNamespaceKeepsLocksAndUnknownKeys(t *testing.T) {
 		defaultKeyspace.groupMessageStreamKey(),
 		directReadStreamKey(),
 		defaultKeyspace.groupReadStreamKey(),
-		defaultKeyspace.indexEpochKey(),
+		defaultKeyspace.prefixOrDefault() + "index:epoch",
 		sequenceReadyKey(),
 	}
 	for _, key := range known {
@@ -881,7 +884,7 @@ func TestClearNamespaceInvalidatesMarkersBeforeFailing(t *testing.T) {
 	if err := client.Set(ctx, sequenceReadyKey(), "1", 0).Err(); err != nil {
 		t.Fatalf("seed seq:ready: %v", err)
 	}
-	if err := client.Set(ctx, defaultKeyspace.indexEpochKey(), "0", 0).Err(); err != nil {
+	if err := client.Set(ctx, defaultKeyspace.prefixOrDefault()+"index:epoch", "0", 0).Err(); err != nil {
 		t.Fatalf("seed index:epoch: %v", err)
 	}
 	if err := client.Set(ctx, dedupKey(1, 2, "x"), "1", 0).Err(); err != nil {
@@ -905,7 +908,7 @@ func TestClearNamespaceInvalidatesMarkersBeforeFailing(t *testing.T) {
 	if exists := client.Exists(ctx, sequenceReadyKey()).Val(); exists != 0 {
 		t.Fatalf("seq:ready survived a failed clear")
 	}
-	if exists := client.Exists(ctx, defaultKeyspace.indexEpochKey()).Val(); exists != 0 {
+	if exists := client.Exists(ctx, defaultKeyspace.prefixOrDefault()+"index:epoch").Val(); exists != 0 {
 		t.Fatalf("index:epoch survived a failed clear")
 	}
 }
@@ -1101,7 +1104,9 @@ func TestRedisRebuildToleratesPendingCleanupFailure(t *testing.T) {
 		t.Fatalf("messages = %d/%d, want 5/3", result.DirectMessages, result.GroupMessages)
 	}
 	expectString(t, client, sequenceReadyKey(), "1")
-	expectString(t, client, defaultKeyspace.indexEpochKey(), "0")
+	if exists := client.Exists(ctx, defaultKeyspace.prefixOrDefault()+"index:epoch").Val(); exists != 0 {
+		t.Fatalf("index:epoch was recreated by the rebuild")
+	}
 	if exists := client.Exists(ctx, RebuildPendingKey(defaultKeyspace)).Val(); exists != 1 {
 		t.Fatalf("rebuild:pending did not survive the injected delete failure")
 	}
@@ -1215,9 +1220,6 @@ func TestRedisRebuildClearsEpochWhenReadyWriteFails(t *testing.T) {
 
 	if _, err := rebuilder.Run(ctx); err == nil {
 		t.Fatalf("Run() succeeded despite the injected SET failure")
-	}
-	if exists := client.Exists(ctx, defaultKeyspace.indexEpochKey()).Val(); exists != 0 {
-		t.Fatalf("index:epoch survived a failed seq:ready write")
 	}
 	if exists := client.Exists(ctx, sequenceReadyKey()).Val(); exists != 0 {
 		t.Fatalf("seq:ready exists after the injected SET failure")

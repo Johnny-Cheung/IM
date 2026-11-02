@@ -170,18 +170,6 @@ func (s *Store) ListGroupMessagesBySeqRange(
 	return messages, nil
 }
 
-// CountMessagesInvolvingUser counts direct messages the user sent or received.
-func (s *Store) CountMessagesInvolvingUser(ctx context.Context, userID uint64) (uint64, error) {
-	var count uint64
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM messages WHERE sender_id = ? OR recipient_id = ?`,
-		userID, userID,
-	).Scan(&count); err != nil {
-		return 0, fmt.Errorf("count messages involving user: %w", err)
-	}
-	return count, nil
-}
-
 // ListUserIDs returns one ascending page of user IDs used to rotate audits.
 func (s *Store) ListUserIDs(ctx context.Context, afterID uint64, limit int) ([]uint64, error) {
 	if limit <= 0 {

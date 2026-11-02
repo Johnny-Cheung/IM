@@ -34,10 +34,6 @@ func messageStreamKey() string {
 	return defaultKeyspace.messageStreamKey()
 }
 
-func directFeedKey(userID uint64) string {
-	return defaultKeyspace.directFeedKey(userID)
-}
-
 func directSequenceKey(userID, peerID uint64) string {
 	return defaultKeyspace.directSequenceKey(userID, peerID)
 }
@@ -84,12 +80,6 @@ func (k Keyspace) outboxKey(userID uint64) string {
 
 func (k Keyspace) inboxKey(userID uint64) string {
 	return fmt.Sprintf("%sinbox:%d", k.prefixOrDefault(), userID)
-}
-
-// directFeedKey indexes every direct message the user participates in,
-// regardless of direction. It backs whole-user incremental sync.
-func (k Keyspace) directFeedKey(userID uint64) string {
-	return fmt.Sprintf("%sdm:feed:%d", k.prefixOrDefault(), userID)
 }
 
 // directPairKey indexes every message of one private conversation, in both
@@ -152,13 +142,6 @@ func RebuildLockKey(keyspace Keyspace) string {
 // rebuild instead of starting on a half-built namespace.
 func RebuildPendingKey(keyspace Keyspace) string {
 	return keyspace.prefixOrDefault() + "rebuild:pending"
-}
-
-// indexEpochKey records the highest message ID that is not guaranteed to be
-// present in the private feed index. It is a global-ID score floor for
-// dm:feed only and must never be used for conversation seq ranges.
-func (k Keyspace) indexEpochKey() string {
-	return k.prefixOrDefault() + "index:epoch"
 }
 
 func (k Keyspace) messageStreamKey() string {

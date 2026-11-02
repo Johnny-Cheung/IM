@@ -180,25 +180,6 @@ func TestListGroupMessagesBySeqRange(t *testing.T) {
 	script.assertDone(t)
 }
 
-func TestCountMessagesInvolvingUser(t *testing.T) {
-	store, script := newScriptStore(t, scriptStep{
-		match:   "SELECT COUNT(*) FROM messages WHERE sender_id = ? OR recipient_id = ?",
-		columns: []string{"count"},
-		rows:    [][]driver.Value{{int64(42)}},
-	})
-
-	count, err := store.CountMessagesInvolvingUser(context.Background(), 9)
-	if err != nil {
-		t.Fatalf("CountMessagesInvolvingUser() error = %v", err)
-	}
-	if count != 42 {
-		t.Fatalf("count = %d, want 42", count)
-	}
-	script.assertArg(t, 0, 0, int64(9))
-	script.assertArg(t, 0, 1, int64(9))
-	script.assertDone(t)
-}
-
 func TestListUserIDs(t *testing.T) {
 	store, script := newScriptStore(t, scriptStep{
 		match:   "SELECT id FROM users",

@@ -25,26 +25,22 @@ type ConversationPage struct {
 	Complete bool
 }
 
-// RedisMessageReader reads one private conversation from dm:pair and the
-// bidirectional per-user feed from dm:feed.
+// RedisMessageReader reads one private conversation from dm:pair.
 type RedisMessageReader struct {
-	client    redis.UniversalClient
-	keyspace  Keyspace
-	feedEpoch uint64
+	client   redis.UniversalClient
+	keyspace Keyspace
 }
 
 func NewRedisMessageReader(client redis.UniversalClient) *RedisMessageReader {
-	return NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	return NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
 }
 
-// NewRedisMessageReaderWithKeyspace builds a reader. feedEpoch is the
-// global-ID floor of dm:feed only; conversation ranges never use it.
+// NewRedisMessageReaderWithKeyspace builds a reader for one namespace.
 func NewRedisMessageReaderWithKeyspace(
 	client redis.UniversalClient,
 	keyspace Keyspace,
-	feedEpoch uint64,
 ) *RedisMessageReader {
-	return &RedisMessageReader{client: client, keyspace: keyspace, feedEpoch: feedEpoch}
+	return &RedisMessageReader{client: client, keyspace: keyspace}
 }
 
 // ReadConversation returns the newest messages before beforeSeq, or the newest
@@ -66,69 +62,6 @@ func (r *RedisMessageReader) ReadConversationAfter(
 	limit int,
 ) (ConversationPage, error) {
 	return r.read(ctx, userID, otherID, true, 0, afterSeq, limit)
-}
-
-// FeedPage is one page of the user's direct-message feed.
-//
-// Complete reports whether the feed covers every message after the cursor.
-// When it is false the caller must resynchronise from conversation history.
-type FeedPage struct {
-	Page     store.MessagePage
-	Complete bool
-}
-
-// ReadFeed returns the messages the user exchanged after afterID, oldest
-// first, across all direct conversations. The cursor stays a global message
-// ID; returned messages carry their conversation seq.
-func (r *RedisMessageReader) ReadFeed(
-	ctx context.Context,
-	userID, afterID uint64,
-	limit int,
-) (FeedPage, error) {
-	if r == nil || r.client == nil {
-		return FeedPage{}, ErrMessageServiceUnavailable
-	}
-	if limit < 1 {
-		return FeedPage{}, fmt.Errorf("invalid feed limit")
-	}
-
-	lower := r.feedEpoch
-	if afterID > lower {
-		lower = afterID
-	}
-	values, err := r.client.ZRangeByScore(ctx, r.keyspace.directFeedKey(userID), &redis.ZRangeBy{
-		Min:    exclusiveMin(lower),
-		Max:    "+inf",
-		Offset: 0,
-		Count:  int64(limit + 1),
-	}).Result()
-	if err != nil {
-		return FeedPage{}, err
-	}
-
-	ids := make([]uint64, 0, len(values))
-	for _, value := range values {
-		id, parseErr := strconv.ParseUint(value, 10, 64)
-		if parseErr != nil || id == 0 {
-			continue
-		}
-		ids = append(ids, id)
-	}
-
-	messages, missing, err := r.loadMessages(ctx, ids)
-	if err != nil {
-		return FeedPage{}, err
-	}
-	sort.Slice(messages, func(i, j int) bool { return messages[i].ID < messages[j].ID })
-
-	hasMore := len(messages) > limit
-	if hasMore {
-		messages = messages[:limit]
-	}
-	return FeedPage{
-		Page:     store.MessagePage{Messages: messages, HasMore: hasMore},
-		Complete: !missing && afterID >= r.feedEpoch,
-	}, nil
 }
 
 // LastConversationMessages returns the newest message exchanged with each peer,

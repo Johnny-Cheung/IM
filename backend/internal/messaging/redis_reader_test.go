@@ -47,7 +47,7 @@ func TestRedisMessageReaderListsHotConversationMessages(t *testing.T) {
 
 	seedDirectMessages(t, client, 1, 2, 2)
 
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
 	page, err := reader.ReadConversation(ctx, 2, 1, 0, 10)
 	if err != nil {
 		t.Fatalf("ReadConversation() error = %v", err)
@@ -82,7 +82,7 @@ func TestRedisMessageReaderInitialPageReturnsNewestMessages(t *testing.T) {
 
 	seedDirectMessages(t, client, 1, 2, 5)
 
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
 	page, err := reader.ReadConversation(ctx, 2, 1, 0, 2)
 	if err != nil {
 		t.Fatalf("ReadConversation() error = %v", err)
@@ -102,7 +102,7 @@ func TestRedisMessageReaderHasMoreUsesRangeBoundaries(t *testing.T) {
 	ctx := context.Background()
 
 	seedDirectMessages(t, client, 1, 2, 5)
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
 
 	before, err := reader.ReadConversation(ctx, 2, 1, 4, 2)
 	if err != nil {
@@ -172,7 +172,7 @@ func TestRedisMessageReaderAfterZeroStartsAtFirstSeq(t *testing.T) {
 	ctx := context.Background()
 
 	seedDirectMessages(t, client, 1, 2, 5)
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
 	page, err := reader.ReadConversationAfter(ctx, 2, 1, 0, 2)
 	if err != nil {
 		t.Fatalf("ReadConversationAfter(0) error = %v", err)
@@ -194,7 +194,7 @@ func TestRedisMessageReaderStaleCounterFallsBackToMySQL(t *testing.T) {
 		t.Fatalf("lower counter: %v", err)
 	}
 
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
 	newest, err := reader.ReadConversation(ctx, 2, 1, 0, 2)
 	if err != nil {
 		t.Fatalf("ReadConversation() error = %v", err)
@@ -233,7 +233,7 @@ func TestRedisMessageReaderEmptyWindowIsNotComplete(t *testing.T) {
 
 	seedDirectMessages(t, client, 1, 2, 2)
 
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
 	empty, err := reader.ReadConversationAfter(ctx, 2, 1, 2, 10)
 	if err != nil {
 		t.Fatalf("ReadConversationAfter() error = %v", err)
@@ -260,7 +260,7 @@ func TestRedisMessageReaderIsolatesConversations(t *testing.T) {
 	seedDirectMessages(t, client, 1, 2, 2)
 	seedDirectMessages(t, client, 3, 2, 3)
 
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
 	page, err := reader.ReadConversation(ctx, 2, 1, 0, 10)
 	if err != nil {
 		t.Fatalf("ReadConversation() error = %v", err)
@@ -275,71 +275,6 @@ func TestRedisMessageReaderIsolatesConversations(t *testing.T) {
 	}
 }
 
-func TestRedisMessageReaderConversationIgnoresFeedEpoch(t *testing.T) {
-	server := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	defer client.Close()
-	ctx := context.Background()
-
-	ids := seedDirectMessages(t, client, 1, 2, 2)
-
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, ids[0])
-	page, err := reader.ReadConversation(ctx, 2, 1, 0, 10)
-	if err != nil {
-		t.Fatalf("ReadConversation() error = %v", err)
-	}
-	if !page.Complete || len(page.Page.Messages) != 2 {
-		t.Fatalf("page = %#v, want the full seq range regardless of the feed epoch", page)
-	}
-}
-
-func TestRedisMessageReaderReadsFeed(t *testing.T) {
-	server := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	defer client.Close()
-	ctx := context.Background()
-
-	ids := seedDirectMessages(t, client, 1, 2, 2)
-
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
-	feed, err := reader.ReadFeed(ctx, 2, 0, 10)
-	if err != nil {
-		t.Fatalf("ReadFeed() error = %v", err)
-	}
-	if !feed.Complete || len(feed.Page.Messages) != 2 {
-		t.Fatalf("feed = %#v, want both messages and complete", feed)
-	}
-	if feed.Page.Messages[0].Seq != 1 || feed.Page.Messages[1].Seq != 2 {
-		t.Fatalf("feed seqs = %#v", feed.Page.Messages)
-	}
-
-	tail, err := reader.ReadFeed(ctx, 2, ids[0], 10)
-	if err != nil {
-		t.Fatalf("ReadFeed(after) error = %v", err)
-	}
-	if !tail.Complete || len(tail.Page.Messages) != 1 || tail.Page.Messages[0].ID != ids[1] {
-		t.Fatalf("tail = %#v", tail)
-	}
-}
-
-func TestRedisMessageReaderFeedBelowEpochIsIncomplete(t *testing.T) {
-	server := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	defer client.Close()
-	ctx := context.Background()
-
-	ids := seedDirectMessages(t, client, 1, 2, 2)
-
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, ids[0])
-	feed, err := reader.ReadFeed(ctx, 2, 1, 10)
-	if err != nil {
-		t.Fatalf("ReadFeed() error = %v", err)
-	}
-	if feed.Complete {
-		t.Fatal("complete = true, want false below the epoch")
-	}
-}
-
 func TestRedisMessageReaderReturnsLastConversationMessages(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
@@ -348,7 +283,7 @@ func TestRedisMessageReaderReturnsLastConversationMessages(t *testing.T) {
 
 	ids := seedDirectMessages(t, client, 1, 2, 3)
 
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
 	recipientView, err := reader.LastConversationMessages(ctx, 2)
 	if err != nil {
 		t.Fatalf("LastConversationMessages() error = %v", err)
@@ -377,7 +312,7 @@ func TestRedisMessageReaderMissingEntityForcesFallback(t *testing.T) {
 		t.Fatalf("delete entity: %v", err)
 	}
 
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
 	page, err := reader.ReadConversation(ctx, 2, 1, 0, 10)
 	if err != nil {
 		t.Fatalf("ReadConversation() error = %v", err)
@@ -401,7 +336,7 @@ func TestRedisMessageReaderMissingIndexEntryForcesFallback(t *testing.T) {
 		t.Fatalf("remove index entry: %v", err)
 	}
 
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
 	page, err := reader.ReadConversation(ctx, 2, 1, 0, 10)
 	if err != nil {
 		t.Fatalf("ReadConversation() error = %v", err)
@@ -422,7 +357,7 @@ func TestRedisMessageReaderEntityWithoutSeqIsMissing(t *testing.T) {
 		t.Fatalf("remove entity seq: %v", err)
 	}
 
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
 	page, err := reader.ReadConversation(ctx, 2, 1, 0, 10)
 	if err != nil {
 		t.Fatalf("ReadConversation() error = %v", err)
@@ -443,7 +378,7 @@ func TestRedisMessageReaderMissingCounterForcesFallback(t *testing.T) {
 		t.Fatalf("delete counter: %v", err)
 	}
 
-	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace, 0)
+	reader := NewRedisMessageReaderWithKeyspace(client, defaultKeyspace)
 	page, err := reader.ReadConversation(ctx, 2, 1, 0, 10)
 	if err != nil {
 		t.Fatalf("ReadConversation() error = %v", err)

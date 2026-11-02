@@ -82,8 +82,6 @@ func (a *RedisAcceptor) Accept(ctx context.Context, request DirectMessageRequest
 		keyspace.counterKey(),
 		keyspace.friendshipKey(request.SenderID),
 		keyspace.dedupKey(request.SenderID, request.RecipientID, request.ClientMessageID),
-		keyspace.directFeedKey(request.SenderID),
-		keyspace.directFeedKey(request.RecipientID),
 		keyspace.directPairKey(request.SenderID, request.RecipientID),
 		keyspace.directSequenceKey(request.SenderID, request.RecipientID),
 		keyspace.directConversationLastKey(request.SenderID),

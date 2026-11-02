@@ -3,7 +3,6 @@ package messaging
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -383,111 +382,6 @@ func TestReconcilerDeepAuditRepairsMissingEntity(t *testing.T) {
 	}
 }
 
-func TestReconcilerDeepAuditRepairsSmallFeedGap(t *testing.T) {
-	client, _ := newReconcileTestClient(t)
-	now := reconcileTestNow()
-	ctx := context.Background()
-	messages := auditDirectMessages(3, now.Add(-time.Hour))
-
-	fakeStore := newFakeReconcileStore()
-	fakeStore.directMessages[[2]uint64{1, 2}] = messages
-	fakeStore.userIDs = []uint64{1}
-	fakeStore.userPeers[1] = []uint64{2}
-	if err := client.ZAdd(ctx, defaultKeyspace.directFeedKey(1), redis.Z{
-		Score: 101, Member: "101",
-	}).Err(); err != nil {
-		t.Fatalf("seed feed: %v", err)
-	}
-
-	current := now
-	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
-		Repair:         newAuditWriter(client, now),
-		DeepAuditUsers: 1,
-		Now:            func() time.Time { return current },
-	})
-	current = now.Add(2 * time.Hour)
-	result, err := reconciler.RunOnce(ctx)
-	if err != nil {
-		t.Fatalf("RunOnce() error = %v", err)
-	}
-	if result.FeedRepairs != 2 || result.RedisMissing != 2 {
-		t.Fatalf("result = %+v, want two feed entries repaired", result)
-	}
-	card, err := client.ZCard(ctx, defaultKeyspace.directFeedKey(1)).Result()
-	if err != nil {
-		t.Fatalf("read feed card: %v", err)
-	}
-	if card != 3 {
-		t.Fatalf("feed card = %d, want 3", card)
-	}
-}
-
-func TestReconcilerDeepAuditLargeFeedGapNeedsRebuild(t *testing.T) {
-	client, _ := newReconcileTestClient(t)
-	now := reconcileTestNow()
-	messages := auditDirectMessages(51, now.Add(-time.Hour))
-
-	fakeStore := newFakeReconcileStore()
-	fakeStore.directMessages[[2]uint64{1, 2}] = messages
-	fakeStore.userIDs = []uint64{1}
-	fakeStore.userPeers[1] = []uint64{2}
-	logs := captureReconcileLog(t)
-
-	current := now
-	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
-		Repair:         newAuditWriter(client, now),
-		DeepAuditUsers: 1,
-		Now:            func() time.Time { return current },
-	})
-	current = now.Add(2 * time.Hour)
-	result, err := reconciler.RunOnce(context.Background())
-	if err != nil {
-		t.Fatalf("RunOnce() error = %v", err)
-	}
-	if result.NeedsRebuild != 1 || result.FeedRepairs != 0 {
-		t.Fatalf("result = %+v, want needs_rebuild without repair", result)
-	}
-	if result.RedisMissing != 51 {
-		t.Fatalf("redis_missing = %d, want 51", result.RedisMissing)
-	}
-	if card := client.ZCard(context.Background(), defaultKeyspace.directFeedKey(1)).Val(); card != 0 {
-		t.Fatalf("feed card = %d, want no repair", card)
-	}
-	if !strings.Contains(logs.String(), "needs-rebuild user:1:feed") {
-		t.Fatalf("log = %s, want a needs-rebuild line", logs.String())
-	}
-}
-
-func TestReconcilerDeepAuditRotatesUsers(t *testing.T) {
-	client, _ := newReconcileTestClient(t)
-	now := reconcileTestNow()
-
-	fakeStore := newFakeReconcileStore()
-	fakeStore.userIDs = []uint64{1, 2}
-
-	current := now
-	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
-		Repair:         newAuditWriter(client, now),
-		DeepAuditUsers: 1,
-		Now:            func() time.Time { return current },
-	})
-	current = now.Add(2 * time.Hour)
-	if _, err := reconciler.RunOnce(context.Background()); err != nil {
-		t.Fatalf("first RunOnce() error = %v", err)
-	}
-	if got := fakeStore.userCountCallsSnapshot(); len(got) != 1 || got[0] != 1 {
-		t.Fatalf("first audit users = %v, want [1]", got)
-	}
-
-	current = now.Add(3 * time.Hour)
-	if _, err := reconciler.RunOnce(context.Background()); err != nil {
-		t.Fatalf("second RunOnce() error = %v", err)
-	}
-	if got := fakeStore.userCountCallsSnapshot(); len(got) != 2 || got[1] != 2 {
-		t.Fatalf("audited users = %v, want the next user on the next run", got)
-	}
-}
-
 func TestReconcilerNilRepairReportsWithoutWriting(t *testing.T) {
 	client, _ := newReconcileTestClient(t)
 	now := reconcileTestNow()
@@ -517,14 +411,11 @@ func TestReconcilerNilRepairReportsWithoutWriting(t *testing.T) {
 	if result.RedisMissing == 0 {
 		t.Fatalf("result = %+v, want the defects reported", result)
 	}
-	if result.RedisRepaired != 0 || result.WatermarksRaised != 0 || result.FeedRepairs != 0 {
+	if result.RedisRepaired != 0 || result.WatermarksRaised != 0 {
 		t.Fatalf("result = %+v, want no writes with a nil repairer", result)
 	}
 	if card := client.ZCard(ctx, defaultKeyspace.directPairKey(1, 2)).Val(); card != 1 {
 		t.Fatalf("pair card = %d, want 1", card)
-	}
-	if card := client.ZCard(ctx, defaultKeyspace.directFeedKey(1)).Val(); card != 0 {
-		t.Fatalf("feed card = %d, want 0", card)
 	}
 	if got := client.HGet(ctx, defaultKeyspace.directReadKey(1), "2").Val(); got != "" {
 		t.Fatalf("direct watermark = %q, want it untouched", got)
@@ -675,7 +566,6 @@ func TestReconcileStatusReverseFieldsJSON(t *testing.T) {
 		RedisMissing:     1,
 		RedisRepaired:    2,
 		WatermarksRaised: 3,
-		FeedRepairs:      4,
 		NeedsRebuild:     5,
 		LastDeepAuditAt:  reconcileTestNow(),
 		DeepAuditError:   "boom",
@@ -692,7 +582,6 @@ func TestReconcileStatusReverseFieldsJSON(t *testing.T) {
 		"redis_missing",
 		"redis_repaired",
 		"watermarks_raised",
-		"feed_repairs",
 		"needs_rebuild",
 		"last_deep_audit_at",
 		"deep_audit_error",
@@ -1495,58 +1384,6 @@ func TestReconcilerAuditsGlobalMessageIDCounter(t *testing.T) {
 	})
 }
 
-// A present feed entity that differs from MySQL must be reported, not
-// overwritten, exactly like the index-gap and deep-entity repairs.
-func TestReconcilerDeepAuditFeedDoesNotOverwriteDivergedEntity(t *testing.T) {
-	client, _ := newReconcileTestClient(t)
-	now := reconcileTestNow()
-	ctx := context.Background()
-	messages := auditDirectMessages(3, now.Add(-time.Hour))
-	if _, err := newAuditWriter(client, now).WriteDirectBatch(ctx, messages); err != nil {
-		t.Fatalf("seed Redis: %v", err)
-	}
-	if err := client.HSet(ctx, defaultKeyspace.messageKey(102), "body", "tampered").Err(); err != nil {
-		t.Fatalf("tamper entity: %v", err)
-	}
-	if err := client.ZRem(ctx, defaultKeyspace.directFeedKey(1), "102").Err(); err != nil {
-		t.Fatalf("remove feed member: %v", err)
-	}
-
-	logs := captureReconcileLog(t)
-	fakeStore := newFakeReconcileStore()
-	fakeStore.conversations = []store.ConversationSeqStat{{
-		LowID: 1, HighID: 2, Count: 3, MaxSeq: 3,
-	}}
-	fakeStore.directMessages[[2]uint64{1, 2}] = messages
-	fakeStore.directSeqs[[2]uint64{1, 2}] = []uint64{1, 2, 3}
-	fakeStore.userIDs = []uint64{1}
-	fakeStore.userPeers[1] = []uint64{2}
-
-	current := now
-	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
-		Repair:         newAuditWriter(client, now),
-		DeepAuditUsers: 1,
-		Now:            func() time.Time { return current },
-	})
-	current = now.Add(2 * time.Hour)
-	result, err := reconciler.RunOnce(ctx)
-	if err != nil {
-		t.Fatalf("RunOnce() error = %v", err)
-	}
-	if result.NeedsRebuild == 0 || result.FeedRepairs != 0 {
-		t.Fatalf("result = %+v, want the divergence flagged without a feed repair", result)
-	}
-	if !strings.Contains(logs.String(), "needs-rebuild user:1:feed:entity") {
-		t.Fatalf("log = %s, want the feed divergence reported", logs.String())
-	}
-	if body := client.HGet(ctx, defaultKeyspace.messageKey(102), "body").Val(); body != "tampered" {
-		t.Fatalf("entity body = %q, want the divergence left untouched", body)
-	}
-	if err := client.ZScore(ctx, defaultKeyspace.directFeedKey(1), "102").Err(); !errors.Is(err, redis.Nil) {
-		t.Fatalf("feed member 102 error = %v, want the feed entry still absent", err)
-	}
-}
-
 // A diverged entity behind a stale conversation preview must not be rewritten
 // just to repair the preview.
 func TestReconcilerDeepAuditPreviewDoesNotOverwriteDivergedEntity(t *testing.T) {
@@ -1603,104 +1440,6 @@ func TestReconcilerDeepAuditPreviewDoesNotOverwriteDivergedEntity(t *testing.T) 
 	}
 }
 
-// The feed walk must not report success when it stopped at the 2000-check cap
-// before finding the whole gap; the user must be retried on the next audit.
-func TestReconcilerFeedWalkRetriesGapAfterCheckCap(t *testing.T) {
-	client, _ := newReconcileTestClient(t)
-	now := reconcileTestNow()
-	ctx := context.Background()
-	const (
-		firstPeerMessages = 2000
-		missingID         = uint64(5000)
-	)
-	writer := newAuditWriter(client, now)
-	messages := make([]store.Message, 0, firstPeerMessages+1)
-	for seq := uint64(1); seq <= firstPeerMessages; seq++ {
-		messages = append(messages, store.Message{
-			ID:              uint64(1000) + seq,
-			Seq:             seq,
-			SenderID:        1,
-			RecipientID:     2,
-			ClientMessageID: fmt.Sprintf("cap-a-%d", seq),
-			Body:            fmt.Sprintf("cap-a-%d", seq),
-			CreatedAt:       now.Add(-time.Hour),
-		})
-	}
-	missing := store.Message{
-		ID:              missingID,
-		Seq:             1,
-		SenderID:        1,
-		RecipientID:     3,
-		ClientMessageID: "cap-b-1",
-		Body:            "cap-b-1",
-		CreatedAt:       now.Add(-time.Hour),
-	}
-	messages = append(messages, missing)
-	if _, err := writer.WriteDirectBatch(ctx, messages[:firstPeerMessages]); err != nil {
-		t.Fatalf("seed first conversation: %v", err)
-	}
-	if _, err := writer.WriteDirectBatch(ctx, []store.Message{missing}); err != nil {
-		t.Fatalf("seed second conversation: %v", err)
-	}
-	// Only the sampled user's feed loses the second conversation's message; the
-	// pair index and the entity stay healthy.
-	if err := client.ZRem(ctx, defaultKeyspace.directFeedKey(1), strconvUint(missingID)).Err(); err != nil {
-		t.Fatalf("remove feed member: %v", err)
-	}
-
-	fakeStore := newFakeReconcileStore()
-	fakeStore.directMessages[[2]uint64{1, 2}] = messages[:firstPeerMessages]
-	fakeStore.directMessages[[2]uint64{1, 3}] = []store.Message{missing}
-	fakeStore.directSeqs[[2]uint64{1, 2}] = sequenceRange(1, firstPeerMessages)
-	fakeStore.directSeqs[[2]uint64{1, 3}] = []uint64{1}
-	fakeStore.conversations = []store.ConversationSeqStat{
-		{LowID: 1, HighID: 2, Count: firstPeerMessages, MaxSeq: firstPeerMessages},
-		{LowID: 1, HighID: 3, Count: 1, MaxSeq: 1},
-	}
-	fakeStore.userIDs = []uint64{1}
-	fakeStore.userPeers[1] = []uint64{2, 3}
-
-	current := now
-	reconciler := newTestReconciler(client, fakeStore, ReconcileOptions{
-		Repair:         writer,
-		DeepAuditUsers: 1,
-		Now:            func() time.Time { return current },
-	})
-	current = now.Add(2 * time.Hour)
-	result, err := reconciler.RunOnce(ctx)
-	if err != nil {
-		t.Fatalf("first RunOnce() error = %v", err)
-	}
-	if result.FeedRepairs != 0 {
-		t.Fatalf("first result = %+v, want the capped walk to repair nothing", result)
-	}
-	if userID := reconciler.userDeepCursorState(); userID != 0 {
-		t.Fatalf("user cursor = %d, want the user retried next audit", userID)
-	}
-
-	current = now.Add(3 * time.Hour)
-	result, err = reconciler.RunOnce(ctx)
-	if err != nil {
-		t.Fatalf("second RunOnce() error = %v", err)
-	}
-	if result.FeedRepairs != 1 {
-		t.Fatalf("second result = %+v, want the deferred gap repaired", result)
-	}
-	if err := client.ZScore(
-		ctx, defaultKeyspace.directFeedKey(1), strconvUint(missingID),
-	).Err(); err != nil {
-		t.Fatalf("feed member error = %v, want the entry restored", err)
-	}
-}
-
-func sequenceRange(from, to uint64) []uint64 {
-	seqs := make([]uint64, 0, to-from+1)
-	for seq := from; seq <= to; seq++ {
-		seqs = append(seqs, seq)
-	}
-	return seqs
-}
-
 // failingWatermarkRepairer fails the direct watermark raise for one user, so a
 // test can prove the retry budget and the cursor advance past a dead chunk.
 type failingWatermarkRepairer struct {
@@ -1733,8 +1472,6 @@ func (r *failingWatermarkRepairer) failureCount() int {
 	return r.failures
 }
 
-// A permanently failing watermark chunk must be marked and skipped after three
-// attempts instead of pinning every later watermark forever.
 func TestReconcilerWatermarkRetryLimitAdvancesPastFailingChunk(t *testing.T) {
 	client, _ := newReconcileTestClient(t)
 	now := reconcileTestNow()

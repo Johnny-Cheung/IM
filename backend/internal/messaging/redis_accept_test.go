@@ -62,14 +62,14 @@ func TestRedisAcceptorAcceptsAndDeduplicates(t *testing.T) {
 	if got := client.HGet(ctx, messageKey(42), "seq").Val(); got != "1" {
 		t.Fatalf("entity seq = %q, want 1", got)
 	}
-	if got := client.ZScore(ctx, directFeedKey(1), "42").Val(); got != 42 {
-		t.Fatalf("sender feed score = %v, want 42", got)
-	}
-	if got := client.ZScore(ctx, directFeedKey(2), "42").Val(); got != 42 {
-		t.Fatalf("recipient feed score = %v, want 42", got)
-	}
 	if got := client.ZScore(ctx, directPairKey(2, 1), "42").Val(); got != 1 {
 		t.Fatalf("dm:pair score = %v, want seq 1", got)
+	}
+	if got := client.Exists(ctx,
+		defaultKeyspace.prefixOrDefault()+"dm:feed:1",
+		defaultKeyspace.prefixOrDefault()+"dm:feed:2",
+	).Val(); got != 0 {
+		t.Fatalf("retired dm:feed keys created = %d, want 0", got)
 	}
 	if got := client.Get(ctx, directSequenceKey(1, 2)).Val(); got != "1" {
 		t.Fatalf("dm:seq = %q, want 1", got)
@@ -413,7 +413,7 @@ func TestRedisAcceptorFailsClosedWhenSequenceTaken(t *testing.T) {
 	if got := client.Get(ctx, directSequenceKey(1, 2)).Val(); got != "3" {
 		t.Fatalf("dm:seq = %q, want unchanged 3", got)
 	}
-	// The global ID is consumed; the entity, index, feed and dedup must not be
+	// The global ID is consumed; the entity, index and dedup must not be
 	// written for it.
 	if got := client.Get(ctx, counterKey()).Val(); got != "1" {
 		t.Fatalf("global counter = %q, want consumed 1", got)
@@ -427,11 +427,8 @@ func TestRedisAcceptorFailsClosedWhenSequenceTaken(t *testing.T) {
 	if got := client.ZScore(ctx, directPairKey(1, 2), "900").Val(); got != 4 {
 		t.Fatalf("seeded index member score = %v, want 4", got)
 	}
-	if got := client.ZCard(ctx, directFeedKey(1)).Val(); got != 0 {
-		t.Fatalf("sender feed written = %d, want 0", got)
-	}
-	if got := client.ZCard(ctx, directFeedKey(2)).Val(); got != 0 {
-		t.Fatalf("recipient feed written = %d, want 0", got)
+	if got := client.ZCard(ctx, directPairKey(1, 2)).Val(); got != 1 {
+		t.Fatalf("seeded index card = %d, want 1", got)
 	}
 	if got := client.XLen(ctx, messageStreamKey()).Val(); got != 0 {
 		t.Fatalf("stream written after rejected seq = %d, want 0", got)
@@ -509,12 +506,6 @@ func TestRedisAcceptorKeepsIndexAndEntitiesAligned(t *testing.T) {
 		}
 	}
 
-	if got := client.ZCard(ctx, directFeedKey(1)).Val(); got != total {
-		t.Fatalf("sender feed size = %d, want %d", got, total)
-	}
-	if got := client.ZCard(ctx, directFeedKey(2)).Val(); got != total {
-		t.Fatalf("recipient feed size = %d, want %d", got, total)
-	}
 	if got := client.ZCard(ctx, directPairKey(1, 2)).Val(); got != total {
 		t.Fatalf("dm:pair size = %d, want %d", got, total)
 	}

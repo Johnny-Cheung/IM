@@ -73,12 +73,6 @@ func TestProjectionWriterWritesDirectMessage(t *testing.T) {
 	if score := client.ZScore(ctx, directPairKey(2, 1), "42").Val(); score != 3 {
 		t.Fatalf("dm:pair score = %v, want seq 3", score)
 	}
-	if score := client.ZScore(ctx, directFeedKey(1), "42").Val(); score != 42 {
-		t.Fatalf("sender feed score = %v, want global id 42", score)
-	}
-	if score := client.ZScore(ctx, directFeedKey(2), "42").Val(); score != 42 {
-		t.Fatalf("recipient feed score = %v, want global id 42", score)
-	}
 	if got := client.HGet(ctx, directConversationLastKey(1), "2").Val(); got != "42" {
 		t.Fatalf("sender conv-last = %q, want 42", got)
 	}
@@ -248,9 +242,6 @@ func TestProjectionWriterWritesGroupMessage(t *testing.T) {
 	}
 	if got := client.Get(ctx, defaultKeyspace.groupSequenceKey(9)).Val(); got != "2" {
 		t.Fatalf("group seq = %q, want 2", got)
-	}
-	if entries := client.ZCard(ctx, directFeedKey(1)).Val(); entries != 0 {
-		t.Fatalf("group message wrote %d feed entries", entries)
 	}
 
 	dedup := defaultKeyspace.groupDedupKey(9, 1, "group-1")
