@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、审查修复和 8199 隔离验证；v1.8.3 Redis 重建与双向一致性检查已完成开发、审查修复和 8199 隔离验证；v2.0 朋友圈（文字版）已完成开发、审查修复和 8199 隔离验证。四者同样暂不切换 8198。v1.9 的 relay 流水线投递、consumer 单 worker 批量落库和发送路径 session/用户缓存已完成代码与单元测试，尚未在真实 MySQL/RabbitMQ 环境压测或部署。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、审查修复和 8199 隔离验证；v1.8.3 Redis 重建与双向一致性检查已完成开发、审查修复和 8199 隔离验证；v2.0 朋友圈（文字版）已完成开发、审查修复和 8199 隔离验证。四者同样暂不切换 8198。v1.9 的 relay 流水线投递、consumer 单 worker 批量落库、发送路径 session/用户缓存和客户端已读游标已完成代码与单元测试，尚未在真实 MySQL/RabbitMQ 环境压测或部署。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -370,7 +370,7 @@ canary 的 Redis DB 1 与正式 `8198` 的 DB 0 在同一个 `im-v11-redis` 容�
 ## v1.6 私聊已读（已切换正式，v1.8.1 起被取代）
 
 - 私聊已读位置保存为 Redis `dm:read:{userID}` HASH；v1.7 及以前未读用 `dm:conv` 的 `ZCOUNT` 现算。v1.8.1 起 `dm:read` 的值改为 `seq`，未读等于会话计数器的 `last_seq` 减去自己的已读 `seq`（小于 0 按 0），不再对消息索引做 `ZCOUNT`；对方回执比较 `peer_last_read_seq` 与消息的 `seq`。
-- 旧的批量接口 `POST /api/read` 和单会话已读接口在 v1.8.1 删除，已读只通过 WebSocket `focus` 推进；`backfill-read` 只在回滚到 v1.7 时使用。
+- 旧的批量接口 `POST /api/read` 和单会话已读接口在 v1.8.1 删除；v1.8.1 起已读通过 WebSocket `focus` 推进，v1.9 起增加 `read` 帧承接前台实际渲染位置；`backfill-read` 只在回滚到 v1.7 时使用。
 - 已读位置通过 `dm:read:stream` 异步写回 MySQL，worker 使用 `GREATEST` 幂等落库；v1.8.1 写入 `last_read_seq`，旧的 `last_read_message_id` 保留但不再维护。
 - 升级到 v1.8.1 前的历史回填由 `backfill-seq` 统一完成（索引历史私聊消息、重建 `dm:pair`、换算已读位置），校验通过后写入 `seq:ready`。启用消息链路时，后端缺少该标记会拒绝启动；Redis 丢数据后需要重新回填。v1.7 及以前使用 `dm:read:ready`，该标记在 v1.8.1 中已被 `seq:ready` 取代。
 - 正式切换前备份为 `/opt/IM-Rebuild/backups/20261027T150410Z-4Z7wA7`；回填统计为 50 条私聊、8 条已读、9 个方向，Redis 内存 1.94 MB → 1.96 MB。
@@ -382,7 +382,7 @@ canary 的 Redis DB 1 与正式 `8198` 的 DB 0 在同一个 `im-v11-redis` 容�
 ## v1.7 群聊已读与 WebSocket 隐式已读（已切换正式，v1.8.1 起被取代）
 
 - 群聊已读位置保存为 Redis `group:{G}:read` ZSET；v1.7 未读用 `group:{G}:inbox` 的 `ZCOUNT` 现算，已读人数由 `GET /api/groups/:id/read-stats` 现算。v1.8.1 起 `group:{G}:inbox` 的分数和 `group:{G}:read` 的值都改为群会话 `seq`，未读等于群计数器 `last_seq` 减去自己的已读 `seq`；`read-stats` 改用 `?seq=` 查询并返回 `{seq, message_id, read_count, member_count, all_read}`。位置通过 `group-read:stream` 异步写回 `group_members.last_read_seq`（`GREATEST`，同一成员合并写）。
-- 前台已读继续使用 WebSocket 隐式已读：客户端发 `focus`/`blur`，服务端的 `focus.ack` 和 `messages.read` 使用 `last_read_seq`。v1.8.1 删除了 `POST /api/read`、`POST /api/conversations/:username/read`、`POST /api/groups/:id/read`，浏览器只会通过 `focus` 推进已读。
+- 前台已读使用 WebSocket：客户端发 `focus`/`blur`。v1.8.1 起 `focus` 在进入会话时推进到最新；v1.9 起停留期间由 `read` 帧按实际渲染位置节流上报，`focus.ack` 和 `messages.read` 继续使用 `last_read_seq`。v1.8.1 删除了 `POST /api/read`、`POST /api/conversations/:username/read`、`POST /api/groups/:id/read`，浏览器只通过 WebSocket 推进已读。
 - v1.8.1 的群聊历史回填补并进 `backfill-seq`，不再有独立的 `backfill-group-read`：
   ```bash
   /opt/IM-Rebuild/imctl --verify backfill-seq
@@ -439,6 +439,14 @@ curl -fsS http://127.0.0.1:8199/ops/infra   # 检查 seq.ready 与 pipeline.reco
 - 计数器哨兵：接纳时如果算出的全局消息号已有实体，或会话编号已被占用，直接返回 503，不会覆盖已有消息或复用编号；校准和运行期对账只抬高计数器。
 - 已知限制：AMQP 客户端看不到其他连接的未确认消息，所以命令自身的排空检查只覆盖自己的 consumer；`imctl` 的未确认数预检和“停后端”守卫共同兜住这种情况。
 - 2026-10-29 已在 8199 完成隔离验证（`79b1f67`）：已有数据重建、整体丢失、MySQL 编号空洞、运行期删除实体/索引成员/水位后 5 分钟内自动补回、维护锁门禁和停机守卫均通过；重建后 API smoke 114 项通过；验证库和命名空间已按 manifest 清理，持久化队列与死信队列均已排空。共享容器重启和 broker 级未确认预检未演练。
+
+## v1.9 批量链路与客户端已读游标（开发中）
+
+- relay/consumer 批量化、发送路径缓存和客户端已读游标目前只有代码与单元测试/race 检查，尚未在真实 MySQL/RabbitMQ 环境压测或部署到 8198。
+- 已读协议：`focus` 仍表示“打开会话即推进到最新”；停留前台时客户端把实际渲染到视口内的最大 `seq` 通过 WS `read` 帧上报，目标必须与当前 focus 一致，`last_read_seq=0` 被忽略；服务端复用现有 `AdvanceRead`，clamp 到会话计数器且只增不减。
+- 服务端不再在消息投递后为“聚焦的接收者/群成员”推进水位，只保留发送者自读。客户端在滚动、切换会话、隐藏标签页、卸载和重连时 flush；隐藏时先发 `read` 再发 `blur`。
+- 不新增 Redis 键、HTTP 接口、后台 worker 或队列；已读仍通过 `dm:read:stream`/`group-read:stream` 异步写 MySQL。群聊 `group.read` 广播给除 reader 外的成员，大群回执扇出需要在压测中观察。
+- 验证：`go test ./...`、`go test -race ./internal/httpapi ./internal/messaging`、`go vet ./...`、`npm test`、`npm run typecheck`、`npm run build` 均通过；真实浏览器、relay/consumer 端到端和压测尚未执行。
 
 ## v2.0 朋友圈（文字版）
 

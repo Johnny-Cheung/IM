@@ -44,6 +44,12 @@ import {
 } from "../cache";
 import type { CachedMessage, CachedOutbox } from "../cache";
 import { BLUR_FRAME, focusFrame, parseFocusAck, type FocusAck, type FocusTarget } from "../focus";
+import {
+  ReadCursorReporter,
+  lastVisibleReadSeq,
+  type ReadFrame,
+  type ReadRowRect,
+} from "../readCursor";
 import { groupReceiptLabel, lastOwnSentSeq as findLastOwnSentSeq } from "../groupReceipt";
 import {
   Debouncer,
@@ -166,6 +172,12 @@ function focusTargetKey(target: FocusTarget): string {
   return target.kind === "direct"
     ? directKey(target.username)
     : groupKey(target.groupID);
+}
+
+function readFrameTarget(frame: ReadFrame): FocusTarget {
+  return frame.kind === "direct"
+    ? { kind: "direct", username: frame.username }
+    : { kind: "group", groupID: frame.group_id };
 }
 
 function isGroupMessage(message: DisplayMessage): message is GroupDisplayMessage {
@@ -776,6 +788,11 @@ export function ChatPage() {
   const conversationsRefetchRef = useRef(false);
   const conversationsRefetchDirtyRef = useRef(false);
   const pendingFocusReadsRef = useRef<Map<string, FocusTarget>>(new Map());
+  const focusReadyRef = useRef<string | null>(null);
+  const readMeasureFrameRef = useRef<number | null>(null);
+  const settleConversationUnreadRef = useRef<() => void>(() => {});
+  const activeKeyRef = useRef("");
+  const messagesKeyRef = useRef("");
   const groupDetailRequestRef = useRef(0);
   const friendsRequestRef = useRef(0);
 
@@ -885,6 +902,75 @@ export function ChatPage() {
         : conversation;
     }));
   }, []);
+
+  const sendReadFrame = useCallback((frame: ReadFrame): boolean => {
+    const socket = websocketRef.current;
+    if (socket === null || socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    const target = readFrameTarget(frame);
+    // The server ignores a read frame whose target does not match the stored
+    // focus. Waiting for focus.ack also prevents a layout measurement from
+    // racing ahead of the focus frame on a conversation switch.
+    if (focusReadyRef.current !== focusTargetKey(target)) {
+      return false;
+    }
+    try {
+      socket.send(JSON.stringify(frame));
+    } catch {
+      return false;
+    }
+    clearLocalUnread(target, frame.last_read_seq);
+    settleConversationUnreadRef.current();
+    return true;
+  }, [clearLocalUnread]);
+
+  const readReporter = useMemo(
+    () => new ReadCursorReporter(sendReadFrame),
+    [sendReadFrame],
+  );
+
+  const measureReadCursor = useCallback(() => {
+    if (!pageVisibleRef.current || document.visibilityState !== "visible") {
+      return;
+    }
+    const target = activeTargetRef.current;
+    const container = messageListRef.current;
+    if (target === null || container === null) {
+      return;
+    }
+    const activeKey = activeKeyRef.current;
+    if (activeKey === "" || messagesKeyRef.current !== activeKey) {
+      return;
+    }
+    const viewport = container.getBoundingClientRect();
+    const rows: ReadRowRect[] = [];
+    container.querySelectorAll<HTMLElement>(".message-row[data-seq]").forEach((element) => {
+      const rect = element.getBoundingClientRect();
+      rows.push({
+        seq: Number(element.dataset.seq),
+        top: rect.top,
+        bottom: rect.bottom,
+      });
+    });
+    const seq = lastVisibleReadSeq(
+      { top: viewport.top, bottom: viewport.bottom },
+      rows,
+    );
+    if (seq > 0) {
+      readReporter.observe(seq);
+    }
+  }, [readReporter]);
+
+  const scheduleReadMeasurement = useCallback(() => {
+    if (readMeasureFrameRef.current !== null) {
+      return;
+    }
+    readMeasureFrameRef.current = requestAnimationFrame(() => {
+      readMeasureFrameRef.current = null;
+      measureReadCursor();
+    });
+  }, [measureReadCursor]);
 
   const syncFocus = useCallback(() => {
     const socket = websocketRef.current;
@@ -1131,17 +1217,12 @@ export function ChatPage() {
     }
   }, [handleSessionError, showArchivedFailures]);
 
-  const handleFocusAck = useCallback((ack: FocusAck) => {
-    if (!ack.ok) {
-      return;
-    }
-    clearLocalUnread(ack.target, ack.lastReadSeq);
-    pendingFocusReadsRef.current.delete(focusTargetKey(ack.target));
+  const settleConversationUnread = useCallback(() => {
     if (conversationsInFlightRef.current === 0) {
       return;
     }
-    // A list response snapshotted before this ack can still overwrite the
-    // unread it just cleared; refetch until the last ack is reflected.
+    // A list response snapshotted before the read can still overwrite the
+    // unread it just cleared; refetch until the latest position is reflected.
     if (conversationsRefetchRef.current) {
       conversationsRefetchDirtyRef.current = true;
       return;
@@ -1157,7 +1238,31 @@ export function ChatPage() {
       });
     };
     refresh();
-  }, [clearLocalUnread, loadConversations]);
+  }, [loadConversations]);
+
+  useEffect(() => {
+    settleConversationUnreadRef.current = settleConversationUnread;
+  }, [settleConversationUnread]);
+
+  const handleFocusAck = useCallback((ack: FocusAck) => {
+    if (!ack.ok) {
+      focusReadyRef.current = null;
+      return;
+    }
+    clearLocalUnread(ack.target, ack.lastReadSeq);
+    pendingFocusReadsRef.current.delete(focusTargetKey(ack.target));
+    const target = activeTargetRef.current;
+    if (target !== null && focusTargetKey(target) === focusTargetKey(ack.target)) {
+      focusReadyRef.current = focusTargetKey(ack.target);
+      readReporter.noteServerPosition(ack.lastReadSeq);
+      if (pageVisibleRef.current) {
+        readReporter.resume();
+        measureReadCursor();
+        readReporter.flushNow();
+      }
+    }
+    settleConversationUnread();
+  }, [clearLocalUnread, measureReadCursor, readReporter, settleConversationUnread]);
 
   const loadFriends = useCallback(async () => {
     if (offline) {
@@ -1494,6 +1599,13 @@ export function ChatPage() {
   }, [createGroupOpen, groupInfoOpen, loadFriends]);
 
   useEffect(() => {
+    const target = activeTargetRef.current;
+    // Flush the previous conversation's cursor while the server still has its
+    // focus, then adopt the new target. The new focus frame is sent by the
+    // later syncFocus effect, so the read frame is always ordered first.
+    if (readReporter.setTarget(target)) {
+      focusReadyRef.current = null;
+    }
     conversationVersionRef.current += 1;
     setDraft("");
     setDraftError(null);
@@ -1502,7 +1614,6 @@ export function ChatPage() {
     setGroupActionError(null);
     setConfirmLeave(false);
     setInviteSelection([]);
-    const target = activeTargetRef.current;
     if (!target) {
       messagesRequestRef.current += 1;
       setMessages([]);
@@ -1515,7 +1626,7 @@ export function ChatPage() {
       return;
     }
     void loadInitialMessages(target);
-  }, [activeKey, activeUsername, activeGroupID, loadInitialMessages]);
+  }, [activeKey, activeUsername, activeGroupID, loadInitialMessages, readReporter]);
 
   useEffect(() => {
     groupDetailRequestRef.current += 1;
@@ -1674,10 +1785,17 @@ export function ChatPage() {
     nearBottomRef.current = container.scrollHeight
       - container.scrollTop
       - container.clientHeight < 100;
+    scheduleReadMeasurement();
     if (container.scrollTop < 80 && hasMore && !loadingOlder && !messagesLoading) {
       void loadOlderMessages();
     }
-  }, [hasMore, loadingOlder, loadOlderMessages, messagesLoading]);
+  }, [
+    hasMore,
+    loadingOlder,
+    loadOlderMessages,
+    messagesLoading,
+    scheduleReadMeasurement,
+  ]);
 
   useLayoutEffect(() => {
     const container = messageListRef.current;
@@ -1695,6 +1813,27 @@ export function ChatPage() {
       container.scrollTop = container.scrollHeight;
     }
   }, [messages]);
+
+  // Sync the guard refs before the read measurement effect below runs; they
+  // must reflect this commit even when only activeKey changed.
+  useLayoutEffect(() => {
+    activeKeyRef.current = activeKey;
+    messagesKeyRef.current = messagesKey;
+  }, [activeKey, messagesKey]);
+
+  useLayoutEffect(() => {
+    if (!pageVisible || messagesLoading || messages.length === 0) {
+      return;
+    }
+    measureReadCursor();
+  }, [
+    activeKey,
+    measureReadCursor,
+    messages,
+    messagesKey,
+    messagesLoading,
+    pageVisible,
+  ]);
 
   const handleIncomingMessage = useCallback((message: ChatMessage) => {
     const currentUser = userRef.current;
@@ -1714,6 +1853,7 @@ export function ChatPage() {
       && sameUsername(target.username, otherUser.username);
     const readingNow = targetMatches
       && pageVisibleRef.current
+      && nearBottomRef.current
       && !replacedRef.current;
 
     const knownLast = conversationLastSeqsRef.current.get(key) ?? 0;
@@ -1856,6 +1996,7 @@ export function ChatPage() {
       && target.groupID === message.group_id;
     const readingNow = targetMatches
       && pageVisibleRef.current
+      && nearBottomRef.current
       && !replacedRef.current;
     const key = groupKey(message.group_id);
 
@@ -1997,6 +2138,10 @@ export function ChatPage() {
           && conversation.last_seq <= event.lastReadSeq
           ? { ...conversation, unread_count: 0 }
           : conversation));
+      const target = activeTargetRef.current;
+      if (target?.kind === "direct" && sameUsername(target.username, event.peer)) {
+        readReporter.noteServerPosition(event.lastReadSeq);
+      }
       return;
     }
     if (sameUsername(event.peer, currentUser.username)) {
@@ -2012,7 +2157,7 @@ export function ChatPage() {
           }
           : conversation));
     }
-  }, []);
+  }, [readReporter]);
 
   const handleGroupChanged = useCallback((event: GroupChangedEvent) => {
     if (event.action === "removed" || event.action === "dissolved") {
@@ -2260,6 +2405,8 @@ export function ChatPage() {
         return;
       }
       websocketRef.current = null;
+      readReporter.transportClosed();
+      focusReadyRef.current = null;
       if (event.code === WS_CLOSE_REPLACED) {
         replacedRef.current = true;
         reconnectAttemptRef.current = 0;
@@ -2294,6 +2441,7 @@ export function ChatPage() {
     loadConversations,
     loadGroupDetail,
     navigate,
+    readReporter,
     scheduleReconnect,
     syncActiveMessages,
     syncFocus,
@@ -2314,13 +2462,30 @@ export function ChatPage() {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
+      if (readMeasureFrameRef.current !== null) {
+        cancelAnimationFrame(readMeasureFrameRef.current);
+        readMeasureFrameRef.current = null;
+      }
+      // Best-effort final cursor before the socket goes away.
+      readReporter.flushNow();
       const socket = websocketRef.current;
       websocketRef.current = null;
       if (socket) {
         socket.close();
       }
     };
-  }, [connectWebSocket, offline]);
+  }, [connectWebSocket, offline, readReporter]);
+
+  useEffect(() => () => {
+    // The socket cleanup may run before or after this one; flushing here keeps
+    // the final cursor best-effort when this cleanup wins the race.
+    readReporter.flushNow();
+    readReporter.stop();
+    if (readMeasureFrameRef.current !== null) {
+      cancelAnimationFrame(readMeasureFrameRef.current);
+      readMeasureFrameRef.current = null;
+    }
+  }, [readReporter]);
 
   useEffect(() => {
     if (offline) {
@@ -2331,6 +2496,13 @@ export function ChatPage() {
   useEffect(() => {
     const handleVisibility = () => {
       const visible = document.visibilityState === "visible";
+      if (!visible) {
+        // Preserve the last rendered position before the blur frame clears the
+        // server-side focus; same-socket ordering makes read precede blur.
+        readReporter.flushNow();
+        readReporter.pause();
+        focusReadyRef.current = null;
+      }
       setPageVisible(visible);
       if (!visible || offline) {
         return;
@@ -2364,15 +2536,39 @@ export function ChatPage() {
       setReconnectAttempt(0);
       connectRef.current();
     };
+    const handlePageHide = () => {
+      readReporter.flushNow();
+      readReporter.pause();
+    };
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted && document.visibilityState === "visible") {
+        // A bfcache restore may not fire visibilitychange; re-focus so the
+        // server accepts the next read cursor and the ack resumes reporting.
+        syncFocus();
+      }
+    };
     document.addEventListener("visibilitychange", handleVisibility);
     window.addEventListener("focus", handleFocus);
     window.addEventListener("online", handleOnline);
+    window.addEventListener("pagehide", handlePageHide);
+    window.addEventListener("pageshow", handlePageShow);
+    window.addEventListener("resize", scheduleReadMeasurement);
     return () => {
       document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("focus", handleFocus);
       window.removeEventListener("online", handleOnline);
+      window.removeEventListener("pagehide", handlePageHide);
+      window.removeEventListener("pageshow", handlePageShow);
+      window.removeEventListener("resize", scheduleReadMeasurement);
     };
-  }, [coldOffline, loadConversations, offline]);
+  }, [
+    coldOffline,
+    loadConversations,
+    offline,
+    readReporter,
+    scheduleReadMeasurement,
+    syncFocus,
+  ]);
 
   function manualReconnect() {
     connectWebSocket(true);
