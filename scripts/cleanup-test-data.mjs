@@ -6,8 +6,11 @@
 // The Redis script also removes the seq model: the private conversation keys
 // (dm:seq, dm:pair, dm:read, dm:conv-last, legacy dm:conv) are named by the
 // internal user id, so the script resolves those ids from MySQL by the exact
-// manifest usernames. Run it BEFORE the SQL cleanup, which deletes the
-// accounts the lookup needs. seq:ready is never touched.
+// manifest usernames. It also removes the retired v1.9 dm:feed key, if a
+// namespace still carries one. Run it BEFORE the SQL cleanup, which deletes the
+// accounts the lookup needs. index:epoch is namespace-scoped and is handled by
+// the v1.10 operations note, not by this per-account script. seq:ready is never
+// touched.
 import { readFile, writeFile } from "node:fs/promises";
 
 const [database, output, ...manifests] = process.argv.slice(2);
@@ -69,6 +72,7 @@ for _, group in ipairs(groups) do
 end
 `;
 const luaDirect = `for index, owner in ipairs(ids) do
+  -- dm:feed is retired in v1.10; delete it only when an older namespace left it.
   removed = removed + redis.call('DEL',
     prefix .. 'dm:read:' .. owner,
     prefix .. 'dm:conv-last:' .. owner,

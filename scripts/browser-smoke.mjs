@@ -322,8 +322,8 @@ async function main() {
         const sync = meta.get(user + ":sync");
         sync.onsuccess = () => {
           const state = sync.result;
-          if (state && state.groups) {
-            delete state.groups[${live}];
+          if (state && state.localSeq) {
+            delete state.localSeq[key];
             meta.put(state, user + ":sync");
           }
         };

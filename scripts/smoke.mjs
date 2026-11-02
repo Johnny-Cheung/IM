@@ -227,12 +227,7 @@ async function main() {
   run.check("private reconnect cursor catches up by seq", contiguous(seqsOf(directAfter.messages), 2) && directAfter.messages.length === 33);
   const directGap = await run.request("b", "GET", `${directPath("a")}/messages?after_seq=30&limit=50`);
   run.check("private after_seq backfills a gap", contiguous(seqsOf(directGap.messages), 31) && directGap.messages.length === 4);
-  const sync = await run.request("b", "GET", `/api/messages/sync?after_id=${newest.messages[0].id}&limit=200`);
-  run.check(
-    "private feed sync still uses after_id and carries seq",
-    sync.messages.length === 29 && sync.messages.every((message) => Number.isInteger(message.seq) && message.seq >= 1)
-      && sync.messages.every((message, index) => index === 0 || message.id > sync.messages[index - 1].id),
-  );
+  await run.expectGone("global private feed sync was removed", "b", "GET", "/api/messages/sync?after_id=1");
   await until(
     async () => directOf(await list("b"), run.users.get("a").username)?.unread_count === 32,
     "private unread did not settle",
@@ -310,15 +305,11 @@ async function main() {
   run.check("group history seqs are contiguous", contiguous(seqsOf(groupPage.messages), 7) && contiguous(seqsOf(groupOlder.messages), 1));
   const groupAfter = await run.request("b", "GET", `/api/groups/${id}/messages?limit=50&after_seq=1`);
   run.check("group reconnect cursor catches up by seq", contiguous(seqsOf(groupAfter.messages), 2) && groupAfter.messages.length === 35);
-  const groupBootstrap = await run.request("b", "POST", "/api/bootstrap", {
-    after_id: 0,
-    groups: [{ group_id: id, after_seq: 5 }],
-    limit: 200,
-  });
-  const groupDelta = groupBootstrap.groups.find((item) => item.group_id === id);
+  const bootstrap = await bootstrapOf("b");
   run.check(
-    "bootstrap group cursor is after_seq in seq units",
-    groupDelta?.cursor === 36 && contiguous(seqsOf(groupDelta.messages), 6),
+    "bootstrap returns metadata only",
+    !("direct" in bootstrap) && !("groups" in bootstrap)
+      && bootstrap.conversations.some((item) => item.type === "group" && item.group.id === id),
   );
   await until(
     async () => groupOf(await list("b"), id).unread_count === 35,
