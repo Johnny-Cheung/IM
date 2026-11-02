@@ -41,7 +41,6 @@ type implicitReadBatch struct {
 	recipientUsername string
 	groupID           uint64
 	throughSeq        uint64
-	memberIDs         []uint64
 	queuedAt          time.Time
 	attempts          int
 }
@@ -239,9 +238,6 @@ func (r *implicitRead) requeue(batches []*implicitReadBatch, attempted *implicit
 				existing.senderUsername = batch.senderUsername
 				existing.recipientUsername = batch.recipientUsername
 			}
-			if len(batch.memberIDs) > 0 {
-				existing.memberIDs = batch.memberIDs
-			}
 			if batch.attempts > existing.attempts {
 				existing.attempts = batch.attempts
 			}
@@ -273,9 +269,6 @@ func (r *implicitRead) enqueue(batch implicitReadBatch) {
 		if batch.senderUsername != "" {
 			existing.senderUsername = batch.senderUsername
 			existing.recipientUsername = batch.recipientUsername
-		}
-		if len(batch.memberIDs) > 0 {
-			existing.memberIDs = batch.memberIDs
 		}
 		r.mu.Unlock()
 		return
@@ -316,11 +309,7 @@ func (a *API) scheduleDirectImplicitRead(
 	})
 }
 
-func (a *API) scheduleGroupImplicitRead(
-	groupID, senderID uint64,
-	seq uint64,
-	memberIDs []uint64,
-) {
+func (a *API) scheduleGroupImplicitRead(groupID, senderID, seq uint64) {
 	if a.groupReads == nil || seq == 0 {
 		return
 	}
@@ -331,131 +320,65 @@ func (a *API) scheduleGroupImplicitRead(
 		senderID:   senderID,
 		groupID:    groupID,
 		throughSeq: seq,
-		memberIDs:  memberIDs,
 	})
 }
 
-// flushDirectImplicitRead reports whether the batch can be retired. A Redis or
-// gate failure returns false so the caller retries instead of losing the
-// readers' positions.
+// flushDirectImplicitRead advances the sender's own read position. Recipients
+// report their rendered position through the websocket read cursor, so the
+// server no longer infers a recipient read from delivery. A Redis or gate
+// failure returns false so the caller retries instead of losing the position.
 func (a *API) flushDirectImplicitRead(ctx context.Context, batch *implicitReadBatch) bool {
 	if a.directReads == nil {
 		return true
 	}
-	ok := true
 	now := time.Now().UTC()
-
-	type advancedRead struct{ readerID, peerID, position uint64 }
-	advanced := make([]advancedRead, 0, 2)
-	if a.hub.isDirectFocus(batch.recipientID, batch.senderID) {
-		result, err := a.directReads.AdvanceRead(
-			ctx, batch.recipientID, batch.senderID, batch.throughSeq, now,
-		)
-		if err != nil {
-			ok = false
-			log.Printf("implicit direct read recipient=%d peer=%d: %v",
-				batch.recipientID, batch.senderID, err)
-		} else if result.Advanced {
-			advanced = append(advanced, advancedRead{
-				readerID: batch.recipientID,
-				peerID:   batch.senderID,
-				position: result.LastReadSeq,
-			})
-		}
-	}
 
 	result, err := a.directReads.AdvanceRead(
 		ctx, batch.senderID, batch.recipientID, batch.throughSeq, now,
 	)
 	if err != nil {
-		ok = false
 		log.Printf("implicit direct read sender=%d peer=%d: %v",
 			batch.senderID, batch.recipientID, err)
-	} else if result.Advanced {
-		advanced = append(advanced, advancedRead{
-			readerID: batch.senderID,
-			peerID:   batch.recipientID,
-			position: result.LastReadSeq,
-		})
+		return false
 	}
-
-	for _, item := range advanced {
-		readerName, peerName := batch.senderUsername, batch.recipientUsername
-		if item.readerID == batch.recipientID {
-			readerName, peerName = batch.recipientUsername, batch.senderUsername
-		}
-		a.PublishRead(item.readerID, item.peerID, readerName, peerName, item.position)
+	if result.StreamError {
+		log.Printf("implicit direct read stream sender=%d peer=%d seq=%d",
+			batch.senderID, batch.recipientID, result.LastReadSeq)
 	}
-	return ok
+	if result.Advanced {
+		a.PublishRead(
+			batch.senderID,
+			batch.recipientID,
+			batch.senderUsername,
+			batch.recipientUsername,
+			result.LastReadSeq,
+		)
+	}
+	return true
 }
 
-// flushGroupImplicitRead reports whether the batch can be retired. A dissolved
-// group or a removed member is terminal; any other Redis or gate failure is
-// retried.
+// flushGroupImplicitRead advances only the sender's own read position. Group
+// members report their rendered position through the websocket read cursor, so
+// the server no longer scans every online connection for focused viewers.
 func (a *API) flushGroupImplicitRead(ctx context.Context, batch *implicitReadBatch) bool {
 	if a.groupReads == nil {
 		return true
 	}
-	ok := true
 	now := time.Now().UTC()
-	advanced := make(map[uint64]struct{}, 4)
 
-	viewers := a.hub.focusedGroupUsers(batch.groupID)
-	if len(viewers) > 0 {
-		advances, err := a.groupReads.AdvanceReadMany(
-			ctx, batch.groupID, viewers, batch.throughSeq, now,
-		)
-		if err != nil {
-			if !groupGoneError(err) {
-				ok = false
-				log.Printf("implicit group read group=%d viewers=%v: %v",
-					batch.groupID, viewers, err)
-			}
-		} else {
-			for _, advance := range advances {
-				logGroupReadStreamError(advance, batch.groupID)
-				if advance.Advanced {
-					advanced[advance.UserID] = struct{}{}
-				}
-			}
+	advance, err := a.groupReads.AdvanceRead(
+		ctx, batch.groupID, batch.senderID, batch.throughSeq, now,
+	)
+	if err != nil {
+		if !groupGoneError(err) {
+			log.Printf("implicit group read sender=%d group=%d: %v",
+				batch.senderID, batch.groupID, err)
+			return false
 		}
+		return true
 	}
-
-	if batch.senderID != 0 {
-		advance, err := a.groupReads.AdvanceRead(
-			ctx, batch.groupID, batch.senderID, batch.throughSeq, now,
-		)
-		if err != nil {
-			if !groupGoneError(err) {
-				ok = false
-				log.Printf("implicit group read sender=%d group=%d: %v",
-					batch.senderID, batch.groupID, err)
-			}
-		} else {
-			logGroupReadStreamError(advance, batch.groupID)
-			if advance.Advanced {
-				advanced[batch.senderID] = struct{}{}
-			}
-		}
-	}
-
-	if len(advanced) == 0 {
-		return ok
-	}
-	// The sender's own advance is not a read by somebody else, so it must not
-	// suppress the signal the sender needs for its receipt: exclude only the
-	// readers that are not the batch sender.
-	excluded := make(map[uint64]struct{}, len(advanced))
-	for userID := range advanced {
-		if userID != batch.senderID {
-			excluded[userID] = struct{}{}
-		}
-	}
-	if len(excluded) == 0 {
-		return ok
-	}
-	a.publishGroupRead(batch.memberIDs, batch.groupID, excluded)
-	return ok
+	logGroupReadStreamError(advance, batch.groupID)
+	return true
 }
 
 // groupGoneError marks the expected race where the group was dissolved or the

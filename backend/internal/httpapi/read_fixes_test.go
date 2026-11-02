@@ -22,8 +22,8 @@ func TestImplicitGroupReadAdvancesEverySender(t *testing.T) {
 	api.Start()
 	t.Cleanup(api.Stop)
 
-	api.scheduleGroupImplicitRead(7, 1, 10, []uint64{1, 2})
-	api.scheduleGroupImplicitRead(7, 2, 11, []uint64{1, 2})
+	api.scheduleGroupImplicitRead(7, 1, 10)
+	api.scheduleGroupImplicitRead(7, 2, 11)
 
 	waitFor(t, func() bool {
 		positions := make(map[uint64]uint64)
@@ -136,7 +136,7 @@ func TestImplicitReadRequeuesFailedAdvance(t *testing.T) {
 	api.Start()
 	t.Cleanup(api.Stop)
 
-	api.scheduleGroupImplicitRead(7, 1, 10, []uint64{1})
+	api.scheduleGroupImplicitRead(7, 1, 10)
 	waitFor(t, func() bool { return attempts.Load() >= 2 })
 }
 
@@ -160,7 +160,7 @@ func TestImplicitReadStopBoundsDrain(t *testing.T) {
 	api := New(&fakeStore{}, WithGroupReadTracker(tracker))
 	api.Start()
 	for groupID := uint64(1); groupID <= 4; groupID++ {
-		api.scheduleGroupImplicitRead(groupID, 1, 10, []uint64{1})
+		api.scheduleGroupImplicitRead(groupID, 1, 10)
 	}
 
 	select {
@@ -202,7 +202,7 @@ func TestImplicitReadRequeuesAfterSlowBatch(t *testing.T) {
 	api.Start()
 	t.Cleanup(api.Stop)
 	for groupID := uint64(1); groupID <= 3; groupID++ {
-		api.scheduleGroupImplicitRead(groupID, 1, 10, []uint64{1})
+		api.scheduleGroupImplicitRead(groupID, 1, 10)
 	}
 
 	waitFor(t, func() bool {

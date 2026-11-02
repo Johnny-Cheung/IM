@@ -83,10 +83,11 @@ type wsGroupReadEvent struct {
 }
 
 type wsInboundFrame struct {
-	Type     string `json:"type"`
-	Kind     string `json:"kind"`
-	Username string `json:"username"`
-	GroupID  uint64 `json:"group_id"`
+	Type        string `json:"type"`
+	Kind        string `json:"kind"`
+	Username    string `json:"username"`
+	GroupID     uint64 `json:"group_id"`
+	LastReadSeq uint64 `json:"last_read_seq"`
 }
 
 type wsFocus struct {
@@ -284,17 +285,15 @@ func (h *Hub) isDirectFocus(userID, peerID uint64) bool {
 	return focus.kind == wsFocusKindDirect && focus.peerID == peerID
 }
 
-func (h *Hub) focusedGroupUsers(groupID uint64) []uint64 {
+func (h *Hub) isGroupFocus(userID, groupID uint64) bool {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
-	users := make([]uint64, 0, len(h.clients))
-	for userID, client := range h.clients {
-		focus := client.currentFocus()
-		if focus.kind == wsFocusKindGroup && focus.groupID == groupID {
-			users = append(users, userID)
-		}
+	client := h.clients[userID]
+	h.mu.RUnlock()
+	if client == nil {
+		return false
 	}
-	return users
+	focus := client.currentFocus()
+	return focus.kind == wsFocusKindGroup && focus.groupID == groupID
 }
 
 func (a *API) websocket(c *gin.Context) {
@@ -379,6 +378,8 @@ func (a *API) handleClientFrame(client *wsClient, payload []byte) {
 		}
 	case "blur":
 		client.clearFocus()
+	case "read":
+		a.handleReadFrame(client, frame)
 	}
 }
 
@@ -509,6 +510,89 @@ func (a *API) handleGroupFocus(client *wsClient, groupID uint64) {
 		GroupID:     groupID,
 		LastReadSeq: result.LastReadSeq,
 	})
+}
+
+// handleReadFrame advances the read watermark of the currently focused
+// conversation. The client reports the last seq it actually rendered; the
+// tracker clamps it to the conversation counter and ignores stale positions.
+// A frame whose target does not match the stored focus is discarded so a late
+// frame from a previous conversation can never advance the new one.
+func (a *API) handleReadFrame(client *wsClient, frame wsInboundFrame) {
+	if frame.LastReadSeq == 0 {
+		return
+	}
+	focus := client.currentFocus()
+	ctx, cancel := context.WithTimeout(context.Background(), wsFrameTimeout)
+	defer cancel()
+	now := time.Now().UTC()
+
+	switch frame.Kind {
+	case wsFocusKindDirect:
+		if focus.kind != wsFocusKindDirect || focus.peerID == 0 || a.directReads == nil {
+			return
+		}
+		if auth.UsernameKey(strings.TrimSpace(frame.Username)) !=
+			auth.UsernameKey(focus.peerUsername) {
+			return
+		}
+		result, err := a.directReads.AdvanceRead(
+			ctx, client.userID, focus.peerID, frame.LastReadSeq, now,
+		)
+		if err != nil {
+			log.Printf(
+				"websocket read direct user=%d peer=%d: %v",
+				client.userID, focus.peerID, err,
+			)
+			return
+		}
+		if result.StreamError {
+			log.Printf(
+				"websocket read direct stream user=%d peer=%d seq=%d",
+				client.userID, focus.peerID, result.LastReadSeq,
+			)
+		}
+		if result.Advanced {
+			a.PublishRead(
+				client.userID,
+				focus.peerID,
+				client.username,
+				focus.peerUsername,
+				result.LastReadSeq,
+			)
+		}
+	case wsFocusKindGroup:
+		if focus.kind != wsFocusKindGroup ||
+			focus.groupID == 0 ||
+			focus.groupID != frame.GroupID ||
+			a.groupReads == nil {
+			return
+		}
+		result, err := a.groupReads.AdvanceRead(
+			ctx, focus.groupID, client.userID, frame.LastReadSeq, now,
+		)
+		if err != nil {
+			if groupGoneError(err) {
+				// A dissolved group or a removed member cannot advance again.
+				// Dropping focus stops the client's further cursors from
+				// repeating the same failure.
+				client.clearFocus()
+				return
+			}
+			log.Printf(
+				"websocket read group=%d user=%d: %v",
+				focus.groupID, client.userID, err,
+			)
+			return
+		}
+		logGroupReadStreamError(result, focus.groupID)
+		if result.Advanced {
+			a.publishGroupReadFromRedis(
+				ctx,
+				focus.groupID,
+				map[uint64]struct{}{client.userID: {}},
+			)
+		}
+	}
 }
 
 func (a *API) sendFocusAck(client *wsClient, event wsFocusAckEvent) {

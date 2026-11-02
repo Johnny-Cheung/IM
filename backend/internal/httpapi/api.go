@@ -170,9 +170,6 @@ type GroupReadTracker interface {
 	AdvanceRead(
 		context.Context, uint64, uint64, uint64, time.Time,
 	) (messaging.GroupReadAdvance, error)
-	AdvanceReadMany(
-		context.Context, uint64, []uint64, uint64, time.Time,
-	) ([]messaging.GroupReadAdvance, error)
 	States(context.Context, uint64, []uint64) (map[uint64]messaging.GroupConversationState, error)
 	ReadStats(context.Context, uint64, uint64, uint64) (messaging.GroupReadStats, error)
 	MessageBySeq(context.Context, uint64, uint64) (messaging.MessageRef, bool, error)

@@ -636,9 +636,10 @@ func (a *API) sendGroupMessage(c *gin.Context) {
 		if len(memberIDs) > 0 {
 			a.PublishGroupMessage(memberIDs, response)
 		}
-		// The recipients only feed the group.read broadcast; the flush still
-		// advances the sender and focused viewers when the list is empty.
-		a.scheduleGroupImplicitRead(groupID, current.ID, message.Seq, memberIDs)
+		// The member list feeds the websocket message fanout. The sender's own
+		// read position advances independently; other members report their
+		// rendered position through the read cursor.
+		a.scheduleGroupImplicitRead(groupID, current.ID, message.Seq)
 	}
 	c.JSON(status, sendGroupMessageResponse{Message: response})
 }

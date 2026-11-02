@@ -119,6 +119,12 @@ func (f *fakeGroupReadTracker) AdvanceRead(
 	}, nil
 }
 
+func (f *fakeGroupReadTracker) setAdvanceErr(err error) {
+	f.mu.Lock()
+	f.advanceErr = err
+	f.mu.Unlock()
+}
+
 func (f *fakeGroupReadTracker) AdvanceReadMany(
 	_ context.Context,
 	groupID uint64,
@@ -291,6 +297,14 @@ type recordingDirectReadTracker struct {
 
 func newRecordingDirectReadTracker() *recordingDirectReadTracker {
 	return &recordingDirectReadTracker{ready: true}
+}
+
+func (r *recordingDirectReadTracker) setAdvanceFn(
+	fn func(userID, peerID, throughSeq uint64) (messaging.DirectReadAdvance, error),
+) {
+	r.mu.Lock()
+	r.advanceFn = fn
+	r.mu.Unlock()
 }
 
 func (r *recordingDirectReadTracker) AdvanceRead(
@@ -816,9 +830,8 @@ func TestWebSocketFocusGroupAdvancesAndAcks(t *testing.T) {
 		advances[0].throughSeq != 0 {
 		t.Fatalf("advances = %#v", advances)
 	}
-	users := api.hub.focusedGroupUsers(7)
-	if len(users) != 1 || users[0] != 1 {
-		t.Fatalf("focused users = %#v", users)
+	if !api.hub.isGroupFocus(1, 7) {
+		t.Fatal("group focus was not stored")
 	}
 }
 
@@ -841,8 +854,8 @@ func TestWebSocketFocusGroupRejectsNonMember(t *testing.T) {
 		ack["group_id"] != float64(7) {
 		t.Fatalf("ack = %#v", ack)
 	}
-	if users := api.hub.focusedGroupUsers(7); len(users) != 0 {
-		t.Fatalf("focused users = %#v", users)
+	if api.hub.isGroupFocus(1, 7) {
+		t.Fatal("failed group focus was stored")
 	}
 }
 
@@ -900,7 +913,7 @@ func TestWebSocketDropsExcessFramesWithoutClosing(t *testing.T) {
 	}
 }
 
-func TestImplicitDirectReadAdvancesFocusedRecipientAndSender(t *testing.T) {
+func TestImplicitDirectReadAdvancesSenderOnly(t *testing.T) {
 	now := time.Now().UTC()
 	alice := store.User{ID: 1, Username: "alice", Nickname: "Alice"}
 	bob := store.User{ID: 2, Username: "bob", Nickname: "Bob"}
@@ -933,6 +946,8 @@ func TestImplicitDirectReadAdvancesFocusedRecipientAndSender(t *testing.T) {
 	api.Start()
 	t.Cleanup(api.Stop)
 
+	// Focus alone must not make the recipient advance on delivery; only the
+	// client-reported read cursor does that now.
 	bobConn := dialChatSocket(t, baseURL, "bob")
 	waitFor(t, func() bool { return api.hub.activeCount(2) == 1 })
 	if err := bobConn.WriteJSON(map[string]any{
@@ -951,21 +966,25 @@ func TestImplicitDirectReadAdvancesFocusedRecipientAndSender(t *testing.T) {
 		t.Fatalf("send status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 
+	senderAdvanced := false
 	waitFor(t, func() bool {
-		sender, recipient := false, false
 		for _, call := range tracker.snapshot()[before:] {
-			if call.throughSeq != 5 {
-				continue
-			}
-			if call.userID == 1 && call.peerID == 2 {
-				sender = true
-			}
-			if call.userID == 2 && call.peerID == 1 {
-				recipient = true
+			if call.throughSeq == 5 && call.userID == 1 && call.peerID == 2 {
+				senderAdvanced = true
+				return true
 			}
 		}
-		return sender && recipient
+		return false
 	})
+	if !senderAdvanced {
+		t.Fatalf("sender advance calls = %#v", tracker.snapshot()[before:])
+	}
+	time.Sleep(150 * time.Millisecond)
+	for _, call := range tracker.snapshot()[before:] {
+		if call.throughSeq == 5 && call.userID == 2 && call.peerID == 1 {
+			t.Fatalf("recipient advanced without a client read cursor: %#v", call)
+		}
+	}
 }
 
 func TestImplicitReadMergesWithinWindow(t *testing.T) {
@@ -995,7 +1014,7 @@ func TestImplicitReadMergesWithinWindow(t *testing.T) {
 	}
 }
 
-func TestImplicitGroupReadAdvancesViewersAndBroadcasts(t *testing.T) {
+func TestImplicitGroupReadAdvancesSenderOnly(t *testing.T) {
 	now := time.Now().UTC()
 	alice := store.User{ID: 1, Username: "alice", Nickname: "Alice"}
 	bob := store.User{ID: 2, Username: "bob", Nickname: "Bob"}
@@ -1016,17 +1035,13 @@ func TestImplicitGroupReadAdvancesViewersAndBroadcasts(t *testing.T) {
 		createdGroupMessageNew: true,
 	}
 	tracker := newFakeGroupReadTracker()
-	tracker.manyFn = func(groupID uint64, userIDs []uint64, throughSeq uint64) ([]messaging.GroupReadAdvance, error) {
-		advances := make([]messaging.GroupReadAdvance, 0, len(userIDs))
-		for _, userID := range userIDs {
-			advances = append(advances, messaging.GroupReadAdvance{
-				UserID: userID, LastReadSeq: throughSeq, Advanced: true,
-			})
-		}
-		return advances, nil
-	}
 	tracker.advanceFn = func(groupID, userID, throughSeq uint64) (messaging.GroupReadAdvance, error) {
-		return messaging.GroupReadAdvance{UserID: userID}, nil
+		if throughSeq == 0 {
+			return messaging.GroupReadAdvance{UserID: userID}, nil
+		}
+		return messaging.GroupReadAdvance{
+			UserID: userID, LastReadSeq: throughSeq, Advanced: true,
+		}, nil
 	}
 	api, router, baseURL := startChatServer(t, dataStore, WithGroupReadTracker(tracker))
 	api.Start()
@@ -1045,7 +1060,7 @@ func TestImplicitGroupReadAdvancesViewersAndBroadcasts(t *testing.T) {
 		}
 		readWSEventType(t, conn, "focus.ack")
 	}
-	before := len(tracker.snapMany())
+	before := len(tracker.snapAdvances())
 
 	recorder := doJSON(t, router, http.MethodPost, "/api/groups/7/messages", map[string]string{
 		"body":              "live group hello",
@@ -1056,55 +1071,42 @@ func TestImplicitGroupReadAdvancesViewersAndBroadcasts(t *testing.T) {
 	}
 
 	waitFor(t, func() bool {
-		for _, call := range tracker.snapMany()[before:] {
-			if call.throughSeq != 12 {
-				continue
+		for _, call := range tracker.snapAdvances()[before:] {
+			if call.groupID == 7 && call.userID == 1 && call.throughSeq == 12 {
+				return true
 			}
-			hasAlice, hasBob := false, false
-			for _, userID := range call.userIDs {
-				if userID == 1 {
-					hasAlice = true
-				}
-				if userID == 2 {
-					hasBob = true
-				}
-			}
-			return hasAlice && hasBob
 		}
 		return false
 	})
+	time.Sleep(150 * time.Millisecond)
 
-	// The sender owns the receipt, so it must receive the signal once another
-	// focused viewer advanced with the batch.
-	readWSEventType(t, aliceConn, "group.read")
-	readWSEventType(t, bobConn, "group.message.created")
-	_ = bobConn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
-	for {
-		_, payload, err := bobConn.ReadMessage()
-		if err != nil {
-			break
-		}
-		var received map[string]any
-		if err := json.Unmarshal(payload, &received); err != nil {
-			continue
-		}
-		if received["type"] == "group.read" {
-			t.Fatal("reader received its own group.read event")
+	if calls := tracker.snapMany(); len(calls) != 0 {
+		t.Fatalf("viewer batch advance calls = %#v, want none", calls)
+	}
+	for _, call := range tracker.snapAdvances()[before:] {
+		if call.groupID == 7 && call.throughSeq == 12 && call.userID != 1 {
+			t.Fatalf("viewer advanced without a client read cursor: %#v", call)
 		}
 	}
-
-	senderCaughtUp := false
-	for _, call := range tracker.snapAdvances() {
-		if call.groupID == 7 && call.userID == 1 && call.throughSeq == 12 {
-			senderCaughtUp = true
+	for _, conn := range []*websocket.Conn{aliceConn, bobConn} {
+		_ = conn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+		for {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				break
+			}
+			var received map[string]any
+			if err := json.Unmarshal(payload, &received); err != nil {
+				continue
+			}
+			if received["type"] == "group.read" {
+				t.Fatal("implicit sender self-read broadcast a group.read event")
+			}
 		}
-	}
-	if !senderCaughtUp {
-		t.Fatalf("sender advance calls = %#v", tracker.snapAdvances())
 	}
 }
 
-func TestImplicitGroupReadSkipsBroadcastWhenOnlySenderAdvanced(t *testing.T) {
+func TestImplicitGroupReadDoesNotBroadcast(t *testing.T) {
 	alice := store.User{ID: 1, Username: "alice", Nickname: "Alice"}
 	bob := store.User{ID: 2, Username: "bob", Nickname: "Bob"}
 	dataStore := &fakeStore{
@@ -1123,7 +1125,7 @@ func TestImplicitGroupReadSkipsBroadcastWhenOnlySenderAdvanced(t *testing.T) {
 	bobConn := dialChatSocket(t, baseURL, "bob")
 	waitFor(t, func() bool { return api.hub.activeCount(2) == 1 })
 
-	api.scheduleGroupImplicitRead(7, 1, 12, []uint64{1, 2})
+	api.scheduleGroupImplicitRead(7, 1, 12)
 	_ = bobConn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
 	for {
 		_, payload, err := bobConn.ReadMessage()
@@ -1135,7 +1137,7 @@ func TestImplicitGroupReadSkipsBroadcastWhenOnlySenderAdvanced(t *testing.T) {
 			continue
 		}
 		if received["type"] == "group.read" {
-			t.Fatal("broadcast fired for the sender's own advance")
+			t.Fatal("implicit sender self-read broadcast a group.read event")
 		}
 	}
 }
