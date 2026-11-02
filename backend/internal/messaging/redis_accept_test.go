@@ -243,6 +243,47 @@ func TestRedisAcceptorRejectsBeforeAllocating(t *testing.T) {
 	}
 }
 
+func TestRedisAcceptorLiftsLowCounterToSeedFloor(t *testing.T) {
+	client, _ := newAcceptTest(t)
+	ctx := context.Background()
+	if err := client.SAdd(ctx, friendshipKey(1), 2).Err(); err != nil {
+		t.Fatalf("seed friendship: %v", err)
+	}
+	if err := client.Set(ctx, counterKey(), 5, 0).Err(); err != nil {
+		t.Fatalf("seed global counter: %v", err)
+	}
+	acceptor := NewRedisAcceptor(client, RedisAcceptorOptions{SeedFloor: 41})
+
+	result, err := acceptor.Accept(ctx, DirectMessageRequest{
+		SenderID:        1,
+		RecipientID:     2,
+		ClientMessageID: "client-low-counter",
+		Body:            "hello",
+	})
+	if err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	if result.Message.ID != 42 {
+		t.Fatalf("message ID = %d, want 42", result.Message.ID)
+	}
+	if got := client.Get(ctx, counterKey()).Val(); got != "42" {
+		t.Fatalf("global counter = %q, want 42", got)
+	}
+
+	result, err = acceptor.Accept(ctx, DirectMessageRequest{
+		SenderID:        1,
+		RecipientID:     2,
+		ClientMessageID: "client-after-low-counter",
+		Body:            "again",
+	})
+	if err != nil {
+		t.Fatalf("second Accept() error = %v", err)
+	}
+	if result.Message.ID != 43 {
+		t.Fatalf("second message ID = %d, want 43", result.Message.ID)
+	}
+}
+
 func TestRedisAcceptorRequiresSequenceReady(t *testing.T) {
 	client, server := newAcceptTest(t)
 	ctx := context.Background()

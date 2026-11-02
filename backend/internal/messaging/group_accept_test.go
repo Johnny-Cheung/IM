@@ -97,6 +97,36 @@ func TestGroupRedisAcceptorAcceptsDeduplicatesAndRejects(t *testing.T) {
 	}
 }
 
+func TestGroupRedisAcceptorLiftsLowCounterToSeedFloor(t *testing.T) {
+	client, _ := newGroupAcceptTest(t)
+	ctx := context.Background()
+	seedGroupProjection(t, client, 9, []uint64{1})
+	if err := client.Set(ctx, counterKey(), 5, 0).Err(); err != nil {
+		t.Fatalf("seed global counter: %v", err)
+	}
+	acceptor := NewGroupRedisAcceptor(
+		client, defaultKeyspace, RedisAcceptorOptions{SeedFloor: 10},
+	)
+
+	result, err := acceptor.Accept(ctx, GroupMessageRequest{
+		SenderID:        1,
+		GroupID:         9,
+		ClientMessageID: "group-low-counter",
+		Body:            "hello",
+		SenderUsername:  "alice",
+		SenderNickname:  "Alice",
+	})
+	if err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	if result.Message.ID != 11 {
+		t.Fatalf("message ID = %d, want 11", result.Message.ID)
+	}
+	if got := client.Get(ctx, counterKey()).Val(); got != "11" {
+		t.Fatalf("global counter = %q, want 11", got)
+	}
+}
+
 func TestGroupRedisAcceptorNeverTrimsMessageStream(t *testing.T) {
 	// A behavioral check with a few entries cannot prove trimming is off: any
 	// MAXLEN above three would still pass. Assert on the script text instead.

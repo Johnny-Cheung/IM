@@ -73,13 +73,14 @@ if last_seq >= max_safe_seq then
   return {'seq_overflow'}
 end
 
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-if current < seed_floor then
-  current = seed_floor
-  redis.call('SET', KEYS[1], current)
-end
-
+-- Allocate the next global ID. A lost or low counter is lifted to the seed
+-- floor before use; the EXISTS check below still refuses an ID whose entity
+-- is already present, so a stale counter cannot overwrite history.
 local message_id = redis.call('INCR', KEYS[1])
+if message_id <= seed_floor then
+  message_id = seed_floor + 1
+  redis.call('SET', KEYS[1], message_id)
+end
 if message_id > max_safe_id then
   return {'id_overflow'}
 end
