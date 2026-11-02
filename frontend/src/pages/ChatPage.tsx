@@ -2238,7 +2238,7 @@ export function ChatPage() {
     if (syncingRef.current || !isCurrent()) {
       return;
     }
-    const ownMessages = messagesRef.current.filter((message) => {
+    let ownMessages = messagesRef.current.filter((message) => {
       if (target.kind === "group") {
         return isGroupMessage(message) && message.group_id === target.groupID;
       }
@@ -2246,6 +2246,19 @@ export function ChatPage() {
         && (sameUsername(message.sender.username, target.username)
           || sameUsername(message.recipient.username, target.username));
     });
+    if (ownMessages.length === 0 && user) {
+      // The initial load may have finished writing the cache just before the
+      // socket opened. Use it so a fresh conversation is not fetched twice.
+      const cached = await readMessages(user.username, target.key);
+      ownMessages = cached.map(toDisplayMessage).filter((message) => {
+        if (target.kind === "group") {
+          return isGroupMessage(message) && message.group_id === target.groupID;
+        }
+        return !isGroupMessage(message)
+          && (sameUsername(message.sender.username, target.username)
+            || sameUsername(message.recipient.username, target.username));
+      });
+    }
     const newest = maxAcceptedSeq(ownMessages);
 
     syncingRef.current = true;
