@@ -1,39 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { ChatMessage, GroupMessage, PublicUser } from "../api";
+import type { PublicUser } from "../api";
 import {
   conversationKey,
   directKey,
-  groupIDFromKey,
   groupKey,
-  messageConversationKey,
 } from "./keys";
 
 const alice: PublicUser = { username: "Alice", nickname: "Alice" };
 const bob: PublicUser = { username: "Bob", nickname: "Bob" };
-
-function directMessage(): ChatMessage {
-  return {
-    id: 1,
-    seq: 1,
-    sender: alice,
-    recipient: bob,
-    body: "hello",
-    client_message_id: "client-00000001",
-    created_at: "2026-10-26T00:00:00Z",
-  };
-}
-
-function groupMessage(): GroupMessage {
-  return {
-    id: 2,
-    seq: 1,
-    group_id: 9,
-    sender: bob,
-    body: "hello group",
-    client_message_id: "client-00000002",
-    created_at: "2026-10-26T00:00:00Z",
-  };
-}
 
 describe("conversation keys", () => {
   it("lowercases direct usernames so one peer maps to one cache key", () => {
@@ -69,26 +43,5 @@ describe("conversation keys", () => {
       last_seq: 0,
       unread_count: 0,
     })).toBe("group:9");
-  });
-
-  it("parses only positive integer group keys", () => {
-    expect(groupIDFromKey("group:9")).toBe(9);
-    expect(groupIDFromKey("group:0")).toBeNull();
-    expect(groupIDFromKey("group:")).toBeNull();
-    expect(groupIDFromKey("group:abc")).toBeNull();
-    expect(groupIDFromKey("group:1.5")).toBeNull();
-    expect(groupIDFromKey("group:-1")).toBeNull();
-    expect(groupIDFromKey("direct:bob")).toBeNull();
-  });
-
-  it("resolves the peer side of a direct message case-insensitively", () => {
-    expect(messageConversationKey(directMessage(), "alice")).toBe("direct:bob");
-    expect(messageConversationKey(directMessage(), "BOB")).toBe("direct:alice");
-    expect(messageConversationKey(directMessage(), "carol")).toBe("");
-  });
-
-  it("uses the group id for group messages regardless of the current user", () => {
-    expect(messageConversationKey(groupMessage(), "alice")).toBe("group:9");
-    expect(messageConversationKey(groupMessage(), "bob")).toBe("group:9");
   });
 });

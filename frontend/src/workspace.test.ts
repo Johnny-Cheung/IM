@@ -1,12 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
-import { api } from "./api";
 import type {
-  BootstrapGroupDelta,
   BootstrapResponse,
   ChatMessage,
   Conversation,
-  GroupMessage,
   PublicUser,
 } from "./api";
 import {
@@ -15,6 +12,8 @@ import {
   readMessages,
   readSyncState,
   resetCacheForTests,
+  writeConversations,
+  writeMessages,
 } from "./cache";
 import { applyBootstrapToCache } from "./workspace";
 
@@ -59,56 +58,10 @@ function directConversation(username: string, lastID: number): Conversation {
   };
 }
 
-function groupConversation(id: number, lastID: number): Conversation {
-  return {
-    type: "group",
-    group: {
-      id,
-      name: `Group ${id}`,
-      owner: alice,
-      member_count: 2,
-      created_at: "2026-10-26T00:00:00Z",
-    },
-    is_owner: false,
-    last_message: {
-      id: lastID,
-      seq: lastID,
-      group_id: id,
-      sender: bob,
-      body: `group-last-${lastID}`,
-      client_message_id: `group-last-client-${lastID}`,
-      created_at: "2026-10-26T00:00:00Z",
-    },
-    last_seq: lastID,
-    unread_count: 0,
-  };
-}
-
-function groupMessage(
-  id: number,
-  groupID: number,
-  sender: PublicUser = bob,
-  seq: number = id,
-): GroupMessage {
-  return {
-    id,
-    seq,
-    group_id: groupID,
-    sender,
-    body: `group-${id}`,
-    client_message_id: `group-client-${id}`,
-    created_at: "2026-10-26T00:00:00Z",
-  };
-}
-
 function bootstrapPayload(overrides: {
-  messages?: ChatMessage[];
-  cursor?: number;
-  hasMore?: boolean;
-  complete?: boolean;
   partial?: string[];
   conversations?: Conversation[];
-  groups?: BootstrapGroupDelta[];
+  friends?: PublicUser[];
 } = {}): BootstrapResponse {
   return {
     user: alice,
@@ -116,14 +69,7 @@ function bootstrapPayload(overrides: {
       directConversation("bob", 5),
       directConversation("carol", 6),
     ],
-    friends: [bob],
-    direct: {
-      messages: overrides.messages ?? [],
-      has_more: overrides.hasMore ?? false,
-      complete: overrides.complete ?? true,
-      cursor: overrides.cursor ?? 0,
-    },
-    groups: overrides.groups ?? [],
+    friends: overrides.friends ?? [bob],
     partial: overrides.partial ?? [],
   };
 }
@@ -138,171 +84,58 @@ afterEach(() => {
 });
 
 describe("applyBootstrapToCache", () => {
-  it("files direct messages under their conversation and stores the cursor", async () => {
-    const payload = bootstrapPayload({
-      messages: [
-        directMessage(5, bob, alice),
-        directMessage(6, alice, carol),
-      ],
-      cursor: 6,
-    });
+  it("writes the conversation list and friends without touching messages", async () => {
+    await writeMessages("alice", "direct:bob", [directMessage(5, bob, alice)]);
 
-    await applyBootstrapToCache(payload);
+    await applyBootstrapToCache(bootstrapPayload());
 
-    expect((await readMessages("alice", "direct:bob")).map((item) => item.id))
-      .toEqual([5]);
-    expect((await readMessages("alice", "direct:carol")).map((item) => item.id))
-      .toEqual([6]);
     expect((await readConversations("alice")).map((item) =>
       item.type === "direct" ? item.user.username : "group")).toEqual(["bob", "carol"]);
     expect(await readFriends("alice")).toEqual([bob]);
-    const state = await readSyncState("alice");
-    expect(state.afterID).toBe(6);
-    expect(state.directComplete).toBe(true);
-  });
-
-  it("skips messages that do not involve the current user", async () => {
-    const payload = bootstrapPayload({
-      messages: [directMessage(7, bob, carol)],
-      cursor: 7,
-    });
-
-    await applyBootstrapToCache(payload);
-
-    expect(await readMessages("alice", "direct:bob")).toEqual([]);
-    expect(await readMessages("alice", "direct:carol")).toEqual([]);
-  });
-
-  it("drains a truncated feed in the background", async () => {
-    const sync = vi.spyOn(api, "syncMessages").mockResolvedValue({
-      messages: [directMessage(6, bob, alice)],
-      has_more: false,
-      complete: true,
-      cursor: 6,
-    });
-    const payload = bootstrapPayload({
-      messages: [directMessage(5, bob, alice)],
-      cursor: 5,
-      hasMore: true,
-    });
-
-    await applyBootstrapToCache(payload);
-
-    expect(sync).toHaveBeenCalledWith(5, 200);
     expect((await readMessages("alice", "direct:bob")).map((item) => item.id))
-      .toEqual([5, 6]);
-    expect((await readSyncState("alice")).afterID).toBe(6);
-  });
-
-  it("marks the direct cache unreliable when the feed is incomplete", async () => {
-    const payload = bootstrapPayload({
-      messages: [directMessage(8, bob, alice)],
-      cursor: 8,
-      complete: false,
-    });
-
-    await applyBootstrapToCache(payload, 4);
-
-    expect((await readSyncState("alice")).directComplete).toBe(false);
-  });
-
-  it("trusts the first sync because there was no cache to distrust", async () => {
-    const payload = bootstrapPayload({
-      messages: [directMessage(8, bob, alice)],
-      cursor: 8,
-      complete: false,
-    });
-
-    await applyBootstrapToCache(payload, 0);
-
-    expect((await readSyncState("alice")).directComplete).toBe(true);
+      .toEqual([5]);
+    expect((await readSyncState("alice")).localSeq).toEqual({ "direct:bob": 5 });
   });
 
   it("does not overwrite conversations when that section is partial", async () => {
-    await applyBootstrapToCache(bootstrapPayload({
-      conversations: [directConversation("bob", 5)],
-    }));
-    vi.spyOn(api, "syncMessages");
+    await writeConversations("alice", [directConversation("bob", 5)]);
 
     await applyBootstrapToCache(bootstrapPayload({
-      messages: [directMessage(9, bob, alice)],
-      cursor: 9,
+      conversations: [directConversation("carol", 6)],
       partial: ["conversations"],
     }));
 
     expect((await readConversations("alice")).map((item) =>
       item.type === "direct" ? item.user.username : "group")).toEqual(["bob"]);
+  });
+
+  it("does not overwrite friends when that section is partial", async () => {
+    await applyBootstrapToCache(bootstrapPayload({ friends: [bob] }));
+
+    await applyBootstrapToCache(bootstrapPayload({
+      friends: [carol],
+      partial: ["friends"],
+    }));
+
+    expect(await readFriends("alice")).toEqual([bob]);
+  });
+
+  it("removes conversations and messages missing from a complete list", async () => {
+    await writeConversations("alice", [
+      directConversation("bob", 5),
+      directConversation("carol", 6),
+    ]);
+    await writeMessages("alice", "direct:bob", [directMessage(5, bob, alice)]);
+    await writeMessages("alice", "direct:carol", [directMessage(6, carol, alice)]);
+
+    await applyBootstrapToCache(bootstrapPayload({
+      conversations: [directConversation("bob", 5)],
+    }));
+
+    expect((await readConversations("alice")).map((item) =>
+      item.type === "direct" ? item.user.username : "group")).toEqual(["bob"]);
+    expect(await readMessages("alice", "direct:carol")).toEqual([]);
     expect((await readMessages("alice", "direct:bob")).map((item) => item.id))
-      .toEqual([9]);
-  });
-
-  it("caches complete group deltas and their cursors", async () => {
-    const payload = bootstrapPayload({
-      conversations: [groupConversation(9, 42)],
-      groups: [{
-        group_id: 9,
-        messages: [groupMessage(41, 9), groupMessage(42, 9)],
-        has_more: false,
-        complete: true,
-        cursor: 42,
-      }],
-    });
-
-    await applyBootstrapToCache(payload);
-
-    expect((await readMessages("alice", "group:9")).map((item) => item.id))
-      .toEqual([41, 42]);
-    expect((await readSyncState("alice")).groups).toEqual({ 9: 42 });
-  });
-
-  it("drops a cached group when its delta is incomplete", async () => {
-    await applyBootstrapToCache(bootstrapPayload({
-      conversations: [groupConversation(9, 40)],
-      groups: [{
-        group_id: 9,
-        messages: [groupMessage(40, 9)],
-        has_more: false,
-        complete: true,
-        cursor: 40,
-      }],
-    }));
-
-    await applyBootstrapToCache(bootstrapPayload({
-      conversations: [groupConversation(9, 60)],
-      groups: [{
-        group_id: 9,
-        messages: [],
-        has_more: false,
-        complete: false,
-        cursor: 40,
-      }],
-    }));
-
-    expect(await readMessages("alice", "group:9")).toEqual([]);
-    expect((await readSyncState("alice")).groups).toEqual({});
-  });
-
-  it("drains a truncated group delta by seq", async () => {
-    const after = vi.spyOn(api, "listGroupMessagesAfter").mockResolvedValue({
-      messages: [groupMessage(42, 9, bob, 22)],
-      has_more: false,
-    });
-    const payload = bootstrapPayload({
-      conversations: [groupConversation(9, 42)],
-      groups: [{
-        group_id: 9,
-        messages: [groupMessage(41, 9, bob, 21)],
-        has_more: true,
-        complete: true,
-        cursor: 21,
-      }],
-    });
-
-    await applyBootstrapToCache(payload);
-
-    expect(after).toHaveBeenCalledWith(9, 21, 50);
-    expect((await readMessages("alice", "group:9")).map((item) => item.id))
-      .toEqual([41, 42]);
-    expect((await readSyncState("alice")).groups).toEqual({ 9: 22 });
+      .toEqual([5]);
   });
 });

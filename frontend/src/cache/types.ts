@@ -9,11 +9,6 @@ import type {
 export type CachedMessage = ChatMessage | GroupMessage;
 
 export type SyncState = {
-  // Private feed cursor: the only persisted cursor still in global message ids.
-  afterID: number;
-  directComplete: boolean;
-  // Per-group bootstrap cursor, in seq units.
-  groups: Record<number, number>;
   // Per-conversation local high-water mark in seq units, keyed by cache key.
   localSeq: Record<string, number>;
   savedAt: string;
@@ -21,12 +16,6 @@ export type SyncState = {
 
 export type CacheHints = {
   user: User | null;
-  sync: SyncState | null;
-};
-
-export type GroupSyncRequest = {
-  groupID: number;
-  afterSeq: number;
 };
 
 export type CachedConversation = {
@@ -60,9 +49,6 @@ export const CONVERSATION_CACHE_LIMIT = 100;
 
 export function emptySyncState(): SyncState {
   return {
-    afterID: 0,
-    directComplete: true,
-    groups: {},
     localSeq: {},
     savedAt: "",
   };

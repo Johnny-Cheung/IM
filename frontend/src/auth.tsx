@@ -11,7 +11,6 @@ import { Navigate, useLocation } from "react-router-dom";
 import {
   api,
   ApiError,
-  type BootstrapGroupCursor,
   type BootstrapResponse,
   type RegisterInput,
   type User,
@@ -21,7 +20,6 @@ import {
   readHints,
   setActiveUser,
 } from "./cache";
-import type { SyncState } from "./cache";
 import { applyBootstrapToCache } from "./workspace";
 
 type AuthStatus = "loading" | "authenticated" | "guest" | "offline";
@@ -48,25 +46,8 @@ const sessionNotices: Record<string, string> = {
   session_revoked: "登录已失效，请重新登录。",
 };
 
-function groupCursors(sync: SyncState | null): BootstrapGroupCursor[] {
-  if (sync === null) {
-    return [];
-  }
-  return Object.entries(sync.groups)
-    .map(([groupID, afterSeq]) => ({
-      group_id: Number(groupID),
-      after_seq: afterSeq,
-    }))
-    .filter((cursor) => cursor.group_id > 0 && cursor.after_seq > 0)
-    .slice(0, 200);
-}
-
-async function loadBootstrap(sync: SyncState | null): Promise<BootstrapResponse> {
-  return api.bootstrap({
-    afterID: sync?.afterID ?? 0,
-    groups: groupCursors(sync),
-    limit: 200,
-  });
+async function loadBootstrap(): Promise<BootstrapResponse> {
+  return api.bootstrap();
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -75,13 +56,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null);
 
-  const applyBootstrap = useCallback((payload: BootstrapResponse, previousAfterID = 0) => {
+  const applyBootstrap = useCallback((payload: BootstrapResponse) => {
     setUser(payload.user);
     setBootstrap(payload);
     setStatus("authenticated");
     setNotice(null);
     void setActiveUser(payload.user);
-    void applyBootstrapToCache(payload, previousAfterID);
+    void applyBootstrapToCache(payload);
   }, []);
 
   useEffect(() => {
@@ -90,9 +71,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     void (async () => {
       const hints = await readHints();
       try {
-        const payload = await loadBootstrap(hints.sync);
+        const payload = await loadBootstrap();
         if (cancelled) return;
-        applyBootstrap(payload, hints.sync?.afterID ?? 0);
+        applyBootstrap(payload);
       } catch (error: unknown) {
         if (cancelled) return;
         if (error instanceof ApiError && error.status === 401) {
@@ -130,9 +111,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const current = await api.login(username, password);
     setNotice(null);
     try {
-      const hints = await readHints();
-      const sync = hints.user?.username === current.username ? hints.sync : null;
-      applyBootstrap(await loadBootstrap(sync), sync?.afterID ?? 0);
+      applyBootstrap(await loadBootstrap());
     } catch {
       setUser(current);
       setStatus("authenticated");
@@ -143,7 +122,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const current = await api.register(input);
     setNotice(null);
     try {
-      applyBootstrap(await loadBootstrap(null), 0);
+      applyBootstrap(await loadBootstrap());
     } catch {
       setUser(current);
       setStatus("authenticated");

@@ -215,48 +215,11 @@ export type MessagePageResponse = {
   has_more: boolean;
 };
 
-export type SyncMessagePageResponse = {
-  messages: ChatMessage[];
-  has_more: boolean;
-  complete: boolean;
-  cursor: number;
-};
-
-export type BootstrapGroupCursor = {
-  group_id: number;
-  after_seq: number;
-};
-
-// The private feed is the only cursor that stays on the global message id.
-export type BootstrapDirect = {
-  messages: ChatMessage[];
-  has_more: boolean;
-  complete: boolean;
-  cursor: number;
-};
-
-export type BootstrapGroupDelta = {
-  group_id: number;
-  messages: GroupMessage[];
-  has_more: boolean;
-  complete: boolean;
-  // Group conversation cursor, in seq units.
-  cursor: number;
-};
-
 export type BootstrapResponse = {
   user: User;
   conversations: Conversation[];
   friends: PublicUser[];
-  direct: BootstrapDirect;
-  groups: BootstrapGroupDelta[];
   partial: string[];
-};
-
-export type BootstrapInput = {
-  afterID: number;
-  groups: BootstrapGroupCursor[];
-  limit?: number;
 };
 
 export type SendMessageResponse = {
@@ -340,14 +303,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 export const api = {
   me: () => request<User>("/api/me"),
 
-  bootstrap: (input: BootstrapInput) =>
+  bootstrap: () =>
     request<BootstrapResponse>("/api/bootstrap", {
       method: "POST",
-      body: JSON.stringify({
-        after_id: input.afterID,
-        groups: input.groups,
-        limit: input.limit ?? 200,
-      }),
+      body: JSON.stringify({}),
     }),
   register: (input: RegisterInput) =>
     request<User>("/api/auth/register", {
@@ -413,13 +372,6 @@ export const api = {
 
   listConversations: () =>
     request<ConversationListResponse>("/api/conversations"),
-
-  syncMessages: (afterID: number, limit = 200) => {
-    const params = new URLSearchParams();
-    params.set("after_id", String(afterID));
-    params.set("limit", String(limit));
-    return request<SyncMessagePageResponse>(`/api/messages/sync?${params.toString()}`);
-  },
 
   listMessages: (username: string, beforeSeq?: number, limit = 30) => {
     const params = new URLSearchParams();

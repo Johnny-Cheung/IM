@@ -13,7 +13,7 @@ import {
   transactionDone,
 } from "./db";
 import type { CacheStoreName } from "./db";
-import { conversationKey, groupIDFromKey } from "./keys";
+import { conversationKey } from "./keys";
 import { mergeMessages, sortMessagesBySeq } from "./merge";
 import {
   CONVERSATION_CACHE_LIMIT,
@@ -55,33 +55,12 @@ function readSyncStateValue(value: unknown): SyncState | null {
   if (!isRecord(value)) {
     return null;
   }
-  const { afterID, directComplete, groups, localSeq, savedAt } = value;
-  if (
-    typeof afterID !== "number" ||
-    !Number.isInteger(afterID) ||
-    afterID < 0 ||
-    typeof directComplete !== "boolean" ||
-    !isRecord(groups) ||
-    !isRecord(localSeq) ||
-    typeof savedAt !== "string"
-  ) {
+  // Older records also carry afterID/directComplete/groups. They are retired
+  // with the private feed, but ignoring them keeps the still-useful localSeq
+  // watermarks when an existing browser upgrades.
+  const { localSeq, savedAt } = value;
+  if (!isRecord(localSeq) || typeof savedAt !== "string") {
     return null;
-  }
-
-  // Group cursor values are seq units; afterID above is the private feed's
-  // global message id. Never compare the two.
-  const cursors: Record<number, number> = {};
-  for (const [key, cursor] of Object.entries(groups)) {
-    const groupID = Number(key);
-    if (
-      Number.isInteger(groupID) &&
-      groupID > 0 &&
-      typeof cursor === "number" &&
-      Number.isInteger(cursor) &&
-      cursor >= 0
-    ) {
-      cursors[groupID] = cursor;
-    }
   }
 
   const seqs: Record<string, number> = {};
@@ -94,7 +73,7 @@ function readSyncStateValue(value: unknown): SyncState | null {
     }
   }
 
-  return { afterID, directComplete, groups: cursors, localSeq: seqs, savedAt };
+  return { localSeq: seqs, savedAt };
 }
 
 function readUserValue(value: unknown): User | null {
@@ -258,45 +237,6 @@ function normalizeLimit(value: number | undefined, fallback: number): number {
   return Math.max(0, Math.floor(value));
 }
 
-function normalizeCursor(value: number | undefined, fallback: number): number {
-  if (value === undefined || !Number.isFinite(value) || value < 0) {
-    return fallback;
-  }
-  return Math.floor(value);
-}
-
-function mergeGroupCursors(
-  current: Record<number, number>,
-  incoming: Record<number, number>,
-): Record<number, number> {
-  const merged = { ...current };
-  for (const [key, cursor] of Object.entries(incoming)) {
-    const groupID = Number(key);
-    if (
-      Number.isInteger(groupID) &&
-      groupID > 0 &&
-      Number.isInteger(cursor) &&
-      cursor > 0
-    ) {
-      merged[groupID] = Math.max(merged[groupID] ?? 0, cursor);
-    }
-  }
-  return merged;
-}
-
-function mergeLocalSeqs(
-  current: Record<string, number>,
-  incoming: Record<string, number>,
-): Record<string, number> {
-  const merged = { ...current };
-  for (const [key, seq] of Object.entries(incoming)) {
-    if (key !== "" && Number.isInteger(seq) && seq > 0) {
-      merged[key] = Math.max(merged[key] ?? 0, seq);
-    }
-  }
-  return merged;
-}
-
 function conversationSeqRange(
   user: string,
   conversation: string,
@@ -402,19 +342,6 @@ function runTransaction<T>(
   );
 }
 
-async function updateSyncState(
-  db: IDBDatabase,
-  user: string,
-  update: (current: SyncState) => SyncState,
-): Promise<void> {
-  await runTransaction(db, [META_STORE], "readwrite", async (transaction) => {
-    const store = transaction.objectStore(META_STORE);
-    const value = await readValue(store, syncKey(user));
-    const current = readSyncStateValue(value) ?? emptySyncState();
-    await requestToPromise(store.put(update(current), syncKey(user)));
-  });
-}
-
 export function cacheSupported(): boolean {
   return typeof indexedDB !== "undefined";
 }
@@ -427,16 +354,12 @@ export async function resetCacheForTests(): Promise<void> {
 
 export async function readHints(): Promise<CacheHints> {
   return runRead<CacheHints>(
-    { user: null, sync: null },
+    { user: null },
     async (db) =>
       runTransaction(db, [META_STORE], "readonly", async (transaction) => {
         const store = transaction.objectStore(META_STORE);
         const userValue = readUserValue(await readValue(store, ACTIVE_USER_KEY));
-        if (userValue === null) {
-          return { user: null, sync: null };
-        }
-        const syncValue = await readValue(store, syncKey(userValue.username));
-        return { user: userValue, sync: readSyncStateValue(syncValue) };
+        return { user: userValue };
       }),
   );
 }
@@ -503,7 +426,6 @@ export async function writeConversations(
         const keptKeys = new Set(
           conversations.map((conversation) => conversationKey(conversation)),
         );
-        const removedGroups: number[] = [];
         const removedKeys: string[] = [];
 
         for (const key of existing.keys()) {
@@ -518,10 +440,6 @@ export async function writeConversations(
             outboxStore.delete(conversationOutboxRange(user, key)),
           );
           removedKeys.push(key);
-          const groupID = groupIDFromKey(key);
-          if (groupID !== null) {
-            removedGroups.push(groupID);
-          }
         }
 
         const now = Date.now();
@@ -542,12 +460,6 @@ export async function writeConversations(
           );
           if (state !== null) {
             let changed = false;
-            for (const groupID of removedGroups) {
-              if (groupID in state.groups) {
-                delete state.groups[groupID];
-                changed = true;
-              }
-            }
             for (const key of removedKeys) {
               if (key in state.localSeq) {
                 delete state.localSeq[key];
@@ -983,98 +895,9 @@ export async function readSyncState(user: string): Promise<SyncState> {
         if (value === undefined) {
           return emptySyncState();
         }
-        // A corrupt record must not silently restore trust in the cache.
-        return readSyncStateValue(value) ?? {
-          ...emptySyncState(),
-          directComplete: false,
-        };
+        return readSyncStateValue(value) ?? emptySyncState();
       }),
   );
-}
-
-export async function writeSyncState(
-  user: string,
-  state: SyncState,
-): Promise<void> {
-  await runWrite(async (db) => {
-    await runTransaction(db, [META_STORE], "readwrite", async (transaction) => {
-      const store = transaction.objectStore(META_STORE);
-      const current = readSyncStateValue(await readValue(store, syncKey(user)))
-        ?? emptySyncState();
-      const next: SyncState = {
-        afterID: Math.max(
-          current.afterID,
-          normalizeCursor(state.afterID, current.afterID),
-        ),
-        directComplete: state.directComplete,
-        groups: mergeGroupCursors(current.groups, state.groups),
-        localSeq: mergeLocalSeqs(current.localSeq, state.localSeq),
-        savedAt: state.savedAt === "" ? new Date().toISOString() : state.savedAt,
-      };
-      await requestToPromise(store.put(next, syncKey(user)));
-    });
-  });
-}
-
-export async function patchSyncState(
-  user: string,
-  patch: Partial<SyncState>,
-): Promise<void> {
-  await runWrite(async (db) => {
-    await updateSyncState(db, user, (current) => ({
-      afterID: Math.max(
-        current.afterID,
-        normalizeCursor(patch.afterID, current.afterID),
-      ),
-      directComplete: patch.directComplete ?? current.directComplete,
-      groups: patch.groups !== undefined
-        ? mergeGroupCursors(current.groups, patch.groups)
-        : current.groups,
-      localSeq: patch.localSeq !== undefined
-        ? mergeLocalSeqs(current.localSeq, patch.localSeq)
-        : current.localSeq,
-      savedAt: new Date().toISOString(),
-    }));
-  });
-}
-
-export async function setGroupCursor(
-  user: string,
-  groupID: number,
-  cursor: number,
-): Promise<void> {
-  if (!Number.isInteger(groupID) || groupID <= 0) {
-    return;
-  }
-  if (!Number.isInteger(cursor) || cursor <= 0) {
-    return;
-  }
-  await runWrite(async (db) => {
-    await updateSyncState(db, user, (current) => ({
-      ...current,
-      groups: {
-        ...current.groups,
-        [groupID]: Math.max(current.groups[groupID] ?? 0, cursor),
-      },
-      savedAt: new Date().toISOString(),
-    }));
-  });
-}
-
-export async function removeGroupCursor(
-  user: string,
-  groupID: number,
-): Promise<void> {
-  await runWrite(async (db) => {
-    await updateSyncState(db, user, (current) => {
-      if (!(groupID in current.groups)) {
-        return current;
-      }
-      const groups = { ...current.groups };
-      delete groups[groupID];
-      return { ...current, groups, savedAt: new Date().toISOString() };
-    });
-  });
 }
 
 export async function removeMessages(
@@ -1140,23 +963,14 @@ export async function removeConversation(
         const state = readSyncStateValue(
           await readValue(metaStore, syncKey(user)),
         );
-        if (state === null) {
+        if (state === null || !(key in state.localSeq)) {
           return;
-        }
-        const groupID = groupIDFromKey(key);
-        const hasCursor = groupID !== null && groupID in state.groups;
-        if (!hasCursor && !(key in state.localSeq)) {
-          return;
-        }
-        const groups = { ...state.groups };
-        if (groupID !== null) {
-          delete groups[groupID];
         }
         const localSeq = { ...state.localSeq };
         delete localSeq[key];
         await requestToPromise(
           metaStore.put(
-            { ...state, groups, localSeq, savedAt: new Date().toISOString() },
+            { ...state, localSeq, savedAt: new Date().toISOString() },
             syncKey(user),
           ),
         );
@@ -1222,30 +1036,6 @@ export async function clearUser(user: string): Promise<void> {
       },
     );
   });
-}
-
-async function dropGroupCursors(
-  metaStore: IDBObjectStore,
-  user: string,
-  groupIDs: number[],
-): Promise<void> {
-  if (groupIDs.length === 0) {
-    return;
-  }
-  const state = readSyncStateValue(await readValue(metaStore, syncKey(user)));
-  if (state === null) {
-    return;
-  }
-  let changed = false;
-  for (const groupID of groupIDs) {
-    if (groupID in state.groups) {
-      delete state.groups[groupID];
-      changed = true;
-    }
-  }
-  if (changed) {
-    await requestToPromise(metaStore.put(state, syncKey(user)));
-  }
 }
 
 async function dropLocalSeqs(
@@ -1333,7 +1123,6 @@ export async function enforceUserLimits(
           return left.localeCompare(right);
         });
 
-        const removedGroups: number[] = [];
         const removedKeys: string[] = [];
         for (const key of candidates) {
           if (
@@ -1349,13 +1138,8 @@ export async function enforceUserLimits(
           conversationCount -= 1;
           messageCount -= entry.count;
           removedKeys.push(key);
-          const groupID = groupIDFromKey(key);
-          if (groupID !== null) {
-            removedGroups.push(groupID);
-          }
         }
 
-        await dropGroupCursors(metaStore, user, removedGroups);
         await dropLocalSeqs(metaStore, user, removedKeys);
       },
     );

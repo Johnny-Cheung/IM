@@ -30,6 +30,7 @@ import {
 import {
   deleteMessagesFrom,
   deleteOutbox,
+  enforceUserLimits,
   markOutboxFailed,
   readConversations,
   readFriends,
@@ -769,7 +770,8 @@ export function ChatPage() {
   const mountedRef = useRef(true);
   const skipInitialConversationsRef = useRef(bootConversations !== null);
   const skipSocketConversationRefreshRef = useRef(bootConversations !== null);
-  const skipInitialSocketSyncRef = useRef(bootConversations !== null);
+  const initialLoadRef = useRef<{ key: string; requestID: number } | null>(null);
+  const cacheLimitsTimerRef = useRef<number | null>(null);
   const workspaceStartedAtRef = useRef(Date.now());
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptRef = useRef(0);
@@ -817,6 +819,26 @@ export function ChatPage() {
   useEffect(() => {
     userRef.current = user;
   }, [user]);
+
+  const scheduleCacheLimits = useCallback(() => {
+    const username = userRef.current?.username;
+    if (!username || cacheLimitsTimerRef.current !== null) {
+      return;
+    }
+    cacheLimitsTimerRef.current = window.setTimeout(() => {
+      cacheLimitsTimerRef.current = null;
+      void enforceUserLimits(username);
+    }, 3000);
+  }, []);
+
+  const cacheMessages = useCallback((
+    username: string,
+    conversation: string,
+    messages: CachedMessage[],
+  ): Promise<void> => {
+    scheduleCacheLimits();
+    return writeMessages(username, conversation, messages);
+  }, [scheduleCacheLimits]);
 
   useEffect(() => {
     conversationKeysRef.current = new Set(conversations.map(conversationKey));
@@ -1103,7 +1125,7 @@ export function ChatPage() {
           ...outboxFailedMessages(outbox, confirmed, user),
         ]);
         setHasMore(page.hasMore);
-        await writeMessages(user.username, target.key, page.messages);
+        await cacheMessages(user.username, target.key, page.messages);
         scrollToBottomNextRef.current = true;
         return;
       }
@@ -1120,7 +1142,7 @@ export function ChatPage() {
         return;
       }
       setMessages((previous) => mergeMessages(previous, messages));
-      await writeMessages(user.username, target.key, messages);
+      await cacheMessages(user.username, target.key, messages);
       if (nearBottomRef.current) {
         scrollToBottomNextRef.current = true;
       }
@@ -1335,6 +1357,7 @@ export function ChatPage() {
     }
     const version = conversationVersionRef.current;
     const requestID = ++messagesRequestRef.current;
+    initialLoadRef.current = { key: target.key, requestID };
     const isCurrent = () => requestID === messagesRequestRef.current
       && isCurrentConversation(target.key, version);
     setMessagesKey(target.key);
@@ -1352,7 +1375,6 @@ export function ChatPage() {
     const username = user?.username ?? "";
     const currentUser = user;
     let cached: CachedMessage[] = [];
-    let directComplete = true;
     let watermark = 0;
     let outbox: CachedOutbox[] = [];
     if (username !== "") {
@@ -1362,20 +1384,14 @@ export function ChatPage() {
         readOutbox(username, target.key),
       ]);
       cached = stored;
-      directComplete = syncState.directComplete;
       watermark = syncState.localSeq[target.key] ?? 0;
       outbox = pending;
     }
     if (!isCurrent()) {
+      if (initialLoadRef.current?.requestID === requestID) {
+        initialLoadRef.current = null;
+      }
       return;
-    }
-    const staleDirect = target.kind === "direct" && !directComplete;
-    if (staleDirect && cached.length > 0 && username !== "") {
-      // The global feed had a gap, so this conversation's cache cannot be
-      // stitched. Reload a fresh page instead.
-      void removeMessages(username, target.key);
-      cached = [];
-      watermark = 0;
     }
     if (cached.length === 0 && watermark > 0 && username !== "") {
       // A watermark with no cached messages behind it cannot be compared.
@@ -1394,6 +1410,9 @@ export function ChatPage() {
       scrollToBottomNextRef.current = true;
     }
     if (offlineRef.current) {
+      if (initialLoadRef.current?.requestID === requestID) {
+        initialLoadRef.current = null;
+      }
       setMessagesLoading(false);
       if (cached.length === 0) {
         setMessages(failedOutbox(new Set()));
@@ -1436,6 +1455,37 @@ export function ChatPage() {
         showArchivedFailures(target, archived);
       }
 
+      // Cached pages can have holes of their own (a lost push that the server
+      // later skipped). Run the bounded scan on every open, independently of
+      // the newer-tail catch-up below, so an interior hole is not preserved
+      // just because the tail is current.
+      if (cached.length > 1) {
+        const seqs = cached
+          .filter((message) => isAcceptedSeq(message.seq))
+          .map((message) => message.seq);
+        const minSeq = Math.min(...seqs);
+        const maxSeq = Math.max(...seqs);
+        if (seqs.length > 1 && maxSeq - minSeq + 1 <= MAX_GAP_SCAN) {
+          const present = new Set(seqs);
+          const gapMessages = await pullGaps(
+            target,
+            minSeq - 1,
+            maxSeq,
+            present,
+            missingSeqTrackerRef.current,
+          );
+          if (!isCurrent()) {
+            return;
+          }
+          if (gapMessages.length > 0) {
+            setMessages((previous) => mergeMessages(previous, gapMessages));
+            if (username !== "") {
+              void cacheMessages(username, target.key, gapMessages);
+            }
+          }
+        }
+      }
+
       if (localMax === 0 || cached.length === 0) {
         const page = await fetchInitialPage(target);
         if (!isCurrent()) {
@@ -1448,7 +1498,7 @@ export function ChatPage() {
         setHasMore(page.hasMore);
         scrollToBottomNextRef.current = true;
         if (username !== "") {
-          void writeMessages(username, target.key, page.messages);
+          void cacheMessages(username, target.key, page.messages);
         }
       } else if (knownLast === undefined || knownLast > localMax) {
         const pulled = await collectAfterSeq(target, localMax);
@@ -1466,13 +1516,13 @@ export function ChatPage() {
           setMessages([...page.messages, ...failedOutbox(confirmed)]);
           setHasMore(page.hasMore);
           if (username !== "") {
-            void writeMessages(username, target.key, page.messages);
+            void cacheMessages(username, target.key, page.messages);
           }
         } else {
           const present = new Set(pulled.messages.map((message) => message.seq));
           setMessages((previous) => mergeMessages(previous, pulled.messages));
           if (username !== "") {
-            void writeMessages(username, target.key, pulled.messages);
+            void cacheMessages(username, target.key, pulled.messages);
           }
           const gapMessages = await pullGaps(
             target,
@@ -1487,36 +1537,12 @@ export function ChatPage() {
           if (gapMessages.length > 0) {
             setMessages((previous) => mergeMessages(previous, gapMessages));
             if (username !== "") {
-              void writeMessages(username, target.key, gapMessages);
+              void cacheMessages(username, target.key, gapMessages);
             }
           }
         }
         if (nearBottomRef.current) {
           scrollToBottomNextRef.current = true;
-        }
-      } else if (cached.length > 1) {
-        // Cached pages can have holes of their own (a lost push that the
-        // server later skipped). Fill them once; leftovers stay marked.
-        const seqs = cached
-          .filter((message) => isAcceptedSeq(message.seq))
-          .map((message) => message.seq);
-        const minSeq = Math.min(...seqs);
-        const maxSeq = Math.max(...seqs);
-        if (seqs.length > 1 && maxSeq - minSeq + 1 <= MAX_GAP_SCAN) {
-          const present = new Set(seqs);
-          const gapMessages = await pullGaps(
-            target,
-            minSeq - 1,
-            maxSeq,
-            present,
-            missingSeqTrackerRef.current,
-          );
-          if (isCurrent() && gapMessages.length > 0) {
-            setMessages((previous) => mergeMessages(previous, gapMessages));
-            if (username !== "") {
-              void writeMessages(username, target.key, gapMessages);
-            }
-          }
         }
       }
     } catch (error) {
@@ -1530,6 +1556,9 @@ export function ChatPage() {
         setMessagesError(describeError(error));
       }
     } finally {
+      if (initialLoadRef.current?.requestID === requestID) {
+        initialLoadRef.current = null;
+      }
       if (isCurrent()) {
         setMessagesLoading(false);
       }
@@ -1748,7 +1777,7 @@ export function ChatPage() {
       pendingOlderScrollRef.current = { height: previousHeight, top: previousTop };
       setMessages((previous) => mergeMessages(previous, page.messages));
       if (user) {
-        void writeMessages(user.username, target.key, page.messages);
+        void cacheMessages(user.username, target.key, page.messages);
       }
       if (!page.hasMore) {
         setHasMore(false);
@@ -1874,7 +1903,7 @@ export function ChatPage() {
     // cached: writeMessages' conflict merge purges the tail itself, so a
     // preceding write would leave deleteMessagesFrom nothing to archive.
     if (openPlan?.kind !== "resync") {
-      void writeMessages(currentUser.username, key, [message]);
+      void cacheMessages(currentUser.username, key, [message]);
     }
     const listPlan = planIncoming(message.seq, message.id, {
       maxSeq: knownLast,
@@ -1932,7 +1961,7 @@ export function ChatPage() {
             setMessages((previous) => mergeMessages(previous, page.messages));
             setHasMore(page.hasMore);
             if (userRef.current) {
-              void writeMessages(userRef.current.username, key, page.messages);
+              void cacheMessages(userRef.current.username, key, page.messages);
             }
           } catch {
             // The conversation refresh above already scheduled a retry path.
@@ -1958,7 +1987,7 @@ export function ChatPage() {
             }
             setMessages((previous) => mergeMessages(previous, gapMessages));
             if (userRef.current) {
-              void writeMessages(userRef.current.username, key, gapMessages);
+              void cacheMessages(userRef.current.username, key, gapMessages);
             }
           } catch {
             // The conversation refresh above already scheduled a retry path.
@@ -1973,7 +2002,7 @@ export function ChatPage() {
       void deleteMessagesFrom(currentUser.username, key, openPlan.fromSeq + 1)
         .then((archived) => {
           showArchivedFailures(target, archived);
-          return writeMessages(currentUser.username, key, [message]);
+          return cacheMessages(currentUser.username, key, [message]);
         });
       setMessages((previous) => mergeMessages(previous, [toDirectDisplay(message)])
         .filter((item) =>
@@ -2016,7 +2045,7 @@ export function ChatPage() {
     // cached: writeMessages' conflict merge purges the tail itself, so a
     // preceding write would leave deleteMessagesFrom nothing to archive.
     if (openPlan?.kind !== "resync") {
-      void writeMessages(currentUser.username, key, [message]);
+      void cacheMessages(currentUser.username, key, [message]);
     }
     const listPlan = planIncoming(message.seq, message.id, {
       maxSeq: knownLast,
@@ -2071,7 +2100,7 @@ export function ChatPage() {
             setMessages((previous) => mergeMessages(previous, page.messages));
             setHasMore(page.hasMore);
             if (userRef.current) {
-              void writeMessages(userRef.current.username, key, page.messages);
+              void cacheMessages(userRef.current.username, key, page.messages);
             }
           } catch {
             // The conversation refresh above already scheduled a retry path.
@@ -2097,7 +2126,7 @@ export function ChatPage() {
             }
             setMessages((previous) => mergeMessages(previous, gapMessages));
             if (userRef.current) {
-              void writeMessages(userRef.current.username, key, gapMessages);
+              void cacheMessages(userRef.current.username, key, gapMessages);
             }
           } catch {
             // The conversation refresh above already scheduled a retry path.
@@ -2112,7 +2141,7 @@ export function ChatPage() {
       void deleteMessagesFrom(currentUser.username, key, openPlan.fromSeq + 1)
         .then((archived) => {
           showArchivedFailures(target, archived);
-          return writeMessages(currentUser.username, key, [message]);
+          return cacheMessages(currentUser.username, key, [message]);
         });
       setMessages((previous) => mergeMessages(previous, [toGroupDisplay(message)])
         .filter((item) =>
@@ -2256,7 +2285,7 @@ export function ChatPage() {
         setHasMore(page.hasMore);
         setMessagesError(null);
         if (user) {
-          void writeMessages(user.username, target.key, page.messages);
+          void cacheMessages(user.username, target.key, page.messages);
         }
       } else {
         const pulled = await collectAfterSeq(target, plan.afterSeq);
@@ -2270,7 +2299,7 @@ export function ChatPage() {
         if (pulled.messages.length > 0) {
           setMessages((previous) => mergeMessages(previous, pulled.messages));
           if (user) {
-            void writeMessages(user.username, target.key, pulled.messages);
+            void cacheMessages(user.username, target.key, pulled.messages);
           }
         }
         const present = new Set(pulled.messages.map((message) => message.seq));
@@ -2287,7 +2316,7 @@ export function ChatPage() {
         if (gapMessages.length > 0) {
           setMessages((previous) => mergeMessages(previous, gapMessages));
           if (user) {
-            void writeMessages(user.username, target.key, gapMessages);
+            void cacheMessages(user.username, target.key, gapMessages);
           }
         }
       }
@@ -2349,8 +2378,9 @@ export function ChatPage() {
         void loadConversations(false);
       }
       const target = activeTargetRef.current;
-      const skipInitialSync = skipInitialSocketSyncRef.current;
-      skipInitialSocketSyncRef.current = false;
+      const skipInitialSync = target !== null
+        && initialLoadRef.current?.key === target.key
+        && initialLoadRef.current.requestID === messagesRequestRef.current;
       syncFocus();
       void fetchGroupReadStats();
       if (target && !skipInitialSync) {
@@ -2481,6 +2511,10 @@ export function ChatPage() {
     // the final cursor best-effort when this cleanup wins the race.
     readReporter.flushNow();
     readReporter.stop();
+    if (cacheLimitsTimerRef.current !== null) {
+      window.clearTimeout(cacheLimitsTimerRef.current);
+      cacheLimitsTimerRef.current = null;
+    }
     if (readMeasureFrameRef.current !== null) {
       cancelAnimationFrame(readMeasureFrameRef.current);
       readMeasureFrameRef.current = null;
@@ -2606,7 +2640,7 @@ export function ChatPage() {
         ? toGroupDisplay(raw)
         : toDirectDisplay(raw);
       if (user) {
-        void writeMessages(user.username, target.key, [sent]);
+        void cacheMessages(user.username, target.key, [sent]);
         void deleteOutbox(
           user.username,
           target.key,

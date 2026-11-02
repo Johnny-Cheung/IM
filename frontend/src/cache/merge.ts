@@ -1,5 +1,4 @@
-import type { Conversation } from "../api";
-import type { CachedMessage, GroupSyncRequest } from "./types";
+import type { CachedMessage } from "./types";
 
 function acceptedSeq(message: CachedMessage): number {
   return Number.isInteger(message.seq) && message.seq > 0 ? message.seq : 0;
@@ -107,62 +106,4 @@ export function mergeMessages(
   }
 
   return { messages: sortMessagesBySeq(deduped), conflictSeq };
-}
-
-// The ids must be ordered by conversation seq, so the oldest seq is dropped
-// first.
-export function trimMessageIDs(ids: number[], limit: number): number[] {
-  if (limit <= 0) {
-    return ids.slice();
-  }
-  const removeCount = Math.max(0, ids.length - Math.floor(limit));
-  return ids.slice(0, removeCount);
-}
-
-// planGroupSync must be called with a freshly fetched conversation list. A
-// cached list is stale by definition and would drop the groups that received
-// messages since the last session.
-export function planGroupSync(
-  conversations: Conversation[],
-  cursors: Record<number, number>,
-  limit = 200,
-): GroupSyncRequest[] {
-  if (limit <= 0) {
-    return [];
-  }
-
-  const seen = new Set<number>();
-  const plans: Array<GroupSyncRequest & { lastSeq: number }> = [];
-
-  for (const conversation of conversations) {
-    if (conversation.type !== "group") {
-      continue;
-    }
-    const groupID = conversation.group.id;
-    if (groupID <= 0) {
-      continue;
-    }
-    const lastSeq = conversation.last_seq;
-    if (!Number.isInteger(lastSeq) || lastSeq <= 0) {
-      continue;
-    }
-    const cursor = cursors[groupID];
-    if (!Number.isInteger(cursor) || cursor <= 0) {
-      continue;
-    }
-    if (lastSeq <= cursor || seen.has(groupID)) {
-      continue;
-    }
-    seen.add(groupID);
-    plans.push({
-      groupID,
-      afterSeq: cursor,
-      lastSeq,
-    });
-  }
-
-  plans.sort((left, right) => right.lastSeq - left.lastSeq);
-  return plans
-    .slice(0, limit)
-    .map(({ groupID, afterSeq }) => ({ groupID, afterSeq }));
 }

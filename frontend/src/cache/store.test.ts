@@ -17,7 +17,6 @@ import {
   deleteOutbox,
   enforceUserLimits,
   markOutboxFailed,
-  patchSyncState,
   readConversationSeq,
   readConversations,
   readFriends,
@@ -28,18 +27,15 @@ import {
   readOutboxEntry,
   readSyncState,
   removeConversation,
-  removeGroupCursor,
   resetCacheForTests,
   setActiveUser,
-  setGroupCursor,
   writeConversations,
   writeFriends,
   writeMessages,
   writeOutbox,
-  writeSyncState,
 } from "./store";
 import { emptySyncState } from "./types";
-import type { CachedOutbox, SyncState } from "./types";
+import type { CachedOutbox } from "./types";
 
 const alice: PublicUser = { username: "alice", nickname: "Alice" };
 const bob: PublicUser = { username: "bob", nickname: "Bob" };
@@ -177,23 +173,12 @@ afterEach(() => {
 describe("hints", () => {
   it("returns empty hints before anything is stored", async () => {
     expect(cacheSupported()).toBe(true);
-    expect(await readHints()).toEqual({ user: null, sync: null });
+    expect(await readHints()).toEqual({ user: null });
   });
 
-  it("reads the active user and that user's sync state", async () => {
-    const state: SyncState = {
-      afterID: 42,
-      directComplete: false,
-      groups: { 7: 99 },
-      localSeq: {},
-      savedAt: "2026-10-26T00:00:00.000Z",
-    };
+  it("reads the active user", async () => {
     await setActiveUser(alice);
-    expect(await readHints()).toEqual({ user: alice, sync: null });
-
-    await writeSyncState("alice", state);
-
-    expect(await readHints()).toEqual({ user: alice, sync: state });
+    expect(await readHints()).toEqual({ user: alice });
   });
 });
 
@@ -211,33 +196,29 @@ describe("conversations", () => {
     expect(await readConversations("bob")).toEqual([]);
   });
 
-  it("removes cached messages and group cursors of dropped conversations", async () => {
+  it("removes cached messages of dropped conversations", async () => {
     const direct = directConversation("bob", 10);
     const group = groupConversation(5, 20);
 
     await writeConversations("alice", [direct, group]);
     await writeMessages("alice", "group:5", [groupMessage(5, 100)]);
     await writeMessages("alice", "direct:bob", [directMessage(100)]);
-    await setGroupCursor("alice", 5, 100);
 
     await writeConversations("alice", [direct]);
 
     expect(keysOf(await readConversations("alice"))).toEqual(["direct:bob"]);
     expect(await readMessages("alice", "group:5")).toEqual([]);
     expect(await readMessages("alice", "direct:bob")).toHaveLength(1);
-    expect((await readSyncState("alice")).groups).toEqual({});
   });
 
-  it("removes a single conversation, its messages, and its group cursor", async () => {
+  it("removes a single conversation and its messages", async () => {
     await writeConversations("alice", [groupConversation(5, 20)]);
     await writeMessages("alice", "group:5", [groupMessage(5, 100)]);
-    await setGroupCursor("alice", 5, 100);
 
     await removeConversation("alice", "group:5");
 
     expect(await readConversations("alice")).toEqual([]);
     expect(await readMessages("alice", "group:5")).toEqual([]);
-    expect((await readSyncState("alice")).groups).toEqual({});
   });
 });
 
@@ -330,63 +311,29 @@ describe("messages", () => {
 });
 
 describe("sync state", () => {
-  it("returns an empty state when absent and stores explicit state", async () => {
+  it("returns an empty state when absent", async () => {
     expect(await readSyncState("alice")).toEqual(emptySyncState());
-
-    const state: SyncState = {
-      afterID: 10,
-      directComplete: true,
-      groups: { 3: 30 },
-      localSeq: {},
-      savedAt: "2026-10-26T00:00:00.000Z",
-    };
-    await writeSyncState("alice", state);
-
-    expect(await readSyncState("alice")).toEqual(state);
   });
 
-  it("patches shallowly, keeps groups, and refreshes savedAt", async () => {
-    await writeSyncState("alice", {
-      afterID: 10,
-      directComplete: true,
-      groups: { 3: 30 },
-      localSeq: {},
-      savedAt: "2026-10-26T00:00:00.000Z",
+  it("keeps localSeq from a legacy record with feed fields", async () => {
+    const savedAt = "2026-10-26T00:00:00.000Z";
+    await writeMeta("alice:sync", {
+      afterID: 42,
+      directComplete: false,
+      groups: { 7: 99 },
+      localSeq: { "direct:bob": 7 },
+      savedAt,
     });
 
-    await patchSyncState("alice", { afterID: 15 });
-
-    const patched = await readSyncState("alice");
-    expect(patched.afterID).toBe(15);
-    expect(patched.directComplete).toBe(true);
-    expect(patched.groups).toEqual({ 3: 30 });
-    expect(patched.savedAt).not.toBe("2026-10-26T00:00:00.000Z");
-    expect(Number.isNaN(Date.parse(patched.savedAt))).toBe(false);
+    expect(await readSyncState("alice")).toEqual({
+      localSeq: { "direct:bob": 7 },
+      savedAt,
+    });
   });
 
-  it("sets and removes group cursors", async () => {
-    await setGroupCursor("alice", 3, 33);
-    await setGroupCursor("alice", 4, 44);
-
-    expect((await readSyncState("alice")).groups).toEqual({ 3: 33, 4: 44 });
-
-    await removeGroupCursor("alice", 3);
-
-    expect((await readSyncState("alice")).groups).toEqual({ 4: 44 });
-    expect((await readSyncState("bob")).groups).toEqual({});
-  });
-
-  it("never moves cursors backwards", async () => {
-    await patchSyncState("alice", { afterID: 50 });
-    await patchSyncState("alice", { afterID: 10 });
-    await setGroupCursor("alice", 7, 30);
-    await setGroupCursor("alice", 7, 20);
-    await setGroupCursor("alice", 7, 0);
-    await setGroupCursor("alice", 0, 5);
-
-    const state = await readSyncState("alice");
-    expect(state.afterID).toBe(50);
-    expect(state.groups).toEqual({ 7: 30 });
+  it("returns an empty state for a corrupt record", async () => {
+    await writeMeta("alice:sync", { afterID: 42, groups: {} });
+    expect(await readSyncState("alice")).toEqual(emptySyncState());
   });
 });
 
@@ -396,13 +343,6 @@ describe("clearUser", () => {
     await writeConversations("alice", [directConversation("bob", 10)]);
     await writeMessages("alice", "direct:bob", [directMessage(10)]);
     await writeFriends("alice", [bob]);
-    await writeSyncState("alice", {
-      afterID: 10,
-      directComplete: true,
-      groups: { 1: 10 },
-      localSeq: {},
-      savedAt: "2026-10-26T00:00:00.000Z",
-    });
     await writeMeta("alice:pending-read", {
       "direct:bob": {
         kind: "direct",
@@ -425,7 +365,7 @@ describe("clearUser", () => {
     expect(await readFriends("alice")).toEqual([]);
     expect(await readSyncState("alice")).toEqual(emptySyncState());
     expect(await readMeta("alice:pending-read")).toBeUndefined();
-    expect(await readHints()).toEqual({ user: null, sync: null });
+    expect(await readHints()).toEqual({ user: null });
 
     expect(keysOf(await readConversations("bob"))).toEqual(["direct:carol"]);
     expect(await readMessages("bob", "direct:carol")).toHaveLength(1);
@@ -438,7 +378,7 @@ describe("clearUser", () => {
 
     await clearUser("alice");
 
-    expect(await readHints()).toEqual({ user: bob, sync: null });
+    expect(await readHints()).toEqual({ user: bob });
   });
 });
 
@@ -454,7 +394,7 @@ describe("enforceUserLimits", () => {
     expect(idsOf(await readMessages("alice", "group:9"))).toEqual([90]);
   });
 
-  it("evicts whole conversations and their cursors by newest message id", async () => {
+  it("evicts whole conversations by newest message id", async () => {
     await writeConversations("alice", [
       groupConversation(1, 10),
       groupConversation(2, 20),
@@ -472,9 +412,6 @@ describe("enforceUserLimits", () => {
       groupMessage(3, 30),
       groupMessage(3, 31),
     ]);
-    await setGroupCursor("alice", 1, 11);
-    await setGroupCursor("alice", 2, 21);
-    await setGroupCursor("alice", 3, 31);
 
     await enforceUserLimits("alice", {
       maxMessages: 2,
@@ -484,7 +421,7 @@ describe("enforceUserLimits", () => {
     expect(await readMessages("alice", "group:1")).toEqual([]);
     expect(await readMessages("alice", "group:2")).toEqual([]);
     expect(idsOf(await readMessages("alice", "group:3"))).toEqual([30, 31]);
-    expect((await readSyncState("alice")).groups).toEqual({ 3: 31 });
+    expect((await readSyncState("alice")).localSeq).toEqual({ "group:3": 31 });
     expect(keysOf(await readConversations("alice"))).toEqual([
       "group:1",
       "group:2",
@@ -501,7 +438,6 @@ describe("enforceUserLimits", () => {
     await writeMessages("alice", "group:1", [groupMessage(1, 10)]);
     await writeMessages("alice", "group:2", [groupMessage(2, 20)]);
     await writeMessages("alice", "group:3", [groupMessage(3, 30)]);
-    await setGroupCursor("alice", 3, 30);
 
     await enforceUserLimits("alice", {
       maxMessages: 10_000,
@@ -511,7 +447,7 @@ describe("enforceUserLimits", () => {
     expect(await readMessages("alice", "group:1")).toEqual([]);
     expect(await readMessages("alice", "group:2")).toEqual([]);
     expect(await readMessages("alice", "group:3")).toHaveLength(1);
-    expect((await readSyncState("alice")).groups).toEqual({ 3: 30 });
+    expect((await readSyncState("alice")).localSeq).toEqual({ "group:3": 30 });
   });
 });
 
@@ -824,7 +760,7 @@ describe("degraded mode", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     expect(cacheSupported()).toBe(false);
-    await expect(readHints()).resolves.toEqual({ user: null, sync: null });
+    await expect(readHints()).resolves.toEqual({ user: null });
     await expect(readConversations("alice")).resolves.toEqual([]);
     await expect(readFriends("alice")).resolves.toEqual([]);
     await expect(readMessages("alice", "direct:bob")).resolves.toEqual([]);
@@ -847,11 +783,6 @@ describe("degraded mode", () => {
     await expect(markOutboxFailed("alice", "direct:bob", "client-outbox"))
       .resolves.toBeUndefined();
     await expect(writeFriends("alice", [bob])).resolves.toBeUndefined();
-    await expect(
-      patchSyncState("alice", { afterID: 1 }),
-    ).resolves.toBeUndefined();
-    await expect(setGroupCursor("alice", 1, 1)).resolves.toBeUndefined();
-    await expect(removeGroupCursor("alice", 1)).resolves.toBeUndefined();
     await expect(
       removeConversation("alice", "direct:bob"),
     ).resolves.toBeUndefined();
@@ -918,8 +849,6 @@ describe("storage guarantees", () => {
     await writeMessages("alice", "group:1", [
       groupMessage(1, 100, { seq: 10 }),
     ]);
-    await setGroupCursor("alice", 9, 100);
-    await setGroupCursor("alice", 1, 10);
 
     await enforceUserLimits("alice", {
       maxConversations: 1,
@@ -930,12 +859,11 @@ describe("storage guarantees", () => {
     // holds the newest message even though its seq is lower.
     expect(await readMessages("alice", "group:9")).toEqual([]);
     expect(idsOf(await readMessages("alice", "group:1"))).toEqual([100]);
-    expect((await readSyncState("alice")).groups).toEqual({ 1: 10 });
+    expect((await readSyncState("alice")).localSeq).toEqual({ "group:1": 10 });
   });
 
-  it("drops group cursors when their messages are evicted", async () => {
+  it("drops local watermarks when their messages are evicted", async () => {
     await writeMessages("alice", "group:9", [groupMessage(9, 90)]);
-    await setGroupCursor("alice", 9, 90);
 
     await enforceUserLimits("alice", {
       maxMessages: 10_000,
@@ -943,7 +871,7 @@ describe("storage guarantees", () => {
     });
 
     expect(await readMessages("alice", "group:9")).toEqual([]);
-    expect((await readSyncState("alice")).groups).toEqual({});
+    expect((await readSyncState("alice")).localSeq).toEqual({});
   });
 
   it("isolates message caches and limits per user", async () => {
@@ -958,14 +886,13 @@ describe("storage guarantees", () => {
         client_message_id: "bob-client-10",
       }),
     ]);
-    await setGroupCursor("bob", 5, 50);
 
     await enforceUserLimits("alice", { maxMessages: 0 });
 
     expect(await readMessages("alice", "direct:carol")).toEqual([]);
     expect((await readMessages("bob", "direct:carol")).map((item) => item.body))
       .toEqual(["bob-body"]);
-    expect((await readSyncState("bob")).groups).toEqual({ 5: 50 });
+    expect((await readSyncState("bob")).localSeq).toEqual({ "direct:carol": 10 });
   });
 
   it("ignores unconfirmed messages without a server id", async () => {
@@ -996,23 +923,5 @@ describe("storage guarantees", () => {
     expect(keysOf(await readConversations("alice"))).toEqual(["direct:carol"]);
     expect(await readMessages("alice", "direct:bob")).toEqual([]);
     expect(idsOf(await readMessages("alice", "direct:carol"))).toEqual([11]);
-  });
-
-  it("keeps groups on a partial patch and merges them when supplied", async () => {
-    await patchSyncState("alice", {
-      afterID: 10,
-      directComplete: true,
-      groups: { 1: 5, 2: 6 },
-    });
-
-    await patchSyncState("alice", { directComplete: false });
-    let state = await readSyncState("alice");
-    expect(state.afterID).toBe(10);
-    expect(state.directComplete).toBe(false);
-    expect(state.groups).toEqual({ 1: 5, 2: 6 });
-
-    await patchSyncState("alice", { groups: { 3: 7 } });
-    state = await readSyncState("alice");
-    expect(state.groups).toEqual({ 1: 5, 2: 6, 3: 7 });
   });
 });
