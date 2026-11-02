@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、审查修复和 8199 隔离验证；v1.8.3 Redis 重建与双向一致性检查已完成开发、审查修复和 8199 隔离验证；v2.0 朋友圈（文字版）已完成开发、审查修复和 8199 隔离验证。四者同样暂不切换 8198。v1.9 的 relay 流水线投递、consumer 单 worker 批量落库、发送路径 session/用户缓存和客户端已读游标已完成代码与单元测试，尚未在真实 MySQL/RabbitMQ 环境压测或部署。v1.10 正在开发：删除 `dm:feed`/`index:epoch`，直聊和群聊改为按会话懒加载。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、审查修复和 8199 隔离验证；v1.8.3 Redis 重建与双向一致性检查已完成开发、审查修复和 8199 隔离验证；v2.0 朋友圈（文字版）已完成开发、审查修复和 8199 隔离验证。四者同样暂不切换 8198。v1.9 的 relay 流水线投递、consumer 单 worker 批量落库、发送路径 session/用户缓存和客户端已读游标已完成代码与单元测试，尚未在真实 MySQL/RabbitMQ 环境压测或部署。v1.10 代码与单元测试完成（删除 `dm:feed`/`index:epoch`，直聊和群聊改为按会话懒加载），待 8199 隔离验证。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -452,7 +452,7 @@ curl -fsS http://127.0.0.1:8199/ops/infra   # 检查 seq.ready 与 pipeline.reco
 - 不新增 Redis 键、HTTP 接口、后台 worker 或队列；已读仍通过 `dm:read:stream`/`group-read:stream` 异步写 MySQL。群聊 `group.read` 广播给除 reader 外的成员，大群回执扇出需要在压测中观察。
 - 验证：`go test ./...`、`go test -race ./internal/httpapi ./internal/messaging`、`go vet ./...`、`npm test`、`npm run typecheck`、`npm run build` 均通过；真实浏览器、relay/consumer 端到端和压测尚未执行。
 
-## v1.10 删除私聊 feed，按会话懒加载（开发中）
+## v1.10 删除私聊 feed，按会话懒加载（代码与单测完成，待 8199 验证）
 
 - 删除 `dm:feed:{user}` 和 `index:epoch`；保留 `messages:{id}`、`dm:pair`、`dm:seq`、`dm:conv-last`、`dm:read`、群 inbox/seq/read、Stream、去重、`seq:ready` 和 `messages:next_id`。MySQL 表结构不变。
 - `POST /api/bootstrap` 只返回 `user`、完整 `conversations`、`friends` 和 `partial`；不再返回 `direct`/`groups`，不再接收 `after_id`/群游标。`GET /api/messages/sync` 已删除并返回 404。
@@ -470,7 +470,7 @@ curl -fsS http://127.0.0.1:8199/ops/infra   # 检查 seq.ready 与 pipeline.reco
 
   不使用 `FLUSHDB`/`FLUSHALL`。`rebuild-redis` 会清 `dm:feed:*`，`index:epoch` 需显式删除或由 `ClearNamespace` 处理。
 - 回滚到 v1.9 或更早版本前，用旧二进制重新执行 `rebuild-redis` 生成 `dm:feed`/`index:epoch`；否则旧 `/api/messages/sync` 会返回空/不完整结果。v1.7 回滚仍按“v1.8.1 → v1.7”的命名空间清理和 backfill 流程。
-- 验证状态：代码与单元测试完成后补记；8199 冷启动、离线补收、群聊/朋友圈回归、rebuild 演练和旧键清理待单独确认后执行。
+- 验证状态：后端 `go test ./...`、`httpapi`/`messaging`/`store` race、`go vet`、前端 10 个测试文件 134 项、typecheck 和 build 均通过（2026-11-02）；8199 冷启动、离线补收、群聊/朋友圈回归、rebuild 演练和旧键清理待单独确认后执行。
 
 ## v2.0 朋友圈（文字版）
 
