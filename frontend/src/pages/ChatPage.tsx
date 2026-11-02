@@ -2238,6 +2238,7 @@ export function ChatPage() {
     if (syncingRef.current || !isCurrent()) {
       return;
     }
+    syncingRef.current = true;
     let ownMessages = messagesRef.current.filter((message) => {
       if (target.kind === "group") {
         return isGroupMessage(message) && message.group_id === target.groupID;
@@ -2261,7 +2262,6 @@ export function ChatPage() {
     }
     const newest = maxAcceptedSeq(ownMessages);
 
-    syncingRef.current = true;
     try {
       // The list snapshot only identifies a reused tail message here; a stale
       // last_seq must not be read as a rollback (loadConversations checks that
