@@ -11,8 +11,12 @@ import (
 )
 
 const (
-	implicitReadWindow     = 100 * time.Millisecond
-	implicitReadMaxPending = 256
+	// Read receipts tolerate seconds of delay: a longer window merges more
+	// messages per conversation into one watermark advance, which cuts the
+	// Redis pressure that competes with message acceptance. The queue cap is
+	// sized for that longer window rather than for the old 100ms batch.
+	implicitReadWindow     = time.Second
+	implicitReadMaxPending = 4000
 	implicitReadMaxRetries = 3
 	implicitReadTimeout    = 5 * time.Second
 )
