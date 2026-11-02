@@ -206,8 +206,6 @@ type directReaderStub struct {
 	page         messaging.ConversationPage
 	err          error
 	calls        int
-	feed         messaging.FeedPage
-	feedErr      error
 	lastMessages map[uint64]store.Message
 	lastErr      error
 }
@@ -224,12 +222,6 @@ func (s *directReaderStub) ReadConversationAfter(
 ) (messaging.ConversationPage, error) {
 	s.calls++
 	return s.page, s.err
-}
-
-func (s *directReaderStub) ReadFeed(
-	_ context.Context, _, _ uint64, _ int,
-) (messaging.FeedPage, error) {
-	return s.feed, s.feedErr
 }
 
 func (s *directReaderStub) LastConversationMessages(
@@ -357,81 +349,6 @@ func TestListMessagesFallsBackWhenCounterIsMissing(t *testing.T) {
 	}
 	if len(response.Messages) != 1 || response.Messages[0].Body != "from mysql" {
 		t.Fatalf("messages = %#v, want the MySQL history", response.Messages)
-	}
-}
-
-func TestSyncMessagesReturnsFeedWithPeers(t *testing.T) {
-	now := time.Now().UTC()
-	dataStore := authenticatedFriendStore()
-	dataStore.usersByKey = map[string]store.User{
-		"bob": {ID: 2, Username: "bob", Nickname: "Bob"},
-	}
-	reader := &directReaderStub{feed: messaging.FeedPage{
-		Page: store.MessagePage{
-			Messages: []store.Message{
-				{
-					ID:              11,
-					Seq:             4,
-					SenderID:        2,
-					RecipientID:     1,
-					ClientMessageID: "client-00000001",
-					Body:            "incoming",
-					CreatedAt:       now,
-				},
-				{
-					ID:              12,
-					Seq:             5,
-					SenderID:        1,
-					RecipientID:     2,
-					ClientMessageID: "client-00000002",
-					Body:            "outgoing",
-					CreatedAt:       now,
-				},
-			},
-			HasMore: true,
-		},
-		Complete: true,
-	}}
-
-	gin.SetMode(gin.TestMode)
-	router := gin.New()
-	New(dataStore, WithDirectMessageReader(reader)).Register(router)
-
-	recorder := doJSON(t, router, http.MethodGet, "/api/messages/sync?after_id=10&limit=20", nil, authTestCookie())
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
-	}
-
-	var response syncMessagePageResponse
-	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if !response.Complete || !response.HasMore || len(response.Messages) != 2 {
-		t.Fatalf("response = %#v", response)
-	}
-	if response.Messages[0].Sender.Username != "bob" || response.Messages[0].Recipient.Username != "alice" {
-		t.Fatalf("incoming message identity = %#v", response.Messages[0])
-	}
-	if response.Messages[1].Sender.Username != "alice" || response.Messages[1].Recipient.Username != "bob" {
-		t.Fatalf("outgoing message identity = %#v", response.Messages[1])
-	}
-	if response.Messages[0].Body != "incoming" || response.Messages[1].Body != "outgoing" {
-		t.Fatalf("bodies = %#v", response.Messages)
-	}
-	if response.Messages[0].Seq != 4 || response.Messages[1].Seq != 5 {
-		t.Fatalf("sync seq = %#v", response.Messages)
-	}
-}
-
-func TestSyncMessagesFallsBackWithoutRedis(t *testing.T) {
-	router := testRouter(authenticatedFriendStore())
-
-	recorder := doJSON(t, router, http.MethodGet, "/api/messages/sync?after_id=1", nil, authTestCookie())
-	if recorder.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
-	}
-	if got := errorCode(t, recorder); got != "message_service_unavailable" {
-		t.Fatalf("error code = %q", got)
 	}
 }
 

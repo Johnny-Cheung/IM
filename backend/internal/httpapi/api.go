@@ -152,7 +152,6 @@ type FriendshipProjector interface {
 type DirectMessageReader interface {
 	ReadConversation(context.Context, uint64, uint64, uint64, int) (messaging.ConversationPage, error)
 	ReadConversationAfter(context.Context, uint64, uint64, uint64, int) (messaging.ConversationPage, error)
-	ReadFeed(context.Context, uint64, uint64, int) (messaging.FeedPage, error)
 	LastConversationMessages(context.Context, uint64) (map[uint64]store.Message, error)
 }
 
@@ -332,7 +331,6 @@ func (a *API) Register(router *gin.Engine) {
 	authed.POST("/friend-requests/:id/accept", a.acceptFriendRequest)
 	authed.POST("/friend-requests/:id/reject", a.rejectFriendRequest)
 	authed.GET("/conversations", a.listConversations)
-	authed.GET("/messages/sync", a.syncMessages)
 	authed.POST("/bootstrap", a.bootstrap)
 	authed.GET("/conversations/:username/messages", a.listMessages)
 	authed.POST("/conversations/:username/messages", a.sendMessage)

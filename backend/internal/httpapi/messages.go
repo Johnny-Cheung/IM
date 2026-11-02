@@ -21,8 +21,6 @@ import (
 const (
 	defaultMessagePageSize = 30
 	maxMessagePageSize     = 50
-	defaultSyncPageSize    = 200
-	maxSyncPageSize        = 200
 	maxMessageRunes        = 2000
 )
 
@@ -68,13 +66,6 @@ type conversationListResponse struct {
 type messagePageResponse struct {
 	Messages []messageResponse `json:"messages"`
 	HasMore  bool              `json:"has_more"`
-}
-
-type syncMessagePageResponse struct {
-	Messages []messageResponse `json:"messages"`
-	HasMore  bool              `json:"has_more"`
-	Complete bool              `json:"complete"`
-	Cursor   uint64            `json:"cursor"`
 }
 
 var errMessageServiceUnavailable = errors.New("message service unavailable")
@@ -546,98 +537,6 @@ func mergeMessagePages(primary, hot store.MessagePage, beforeDirection bool, lim
 	return store.MessagePage{Messages: messages, HasMore: hasMore}
 }
 
-// syncMessages returns every direct message after the cursor across all
-// conversations. It backs client-side incremental sync.
-func (a *API) syncMessages(c *gin.Context) {
-	current, ok := currentUser(c)
-	if !ok {
-		writeError(c, http.StatusUnauthorized, "unauthenticated", "请先登录")
-		return
-	}
-	afterID, err := parseUintQuery(c.Query("after_id"))
-	if err != nil {
-		writeError(c, http.StatusBadRequest, "invalid_request", "同步游标不正确")
-		return
-	}
-	limit, err := parseSyncLimit(c.Query("limit"))
-	if err != nil {
-		writeError(c, http.StatusBadRequest, "invalid_request", "消息分页参数不正确")
-		return
-	}
-
-	response, err := a.buildDirectSync(c.Request.Context(), current, afterID, limit)
-	if err != nil {
-		if errors.Is(err, errMessageServiceUnavailable) {
-			log.Printf("read message feed: %v", err)
-			writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂不可用")
-			return
-		}
-		log.Printf("sync messages: %v", err)
-		writeError(c, http.StatusInternalServerError, "internal_error", "服务器内部错误")
-		return
-	}
-	c.JSON(http.StatusOK, response)
-}
-
-func (a *API) buildDirectSync(
-	ctx context.Context,
-	current store.User,
-	afterID uint64,
-	limit int,
-) (syncMessagePageResponse, error) {
-	if a.directReader == nil {
-		return syncMessagePageResponse{}, errMessageServiceUnavailable
-	}
-
-	feed, err := a.directReader.ReadFeed(ctx, current.ID, afterID, limit)
-	if err != nil {
-		return syncMessagePageResponse{}, fmt.Errorf(
-			"%w: read message feed: %v", errMessageServiceUnavailable, err,
-		)
-	}
-
-	peerIDs := make(map[uint64]struct{}, len(feed.Page.Messages))
-	for _, message := range feed.Page.Messages {
-		if message.SenderID == current.ID {
-			peerIDs[message.RecipientID] = struct{}{}
-			continue
-		}
-		peerIDs[message.SenderID] = struct{}{}
-	}
-	ids := make([]uint64, 0, len(peerIDs))
-	for id := range peerIDs {
-		ids = append(ids, id)
-	}
-	peers, err := a.store.ListPublicUsersByIDs(ctx, ids)
-	if err != nil {
-		return syncMessagePageResponse{}, fmt.Errorf("list sync participants: %w", err)
-	}
-
-	cursor := afterID
-	response := syncMessagePageResponse{
-		Messages: make([]messageResponse, 0, len(feed.Page.Messages)),
-		HasMore:  feed.Page.HasMore,
-		Complete: feed.Complete,
-	}
-	for _, message := range feed.Page.Messages {
-		if message.ID > cursor {
-			cursor = message.ID
-		}
-		peerID := message.RecipientID
-		if message.SenderID != current.ID {
-			peerID = message.SenderID
-		}
-		peer := peers[peerID]
-		response.Messages = append(response.Messages, toMessageResponse(
-			message,
-			current,
-			publicUserResponse{Username: peer.Username, Nickname: peer.Nickname},
-		))
-	}
-	response.Cursor = cursor
-	return response, nil
-}
-
 func (a *API) sendMessage(c *gin.Context) {
 	current, ok := currentUser(c)
 	if !ok {
@@ -779,17 +678,6 @@ func parseMessageLimit(raw string) (int, error) {
 	value, err := strconv.Atoi(raw)
 	if err != nil || value < 1 || value > maxMessagePageSize {
 		return 0, errors.New("invalid message limit")
-	}
-	return value, nil
-}
-
-func parseSyncLimit(raw string) (int, error) {
-	if raw == "" {
-		return defaultSyncPageSize, nil
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil || value < 1 || value > maxSyncPageSize {
-		return 0, errors.New("invalid sync limit")
 	}
 	return value, nil
 }
