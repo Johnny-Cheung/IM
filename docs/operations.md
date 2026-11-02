@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、审查修复和 8199 隔离验证；v1.8.3 Redis 重建与双向一致性检查已完成开发、审查修复和 8199 隔离验证；v2.0 朋友圈（文字版）已完成开发、审查修复和 8199 隔离验证。四者同样暂不切换 8198。v1.9 的 relay 流水线投递、consumer 单 worker 批量落库、发送路径 session/用户缓存和客户端已读游标已完成代码与单元测试，尚未在真实 MySQL/RabbitMQ 环境压测或部署。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、审查修复和 8199 隔离验证；v1.8.3 Redis 重建与双向一致性检查已完成开发、审查修复和 8199 隔离验证；v2.0 朋友圈（文字版）已完成开发、审查修复和 8199 隔离验证。四者同样暂不切换 8198。v1.9 的 relay 流水线投递、consumer 单 worker 批量落库、发送路径 session/用户缓存和客户端已读游标已完成代码与单元测试，尚未在真实 MySQL/RabbitMQ 环境压测或部署。v1.10 正在开发：删除 `dm:feed`/`index:epoch`，直聊和群聊改为按会话懒加载。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -47,7 +47,7 @@ sha256sum -c SHA256SUMS         # Linux
 | --- | --- |
 | `/health` | HTTP 进程可响应即返回 200；不检查 MySQL。 |
 | `/ready` | 2 秒内成功 ping MySQL 时返回 200（`database=ok`）；否则返回 503（`database=unavailable`）。它仍然只检查 MySQL，不反映消息号闸门。 |
-| `/ops/infra` | 基础设施连通性、`seq` 就绪/校准状态。v1.8.2 启用消息链路时增加 `pipeline`：Stream 长度、pending、最老条目年龄、积压告警、死信数、relay/consumer 错误及对账结果。v1.8.3 起对账还包含 `redis_missing`、`redis_repaired`、`watermarks_raised`、`feed_repairs`、`needs_rebuild`、`last_deep_audit_at`、`deep_audit_error`；consumer 增加 `in_flight`。v1.9 起 consumer 使用 `Qos(100)` 批量落库，`in_flight` 可能覆盖一批最多 100 条未确认消息。返回最近采样，不在请求中连接基础设施。 |
+| `/ops/infra` | 基础设施连通性、`seq` 就绪/校准状态。v1.8.2 启用消息链路时增加 `pipeline`：Stream 长度、pending、最老条目年龄、积压告警、死信数、relay/consumer 错误及对账结果。v1.8.3 起对账还包含 `redis_missing`、`redis_repaired`、`watermarks_raised`、`needs_rebuild`、`last_deep_audit_at`、`deep_audit_error`；consumer 增加 `in_flight`。v1.9 起 consumer 使用 `Qos(100)` 批量落库，`in_flight` 可能覆盖一批最多 100 条未确认消息。v1.10 起删除 feed 审计，`feed_repairs` 字段不再返回。返回最近采样，不在请求中连接基础设施。 |
 
 ```bash
 /opt/IM-Rebuild/imctl health
@@ -278,7 +278,7 @@ BACKUP="$(/opt/IM-Rebuild/imctl backup)"
 - 使用独立 schema/用户 `im_v07_verify`，应用密码文件为 `/opt/IM-Rebuild/canary-v07/mysql-app`（属主 `nobody`，权限 0400）。不得复用生产库 `im`、账号 `im_app` 或生产凭据。自动化检查只使用本轮创建的账号和群，不登录、不修改 `demo_*` 演示数据。
 - v0.6 基线保留为 `/opt/IM-Rebuild/canary-v07/bin/im-server-v06`、`RELEASE.v06` 和初始 v0.6 `web/`。部署候选版本前先备份 canary 当前文件。
 
-canary 应用入口是 `/opt/IM-Rebuild/canary-v07/bin/im-server` 和 `web/`。当前 canary 已部署 v1.7（验证后已停止），其 v1.6 备份为 `bin/im-server-v16`、`RELEASE.v16` 和 `web-v16`；v1.5 备份为 `bin/im-server-v15`、`RELEASE.v15` 和 `web-v15`；v0.6 基线仍保留为 `bin/im-server-v06`、`RELEASE.v06` 和初始 v0.6 `web/`。启动、状态和检查：
+canary 应用入口是 `/opt/IM-Rebuild/canary-v07/bin/im-server` 和 `web/`。当前 canary 已部署 v2.0（验证后已停止）；旧的 v1.7/v1.6/v1.5 备份和 v0.6 基线仍保留在 `bin/`、`RELEASE.*` 和 `web-v*` 中。启动、状态和检查：
 
 ```bash
 /opt/IM-Rebuild/imctl --verify start
@@ -348,6 +348,8 @@ canary 的 Redis DB 1 与正式 `8198` 的 DB 0 在同一个 `im-v11-redis` 容�
 
 ## v1.4 服务端消息读取链路（已切换正式，v1.8.1 起部分被取代）
 
+> v1.10 起删除 `dm:feed`、`index:epoch` 和 `GET /api/messages/sync`；以下 feed/epoch/sync 内容保留为历史设计记录。当前保留 `dm:pair`、`dm:seq`、`dm:conv-last`、`dm:read`，读取改为按会话懒加载，见“v1.10”。
+
 - 读取改为按会话索引，另加用户级增量日志 `dm:feed:{user}` 和会话最后消息 `dm:conv-last:{user}`；`inbox`/`outbox` 已停止写入，只保留作回滚兜底。v1.8.1 起私聊的两个方向索引 `dm:conv:{owner}:{peer}` 被单个 `dm:pair:{low}:{high}` 取代（分数为会话 `seq`），`dm:feed` 和私聊增量同步的 `after_id` 仍使用全局消息号。
 - `index:epoch` 标记读取索引的完整边界：epoch 以下一律回落 MySQL。首次启动取 `max(落库最大消息号, Redis 计数器)`，重启保留原值，只有计数器落后于落库最大值时才上调。v1.8.1 起 `index:epoch` 只保留给私聊 feed；热读按 `seq` 区间进行并由 MySQL 补齐缺失编号。
 - 新增 `GET /api/messages/sync?after_id=N`，一次返回该用户全部私聊增量；`complete=false` 表示补收不完整，需要从会话历史重新同步。
@@ -359,6 +361,8 @@ canary 的 Redis DB 1 与正式 `8198` 的 DB 0 在同一个 `im-v11-redis` 容�
 - 验证实例继续使用 `imctl --verify`、Redis DB 1、vhost `im_v13_verify` 和命名空间 `im:v13-verify`。
 
 ## v1.5 Web 端本地缓存（已切换正式）
+
+> v1.10 起 bootstrap 只返回会话列表和好友元数据，不再返回私聊/群增量；以下增量同步内容保留为历史设计记录，当前按会话懒加载见“v1.10”。
 
 - 新增 `POST /api/bootstrap`，一次返回当前用户、会话列表、好友列表、私聊增量和有变化的群增量；`/api/messages/sync` 增加 `cursor`，单页上限提高到 200。
 - 浏览器使用 IndexedDB `im-cache` 按账号缓存会话、好友和最近消息；每个会话最多 200 条，全账号最多 10000 条、100 个会话。
@@ -429,13 +433,13 @@ curl -fsS http://127.0.0.1:8199/ops/infra   # 检查 seq.ready 与 pipeline.reco
 ```
 
 - 可选环境变量：`REBUILD_BATCH`（默认 1000）、`REBUILD_QUEUE_TIMEOUT`（默认 10m）、`REBUILD_TIMEOUT`（默认 30m，必须大于队列超时）。
-- 执行顺序：排空两个持久化队列（含正在处理的消息）→ 写 `rebuild:pending` → 先删 `seq:ready`/`index:epoch` 再清理本命名空间 → 全局计数器 → 消息主遍 → 好友、群投影和水位 → 校验 → `index:epoch=0` → `seq:ready` → 删除 `rebuild:pending`。
+- 执行顺序：排空两个持久化队列（含正在处理的消息）→ 写 `rebuild:pending` → 删除 `seq:ready` 和 legacy `index:epoch` 再清理本命名空间 → 全局计数器 → 消息主遍 → 好友、群投影和水位 → 校验 → `seq:ready` → 删除 `rebuild:pending`。v1.10 起消息主遍不再写/校验 `dm:feed`，也不再设置 `index:epoch`；`dm:*` 清理模式仍会清掉旧的 feed 键。
 - 运行前 `imctl` 还会检查两个持久化队列的未确认消息数；有未确认消息（可能被别的进程占用）时拒绝执行。
 - 只删除已知前缀；不使用 `FLUSHDB`。失败时不写 `seq:ready` 且保留 `rebuild:pending`，启动提示会指向 `rebuild-redis`；成功写入 `seq:ready` 后删除标记失败只记警告，不把成功当失败。
 - MySQL 中允许存在编号空洞（毒消息进死信、掉电丢尾）。重建会记录空洞数，不因此失败。
 - `rebuild:lock` 和 `backfill:lock` 原子互斥，任一存在时另一个命令和后端启动都会被拒绝。锁的 TTL 是总超时加 5 分钟；进程被杀后最多等这么久，确认无人运行后可 `SCAN` 找到并 `UNLINK` 残留键。
 - 命令按 `-addr` 的端口探测本机后端，能连上就拒绝执行。该检查只覆盖同一台机器；共享 Redis 的其他主机不在单体范围。
-- 运行期间部分丢失由对账自动发现：每 5 分钟比对条数、计数器和已读位置，并补回索引缺口（索引里缺消息时会连同缺失的实体一起补）；每小时再抽样最新/最旧和轮转的中段消息实体、feed 和会话预览。少量缺失自动补 Redis（每轮最多 200 条、单会话 50 条）；超过阈值时 `needs_rebuild` 增加，按上面的步骤人工重建。对账只写 Redis，不删除、不覆盖分叉的实体，也不改 MySQL。
+- 运行期间部分丢失由对账自动发现：每 5 分钟比对条数、计数器和已读位置，并补回索引缺口（索引里缺消息时会连同缺失的实体一起补）；每小时再抽样最新/最旧和轮转的中段消息实体、会话预览和计数器。少量缺失自动补 Redis（每轮最多 200 条、单会话 50 条）；超过阈值时 `needs_rebuild` 增加，按上面的步骤人工重建。对账只写 Redis，不删除、不覆盖分叉的实体，也不改 MySQL。v1.10 起移除 feed 抽样和 `feed_repairs` 指标，预览/实体/水位审计保留。
 - 计数器哨兵：接纳时如果算出的全局消息号已有实体，或会话编号已被占用，直接返回 503，不会覆盖已有消息或复用编号；校准和运行期对账只抬高计数器。
 - 已知限制：AMQP 客户端看不到其他连接的未确认消息，所以命令自身的排空检查只覆盖自己的 consumer；`imctl` 的未确认数预检和“停后端”守卫共同兜住这种情况。
 - 2026-10-29 已在 8199 完成隔离验证（`79b1f67`）：已有数据重建、整体丢失、MySQL 编号空洞、运行期删除实体/索引成员/水位后 5 分钟内自动补回、维护锁门禁和停机守卫均通过；重建后 API smoke 114 项通过；验证库和命名空间已按 manifest 清理，持久化队列与死信队列均已排空。共享容器重启和 broker 级未确认预检未演练。
@@ -447,6 +451,26 @@ curl -fsS http://127.0.0.1:8199/ops/infra   # 检查 seq.ready 与 pipeline.reco
 - 服务端不再在消息投递后为“聚焦的接收者/群成员”推进水位，只保留发送者自读。客户端在滚动、切换会话、隐藏标签页、卸载和重连时 flush；隐藏时先发 `read` 再发 `blur`。
 - 不新增 Redis 键、HTTP 接口、后台 worker 或队列；已读仍通过 `dm:read:stream`/`group-read:stream` 异步写 MySQL。群聊 `group.read` 广播给除 reader 外的成员，大群回执扇出需要在压测中观察。
 - 验证：`go test ./...`、`go test -race ./internal/httpapi ./internal/messaging`、`go vet ./...`、`npm test`、`npm run typecheck`、`npm run build` 均通过；真实浏览器、relay/consumer 端到端和压测尚未执行。
+
+## v1.10 删除私聊 feed，按会话懒加载（开发中）
+
+- 删除 `dm:feed:{user}` 和 `index:epoch`；保留 `messages:{id}`、`dm:pair`、`dm:seq`、`dm:conv-last`、`dm:read`、群 inbox/seq/read、Stream、去重、`seq:ready` 和 `messages:next_id`。MySQL 表结构不变。
+- `POST /api/bootstrap` 只返回 `user`、完整 `conversations`、`friends` 和 `partial`；不再返回 `direct`/`groups`，不再接收 `after_id`/群游标。`GET /api/messages/sync` 已删除并返回 404。
+- 客户端打开会话时才按 `localSeq`/列表 `last_seq` 懒加载：落后用 `after_seq` 补，没缓存或跨度过大取最新页；重连/切回前台补当前会话。未打开过的会话不再预缓存正文，离线只能看打开过的会话。
+- IndexedDB `SyncState` 只保留 `localSeq`/`savedAt`；旧记录里的 `afterID`/`directComplete`/`groups` 被忽略，不提升 DB 版本、不清空消息缓存。
+- `rebuild-redis` 不再写/校验 feed，也不再设置 `index:epoch`；`ClearNamespace` 保留 `dm:*` 清理旧 feed，并显式删除 legacy `index:epoch`。对账删除 feed 抽样和 `feed_repairs`，保留 `dm:conv-last` 预览审计、`dm:pair` 缺口、实体和已读水位审计。
+- `backfill-seq` 的投影门禁改为只检查 `messages:next_id`：MySQL 有条目而全局计数器缺失时拒绝 backfill。
+- 旧键一次性清理（只在验证命名空间执行；正式切换时换前缀）：
+
+  ```text
+  SCAN <cursor> MATCH im:v13-verify:dm:feed:* COUNT 100
+  UNLINK <返回的键>
+  DEL im:v13-verify:index:epoch
+  ```
+
+  不使用 `FLUSHDB`/`FLUSHALL`。`rebuild-redis` 会清 `dm:feed:*`，`index:epoch` 需显式删除或由 `ClearNamespace` 处理。
+- 回滚到 v1.9 或更早版本前，用旧二进制重新执行 `rebuild-redis` 生成 `dm:feed`/`index:epoch`；否则旧 `/api/messages/sync` 会返回空/不完整结果。v1.7 回滚仍按“v1.8.1 → v1.7”的命名空间清理和 backfill 流程。
+- 验证状态：代码与单元测试完成后补记；8199 冷启动、离线补收、群聊/朋友圈回归、rebuild 演练和旧键清理待单独确认后执行。
 
 ## v2.0 朋友圈（文字版）
 
@@ -520,7 +544,7 @@ node scripts/cleanup-test-data.mjs im_v07_verify /tmp/im-cleanup.sql /path/to/ma
 # 多轮清单可依次追加；正式8198的本轮清单需显式选择 im
 ```
 
-输出文件不会覆盖已有文件。核对 SQL 中的数据库和账号清单后，用既有 relay 流程上传到开发机。**先执行 Redis 清理，再执行 SQL**：私聊的 `dm:seq`/`dm:pair`/`dm:read`/`dm:conv-last` 以内部用户 ID 命名，Redis 脚本需要账号仍然存在，才能按清单里的精确用户名从 MySQL 查出 ID 再拼键（示例使用已上传的文件）：
+输出文件不会覆盖已有文件。核对 SQL 中的数据库和账号清单后，用既有 relay 流程上传到开发机。**先执行 Redis 清理，再执行 SQL**：私聊的 `dm:seq`/`dm:pair`/`dm:read`/`dm:conv-last` 以内部用户 ID 命名，Redis 脚本需要账号仍然存在，才能按清单里的精确用户名从 MySQL 查出 ID 再拼键（示例使用已上传的文件）。v1.10 起脚本仍保留 legacy `dm:feed:{user}` 删除，避免旧命名空间残留；`index:epoch` 是命名空间级键，不加入按账号脚本，按“v1.10”一节单独清理：
 
 ```bash
 bash /opt/IM-Rebuild/canary-v07/reports/cleanup.redis.sh
