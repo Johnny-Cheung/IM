@@ -20,7 +20,15 @@ type ConsumerStatus struct {
 	TransientRetries uint64    `json:"transient_retries"`
 	MessageRetries   uint64    `json:"message_retries"`
 	DeadLettered     uint64    `json:"dead_lettered"`
-	Retrying         bool      `json:"retrying"`
+	// BatchDuplicatesFiltered counts exact redeliveries removed by the batch
+	// fast path before insert.
+	BatchDuplicatesFiltered uint64 `json:"batch_duplicates_filtered"`
+	// BatchFallbacks counts batches handed to the per-message path.
+	BatchFallbacks uint64 `json:"batch_fallbacks"`
+	// MessageConflicts counts per-message idempotency conflicts that take the
+	// dead-letter path.
+	MessageConflicts uint64 `json:"message_conflicts"`
+	Retrying         bool   `json:"retrying"`
 	// InFlight is the number of deliveries the consumer holds unacknowledged
 	// right now: decoded, persisting, acking or dead-lettering. A queue can
 	// report zero ready messages while a delivery is still in flight.
@@ -30,31 +38,37 @@ type ConsumerStatus struct {
 // consumeStatusState collects counters and timestamps shared by both chains.
 // The zero value is ready to use.
 type consumeStatusState struct {
-	mu               sync.Mutex
-	lastError        string
-	lastErrorAt      time.Time
-	lastPersistedAt  time.Time
-	persisted        uint64
-	transientRetries uint64
-	messageRetries   uint64
-	deadLettered     uint64
-	retrying         bool
-	inFlight         int
+	mu                      sync.Mutex
+	lastError               string
+	lastErrorAt             time.Time
+	lastPersistedAt         time.Time
+	persisted               uint64
+	transientRetries        uint64
+	messageRetries          uint64
+	deadLettered            uint64
+	batchDuplicatesFiltered uint64
+	batchFallbacks          uint64
+	messageConflicts        uint64
+	retrying                bool
+	inFlight                int
 }
 
 func (s *consumeStatusState) snapshot() ConsumerStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return ConsumerStatus{
-		LastError:        s.lastError,
-		LastErrorAt:      s.lastErrorAt,
-		LastPersistedAt:  s.lastPersistedAt,
-		Persisted:        s.persisted,
-		TransientRetries: s.transientRetries,
-		MessageRetries:   s.messageRetries,
-		DeadLettered:     s.deadLettered,
-		Retrying:         s.retrying,
-		InFlight:         s.inFlight,
+		LastError:               s.lastError,
+		LastErrorAt:             s.lastErrorAt,
+		LastPersistedAt:         s.lastPersistedAt,
+		Persisted:               s.persisted,
+		TransientRetries:        s.transientRetries,
+		MessageRetries:          s.messageRetries,
+		DeadLettered:            s.deadLettered,
+		BatchDuplicatesFiltered: s.batchDuplicatesFiltered,
+		BatchFallbacks:          s.batchFallbacks,
+		MessageConflicts:        s.messageConflicts,
+		Retrying:                s.retrying,
+		InFlight:                s.inFlight,
 	}
 }
 
@@ -72,8 +86,9 @@ func (s *consumeStatusState) recordPersisted(at time.Time) {
 	s.recordPersistedN(1, at)
 }
 
-// recordPersistedN counts a successfully committed batch by its message count,
-// so queue drain and /ops/infra keep reporting deliveries rather than batches.
+// recordPersistedN counts successfully acknowledged deliveries by message
+// count, including exact redeliveries filtered by the batch fast path, so
+// queue drain and /ops/infra keep reporting deliveries rather than batches.
 func (s *consumeStatusState) recordPersistedN(count int, at time.Time) {
 	if s == nil || count <= 0 {
 		return
@@ -113,6 +128,33 @@ func (s *consumeStatusState) recordDeadLettered() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.deadLettered++
+}
+
+func (s *consumeStatusState) recordBatchDuplicates(count int) {
+	if s == nil || count <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.batchDuplicatesFiltered += uint64(count)
+}
+
+func (s *consumeStatusState) recordBatchFallback() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.batchFallbacks++
+}
+
+func (s *consumeStatusState) recordMessageConflict() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.messageConflicts++
 }
 
 func (s *consumeStatusState) setRetrying(retrying bool) {
@@ -284,6 +326,7 @@ func (j consumeDeliveryJob) persist(ctx context.Context, write func(context.Cont
 		j.status.recordError(err, now)
 		switch classifyPersistError(err) {
 		case persistErrorConflict:
+			j.status.recordMessageConflict()
 			log.Printf("dead-letter %s: %v", j.label, err)
 			return j.deadLetter(ctx, dlqConflictReason(err), err, attempts, firstFailedAt)
 		case persistErrorTransient:

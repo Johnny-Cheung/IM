@@ -899,28 +899,57 @@ func (s *Store) PersistGroupMessage(ctx context.Context, message GroupMessage) (
 }
 
 // PersistGroupMessages inserts a batch of accepted group messages in one
-// transaction. Like PersistMessages, it is only a fast path: any duplicate,
-// conflict or validation failure rolls the batch back and asks the caller to
-// use PersistGroupMessage for individual classification.
-func (s *Store) PersistGroupMessages(ctx context.Context, messages []GroupMessage) error {
+// transaction. Exact redeliveries are filtered out before the insert and
+// counted in the result. Any other duplicate, conflict or validation failure
+// still rolls the whole batch back and asks the caller to use
+// PersistGroupMessage for individual classification.
+func (s *Store) PersistGroupMessages(
+	ctx context.Context,
+	messages []GroupMessage,
+) (BatchPersistResult, error) {
 	if len(messages) == 0 {
-		return nil
+		return BatchPersistResult{}, nil
 	}
 	for _, message := range messages {
 		if message.ID == 0 || message.ID > MaxSafeMessageID {
-			return ErrBatchFallback
+			return BatchPersistResult{}, ErrBatchFallback
 		}
 		if message.Seq == 0 || message.Seq > MaxSafeSeq {
-			return ErrBatchFallback
+			return BatchPersistResult{}, ErrBatchFallback
 		}
+	}
+
+	unique, duplicates, err := dedupeGroupMessages(messages)
+	if err != nil {
+		return BatchPersistResult{}, err
+	}
+	existing, err := s.existingGroupMessages(ctx, unique)
+	if err != nil {
+		return BatchPersistResult{}, err
+	}
+	fresh := make([]GroupMessage, 0, len(unique))
+	for _, message := range unique {
+		previous, ok := existing[message.ID]
+		if !ok {
+			fresh = append(fresh, message)
+			continue
+		}
+		if !sameGroupMessage(previous, message) {
+			return BatchPersistResult{}, ErrBatchFallback
+		}
+		duplicates++
+	}
+	result := BatchPersistResult{Inserted: len(fresh), Duplicates: duplicates}
+	if len(fresh) == 0 {
+		return result, nil
 	}
 
 	var query strings.Builder
 	query.WriteString(`INSERT INTO group_messages
 		   (server_message_id, seq, group_id, sender_id, client_message_id, body, created_at)
 		 VALUES `)
-	args := make([]interface{}, 0, len(messages)*7)
-	for index, message := range messages {
+	args := make([]interface{}, 0, len(fresh)*7)
+	for index, message := range fresh {
 		if index > 0 {
 			query.WriteString(", ")
 		}
@@ -939,25 +968,104 @@ func (s *Store) PersistGroupMessages(ctx context.Context, messages []GroupMessag
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin persist group message batch transaction: %w", err)
+		return BatchPersistResult{}, fmt.Errorf("begin persist group message batch transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	result, err := tx.ExecContext(ctx, query.String(), args...)
+	inserted, err := tx.ExecContext(ctx, query.String(), args...)
 	if err != nil {
-		return fmt.Errorf("persist group message batch: %w", err)
+		return BatchPersistResult{}, fmt.Errorf("persist group message batch: %w", err)
 	}
-	rows, err := result.RowsAffected()
+	rows, err := inserted.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("read persist group message batch result: %w", err)
+		return BatchPersistResult{}, fmt.Errorf("read persist group message batch result: %w", err)
 	}
-	if rows != int64(len(messages)) {
-		return ErrBatchFallback
+	if rows != int64(len(fresh)) {
+		return BatchPersistResult{}, ErrBatchFallback
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit persisted group message batch: %w", err)
+		return BatchPersistResult{}, fmt.Errorf("commit persisted group message batch: %w", err)
 	}
-	return nil
+	return result, nil
+}
+
+// dedupeGroupMessages collapses duplicate server IDs inside one relay batch.
+// An exact duplicate is counted; the same ID with different content is left
+// for the per-message conflict classifier.
+func dedupeGroupMessages(messages []GroupMessage) ([]GroupMessage, int, error) {
+	seen := make(map[uint64]GroupMessage, len(messages))
+	unique := make([]GroupMessage, 0, len(messages))
+	duplicates := 0
+	for _, message := range messages {
+		if previous, ok := seen[message.ID]; ok {
+			if !sameGroupMessage(previous, message) {
+				return nil, 0, ErrBatchFallback
+			}
+			duplicates++
+			continue
+		}
+		seen[message.ID] = message
+		unique = append(unique, message)
+	}
+	return unique, duplicates, nil
+}
+
+// existingGroupMessages loads rows that already own one of the batch server
+// IDs. The caller compares full content so an exact redelivery can be dropped
+// while a real conflict still falls back to the per-message path.
+func (s *Store) existingGroupMessages(
+	ctx context.Context,
+	messages []GroupMessage,
+) (map[uint64]GroupMessage, error) {
+	if len(messages) == 0 {
+		return map[uint64]GroupMessage{}, nil
+	}
+	ids := make([]uint64, 0, len(messages))
+	seen := make(map[uint64]struct{}, len(messages))
+	for _, message := range messages {
+		if _, ok := seen[message.ID]; ok {
+			continue
+		}
+		seen[message.ID] = struct{}{}
+		ids = append(ids, message.ID)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]interface{}, len(ids))
+	for index, id := range ids {
+		args[index] = id
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT server_message_id, COALESCE(seq, 0), group_id, sender_id,
+		        client_message_id, body, created_at
+		 FROM group_messages
+		 WHERE server_message_id IN (`+placeholders+`)`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load existing group message batch: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	existing := make(map[uint64]GroupMessage, len(ids))
+	for rows.Next() {
+		var message GroupMessage
+		if err := rows.Scan(
+			&message.ID,
+			&message.Seq,
+			&message.GroupID,
+			&message.SenderID,
+			&message.ClientMessageID,
+			&message.Body,
+			&message.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan existing group message batch: %w", err)
+		}
+		existing[message.ID] = message
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate existing group message batch: %w", err)
+	}
+	return existing, nil
 }
 
 func sameGroupMessage(left, right GroupMessage) bool {

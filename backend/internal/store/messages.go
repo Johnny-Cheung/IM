@@ -25,9 +25,9 @@ var (
 	ErrSeqExhausted       = errors.New("message seq exhausted")
 	ErrSeqInvalid         = errors.New("message seq invalid")
 	// ErrBatchFallback tells the consumer that the fast multi-row insert could
-	// not prove every row was newly inserted. The caller must retry the batch
-	// through the per-message path, where the three idempotency keys are
-	// classified individually.
+	// not prove every remaining row was newly inserted. Exact redeliveries are
+	// filtered first; the caller retries the batch through the per-message path
+	// so the three idempotency keys are still classified individually.
 	ErrBatchFallback = errors.New("message batch requires individual persistence")
 )
 
@@ -42,6 +42,13 @@ type Message struct {
 	ClientMessageID string
 	Body            string
 	CreatedAt       time.Time
+}
+
+// BatchPersistResult reports how a batch fast path separated messages that
+// were actually inserted from exact redeliveries that already existed.
+type BatchPersistResult struct {
+	Inserted   int
+	Duplicates int
 }
 
 // MessagePage is one page of history, ordered oldest to newest.
@@ -670,22 +677,49 @@ func (s *Store) PersistMessage(ctx context.Context, message Message) (bool, erro
 }
 
 // PersistMessages inserts a batch of accepted messages in one transaction.
-//
-// It is deliberately a fast path only: if any row is not proven newly inserted
-// (RowsAffected != len(messages)), it rolls the whole batch back and returns
-// ErrBatchFallback. The caller then uses PersistMessage for each item, which
-// retains the existing server-id/client-id/conversation-seq conflict rules.
-func (s *Store) PersistMessages(ctx context.Context, messages []Message) error {
+// Exact redeliveries are filtered out before the insert and counted in the
+// result. Any other duplicate, conflict or validation failure still rolls the
+// whole batch back and returns ErrBatchFallback, so the caller can use
+// PersistMessage for individual classification.
+func (s *Store) PersistMessages(
+	ctx context.Context,
+	messages []Message,
+) (BatchPersistResult, error) {
 	if len(messages) == 0 {
-		return nil
+		return BatchPersistResult{}, nil
 	}
 	for _, message := range messages {
 		if message.ID == 0 || message.ID > MaxSafeMessageID {
-			return ErrBatchFallback
+			return BatchPersistResult{}, ErrBatchFallback
 		}
 		if message.Seq == 0 || message.Seq > MaxSafeSeq {
-			return ErrBatchFallback
+			return BatchPersistResult{}, ErrBatchFallback
 		}
+	}
+
+	unique, duplicates, err := dedupeMessages(messages)
+	if err != nil {
+		return BatchPersistResult{}, err
+	}
+	existing, err := s.existingMessages(ctx, unique)
+	if err != nil {
+		return BatchPersistResult{}, err
+	}
+	fresh := make([]Message, 0, len(unique))
+	for _, message := range unique {
+		previous, ok := existing[message.ID]
+		if !ok {
+			fresh = append(fresh, message)
+			continue
+		}
+		if !sameMessage(previous, message) {
+			return BatchPersistResult{}, ErrBatchFallback
+		}
+		duplicates++
+	}
+	result := BatchPersistResult{Inserted: len(fresh), Duplicates: duplicates}
+	if len(fresh) == 0 {
+		return result, nil
 	}
 
 	var query strings.Builder
@@ -693,8 +727,8 @@ func (s *Store) PersistMessages(ctx context.Context, messages []Message) error {
 		   (server_message_id, conversation_low_id, conversation_high_id, seq,
 		    sender_id, recipient_id, client_message_id, body, created_at)
 		 VALUES `)
-	args := make([]interface{}, 0, len(messages)*9)
-	for index, message := range messages {
+	args := make([]interface{}, 0, len(fresh)*9)
+	for index, message := range fresh {
 		if index > 0 {
 			query.WriteString(", ")
 		}
@@ -716,25 +750,104 @@ func (s *Store) PersistMessages(ctx context.Context, messages []Message) error {
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin persist message batch transaction: %w", err)
+		return BatchPersistResult{}, fmt.Errorf("begin persist message batch transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	result, err := tx.ExecContext(ctx, query.String(), args...)
+	inserted, err := tx.ExecContext(ctx, query.String(), args...)
 	if err != nil {
-		return fmt.Errorf("persist message batch: %w", err)
+		return BatchPersistResult{}, fmt.Errorf("persist message batch: %w", err)
 	}
-	rows, err := result.RowsAffected()
+	rows, err := inserted.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("read persist message batch result: %w", err)
+		return BatchPersistResult{}, fmt.Errorf("read persist message batch result: %w", err)
 	}
-	if rows != int64(len(messages)) {
-		return ErrBatchFallback
+	if rows != int64(len(fresh)) {
+		return BatchPersistResult{}, ErrBatchFallback
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit persisted message batch: %w", err)
+		return BatchPersistResult{}, fmt.Errorf("commit persisted message batch: %w", err)
 	}
-	return nil
+	return result, nil
+}
+
+// dedupeMessages collapses duplicate server IDs inside one relay batch. An
+// exact duplicate is counted; the same ID with different content is left for
+// the per-message conflict classifier.
+func dedupeMessages(messages []Message) ([]Message, int, error) {
+	seen := make(map[uint64]Message, len(messages))
+	unique := make([]Message, 0, len(messages))
+	duplicates := 0
+	for _, message := range messages {
+		if previous, ok := seen[message.ID]; ok {
+			if !sameMessage(previous, message) {
+				return nil, 0, ErrBatchFallback
+			}
+			duplicates++
+			continue
+		}
+		seen[message.ID] = message
+		unique = append(unique, message)
+	}
+	return unique, duplicates, nil
+}
+
+// existingMessages loads rows that already own one of the batch server IDs.
+// The caller compares full content so an exact redelivery can be dropped while
+// a real conflict still falls back to the per-message path.
+func (s *Store) existingMessages(
+	ctx context.Context,
+	messages []Message,
+) (map[uint64]Message, error) {
+	if len(messages) == 0 {
+		return map[uint64]Message{}, nil
+	}
+	ids := make([]uint64, 0, len(messages))
+	seen := make(map[uint64]struct{}, len(messages))
+	for _, message := range messages {
+		if _, ok := seen[message.ID]; ok {
+			continue
+		}
+		seen[message.ID] = struct{}{}
+		ids = append(ids, message.ID)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]interface{}, len(ids))
+	for index, id := range ids {
+		args[index] = id
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT server_message_id, COALESCE(seq, 0), sender_id, recipient_id,
+		        client_message_id, body, created_at
+		 FROM messages
+		 WHERE server_message_id IN (`+placeholders+`)`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load existing message batch: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	existing := make(map[uint64]Message, len(ids))
+	for rows.Next() {
+		var message Message
+		if err := rows.Scan(
+			&message.ID,
+			&message.Seq,
+			&message.SenderID,
+			&message.RecipientID,
+			&message.ClientMessageID,
+			&message.Body,
+			&message.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan existing message batch: %w", err)
+		}
+		existing[message.ID] = message
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate existing message batch: %w", err)
+	}
+	return existing, nil
 }
 
 func sameMessage(left, right Message) bool {

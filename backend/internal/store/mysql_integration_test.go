@@ -324,31 +324,37 @@ func TestMySQLReconcileIntegration(t *testing.T) {
 				ClientMessageID: "batch-direct-2", Body: "batch two", CreatedAt: seed.createdAt,
 			},
 		}
-		if err := st.PersistMessages(context.Background(), messages); err != nil {
+		if result, err := st.PersistMessages(context.Background(), messages); err != nil {
 			t.Fatalf("PersistMessages() error = %v", err)
+		} else if result.Inserted != 2 || result.Duplicates != 0 {
+			t.Fatalf("PersistMessages() result = %#v, want inserted 2 duplicates 0", result)
 		}
 		for _, message := range messages {
 			assertStoredMessage(t, st, message)
 		}
-		if err := st.PersistMessages(context.Background(), messages); !errors.Is(err, ErrBatchFallback) {
-			t.Fatalf("duplicate PersistMessages() error = %v, want ErrBatchFallback", err)
+		if result, err := st.PersistMessages(context.Background(), messages); err != nil {
+			t.Fatalf("duplicate PersistMessages() error = %v", err)
+		} else if result.Inserted != 0 || result.Duplicates != 2 {
+			t.Fatalf("duplicate PersistMessages() result = %#v, want inserted 0 duplicates 2", result)
 		}
 
 		partial := Message{
 			ID: 900103, Seq: 602, SenderID: 2, RecipientID: 5,
 			ClientMessageID: "batch-direct-3", Body: "batch three", CreatedAt: seed.createdAt,
 		}
-		if err := st.PersistMessages(
+		if result, err := st.PersistMessages(
 			context.Background(), []Message{partial, messages[0]},
-		); !errors.Is(err, ErrBatchFallback) {
-			t.Fatalf("mixed PersistMessages() error = %v, want ErrBatchFallback", err)
+		); err != nil {
+			t.Fatalf("mixed PersistMessages() error = %v", err)
+		} else if result.Inserted != 1 || result.Duplicates != 1 {
+			t.Fatalf("mixed PersistMessages() result = %#v, want inserted 1 duplicates 1", result)
 		}
 		created, err := st.PersistMessage(context.Background(), partial)
 		if err != nil {
-			t.Fatalf("PersistMessage() after batch rollback error = %v", err)
+			t.Fatalf("PersistMessage() after mixed batch error = %v", err)
 		}
-		if !created {
-			t.Fatal("PersistMessage() after batch rollback created = false; batch left a partial row")
+		if created {
+			t.Fatal("PersistMessage() after mixed batch created = true; batch did not persist the new row")
 		}
 	})
 
@@ -363,31 +369,37 @@ func TestMySQLReconcileIntegration(t *testing.T) {
 				ClientMessageID: "batch-group-2", Body: "batch group two", CreatedAt: seed.createdAt,
 			},
 		}
-		if err := st.PersistGroupMessages(context.Background(), messages); err != nil {
+		if result, err := st.PersistGroupMessages(context.Background(), messages); err != nil {
 			t.Fatalf("PersistGroupMessages() error = %v", err)
+		} else if result.Inserted != 2 || result.Duplicates != 0 {
+			t.Fatalf("PersistGroupMessages() result = %#v, want inserted 2 duplicates 0", result)
 		}
 		for _, message := range messages {
 			assertStoredGroupMessage(t, st, message)
 		}
-		if err := st.PersistGroupMessages(context.Background(), messages); !errors.Is(err, ErrBatchFallback) {
-			t.Fatalf("duplicate PersistGroupMessages() error = %v, want ErrBatchFallback", err)
+		if result, err := st.PersistGroupMessages(context.Background(), messages); err != nil {
+			t.Fatalf("duplicate PersistGroupMessages() error = %v", err)
+		} else if result.Inserted != 0 || result.Duplicates != 2 {
+			t.Fatalf("duplicate PersistGroupMessages() result = %#v, want inserted 0 duplicates 2", result)
 		}
 
 		partial := GroupMessage{
 			ID: 900106, Seq: 602, GroupID: 4, SenderID: 1,
 			ClientMessageID: "batch-group-3", Body: "batch group three", CreatedAt: seed.createdAt,
 		}
-		if err := st.PersistGroupMessages(
+		if result, err := st.PersistGroupMessages(
 			context.Background(), []GroupMessage{partial, messages[0]},
-		); !errors.Is(err, ErrBatchFallback) {
-			t.Fatalf("mixed PersistGroupMessages() error = %v, want ErrBatchFallback", err)
+		); err != nil {
+			t.Fatalf("mixed PersistGroupMessages() error = %v", err)
+		} else if result.Inserted != 1 || result.Duplicates != 1 {
+			t.Fatalf("mixed PersistGroupMessages() result = %#v, want inserted 1 duplicates 1", result)
 		}
 		created, err := st.PersistGroupMessage(context.Background(), partial)
 		if err != nil {
-			t.Fatalf("PersistGroupMessage() after batch rollback error = %v", err)
+			t.Fatalf("PersistGroupMessage() after mixed batch error = %v", err)
 		}
-		if !created {
-			t.Fatal("PersistGroupMessage() after batch rollback created = false; batch left a partial row")
+		if created {
+			t.Fatal("PersistGroupMessage() after mixed batch created = true; batch did not persist the new row")
 		}
 	})
 }

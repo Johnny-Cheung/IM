@@ -95,24 +95,28 @@ func (p *consumeFakeMessagePersister) PersistMessage(context.Context, store.Mess
 // interfaces so fallback tests can observe which path was used.
 type consumeFakeBatchMessagePersister struct {
 	consumeFakeMessagePersister
-	batchCalls [][]store.Message
-	batchFail  func(call int) error
-	onBatch    func()
+	batchCalls  [][]store.Message
+	batchFail   func(call int) error
+	onBatch     func()
+	batchResult *store.BatchPersistResult
 }
 
 func (p *consumeFakeBatchMessagePersister) PersistMessages(
 	_ context.Context, messages []store.Message,
-) error {
+) (store.BatchPersistResult, error) {
 	p.batchCalls = append(p.batchCalls, append([]store.Message(nil), messages...))
 	if p.onBatch != nil {
 		p.onBatch()
 	}
 	if p.batchFail != nil {
 		if err := p.batchFail(len(p.batchCalls)); err != nil {
-			return err
+			return store.BatchPersistResult{}, err
 		}
 	}
-	return nil
+	if p.batchResult != nil {
+		return *p.batchResult, nil
+	}
+	return store.BatchPersistResult{Inserted: len(messages)}, nil
 }
 
 // consumeMessagePersisterFunc lets a test observe consumer state from inside a
@@ -172,24 +176,28 @@ func (p *consumeFakeGroupPersister) PersistGroupMessage(context.Context, store.G
 
 type consumeFakeBatchGroupPersister struct {
 	consumeFakeGroupPersister
-	batchCalls [][]store.GroupMessage
-	batchFail  func(call int) error
-	onBatch    func()
+	batchCalls  [][]store.GroupMessage
+	batchFail   func(call int) error
+	onBatch     func()
+	batchResult *store.BatchPersistResult
 }
 
 func (p *consumeFakeBatchGroupPersister) PersistGroupMessages(
 	_ context.Context, messages []store.GroupMessage,
-) error {
+) (store.BatchPersistResult, error) {
 	p.batchCalls = append(p.batchCalls, append([]store.GroupMessage(nil), messages...))
 	if p.onBatch != nil {
 		p.onBatch()
 	}
 	if p.batchFail != nil {
 		if err := p.batchFail(len(p.batchCalls)); err != nil {
-			return err
+			return store.BatchPersistResult{}, err
 		}
 	}
-	return nil
+	if p.batchResult != nil {
+		return *p.batchResult, nil
+	}
+	return store.BatchPersistResult{Inserted: len(messages)}, nil
 }
 
 // consumeFakeAcknowledger lets tests drive amqp091.Delivery through the real

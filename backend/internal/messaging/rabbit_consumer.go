@@ -27,7 +27,7 @@ type MessagePersister interface {
 // MessageBatchPersister is an optional fast path. A persister that does not
 // implement it keeps using PersistMessage one delivery at a time.
 type MessageBatchPersister interface {
-	PersistMessages(context.Context, []store.Message) error
+	PersistMessages(context.Context, []store.Message) (store.BatchPersistResult, error)
 }
 
 // RabbitMessageConsumer persists RabbitMQ direct-message deliveries.
@@ -373,9 +373,10 @@ func (c *RabbitMessageConsumer) persistBatch(
 		if ctx.Err() != nil {
 			return nil
 		}
-		err := c.batchPersister.PersistMessages(ctx, messages)
+		result, err := c.batchPersister.PersistMessages(ctx, messages)
 		if err == nil {
 			c.status.recordPersistedN(len(messages), retry.now())
+			c.status.recordBatchDuplicates(result.Duplicates)
 			for _, delivery := range deliveries {
 				if err := delivery.Ack(false); err != nil {
 					return fmt.Errorf("ack direct message batch delivery: %w", err)
@@ -389,6 +390,7 @@ func (c *RabbitMessageConsumer) persistBatch(
 		now := retry.now()
 		c.status.recordError(err, now)
 		if errors.Is(err, store.ErrBatchFallback) {
+			c.status.recordBatchFallback()
 			log.Printf("direct message batch requires individual persistence: %v", err)
 			return c.persistIndividually(ctx, deliveries, publisher)
 		}
@@ -401,6 +403,7 @@ func (c *RabbitMessageConsumer) persistBatch(
 				return nil
 			}
 		default:
+			c.status.recordBatchFallback()
 			log.Printf("direct message batch failed; falling back to individual persist: %v", err)
 			return c.persistIndividually(ctx, deliveries, publisher)
 		}

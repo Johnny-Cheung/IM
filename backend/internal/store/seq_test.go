@@ -848,6 +848,10 @@ func TestCreateGroupMembersStartAtSeqZero(t *testing.T) {
 func TestPersistMessagesBatchFastPath(t *testing.T) {
 	now := seqTestTime()
 	store, script := newScriptStore(t,
+		scriptStep{
+			match:   "FROM messages WHERE server_message_id IN",
+			columns: messageColumns(),
+		},
 		scriptStep{match: "INSERT INTO messages", affected: 2},
 	)
 	messages := []Message{
@@ -855,24 +859,144 @@ func TestPersistMessagesBatchFastPath(t *testing.T) {
 		{ID: 102, Seq: 2, SenderID: 2, RecipientID: 3, ClientMessageID: "c2", Body: "two", CreatedAt: now},
 	}
 
-	if err := store.PersistMessages(context.Background(), messages); err != nil {
+	result, err := store.PersistMessages(context.Background(), messages)
+	if err != nil {
 		t.Fatalf("PersistMessages() error = %v", err)
 	}
+	if result.Inserted != 2 || result.Duplicates != 0 {
+		t.Fatalf("PersistMessages() result = %#v, want inserted 2 duplicates 0", result)
+	}
 	script.assertQueryContains(
-		t, 0,
+		t, 1,
 		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		"ON DUPLICATE KEY UPDATE id = id",
 	)
-	script.assertArg(t, 0, 0, int64(101))
-	script.assertArg(t, 0, 1, int64(1))
-	script.assertArg(t, 0, 2, int64(2))
-	script.assertArg(t, 0, 9, int64(102))
+	script.assertArg(t, 1, 0, int64(101))
+	script.assertArg(t, 1, 1, int64(1))
+	script.assertArg(t, 1, 2, int64(2))
+	script.assertArg(t, 1, 9, int64(102))
+	script.assertDone(t)
+}
+
+func TestPersistMessagesBatchFiltersExactDuplicates(t *testing.T) {
+	now := seqTestTime()
+	existing := Message{
+		ID: 121, Seq: 1, SenderID: 1, RecipientID: 2,
+		ClientMessageID: "c1", Body: "one", CreatedAt: now,
+	}
+	fresh := Message{
+		ID: 122, Seq: 2, SenderID: 2, RecipientID: 3,
+		ClientMessageID: "c2", Body: "two", CreatedAt: now,
+	}
+	store, script := newScriptStore(t,
+		scriptStep{
+			match:   "FROM messages WHERE server_message_id IN",
+			columns: messageColumns(),
+			rows: [][]driver.Value{{
+				int64(existing.ID), int64(existing.Seq),
+				int64(existing.SenderID), int64(existing.RecipientID),
+				existing.ClientMessageID, existing.Body, existing.CreatedAt,
+			}},
+		},
+		scriptStep{match: "INSERT INTO messages", affected: 1},
+	)
+
+	result, err := store.PersistMessages(context.Background(), []Message{existing, fresh})
+	if err != nil {
+		t.Fatalf("PersistMessages() error = %v", err)
+	}
+	if result.Inserted != 1 || result.Duplicates != 1 {
+		t.Fatalf("PersistMessages() result = %#v, want inserted 1 duplicates 1", result)
+	}
+	script.assertQueryContains(t, 0, "server_message_id IN (?,?)")
+	script.assertQueryContains(t, 1, "INSERT INTO messages")
+	script.assertArg(t, 1, 0, int64(fresh.ID))
+	script.assertDone(t)
+}
+
+func TestPersistMessagesBatchAllDuplicatesSkipsInsert(t *testing.T) {
+	now := seqTestTime()
+	messages := []Message{
+		{ID: 131, Seq: 1, SenderID: 1, RecipientID: 2, ClientMessageID: "c1", Body: "one", CreatedAt: now},
+		{ID: 132, Seq: 2, SenderID: 1, RecipientID: 2, ClientMessageID: "c2", Body: "two", CreatedAt: now},
+	}
+	store, script := newScriptStore(t, scriptStep{
+		match:   "FROM messages WHERE server_message_id IN",
+		columns: messageColumns(),
+		rows: [][]driver.Value{
+			{int64(131), int64(1), int64(1), int64(2), "c1", "one", now},
+			{int64(132), int64(2), int64(1), int64(2), "c2", "two", now},
+		},
+	})
+
+	result, err := store.PersistMessages(context.Background(), messages)
+	if err != nil {
+		t.Fatalf("PersistMessages() error = %v", err)
+	}
+	if result.Inserted != 0 || result.Duplicates != 2 {
+		t.Fatalf("PersistMessages() result = %#v, want inserted 0 duplicates 2", result)
+	}
+	script.assertDone(t)
+}
+
+func TestPersistMessagesBatchFallsBackOnConflictingContent(t *testing.T) {
+	now := seqTestTime()
+	message := Message{
+		ID: 141, Seq: 1, SenderID: 1, RecipientID: 2,
+		ClientMessageID: "c1", Body: "one", CreatedAt: now,
+	}
+	store, script := newScriptStore(t, scriptStep{
+		match:   "FROM messages WHERE server_message_id IN",
+		columns: messageColumns(),
+		rows: [][]driver.Value{{
+			int64(141), int64(1), int64(1), int64(2),
+			"c1", "different body", now,
+		}},
+	})
+
+	result, err := store.PersistMessages(context.Background(), []Message{message})
+	if !errors.Is(err, ErrBatchFallback) {
+		t.Fatalf("PersistMessages() error = %v, want ErrBatchFallback", err)
+	}
+	if result != (BatchPersistResult{}) {
+		t.Fatalf("PersistMessages() result = %#v, want zero", result)
+	}
+	script.assertDone(t)
+}
+
+func TestPersistMessagesBatchDedupesWithinBatch(t *testing.T) {
+	now := seqTestTime()
+	message := Message{
+		ID: 151, Seq: 1, SenderID: 1, RecipientID: 2,
+		ClientMessageID: "c1", Body: "one", CreatedAt: now,
+	}
+	store, script := newScriptStore(t,
+		scriptStep{
+			match:   "FROM messages WHERE server_message_id IN",
+			columns: messageColumns(),
+		},
+		scriptStep{match: "INSERT INTO messages", affected: 1},
+	)
+
+	result, err := store.PersistMessages(context.Background(), []Message{message, message})
+	if err != nil {
+		t.Fatalf("PersistMessages() error = %v", err)
+	}
+	if result.Inserted != 1 || result.Duplicates != 1 {
+		t.Fatalf("PersistMessages() result = %#v, want inserted 1 duplicates 1", result)
+	}
+	script.assertQueryContains(t, 0, "server_message_id IN (?)")
+	script.assertArg(t, 1, 0, int64(message.ID))
 	script.assertDone(t)
 }
 
 func TestPersistMessagesBatchFallsBackOnDuplicate(t *testing.T) {
 	now := seqTestTime()
 	store, script := newScriptStore(t,
+		scriptStep{
+			match:   "FROM messages WHERE server_message_id IN",
+			columns: messageColumns(),
+		},
 		scriptStep{match: "INSERT INTO messages", affected: 1},
 	)
 	messages := []Message{
@@ -880,28 +1004,38 @@ func TestPersistMessagesBatchFallsBackOnDuplicate(t *testing.T) {
 		{ID: 112, Seq: 2, SenderID: 1, RecipientID: 2, ClientMessageID: "c2", Body: "two", CreatedAt: now},
 	}
 
-	err := store.PersistMessages(context.Background(), messages)
+	result, err := store.PersistMessages(context.Background(), messages)
 	if !errors.Is(err, ErrBatchFallback) {
 		t.Fatalf("PersistMessages() error = %v, want ErrBatchFallback", err)
+	}
+	if result != (BatchPersistResult{}) {
+		t.Fatalf("PersistMessages() result = %#v, want zero", result)
 	}
 	script.assertDone(t)
 }
 
 func TestPersistMessagesBatchRejectsInvalidItemWithoutSQL(t *testing.T) {
 	store, script := newScriptStore(t)
-	err := store.PersistMessages(context.Background(), []Message{
+	result, err := store.PersistMessages(context.Background(), []Message{
 		{ID: 0, Seq: 1, SenderID: 1, RecipientID: 2, ClientMessageID: "c1"},
 	})
 	if !errors.Is(err, ErrBatchFallback) {
 		t.Fatalf("PersistMessages() error = %v, want ErrBatchFallback", err)
+	}
+	if result != (BatchPersistResult{}) {
+		t.Fatalf("PersistMessages() result = %#v, want zero", result)
 	}
 	script.assertDone(t)
 }
 
 func TestPersistMessagesBatchEmptyIsNoop(t *testing.T) {
 	store, script := newScriptStore(t)
-	if err := store.PersistMessages(context.Background(), nil); err != nil {
+	result, err := store.PersistMessages(context.Background(), nil)
+	if err != nil {
 		t.Fatalf("PersistMessages(nil) error = %v", err)
+	}
+	if result != (BatchPersistResult{}) {
+		t.Fatalf("PersistMessages(nil) result = %#v, want zero", result)
 	}
 	script.assertDone(t)
 }
@@ -909,6 +1043,13 @@ func TestPersistMessagesBatchEmptyIsNoop(t *testing.T) {
 func TestPersistGroupMessagesBatchFastPath(t *testing.T) {
 	now := seqTestTime()
 	store, script := newScriptStore(t,
+		scriptStep{
+			match: "FROM group_messages WHERE server_message_id IN",
+			columns: []string{
+				"server_message_id", "seq", "group_id", "sender_id",
+				"client_message_id", "body", "created_at",
+			},
+		},
 		scriptStep{match: "INSERT INTO group_messages", affected: 2},
 	)
 	messages := []GroupMessage{
@@ -916,23 +1057,101 @@ func TestPersistGroupMessagesBatchFastPath(t *testing.T) {
 		{ID: 202, Seq: 2, GroupID: 7, SenderID: 2, ClientMessageID: "g2", Body: "two", CreatedAt: now},
 	}
 
-	if err := store.PersistGroupMessages(context.Background(), messages); err != nil {
+	result, err := store.PersistGroupMessages(context.Background(), messages)
+	if err != nil {
 		t.Fatalf("PersistGroupMessages() error = %v", err)
 	}
+	if result.Inserted != 2 || result.Duplicates != 0 {
+		t.Fatalf("PersistGroupMessages() result = %#v, want inserted 2 duplicates 0", result)
+	}
 	script.assertQueryContains(
-		t, 0,
+		t, 1,
 		"VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?)",
 		"ON DUPLICATE KEY UPDATE id = id",
 	)
-	script.assertQueryContains(t, 0, "server_message_id", "seq", "group_id", "sender_id")
-	script.assertArg(t, 0, 0, int64(201))
-	script.assertArg(t, 0, 7, int64(202))
+	script.assertQueryContains(t, 1, "server_message_id", "seq", "group_id", "sender_id")
+	script.assertArg(t, 1, 0, int64(201))
+	script.assertArg(t, 1, 7, int64(202))
+	script.assertDone(t)
+}
+
+func TestPersistGroupMessagesBatchFiltersExactDuplicates(t *testing.T) {
+	now := seqTestTime()
+	existing := GroupMessage{
+		ID: 221, Seq: 1, GroupID: 7, SenderID: 1,
+		ClientMessageID: "g1", Body: "one", CreatedAt: now,
+	}
+	fresh := GroupMessage{
+		ID: 222, Seq: 2, GroupID: 7, SenderID: 2,
+		ClientMessageID: "g2", Body: "two", CreatedAt: now,
+	}
+	store, script := newScriptStore(t,
+		scriptStep{
+			match: "FROM group_messages WHERE server_message_id IN",
+			columns: []string{
+				"server_message_id", "seq", "group_id", "sender_id",
+				"client_message_id", "body", "created_at",
+			},
+			rows: [][]driver.Value{{
+				int64(existing.ID), int64(existing.Seq), int64(existing.GroupID),
+				int64(existing.SenderID), existing.ClientMessageID,
+				existing.Body, existing.CreatedAt,
+			}},
+		},
+		scriptStep{match: "INSERT INTO group_messages", affected: 1},
+	)
+
+	result, err := store.PersistGroupMessages(context.Background(), []GroupMessage{existing, fresh})
+	if err != nil {
+		t.Fatalf("PersistGroupMessages() error = %v", err)
+	}
+	if result.Inserted != 1 || result.Duplicates != 1 {
+		t.Fatalf("PersistGroupMessages() result = %#v, want inserted 1 duplicates 1", result)
+	}
+	script.assertQueryContains(t, 0, "server_message_id IN (?,?)")
+	script.assertQueryContains(t, 1, "INSERT INTO group_messages")
+	script.assertArg(t, 1, 0, int64(fresh.ID))
+	script.assertDone(t)
+}
+
+func TestPersistGroupMessagesBatchFallsBackOnConflictingContent(t *testing.T) {
+	now := seqTestTime()
+	message := GroupMessage{
+		ID: 231, Seq: 1, GroupID: 7, SenderID: 1,
+		ClientMessageID: "g1", Body: "one", CreatedAt: now,
+	}
+	store, script := newScriptStore(t, scriptStep{
+		match: "FROM group_messages WHERE server_message_id IN",
+		columns: []string{
+			"server_message_id", "seq", "group_id", "sender_id",
+			"client_message_id", "body", "created_at",
+		},
+		rows: [][]driver.Value{{
+			int64(231), int64(1), int64(7), int64(1),
+			"g1", "different body", now,
+		}},
+	})
+
+	result, err := store.PersistGroupMessages(context.Background(), []GroupMessage{message})
+	if !errors.Is(err, ErrBatchFallback) {
+		t.Fatalf("PersistGroupMessages() error = %v, want ErrBatchFallback", err)
+	}
+	if result != (BatchPersistResult{}) {
+		t.Fatalf("PersistGroupMessages() result = %#v, want zero", result)
+	}
 	script.assertDone(t)
 }
 
 func TestPersistGroupMessagesBatchFallsBackOnDuplicate(t *testing.T) {
 	now := seqTestTime()
 	store, script := newScriptStore(t,
+		scriptStep{
+			match: "FROM group_messages WHERE server_message_id IN",
+			columns: []string{
+				"server_message_id", "seq", "group_id", "sender_id",
+				"client_message_id", "body", "created_at",
+			},
+		},
 		scriptStep{match: "INSERT INTO group_messages", affected: 1},
 	)
 	messages := []GroupMessage{
@@ -940,9 +1159,12 @@ func TestPersistGroupMessagesBatchFallsBackOnDuplicate(t *testing.T) {
 		{ID: 212, Seq: 2, GroupID: 7, SenderID: 1, ClientMessageID: "g2", Body: "two", CreatedAt: now},
 	}
 
-	err := store.PersistGroupMessages(context.Background(), messages)
+	result, err := store.PersistGroupMessages(context.Background(), messages)
 	if !errors.Is(err, ErrBatchFallback) {
 		t.Fatalf("PersistGroupMessages() error = %v, want ErrBatchFallback", err)
+	}
+	if result != (BatchPersistResult{}) {
+		t.Fatalf("PersistGroupMessages() result = %#v, want zero", result)
 	}
 	script.assertDone(t)
 }

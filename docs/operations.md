@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、审查修复和 8199 隔离验证；v1.8.3 Redis 重建与双向一致性检查已完成开发、审查修复和 8199 隔离验证；v2.0 朋友圈（文字版）已完成开发、审查修复和 8199 隔离验证。四者同样暂不切换 8198。v1.9 的 relay 流水线投递、consumer 单 worker 批量落库、发送路径 session/用户缓存和客户端已读游标已完成代码与单元测试，尚未在真实 MySQL/RabbitMQ 环境压测或部署。v1.10 代码与单元测试完成（删除 `dm:feed`/`index:epoch`，直聊和群聊改为按会话懒加载），待 8199 隔离验证。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、审查修复和 8199 隔离验证；v1.8.3 Redis 重建与双向一致性检查已完成开发、审查修复和 8199 隔离验证；v2.0 朋友圈（文字版）已完成开发、审查修复和 8199 隔离验证。四者同样暂不切换 8198。v1.9 的 relay 流水线投递、consumer 单 worker 批量落库、发送路径 session/用户缓存和客户端已读游标已完成代码与单元测试，并于 2026-11-02 在 Ubuntu 环境完成 direct 链路真实压测；压测发现的 consumer 批量回落已完成代码与单测修复，待重复投递 soak，尚未部署。v1.10 代码与单元测试完成（删除 `dm:feed`/`index:epoch`，直聊和群聊改为按会话懒加载），待 8199 隔离验证。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -47,7 +47,7 @@ sha256sum -c SHA256SUMS         # Linux
 | --- | --- |
 | `/health` | HTTP 进程可响应即返回 200；不检查 MySQL。 |
 | `/ready` | 2 秒内成功 ping MySQL 时返回 200（`database=ok`）；否则返回 503（`database=unavailable`）。它仍然只检查 MySQL，不反映消息号闸门。 |
-| `/ops/infra` | 基础设施连通性、`seq` 就绪/校准状态。v1.8.2 启用消息链路时增加 `pipeline`：Stream 长度、pending、最老条目年龄、积压告警、死信数、relay/consumer 错误及对账结果。v1.8.3 起对账还包含 `redis_missing`、`redis_repaired`、`watermarks_raised`、`needs_rebuild`、`last_deep_audit_at`、`deep_audit_error`；consumer 增加 `in_flight`。v1.9 起 consumer 使用 `Qos(100)` 批量落库，`in_flight` 可能覆盖一批最多 100 条未确认消息。v1.10 起删除 feed 审计，`feed_repairs` 字段不再返回。返回最近采样，不在请求中连接基础设施。 |
+| `/ops/infra` | 基础设施连通性、`seq` 就绪/校准状态。v1.8.2 启用消息链路时增加 `pipeline`：Stream 长度、pending、最老条目年龄、积压告警、死信数、relay/consumer 错误及对账结果。v1.8.3 起对账还包含 `redis_missing`、`redis_repaired`、`watermarks_raised`、`needs_rebuild`、`last_deep_audit_at`、`deep_audit_error`；consumer 增加 `in_flight`。v1.9 起 consumer 使用 `Qos(100)` 批量落库，`in_flight` 可能覆盖一批最多 100 条未确认消息；批量路径按 `server_message_id` 预查剔除完全相同的重投，并增加 `batch_duplicates_filtered`、`batch_fallbacks`、`message_conflicts` 指标。v1.10 起删除 feed 审计，`feed_repairs` 字段不再返回。返回最近采样，不在请求中连接基础设施。 |
 
 ```bash
 /opt/IM-Rebuild/imctl health
@@ -145,7 +145,7 @@ grep -q 'backfill-group-read' "$PRE" \
 本块只执行一次。副本已存在时不会覆盖；`imctl.pre-v1.8.1` 必须是旧脚本，新脚本没有 `backfill-read`/`backfill-group-read`。
 
 - `imctl queue-status` 读取正式 vhost 的 `im.v12.messages.persist` 和 `im.v12.group.messages.persist`，`ready` 与 `unacknowledged` 都为 0 才算排空；`--verify` 形式检查验证 vhost `im_v13_verify`，不会碰正式队列。
-- v1.9 起 consumer 使用 `Qos(100)` 和单 worker 批量落库；正常消费时 `unacknowledged` 可能短暂非 0，排空判据不变，重建前应等待其归零。批量事务提交成功后才 ack，失败批次会回落到逐条幂等路径。
+- v1.9 起 consumer 使用 `Qos(100)` 和单 worker 批量落库；正常消费时 `unacknowledged` 可能短暂非 0，排空判据不变，重建前应等待其归零。批量事务提交成功后才 ack，失败批次会回落到逐条幂等路径。批量路径插入前会按 `server_message_id` 预查并剔除完全相同的重投，减少重复投递触发的整批回落；`batch_fallbacks` 持续增长时仍需排查逐条冲突。
 - v1.9 起发送路径使用进程内 session/用户缓存，稳态消息请求不再查询 MySQL 的 session 和 users。缓存随进程重启清空，首次访问或未命中会回源 MySQL；session 缓存 TTL 5 分钟，用于外部直接改库的撤销兜底。当前只适用于单实例，多实例需改为 Redis 共享缓存。
 - 新 `deploy/imctl` 提供 `backfill-seq` 和 `queue-status`；切换前用 relay 上传并安装为 `/opt/IM-Rebuild/imctl`，旧脚本已复制为 `imctl.pre-v1.8.1`。`imctl` 不在发布包里，也不在 `backup` 中，必须单独保留旧副本。
 - `imctl backup` 只包含 MySQL 和应用文件，不含 Redis。`seq` 计数器、`dm:pair`、`seq:ready` 不备份，靠 `backfill-seq` 从 MySQL 重建。
@@ -444,13 +444,14 @@ curl -fsS http://127.0.0.1:8199/ops/infra   # 检查 seq.ready 与 pipeline.reco
 - 已知限制：AMQP 客户端看不到其他连接的未确认消息，所以命令自身的排空检查只覆盖自己的 consumer；`imctl` 的未确认数预检和“停后端”守卫共同兜住这种情况。
 - 2026-10-29 已在 8199 完成隔离验证（`79b1f67`）：已有数据重建、整体丢失、MySQL 编号空洞、运行期删除实体/索引成员/水位后 5 分钟内自动补回、维护锁门禁和停机守卫均通过；重建后 API smoke 114 项通过；验证库和命名空间已按 manifest 清理，持久化队列与死信队列均已排空。共享容器重启和 broker 级未确认预检未演练。
 
-## v1.9 批量链路与客户端已读游标（开发中）
+## v1.9 批量链路与客户端已读游标（真实压测完成，批量回落修复待回归）
 
-- relay/consumer 批量化、发送路径缓存和客户端已读游标目前只有代码与单元测试/race 检查，尚未在真实 MySQL/RabbitMQ 环境压测或部署到 8198。
+- relay/consumer 批量化、发送路径缓存和客户端已读游标已在 Ubuntu 完成 direct 链路真实压测；压测发现的 consumer 批量回落已完成代码与单测修复（按 `server_message_id` 预查剔除完全相同的重投，其余冲突仍回落逐条），尚未做重复投递注入 soak，也未部署到 8198。
+- consumer 批量路径新增 `/ops/infra` 指标：`batch_duplicates_filtered`、`batch_fallbacks`、`message_conflicts`；正常重投下第一个会增长，后两个应接近 0。
 - 已读协议：`focus` 仍表示“打开会话即推进到最新”；停留前台时客户端把实际渲染到视口内的最大 `seq` 通过 WS `read` 帧上报，目标必须与当前 focus 一致，`last_read_seq=0` 被忽略；服务端复用现有 `AdvanceRead`，clamp 到会话计数器且只增不减。
 - 服务端不再在消息投递后为“聚焦的接收者/群成员”推进水位，只保留发送者自读。客户端在滚动、切换会话、隐藏标签页、卸载和重连时 flush；隐藏时先发 `read` 再发 `blur`。
 - 不新增 Redis 键、HTTP 接口、后台 worker 或队列；已读仍通过 `dm:read:stream`/`group-read:stream` 异步写 MySQL。群聊 `group.read` 广播给除 reader 外的成员，大群回执扇出需要在压测中观察。
-- 验证：`go test ./...`、`go test -race ./internal/httpapi ./internal/messaging`、`go vet ./...`、`npm test`、`npm run typecheck`、`npm run build` 均通过；真实浏览器、relay/consumer 端到端和压测尚未执行。
+- 验证：`go test ./...`、`go test -race ./internal/messaging ./internal/store`、`go vet ./...` 均通过；真实浏览器、重复投递 soak、群聊链路压测尚未执行。
 
 ## v1.10 删除私聊 feed，按会话懒加载（代码与单测完成，待 8199 验证）
 

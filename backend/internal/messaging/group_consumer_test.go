@@ -284,6 +284,42 @@ func TestGroupConsumerBatchPersistsAndAcksAll(t *testing.T) {
 	}
 }
 
+func TestGroupConsumerBatchRecordsFilteredDuplicates(t *testing.T) {
+	deliveries := []consumeDelivery{
+		&consumeFakeDelivery{body: consumeTestGroupBodyWith(4, 1), messageID: "4"},
+		&consumeFakeDelivery{body: consumeTestGroupBodyWith(5, 2), messageID: "5"},
+		&consumeFakeDelivery{body: consumeTestGroupBodyWith(6, 3), messageID: "6"},
+	}
+	persister := &consumeFakeBatchGroupPersister{
+		batchResult: &store.BatchPersistResult{Inserted: 2, Duplicates: 1},
+	}
+	publisher := &consumeFakePublisher{}
+	consumer := &GroupMessageConsumer{
+		persister:      persister,
+		batchPersister: persister,
+		retry:          consumeTestRetryPolicy(&consumeFakeClock{}, consumeTestNow),
+	}
+
+	if err := consumer.handleBatch(context.Background(), deliveries, publisher); err != nil {
+		t.Fatalf("handleBatch() error = %v", err)
+	}
+	if len(persister.batchCalls) != 1 || persister.calls != 0 {
+		t.Fatalf("batch/single calls = %d/%d, want 1/0", len(persister.batchCalls), persister.calls)
+	}
+	for index, delivery := range deliveries {
+		fake := delivery.(*consumeFakeDelivery)
+		if fake.acks != 1 || fake.nacks != 0 {
+			t.Fatalf("delivery %d acks/nacks = %d/%d, want 1/0", index, fake.acks, fake.nacks)
+		}
+	}
+	if status := consumer.Status(); status.Persisted != 3 ||
+		status.BatchDuplicatesFiltered != 1 ||
+		status.BatchFallbacks != 0 ||
+		status.MessageConflicts != 0 {
+		t.Fatalf("status = %#v, want persisted 3/duplicates 1/fallback 0/conflict 0", status)
+	}
+}
+
 func TestGroupConsumerBatchFallsBackAndIsolatesConflict(t *testing.T) {
 	deliveries := []consumeDelivery{
 		&consumeFakeDelivery{body: consumeTestGroupBodyWith(11, 1), messageID: "11"},
@@ -319,8 +355,12 @@ func TestGroupConsumerBatchFallsBackAndIsolatesConflict(t *testing.T) {
 			t.Fatalf("delivery %d acks/nacks = %d/%d, want 1/0", index, fake.acks, fake.nacks)
 		}
 	}
-	if status := consumer.Status(); status.Persisted != 1 || status.DeadLettered != 1 {
-		t.Fatalf("status = %#v, want persisted 1/dead-lettered 1", status)
+	if status := consumer.Status(); status.Persisted != 1 ||
+		status.DeadLettered != 1 ||
+		status.BatchFallbacks != 1 ||
+		status.MessageConflicts != 1 ||
+		status.BatchDuplicatesFiltered != 0 {
+		t.Fatalf("status = %#v, want persisted 1/dead-lettered 1/fallback 1/conflict 1", status)
 	}
 }
 

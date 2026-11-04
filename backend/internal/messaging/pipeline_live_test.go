@@ -178,16 +178,20 @@ func (p *livePersister) PersistGroupMessage(ctx context.Context, message store.G
 	return p.store.PersistGroupMessage(ctx, message)
 }
 
-func (p *livePersister) PersistMessages(ctx context.Context, messages []store.Message) error {
+func (p *livePersister) PersistMessages(
+	ctx context.Context, messages []store.Message,
+) (store.BatchPersistResult, error) {
 	if p.simulating() {
-		return driver.ErrBadConn
+		return store.BatchPersistResult{}, driver.ErrBadConn
 	}
 	return p.store.PersistMessages(ctx, messages)
 }
 
-func (p *livePersister) PersistGroupMessages(ctx context.Context, messages []store.GroupMessage) error {
+func (p *livePersister) PersistGroupMessages(
+	ctx context.Context, messages []store.GroupMessage,
+) (store.BatchPersistResult, error) {
 	if p.simulating() {
-		return driver.ErrBadConn
+		return store.BatchPersistResult{}, driver.ErrBadConn
 	}
 	return p.store.PersistGroupMessages(ctx, messages)
 }

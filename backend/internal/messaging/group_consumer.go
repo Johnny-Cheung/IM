@@ -20,7 +20,7 @@ type GroupMessagePersister interface {
 
 // GroupMessageBatchPersister is an optional fast path for group deliveries.
 type GroupMessageBatchPersister interface {
-	PersistGroupMessages(context.Context, []store.GroupMessage) error
+	PersistGroupMessages(context.Context, []store.GroupMessage) (store.BatchPersistResult, error)
 }
 
 // GroupMessageConsumer persists group RabbitMQ deliveries.
@@ -350,9 +350,10 @@ func (c *GroupMessageConsumer) persistBatch(
 		if ctx.Err() != nil {
 			return nil
 		}
-		err := c.batchPersister.PersistGroupMessages(ctx, messages)
+		result, err := c.batchPersister.PersistGroupMessages(ctx, messages)
 		if err == nil {
 			c.status.recordPersistedN(len(messages), retry.now())
+			c.status.recordBatchDuplicates(result.Duplicates)
 			for _, delivery := range deliveries {
 				if err := delivery.Ack(false); err != nil {
 					return fmt.Errorf("ack group message batch delivery: %w", err)
@@ -366,6 +367,7 @@ func (c *GroupMessageConsumer) persistBatch(
 		now := retry.now()
 		c.status.recordError(err, now)
 		if errors.Is(err, store.ErrBatchFallback) {
+			c.status.recordBatchFallback()
 			log.Printf("group message batch requires individual persistence: %v", err)
 			return c.persistIndividually(ctx, deliveries, publisher)
 		}
@@ -378,6 +380,7 @@ func (c *GroupMessageConsumer) persistBatch(
 				return nil
 			}
 		default:
+			c.status.recordBatchFallback()
 			log.Printf("group message batch failed; falling back to individual persist: %v", err)
 			return c.persistIndividually(ctx, deliveries, publisher)
 		}
