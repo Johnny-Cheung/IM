@@ -225,13 +225,16 @@ async function main() {
   await scenario("cold reload renders the cached conversation with one bootstrap", async () => {
     await tab.select(directSelector("b"), `/chat/${name("b")}`);
     await tab.waitFor(`document.querySelector('#message-list').innerText.includes(${JSON.stringify(fromB)})`);
+    // Message cache writes are intentionally backgrounded; let IndexedDB
+    // settle before reloading so the cold-start assertion is deterministic.
+    await delay(400);
 
     const requests = [];
     const off = tab.on("Network.requestWillBeSent", ({ request }) => {
       try {
         const url = new URL(request.url);
         if (url.origin === run.base && url.pathname.startsWith("/api/")) {
-          requests.push(url.pathname);
+          requests.push(url.pathname + url.search);
         }
       } catch {
         // Ignore non-URL requests.
@@ -258,9 +261,12 @@ async function main() {
       "cold start does not refetch conversations",
       !requests.includes("/api/conversations"),
     );
+    const openRequests = requests.filter((path) =>
+      path.startsWith(`/api/conversations/${name("b")}/messages`));
     run.check(
-      "cold start does not refetch the open conversation",
-      !requests.some((path) => path === `/api/conversations/${name("b")}/messages`),
+      "cold start only catches up the open conversation by cursor",
+      openRequests.length === 1
+        && openRequests[0].endsWith(`?limit=50&after_seq=1`),
     );
     const state = await cacheState(name("a"));
     run.check("cached messages carry conversation seqs", state.withoutSeq.length === 0 && state.messages > 0);

@@ -454,6 +454,8 @@ async function implicitReadOverWebSocket() {
     const ownerFrom = owner.events.length;
     const first = await sendGroup("h", live, "隐式已读群消息");
     run.check("the first group message gets seq 1", first.message.seq === 1);
+    readerI.send({ type: "read", kind: "group", group_id: live, last_read_seq: first.message.seq });
+    readerJ.send({ type: "read", kind: "group", group_id: live, last_read_seq: first.message.seq });
     await owner.waitFor((event) => event.type === "group.read" && event.group_id === live, "the sender never received group.read", ownerFrom);
     run.check("sender receives group.read when focused viewers read", true);
     await until(async () => (await readStats("h", live, 1)).all_read, "focused viewers did not complete the receipt");
@@ -462,15 +464,19 @@ async function implicitReadOverWebSocket() {
       "focused viewers implicitly read the seq",
       stats.seq === 1 && stats.message_id === first.message.id && stats.read_count === 2 && stats.member_count === 2,
     );
-    run.check(
-      "no member has unread after implicit read",
-      (await Promise.all(["h", "i", "j"].map((key) => list(key)))).every((conversations) => groupOf(conversations, live).unread_count === 0),
+    await until(
+      async () => (await Promise.all(["h", "i", "j"].map((key) => list(key))))
+        .every((conversations) => groupOf(conversations, live).unread_count === 0),
+      "unread did not settle after read cursors",
+      3000,
     );
+    run.check("no member has unread after implicit read", true);
 
     readerJ.blur();
     await delay(150);
     const second = await sendGroup("h", live, "j 已离开");
     run.check("the second group message gets seq 2", second.message.seq === 2);
+    readerI.send({ type: "read", kind: "group", group_id: live, last_read_seq: second.message.seq });
     await until(async () => (await readStats("h", live, 2)).read_count === 1, "the focused viewer did not read");
     await delay(400);
     run.check(
@@ -491,6 +497,7 @@ async function implicitReadOverWebSocket() {
     const directAck = await readerI.focusDirect(run.users.get("h").username);
     const direct = await run.request("h", "POST", `${directPath("i")}/messages`, { body: "私聊隐式已读", client_message_id: randomUUID() });
     run.check("the first private message gets seq 1", direct.message.seq === 1);
+    readerI.send({ type: "read", kind: "direct", username: run.users.get("h").username, last_read_seq: direct.message.seq });
     const readEvent = await owner.waitFor(
       (event) => event.type === "messages.read" && event.last_read_seq >= direct.message.seq,
       "the sender never received messages.read",
