@@ -97,6 +97,21 @@ func WithMomentStore(momentStore MomentStore) Option {
 	}
 }
 
+// MomentFriendshipCache is implemented by the optional Redis Moments wrapper.
+// It invalidates materialized feeds after a committed friendship change; plain
+// MySQL stores and test fakes deliberately do not need to implement it.
+type MomentFriendshipCache interface {
+	OnFriendshipChanged(ctx context.Context, userID, friendID uint64)
+}
+
+func (a *API) notifyMomentFriendshipChanged(ctx context.Context, userID, friendID uint64) {
+	cache, ok := a.moments.(MomentFriendshipCache)
+	if !ok {
+		return
+	}
+	cache.OnFriendshipChanged(ctx, userID, friendID)
+}
+
 type momentCommentResponse struct {
 	ID        uint64             `json:"id"`
 	Author    publicUserResponse `json:"author"`

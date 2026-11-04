@@ -1280,6 +1280,10 @@ var rebuildClearPatterns = []string{
 	"friends:*",
 	"dedup:*",
 	"group-dedup:*",
+	// Moments feed/like entries are disposable caches. Clearing them here
+	// makes a messaging rebuild leave no stale viewer feed behind; the next
+	// Moments read warms from MySQL.
+	"moments:*",
 }
 
 // ClearNamespace deletes the known messaging keys of one keyspace in batches.

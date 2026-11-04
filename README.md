@@ -14,11 +14,11 @@
 ![Redis](https://img.shields.io/badge/Redis-7.2-DC382D?style=flat-square&logo=redis&logoColor=DC382D)
 ![RabbitMQ](https://img.shields.io/badge/RabbitMQ-3.13-FF6600?style=flat-square&logo=rabbitmq&logoColor=white)
 ![Web](https://img.shields.io/badge/Platform-Web-0ea5e9?style=flat-square)
-![Version](https://img.shields.io/badge/version-v2.0-6366f1?style=flat-square)
+![Version](https://img.shields.io/badge/version-v2.1-6366f1?style=flat-square)
 
 </div>
 
-> **当前状态**：v2.0 朋友圈（文字版）已完成并在 `8199` 隔离验证；正式 `8198` 仍运行 v1.7。v1.8.1–v1.8.3 与 v2.0 尚未切换正式实例；v1.9 已开始，relay 流水线投递、consumer 批量落库和发送路径 session/用户缓存已完成代码与单测，并在 Ubuntu 完成真实链路压测；压测发现的 consumer 批量回落问题已完成代码与单测修复，待真实链路重复投递 soak。v1.10 代码与单测完成：删除 `dm:feed`/`index:epoch`，直聊和群聊改为按会话懒加载；待 8199 隔离验证。
+> **当前状态**：v2.0 朋友圈（文字版）已完成并在 `8199` 隔离验证；v2.1 朋友圈 Redis 缓存已完成代码与单测，待 8199 隔离验证。正式 `8198` 仍运行 v1.7，v1.8.1–v1.8.3、v2.0 和 v2.1 尚未切换正式实例；v1.9 的 relay 流水线投递、consumer 批量落库和发送路径缓存已完成真实链路压测，consumer 批量回落修复待重复投递 soak；v1.10 删除 `dm:feed`/`index:epoch`、直聊和群聊按会话懒加载，待 8199 验证。
 
 ## 功能
 
@@ -31,7 +31,7 @@ IM 是一个单体 Web IM：React 前端负责界面与本地缓存，Go 后端�
 - **已读**：进入会话时通过 WebSocket `focus` 推进到最新；停留前台时，客户端把实际渲染到视口内的最新消息通过 `read` 帧按约 1 秒节流上报，滚到历史位置时新消息不自动已读；后台页面收到消息不自动已读。群聊返回发送者可见的已读人数，不提供逐条回执或成员名单。完整已读能力需要 Redis 和 RabbitMQ。
 - **Web 缓存与按会话懒加载**：浏览器使用 IndexedDB，按账号隔离；冷启动通过 `POST /api/bootstrap` 拉齐会话列表元数据和好友，打开会话时再按 `last_seq`/`after_seq` 加载该会话的消息；支持离线只读查看已打开过的会话。每个会话保留最近 200 条、全账号最多 10000 条，服务端始终是权威。
 - **可靠投递**：会话内连续 `seq`、Redis Lua 原子接纳、客户端幂等、Stream → RabbitMQ → MySQL 异步幂等落库、relay 流水线确认、consumer 批量落库与完全重复预过滤、发送路径 session/用户缓存、失败重试与死信、Redis/MySQL 双向对账和 Redis 重建。
-- **朋友圈（文字版）**：发布 1–1000 字纯文字动态，选择“好友可见”或“仅自己可见”；按时间倒序分页浏览；点赞/取消点赞；单层评论；删除自己的评论或动态；好友发布非私密动态时导航显示红点。
+- **朋友圈（文字版）**：发布 1–1000 字纯文字动态，选择“好友可见”或“仅自己可见”；按时间倒序分页浏览；点赞/取消点赞；单层评论；删除自己的评论或动态；好友发布非私密动态时导航显示红点。v2.1 起服务端用 Redis 缓存动态 ID 时间线和点赞 Set/计数，低好友数作者写扩散、高好友数作者读时拉取；MySQL 仍是权威，缓存故障自动回退。
 - **响应式 Web**：桌面和手机浏览器共用同一套页面，不提供桌面或移动客户端。
 
 **当前范围之外：** 图片、音视频、文件和头像上传；消息撤回、删除和搜索；拉黑、群主转让；朋友圈图片/相册、隐私名单、评论回复和通知中心；多实例高可用。
@@ -45,7 +45,7 @@ IM 是一个单体 Web IM：React 前端负责界面与本地缓存，Go 后端�
 | 后端 | Go 1.26 · Gin | REST API、鉴权、业务逻辑与静态资源托管 |
 | 实时通信 | Gorilla WebSocket | 消息推送、在线连接、已读游标 |
 | 权威存储 | MySQL 8.4 | 用户、好友、群组、消息、已读水位、朋友圈 |
-| 读模型与接纳 | Redis 7.2 · Lua | 消息实体、会话索引、`seq`、未读/已读、幂等 |
+| 读模型与接纳 | Redis 7.2 · Lua | 消息实体、会话索引、`seq`、未读/已读、幂等；v2.1 朋友圈 feed/点赞缓存 |
 | 异步投递 | RabbitMQ 3.13 | Stream relay、批量确认、持久化队列、批量落库、重试与死信 |
 | 测试 | Go test · Vitest · Node smoke | 单元/集成、前端、API/浏览器/缓存 smoke |
 | 交付 | Linux 发布包 · `imctl`/`infractl` · systemd-run | 构建、部署、备份、重建与回滚 |
@@ -77,7 +77,7 @@ Redis 7.2        Stream → relay →       MySQL 8.4
 
 ### 朋友圈
 
-朋友圈直接读写 MySQL，不经过 Redis、RabbitMQ 或后台 worker。点赞、评论和冗余计数在同一事务内更新；分页使用自增 ID 游标；可见性由服务端校验。好友发布非私密动态时，复用现有 WebSocket 推送 `moment.created`，前端只更新导航红点。
+MySQL 是朋友圈权威数据源，点赞、评论和冗余计数仍在同一事务内更新；分页使用自增 ID 游标，可见性由服务端校验。v2.1 起 Redis 只保存可丢弃的 feed ID 索引和点赞 Set/计数：低好友数作者的动态写入好友 feed，高好友数作者只维护作者时间线并在读取时拉取；缓存未命中、深分页、好友变化或 Redis 故障时回退 MySQL。好友发布非私密动态时仍复用 WebSocket 推送 `moment.created`，前端只更新导航红点。
 
 ### 可靠性
 
@@ -98,6 +98,7 @@ IM/
 │   │   ├── httpapi/             # REST、WebSocket 与业务处理器
 │   │   ├── infra/               # Redis、RabbitMQ 连接（MySQL 由 store 打开）
 │   │   ├── messaging/           # 接纳、读模型、relay、consumer、对账与重建
+│   │   ├── momentcache/         # v2.1 朋友圈 Redis feed/点赞缓存
 │   │   └── store/               # MySQL 模型、查询与内嵌迁移
 │   │       └── migrations/
 │   ├── go.mod
@@ -202,7 +203,7 @@ npm run dev
 当前交付路径是 Linux 发布包，不是容器镜像。在干净的 `main` 工作区执行：
 
 ```bash
-scripts/build-release.sh v2.0 /tmp/im-v2.0
+scripts/build-release.sh v2.1 /tmp/im-v2.1
 ```
 
 产物包含 `bin/im-server`、`web/`、`RELEASE` 和 `SHA256SUMS`。上传到 Linux 机器后，由 `deploy/imctl` 负责启停、健康检查、备份、`backfill-seq`、`rebuild-redis` 和死信操作；基础设施由 `deploy/infractl` 管理。完整步骤、正式/验证实例隔离和回滚规则见 [运行与发布操作](docs/operations.md)。
@@ -237,7 +238,7 @@ docker compose up -d app
 (cd backend && IM_TEST_MYSQL_DSN='<dsn>' go test -race ./internal/store)
 ```
 
-运行实例的 smoke 需要先构建并托管前端。下面的 `8199` 是 v2.0 验证实例；不设置 `BASE_URL` 时 smoke 默认也打 8199，建议仍然显式指定目标地址：
+运行实例的 smoke 需要先构建并托管前端。下面的 `8199` 是当前验证实例；不设置 `BASE_URL` 时 smoke 默认也打 8199，建议仍然显式指定目标地址：
 
 ```bash
 BASE_URL=http://127.0.0.1:8199 node scripts/smoke.mjs
@@ -257,7 +258,8 @@ BASE_URL=http://127.0.0.1:8199 node scripts/cache-smoke.mjs
 | v1.9 | 容量验证与调优；真实链路压测完成，consumer 批量回落已修复（代码与单测），待重复投递 soak（进行中） |
 | v1.10 | 删除私聊 feed/`index:epoch`，直聊和群聊改为按会话懒加载；代码与单测完成，待 8199 隔离验证，未切换正式 `8198` |
 | v2.0 | 朋友圈（文字版）；已完成并在 `8199` 隔离验证；未切换正式 `8198` |
-| v2.1+ | 朋友圈图片/相册、隐私与通知等；方向待讨论 |
+| v2.1 | 朋友圈 Redis 缓存与推拉优化；代码与单测完成，待 8199 隔离验证 |
+| v2.2+ | 朋友圈图片/相册、隐私与通知等；方向待讨论 |
 
 ## 文档
 
@@ -273,6 +275,7 @@ BASE_URL=http://127.0.0.1:8199 node scripts/cache-smoke.mjs
 ### v2.x 社交功能
 
 - [v2.x 总览](docs/versions/v2.md)
+- [v2.1 朋友圈 Redis 缓存与推拉优化](docs/versions/v2.1.md)（代码与单测完成，待 8199 验证）
 - [v2.0 朋友圈（文字版）](docs/versions/v2.0.md)
 
 ### v1.x 可靠性、消息链路与已读
@@ -317,7 +320,7 @@ BASE_URL=http://127.0.0.1:8199 node scripts/cache-smoke.mjs
 - **仅 Web。** 用户通过浏览器访问，不提供需要下载安装的桌面或移动客户端；桌面与手机支持均指响应式网页。
 - **单实例。** 一个后端进程、一台 MySQL、一台 Redis 和一台 RabbitMQ，没有跨实例广播和高可用；整机或磁盘故障只能靠备份和 MySQL 重建恢复。
 - **Redis 不是备份。** Redis 使用 AOF `appendfsync everysec`，整机掉电时最多约 1 秒内已确认的消息可能丢失；Redis 数据不进入备份，丢失后从 MySQL 重建，重建期间发送和已读不可用。
-- **未做容量治理。** 消息和朋友圈没有自动清理或 TTL；v1.9 的 relay/consumer 批量改造与发送路径缓存已完成代码与单测，但真实链路压测、容量结论和最终调优尚未完成。
+- **未做容量治理。** 消息本身没有自动清理或 TTL；v2.1 的 Redis 朋友圈 feed/点赞缓存有 TTL，并可在 `rebuild-redis` 或故障后整体丢弃重载。v1.9 的 relay/consumer 批量改造与发送路径缓存已完成真实压测，但最终容量结论和调优尚未完成。
 - **本地缓存按会话懒加载。** 登录只保证会话列表预览和未读数；未打开过的私聊/群聊不会在本地缓存正文，离线时只能查看打开过的会话。
 - **发送缓存是单实例缓存。** session 和 username 缓存位于进程内，正常登出、改密、顶号会立即失效；重启后首次访问或缓存未命中仍回源 MySQL，外部直接修改 MySQL 的撤销最多有 5 分钟兜底窗口。多实例部署需要改为 Redis 共享缓存。
 - **当前不开放公网。** 现有部署不修改防火墙和 Nginx，也没有设计公网域名、TLS、反向代理和访问控制。

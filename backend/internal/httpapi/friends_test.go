@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -345,4 +346,67 @@ func TestFriendEndpointsRequireSession(t *testing.T) {
 			}
 		})
 	}
+}
+
+type recordingMomentFriendshipCache struct {
+	fakeMomentStore
+	changes [][2]uint64
+}
+
+func (r *recordingMomentFriendshipCache) OnFriendshipChanged(
+	_ context.Context,
+	userID, friendID uint64,
+) {
+	r.changes = append(r.changes, [2]uint64{userID, friendID})
+}
+
+func TestFriendChangesInvalidateMomentCache(t *testing.T) {
+	t.Run("auto accepted request", func(t *testing.T) {
+		dataStore := authenticatedFriendStore()
+		dataStore.user = store.User{ID: 2, Username: "bob", Nickname: "Bob"}
+		dataStore.createFriendResult = store.FriendRequestResult{
+			Accepted: true,
+			Friend:   store.PublicUser{Username: "bob", Nickname: "Bob"},
+		}
+		recorder := &recordingMomentFriendshipCache{}
+		router := testRouter(dataStore, WithMomentStore(recorder))
+		response := doJSON(t, router, http.MethodPost, "/api/friend-requests", map[string]string{
+			"username": "bob",
+		}, authTestCookie())
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+		}
+		if len(recorder.changes) != 1 || recorder.changes[0] != [2]uint64{1, 2} {
+			t.Fatalf("cache invalidations = %#v, want [[1 2]]", recorder.changes)
+		}
+	})
+
+	t.Run("accepted request", func(t *testing.T) {
+		dataStore := authenticatedFriendStore()
+		dataStore.user = store.User{ID: 2, Username: "bob", Nickname: "Bob"}
+		dataStore.acceptFriendResult = store.PublicUser{Username: "bob", Nickname: "Bob"}
+		recorder := &recordingMomentFriendshipCache{}
+		router := testRouter(dataStore, WithMomentStore(recorder))
+		response := doJSON(t, router, http.MethodPost, "/api/friend-requests/5/accept", nil, authTestCookie())
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+		}
+		if len(recorder.changes) != 1 || recorder.changes[0] != [2]uint64{1, 2} {
+			t.Fatalf("cache invalidations = %#v, want [[1 2]]", recorder.changes)
+		}
+	})
+
+	t.Run("deleted friend", func(t *testing.T) {
+		dataStore := authenticatedFriendStore()
+		dataStore.user = store.User{ID: 2, Username: "bob", Nickname: "Bob"}
+		recorder := &recordingMomentFriendshipCache{}
+		router := testRouter(dataStore, WithMomentStore(recorder))
+		response := doJSON(t, router, http.MethodDelete, "/api/friends/bob", nil, authTestCookie())
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
+		}
+		if len(recorder.changes) != 1 || recorder.changes[0] != [2]uint64{1, 2} {
+			t.Fatalf("cache invalidations = %#v, want [[1 2]]", recorder.changes)
+		}
+	})
 }

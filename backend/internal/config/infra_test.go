@@ -20,6 +20,43 @@ func TestLoadInfraDisabledByDefault(t *testing.T) {
 	if config.MessagingNamespace != DefaultMessagingNamespace || config.MessagingRequired || config.GroupMessagingEnabled {
 		t.Fatalf("messaging config = %#v, want default disabled settings", config)
 	}
+	if !config.MomentsCache.Enabled ||
+		config.MomentsCache.PullThreshold != 500 ||
+		config.MomentsCache.FeedWarmLimit != defaultMomentsFeedLimit ||
+		config.MomentsCache.FeedTTL != defaultMomentsFeedTTL ||
+		config.MomentsCache.LikeTTL != defaultMomentsLikeTTL ||
+		config.MomentsCache.OperationTimeout != defaultMomentsCacheTimeout ||
+		config.MomentsCache.MaxPullSources != defaultMomentsPullSources {
+		t.Fatalf("moments cache defaults = %#v", config.MomentsCache)
+	}
+}
+
+func TestLoadInfraReadsMomentsCacheSettings(t *testing.T) {
+	clearInfraEnv(t)
+	t.Setenv("IM_MOMENTS_CACHE_ENABLED", "false")
+	t.Setenv("IM_MOMENTS_PULL_THRESHOLD", "7")
+	t.Setenv("IM_MOMENTS_FEED_WARM_LIMIT", "12")
+	t.Setenv("IM_MOMENTS_FEED_TTL", "2h")
+	t.Setenv("IM_MOMENTS_LIKE_TTL", "3h")
+	t.Setenv("IM_MOMENTS_CACHE_TIMEOUT", "250ms")
+	t.Setenv("IM_MOMENTS_MAX_PULL_SOURCES", "9")
+
+	config, err := LoadInfra()
+	if err != nil {
+		t.Fatalf("LoadInfra() error = %v", err)
+	}
+	want := MomentsCacheConfig{
+		Enabled:          false,
+		PullThreshold:    7,
+		FeedWarmLimit:    12,
+		FeedTTL:          2 * time.Hour,
+		LikeTTL:          3 * time.Hour,
+		OperationTimeout: 250 * time.Millisecond,
+		MaxPullSources:   9,
+	}
+	if config.MomentsCache != want {
+		t.Fatalf("moments cache = %#v, want %#v", config.MomentsCache, want)
+	}
 }
 
 func TestLoadInfraReadsMessagingSettings(t *testing.T) {
@@ -113,6 +150,24 @@ func TestLoadInfraRejectsInvalidSettings(t *testing.T) {
 				t.Setenv("IM_RABBITMQ_HEARTBEAT", "0s")
 			},
 		},
+		{
+			name: "invalid moments threshold",
+			set: func(t *testing.T) {
+				t.Setenv("IM_MOMENTS_PULL_THRESHOLD", "0")
+			},
+		},
+		{
+			name: "invalid moments feed limit",
+			set: func(t *testing.T) {
+				t.Setenv("IM_MOMENTS_FEED_WARM_LIMIT", "0")
+			},
+		},
+		{
+			name: "invalid moments cache timeout",
+			set: func(t *testing.T) {
+				t.Setenv("IM_MOMENTS_CACHE_TIMEOUT", "0s")
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -154,6 +209,9 @@ func clearInfraEnv(t *testing.T) {
 		"IM_REDIS_URL", "IM_REDIS_URL_FILE", "IM_REDIS_PASSWORD", "IM_REDIS_PASSWORD_FILE", "IM_REDIS_DB",
 		"IM_REDIS_DIAL_TIMEOUT", "IM_REDIS_READ_TIMEOUT", "IM_REDIS_WRITE_TIMEOUT",
 		"IM_MESSAGING_NAMESPACE", "IM_MESSAGING_REQUIRED", "IM_GROUP_MESSAGING_ENABLED",
+		"IM_MOMENTS_CACHE_ENABLED", "IM_MOMENTS_PULL_THRESHOLD", "IM_MOMENTS_FEED_WARM_LIMIT",
+		"IM_MOMENTS_FEED_TTL", "IM_MOMENTS_LIKE_TTL", "IM_MOMENTS_CACHE_TIMEOUT",
+		"IM_MOMENTS_MAX_PULL_SOURCES",
 		"IM_RABBITMQ_URL", "IM_RABBITMQ_URL_FILE", "IM_RABBITMQ_PASSWORD", "IM_RABBITMQ_PASSWORD_FILE", "IM_RABBITMQ_DIAL_TIMEOUT", "IM_RABBITMQ_HEARTBEAT",
 	} {
 		t.Setenv(key, "")

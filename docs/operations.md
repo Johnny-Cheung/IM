@@ -1,6 +1,6 @@
 # 运行与发布操作
 
-本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、审查修复和 8199 隔离验证；v1.8.3 Redis 重建与双向一致性检查已完成开发、审查修复和 8199 隔离验证；v2.0 朋友圈（文字版）已完成开发、审查修复和 8199 隔离验证。四者同样暂不切换 8198。v1.9 的 relay 流水线投递、consumer 单 worker 批量落库、发送路径 session/用户缓存和客户端已读游标已完成代码与单元测试，并于 2026-11-02 在 Ubuntu 环境完成 direct 链路真实压测；压测发现的 consumer 批量回落已完成代码与单测修复，待重复投递 soak，尚未部署。v1.10 代码与单元测试完成（删除 `dm:feed`/`index:epoch`，直聊和群聊改为按会话懒加载），待 8199 隔离验证。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
+本文覆盖当前重构版在 Linux 开发机上的运行、发布和回滚。当前正式运行实例仍为 v1.7：正式 `8198` 和验证 `8199`，MySQL、Redis、RabbitMQ 已就绪。v1.1 基础设施、v1.2 私聊消息链路、v1.3 群聊消息链路、v1.4 服务端读取链路、v1.5 本地缓存、v1.6 私聊已读和 v1.7 群聊已读均已完成正式切换。v1.8.1（会话消息号 `seq`、读模型单位改为 `seq`、删除旧 HTTP 已读接口）已完成开发与 8199 隔离验证，开发阶段暂不切换 8198。v1.8.2 可靠投递与对账已完成开发、审查修复和 8199 隔离验证；v1.8.3 Redis 重建与双向一致性检查已完成开发、审查修复和 8199 隔离验证；v2.0 朋友圈（文字版）已完成开发、审查修复和 8199 隔离验证；v2.1 朋友圈 Redis 缓存已完成代码与单元测试，待 8199 隔离验证。五者同样暂不切换 8198。v1.9 的 relay 流水线投递、consumer 单 worker 批量落库、发送路径 session/用户缓存和客户端已读游标已完成代码与单元测试，并于 2026-11-02 在 Ubuntu 环境完成 direct 链路真实压测；压测发现的 consumer 批量回落已完成代码与单测修复，待重复投递 soak，尚未部署。v1.10 代码与单元测试完成（删除 `dm:feed`/`index:epoch`，直聊和群聊改为按会话懒加载），待 8199 隔离验证。正式切换步骤保留在下文“v1.8.1 切换步骤与回滚”，统一上线前再执行。业务接入只在明确配置 Redis/RabbitMQ 的实例启用，高可用、容量方案和最终部署拓扑仍按路线留到后续版本。旧 `/opt/IM` 不在本文范围。
 
 ## 环境
 
@@ -47,7 +47,7 @@ sha256sum -c SHA256SUMS         # Linux
 | --- | --- |
 | `/health` | HTTP 进程可响应即返回 200；不检查 MySQL。 |
 | `/ready` | 2 秒内成功 ping MySQL 时返回 200（`database=ok`）；否则返回 503（`database=unavailable`）。它仍然只检查 MySQL，不反映消息号闸门。 |
-| `/ops/infra` | 基础设施连通性、`seq` 就绪/校准状态。v1.8.2 启用消息链路时增加 `pipeline`：Stream 长度、pending、最老条目年龄、积压告警、死信数、relay/consumer 错误及对账结果。v1.8.3 起对账还包含 `redis_missing`、`redis_repaired`、`watermarks_raised`、`needs_rebuild`、`last_deep_audit_at`、`deep_audit_error`；consumer 增加 `in_flight`。v1.9 起 consumer 使用 `Qos(100)` 批量落库，`in_flight` 可能覆盖一批最多 100 条未确认消息；批量路径按 `server_message_id` 预查剔除完全相同的重投，并增加 `batch_duplicates_filtered`、`batch_fallbacks`、`message_conflicts` 指标。v1.10 起删除 feed 审计，`feed_repairs` 字段不再返回。返回最近采样，不在请求中连接基础设施。 |
+| `/ops/infra` | 基础设施连通性、`seq` 就绪/校准状态。v1.8.2 启用消息链路时增加 `pipeline`：Stream 长度、pending、最老条目年龄、积压告警、死信数、relay/consumer 错误及对账结果。v1.8.3 起对账还包含 `redis_missing`、`redis_repaired`、`watermarks_raised`、`needs_rebuild`、`last_deep_audit_at`、`deep_audit_error`；consumer 增加 `in_flight`。v1.9 起 consumer 使用 `Qos(100)` 批量落库，`in_flight` 可能覆盖一批最多 100 条未确认消息；批量路径按 `server_message_id` 预查剔除完全相同的重投，并增加 `batch_duplicates_filtered`、`batch_fallbacks`、`message_conflicts` 指标。v1.10 起删除 feed 审计，`feed_repairs` 字段不再返回。v2.1 起增加可选 `moments_cache`：feed 命中/回退/预热、push 接收者、pull 来源、点赞命中/未命中和 Redis 错误；该段同样只返回进程内计数。返回最近采样，不在请求中连接基础设施。 |
 
 ```bash
 /opt/IM-Rebuild/imctl health
@@ -433,7 +433,7 @@ curl -fsS http://127.0.0.1:8199/ops/infra   # 检查 seq.ready 与 pipeline.reco
 ```
 
 - 可选环境变量：`REBUILD_BATCH`（默认 1000）、`REBUILD_QUEUE_TIMEOUT`（默认 10m）、`REBUILD_TIMEOUT`（默认 30m，必须大于队列超时）。
-- 执行顺序：排空两个持久化队列（含正在处理的消息）→ 写 `rebuild:pending` → 删除 `seq:ready` 和 legacy `index:epoch` 再清理本命名空间 → 全局计数器 → 消息主遍 → 好友、群投影和水位 → 校验 → `seq:ready` → 删除 `rebuild:pending`。v1.10 起消息主遍不再写/校验 `dm:feed`，也不再设置 `index:epoch`；`dm:*` 清理模式仍会清掉旧的 feed 键。
+- 执行顺序：排空两个持久化队列（含正在处理的消息）→ 写 `rebuild:pending` → 删除 `seq:ready` 和 legacy `index:epoch` 再清理本命名空间 → 全局计数器 → 消息主遍 → 好友、群投影和水位 → 校验 → `seq:ready` → 删除 `rebuild:pending`。v1.10 起消息主遍不再写/校验 `dm:feed`，也不再设置 `index:epoch`；`dm:*` 清理模式仍会清掉旧的 feed 键。v2.1 起 `ClearNamespace` 还会清理 `moments:*`；朋友圈缓存不参与 `seq:ready` 校验，重建后按读取请求从 MySQL 懒加载。
 - 运行前 `imctl` 还会检查两个持久化队列的未确认消息数；有未确认消息（可能被别的进程占用）时拒绝执行。
 - 只删除已知前缀；不使用 `FLUSHDB`。失败时不写 `seq:ready` 且保留 `rebuild:pending`，启动提示会指向 `rebuild-redis`；成功写入 `seq:ready` 后删除标记失败只记警告，不把成功当失败。
 - MySQL 中允许存在编号空洞（毒消息进死信、掉电丢尾）。重建会记录空洞数，不因此失败。
@@ -483,6 +483,23 @@ curl -fsS http://127.0.0.1:8199/ops/infra   # 检查 seq.ready 与 pipeline.reco
 - 计数字段 `like_count`/`comment_count` 与点赞、评论在同一事务更新。删除用户时外键级联，不做额外计数回填；v2.0 没有后台对账。
 - 回滚应用：恢复上一版 `bin/`、`web/`、`RELEASE` 即可；v2.0 的表是新增表，v1.8.3 不会读取。回滚不删除朋友圈数据。
 - 2026-10-30 已在 8199 完成隔离验证（`v2.0.0` / `75d681a`）：API smoke 129 项、浏览器 smoke 63 项、缓存 smoke 29 项和真实 MySQL 集成测试通过；按 manifest 删除 19 个测试账号、11 个测试群和 208 个 Redis 键，验证库保留 4 个演示账号、朋友圈表 0 行。8198 和共享容器未操作。
+
+## v2.1 朋友圈 Redis 缓存（代码与单测完成，待 8199 验证）
+
+- MySQL 仍是朋友圈权威数据源。Redis 只保存可丢弃的 feed ID 索引和点赞 Set/计数；缓存故障、TTL 到期、Redis 重建或 namespace 清理后自动回退 MySQL，不返回 503。
+- 动态 feed 使用推拉结合：好友数 `<= IM_MOMENTS_PULL_THRESHOLD` 的作者发布时写入好友 feed；超过阈值或已在 `moments:pull-authors` 的作者只维护 `moments:author`，好友读取时拉取。作者进入 pull 后不自动降回 push。
+- 读取先按当前好友关系、visibility 和 `deleted_at` 校验 Redis 候选；深分页、最后一个不完整页、好友关系变化、删除造成的空洞和 Redis 错误均回退现有 MySQL `ListMoments`。`before_id` 和 `has_more` 语义不变。
+- 点赞写路径仍是 MySQL 事务。读取使用 Set + count；Set 基数与 count 不一致时不使用缓存。MySQL 点赞提交后，已预热的缓存通过 Lua 更新，未预热则不建立不完整 Set。Redis 更新失败会在进程内标记该动态 dirty，读取回退 MySQL。
+- 配置：`IM_MOMENTS_CACHE_ENABLED`（默认 true，仅 Redis 配置时装配）、`IM_MOMENTS_PULL_THRESHOLD`（500）、`IM_MOMENTS_FEED_WARM_LIMIT`（500）、`IM_MOMENTS_FEED_TTL`（168h）、`IM_MOMENTS_LIKE_TTL`（168h）、`IM_MOMENTS_CACHE_TIMEOUT`（300ms）、`IM_MOMENTS_MAX_PULL_SOURCES`（100）。
+- Redis key：`moments:feed:*`、`moments:feed:meta:*`、`moments:feed:gen:*`、`moments:author:*`、`moments:pull-authors`、`moments:likes:*`。键都带 namespace 前缀；`rebuild-redis` 会清理 `moments:*`。
+- `/ops/infra` 的 `moments_cache`：`feed_hits`/`feed_fallbacks`/`feed_warms`/`warm_errors`、`push_recipients`、`pull_sources`、`like_hits`/`like_misses`、`cache_errors`；`degraded` 表示 Redis 连续错误窗口或无法确定 fanout 接收者后的全局 MySQL 回退。
+- 降级/回滚：设置 `IM_MOMENTS_CACHE_ENABLED=false` 或回退到上一版二进制即可；没有 MySQL 迁移。需要清缓存时只在目标 namespace 内按 `moments:*` 精确 `SCAN` + `UNLINK`，再打开朋友圈触发懒加载；不要 `FLUSHDB`/`FLUSHALL`。`scripts/cleanup-test-data.mjs` 现在按 manifest 账号解析其 authored/liked 的动态 ID，并清理对应的 `moments:*` 缓存键，仍按精确账号执行。
+- 已知限制：缓存是单实例、最终一致的读加速；不缓存动态正文、昵称、评论、未读；Redis 随机驱逐单 key 可能造成页内空洞，此时清理 `moments:*` 重载；进程重启会丢失内存 dirty 标记，极端的“MySQL 已提交、Redis 写失败后立刻重启”窗口由 TTL 和下次预热兜底。无法获取作者好友列表时，进程会把 `moments_cache.degraded` 置为 true 并一直使用 MySQL，直到重启。
+- 验证状态：后端全量、race、vet、前端测试/typecheck/build 和 `deploy/imctl_test.sh` 已通过；8199 冷缓存、push/pull、分页、好友增删、删除、点赞故障回退待执行。`bench/` 不修改。`imctl` 会把已导出的 `IM_MOMENTS_*` 环境变量传给后端，例如 8199 验证高好友数 pull 分支：
+
+  ```bash
+  IM_MOMENTS_PULL_THRESHOLD=1 /opt/IM-Rebuild/imctl --verify restart
+  ```
 
 ## 死信队列处理
 

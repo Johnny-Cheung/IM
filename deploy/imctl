@@ -300,6 +300,19 @@ backend_env_args() {
       "IM_GROUP_MESSAGING_ENABLED=true" \
       "IM_MESSAGING_REQUIRED=$([ "${VERIFY_MODE}" = "1" ] && printf 'true' || printf 'false')"
   fi
+  local moments_var
+  for moments_var in \
+    IM_MOMENTS_CACHE_ENABLED \
+    IM_MOMENTS_PULL_THRESHOLD \
+    IM_MOMENTS_FEED_WARM_LIMIT \
+    IM_MOMENTS_FEED_TTL \
+    IM_MOMENTS_LIKE_TTL \
+    IM_MOMENTS_CACHE_TIMEOUT \
+    IM_MOMENTS_MAX_PULL_SOURCES; do
+    if [ -n "${!moments_var:-}" ]; then
+      printf '%s=%s\n' "${moments_var}" "${!moments_var}"
+    fi
+  done
 }
 
 # The RabbitMQ vhost and queue prefix follow the selected namespace, so every

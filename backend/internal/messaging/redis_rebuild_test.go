@@ -729,6 +729,10 @@ func TestClearNamespaceKeepsLocksAndUnknownKeys(t *testing.T) {
 		directReadStreamKey(),
 		defaultKeyspace.groupReadStreamKey(),
 		defaultKeyspace.prefixOrDefault() + "index:epoch",
+		defaultKeyspace.prefixOrDefault() + "moments:feed:1",
+		defaultKeyspace.prefixOrDefault() + "moments:author:2",
+		defaultKeyspace.prefixOrDefault() + "moments:likes:3:members",
+		defaultKeyspace.prefixOrDefault() + "moments:feed:meta:1",
 		sequenceReadyKey(),
 	}
 	for _, key := range known {

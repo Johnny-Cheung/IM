@@ -13,6 +13,7 @@ import (
 
 	"github.com/Johnny-Cheung/IM/backend/internal/infra"
 	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
+	"github.com/Johnny-Cheung/IM/backend/internal/momentcache"
 )
 
 type fakeInfraStatus struct {
@@ -33,7 +34,7 @@ func TestInfraStatusExposesSnapshotWithoutChangingReadiness(t *testing.T) {
 		RabbitMQ: infra.ComponentStatus{Enabled: true, Connected: false},
 	}}, func() *messaging.SeqWatcherStatus {
 		return &messaging.SeqWatcherStatus{Ready: true, Conversations: 3}
-	}, nil)
+	}, nil, nil)
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ops/infra", nil))
@@ -92,6 +93,7 @@ func TestInfraStatusExposesPipelineSnapshot(t *testing.T) {
 				Reconcile: messaging.ReconcileStatus{Repaired: 2, TotalRepaired: 5},
 			}
 		},
+		nil,
 	)
 
 	recorder := httptest.NewRecorder()
@@ -141,6 +143,7 @@ func TestInfraStatusOmitsPipelineWhenMonitorIsAbsent(t *testing.T) {
 		fakeInfraStatus{},
 		nil,
 		func() *messaging.PipelineStatus { return nil },
+		nil,
 	)
 
 	recorder := httptest.NewRecorder()
@@ -156,6 +159,59 @@ func TestInfraStatusOmitsPipelineWhenMonitorIsAbsent(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), `"pipeline"`) {
 		t.Fatalf("body = %s, want no pipeline key", recorder.Body.String())
+	}
+}
+
+func TestInfraStatusExposesMomentsCacheSnapshot(t *testing.T) {
+	router, err := newRouter("", nil)
+	if err != nil {
+		t.Fatalf("newRouter() error = %v", err)
+	}
+	registerInfraStatus(
+		router,
+		fakeInfraStatus{},
+		nil,
+		nil,
+		func() *momentcache.Status {
+			return &momentcache.Status{
+				Enabled:        true,
+				FeedHits:       7,
+				FeedFallbacks:  2,
+				PullSources:    3,
+				PushRecipients: 11,
+				LikeMisses:     4,
+			}
+		},
+	)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ops/infra", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var response struct {
+		MomentsCache *momentcache.Status `json:"moments_cache"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.MomentsCache == nil ||
+		response.MomentsCache.FeedHits != 7 ||
+		response.MomentsCache.FeedFallbacks != 2 ||
+		response.MomentsCache.PushRecipients != 11 {
+		t.Fatalf("moments cache status = %#v", response.MomentsCache)
+	}
+}
+
+func TestInfraStatusOmitsMomentsCacheWhenAbsent(t *testing.T) {
+	router, err := newRouter("", nil)
+	if err != nil {
+		t.Fatalf("newRouter() error = %v", err)
+	}
+	registerInfraStatus(router, fakeInfraStatus{}, nil, nil, func() *momentcache.Status { return nil })
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ops/infra", nil))
+	if strings.Contains(recorder.Body.String(), `"moments_cache"`) {
+		t.Fatalf("body = %s, want no moments_cache key", recorder.Body.String())
 	}
 }
 

@@ -282,3 +282,85 @@ func TestMySQLMomentsIntegration(t *testing.T) {
 		}
 	})
 }
+
+func TestMySQLMomentCacheQueriesIntegration(t *testing.T) {
+	st := openIntegrationStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	alice, err := st.CreateUser(ctx, "cache_alice", "cache_alice", "Alice", "hash")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	bob, err := st.CreateUser(ctx, "cache_bob", "cache_bob", "Bob", "hash")
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	carol, err := st.CreateUser(ctx, "cache_carol", "cache_carol", "Carol", "hash")
+	if err != nil {
+		t.Fatalf("create carol: %v", err)
+	}
+	if _, err := st.db.ExecContext(ctx,
+		`INSERT INTO friendships (user_id, friend_user_id, created_at)
+		 VALUES (?, ?, ?), (?, ?, ?)`,
+		alice.ID, bob.ID, now, bob.ID, alice.ID, now,
+	); err != nil {
+		t.Fatalf("create friendship: %v", err)
+	}
+
+	friendMoment, err := st.CreateMoment(
+		ctx, alice.ID, "alice friends", MomentVisibilityFriends, now,
+	)
+	if err != nil {
+		t.Fatalf("create friends moment: %v", err)
+	}
+	privateMoment, err := st.CreateMoment(
+		ctx, alice.ID, "alice private", MomentVisibilityPrivate, now,
+	)
+	if err != nil {
+		t.Fatalf("create private moment: %v", err)
+	}
+	strangerMoment, err := st.CreateMoment(
+		ctx, carol.ID, "carol friends", MomentVisibilityFriends, now,
+	)
+	if err != nil {
+		t.Fatalf("create stranger moment: %v", err)
+	}
+
+	visible, err := st.ListVisibleMomentsByIDs(
+		ctx,
+		bob.ID,
+		[]uint64{alice.ID},
+		[]uint64{privateMoment.ID, friendMoment.ID, strangerMoment.ID, friendMoment.ID},
+	)
+	if err != nil {
+		t.Fatalf("list visible by ids: %v", err)
+	}
+	if len(visible) != 1 || visible[0].ID != friendMoment.ID || visible[0].Mine {
+		t.Fatalf("visible moments = %#v", visible)
+	}
+
+	authorIDs, hasMore, err := st.ListAuthorMomentIDs(ctx, alice.ID, 0, 10)
+	if err != nil || hasMore {
+		t.Fatalf("list author IDs = %v, hasMore = %v, err = %v", authorIDs, hasMore, err)
+	}
+	if len(authorIDs) != 1 || authorIDs[0] != friendMoment.ID {
+		t.Fatalf("author IDs = %v, want only %d", authorIDs, friendMoment.ID)
+	}
+
+	if _, err := st.LikeMoment(ctx, friendMoment.ID, bob.ID, now); err != nil {
+		t.Fatalf("like moment: %v", err)
+	}
+	likes, err := st.ListMomentLikeUserIDs(ctx, []uint64{friendMoment.ID})
+	if err != nil {
+		t.Fatalf("list like user IDs: %v", err)
+	}
+	if len(likes[friendMoment.ID]) != 1 || likes[friendMoment.ID][0] != bob.ID {
+		t.Fatalf("like users = %#v", likes)
+	}
+
+	empty, err := st.ListVisibleMomentsByIDs(ctx, bob.ID, []uint64{alice.ID}, nil)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty visible query = %#v, err = %v", empty, err)
+	}
+}

@@ -19,6 +19,7 @@ import (
 	"github.com/Johnny-Cheung/IM/backend/internal/httpapi"
 	"github.com/Johnny-Cheung/IM/backend/internal/infra"
 	"github.com/Johnny-Cheung/IM/backend/internal/messaging"
+	"github.com/Johnny-Cheung/IM/backend/internal/momentcache"
 	"github.com/Johnny-Cheung/IM/backend/internal/store"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
@@ -426,6 +427,29 @@ func run(options serverOptions) error {
 		log.Printf("message pipeline disabled: Redis and RabbitMQ must both be configured")
 	}
 
+	var momentStore httpapi.MomentStore = dataStore
+	var momentsCache *momentcache.Store
+	if infraManager != nil &&
+		infraManager.RedisEnabled() &&
+		infraConfig.MomentsCache.Enabled {
+		momentsCache = momentcache.New(
+			dataStore,
+			infraManager.Redis(),
+			momentcache.NewKeyspace(namespace.RedisPrefix()),
+			momentcache.Options{
+				Enabled:          true,
+				PullThreshold:    infraConfig.MomentsCache.PullThreshold,
+				FeedWarmLimit:    infraConfig.MomentsCache.FeedWarmLimit,
+				MaxPullSources:   infraConfig.MomentsCache.MaxPullSources,
+				FeedTTL:          infraConfig.MomentsCache.FeedTTL,
+				LikeTTL:          infraConfig.MomentsCache.LikeTTL,
+				OperationTimeout: infraConfig.MomentsCache.OperationTimeout,
+			},
+		)
+		momentStore = momentsCache
+		log.Printf("moments Redis cache enabled namespace=%s", namespace.Base())
+	}
+
 	router, err := newRouter(options.webDir, dataStore.Ping)
 	if err != nil {
 		return err
@@ -446,6 +470,13 @@ func run(options serverOptions) error {
 					return nil
 				}
 				status := pipelineMonitor.Status()
+				return &status
+			},
+			func() *momentcache.Status {
+				if momentsCache == nil {
+					return nil
+				}
+				status := momentsCache.Status()
 				return &status
 			},
 		)
@@ -486,7 +517,7 @@ func run(options serverOptions) error {
 	if groupReadTracker != nil {
 		apiOptions = append(apiOptions, httpapi.WithGroupReadTracker(groupReadTracker))
 	}
-	apiOptions = append(apiOptions, httpapi.WithMomentStore(dataStore))
+	apiOptions = append(apiOptions, httpapi.WithMomentStore(momentStore))
 	api := httpapi.New(dataStore, apiOptions...)
 	api.Register(router)
 	api.Start()
@@ -523,8 +554,9 @@ type infraStatusProvider interface {
 
 type infraStatusResponse struct {
 	infra.Snapshot
-	Seq      *messaging.SeqWatcherStatus `json:"seq,omitempty"`
-	Pipeline *messaging.PipelineStatus   `json:"pipeline,omitempty"`
+	Seq          *messaging.SeqWatcherStatus `json:"seq,omitempty"`
+	Pipeline     *messaging.PipelineStatus   `json:"pipeline,omitempty"`
+	MomentsCache *momentcache.Status         `json:"moments_cache,omitempty"`
 }
 
 func registerInfraStatus(
@@ -532,6 +564,7 @@ func registerInfraStatus(
 	provider infraStatusProvider,
 	seqStatus func() *messaging.SeqWatcherStatus,
 	pipelineStatus func() *messaging.PipelineStatus,
+	momentsCacheStatus func() *momentcache.Status,
 ) {
 	router.GET("/ops/infra", func(c *gin.Context) {
 		response := infraStatusResponse{Snapshot: provider.Snapshot()}
@@ -542,6 +575,9 @@ func registerInfraStatus(
 		// Redis or RabbitMQ on the request path.
 		if pipelineStatus != nil {
 			response.Pipeline = pipelineStatus()
+		}
+		if momentsCacheStatus != nil {
+			response.MomentsCache = momentsCacheStatus()
 		}
 		c.JSON(http.StatusOK, response)
 	})

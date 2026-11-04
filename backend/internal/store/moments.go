@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -421,6 +422,188 @@ func (s *Store) UnlikeMoment(
 		return 0, fmt.Errorf("commit unlike moment: %w", err)
 	}
 	return likeCount, nil
+}
+
+// ListVisibleMomentsByIDs hydrates a cached candidate page. It re-applies the
+// current friend/visibility rule and drops deleted moments, so a stale cache
+// can never widen access. Results are newest first.
+func (s *Store) ListVisibleMomentsByIDs(
+	ctx context.Context,
+	viewerID uint64,
+	friendIDs []uint64,
+	momentIDs []uint64,
+) ([]Moment, error) {
+	ids := uniqueMomentIDs(momentIDs)
+	if len(ids) == 0 {
+		return []Moment{}, nil
+	}
+
+	const chunkSize = 400
+	moments := make([]Moment, 0, len(ids))
+	for start := 0; start < len(ids); start += chunkSize {
+		end := start + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		args := make([]any, 0, 1+len(chunk)+1+len(friendIDs))
+		args = append(args, viewerID)
+		where := `m.deleted_at IS NULL AND m.id IN (` +
+			strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",") + `)`
+		for _, momentID := range chunk {
+			args = append(args, momentID)
+		}
+		where += ` AND (m.author_id = ?`
+		args = append(args, viewerID)
+		if len(friendIDs) > 0 {
+			where += ` OR (m.visibility = 'friends' AND m.author_id IN (` +
+				strings.TrimSuffix(strings.Repeat("?,", len(friendIDs)), ",") + `))`
+			for _, friendID := range friendIDs {
+				args = append(args, friendID)
+			}
+		}
+		where += `)`
+
+		rows, err := s.db.QueryContext(
+			ctx,
+			momentSelect+` WHERE `+where+` ORDER BY m.id DESC`,
+			args...,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("list visible moments by ids: %w", err)
+		}
+		for rows.Next() {
+			moment, err := scanMoment(rows, viewerID)
+			if err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			moments = append(moments, moment)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("iterate visible moments by ids: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("close visible moments by ids: %w", err)
+		}
+	}
+	sort.Slice(moments, func(i, j int) bool {
+		return moments[i].ID > moments[j].ID
+	})
+	return moments, nil
+}
+
+func uniqueMomentIDs(ids []uint64) []uint64 {
+	unique := make([]uint64, 0, len(ids))
+	seen := make(map[uint64]struct{}, len(ids))
+	for _, id := range ids {
+		if id == 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	return unique
+}
+
+// ListAuthorMomentIDs returns the high-fanout pull source for one author. It
+// contains only friends-visible, non-deleted moments.
+func (s *Store) ListAuthorMomentIDs(
+	ctx context.Context,
+	authorID, beforeID uint64,
+	limit int,
+) ([]uint64, bool, error) {
+	if limit <= 0 {
+		return nil, false, fmt.Errorf("invalid author moment limit")
+	}
+	args := []any{authorID}
+	where := `author_id = ? AND visibility = 'friends' AND deleted_at IS NULL`
+	if beforeID > 0 {
+		where += ` AND id < ?`
+		args = append(args, beforeID)
+	}
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM moments WHERE `+where+` ORDER BY id DESC LIMIT ?`,
+		args...,
+	)
+	if err != nil {
+		return nil, false, fmt.Errorf("list author moment ids: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	ids := make([]uint64, 0, limit+1)
+	for rows.Next() {
+		var id uint64
+		if err := rows.Scan(&id); err != nil {
+			return nil, false, fmt.Errorf("scan author moment id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("iterate author moment ids: %w", err)
+	}
+	hasMore := len(ids) > limit
+	if hasMore {
+		ids = ids[:limit]
+	}
+	return ids, hasMore, nil
+}
+
+// ListMomentLikeUserIDs returns the complete liker set per moment. The caller
+// compares each set size with the authoritative like_count before installing a
+// cache entry.
+func (s *Store) ListMomentLikeUserIDs(
+	ctx context.Context,
+	momentIDs []uint64,
+) (map[uint64][]uint64, error) {
+	ids := uniqueMomentIDs(momentIDs)
+	result := make(map[uint64][]uint64, len(ids))
+	if len(ids) == 0 {
+		return result, nil
+	}
+	const chunkSize = 500
+	for start := 0; start < len(ids); start += chunkSize {
+		end := start + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		args := make([]any, 0, len(chunk))
+		for _, momentID := range chunk {
+			args = append(args, momentID)
+		}
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT moment_id, user_id FROM moment_likes
+			 WHERE moment_id IN (`+
+				strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")+`)
+			 ORDER BY moment_id ASC, id ASC`,
+			args...,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("list moment like users: %w", err)
+		}
+		for rows.Next() {
+			var momentID, userID uint64
+			if err := rows.Scan(&momentID, &userID); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan moment like user: %w", err)
+			}
+			result[momentID] = append(result[momentID], userID)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("iterate moment like users: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("close moment like users: %w", err)
+		}
+	}
+	return result, nil
 }
 
 // ListMomentLikes returns newest likes first.

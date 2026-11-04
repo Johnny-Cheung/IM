@@ -9,10 +9,28 @@ import (
 )
 
 const (
-	defaultInfraTimeout       = 5 * time.Second
-	defaultRabbitHeartbeat    = 10 * time.Second
-	DefaultMessagingNamespace = "im:v12"
+	defaultInfraTimeout        = 5 * time.Second
+	defaultRabbitHeartbeat     = 10 * time.Second
+	defaultMomentsFeedLimit    = 500
+	defaultMomentsFeedTTL      = 7 * 24 * time.Hour
+	defaultMomentsLikeTTL      = 7 * 24 * time.Hour
+	defaultMomentsCacheTimeout = 300 * time.Millisecond
+	defaultMomentsPullSources  = 100
+	DefaultMessagingNamespace  = "im:v12"
 )
+
+// MomentsCacheConfig controls the derived Redis feed and like cache. The cache
+// is optional: when Redis is absent or the cache is disabled, Moments keep
+// using MySQL directly.
+type MomentsCacheConfig struct {
+	Enabled          bool
+	PullThreshold    int
+	FeedWarmLimit    int
+	FeedTTL          time.Duration
+	LikeTTL          time.Duration
+	OperationTimeout time.Duration
+	MaxPullSources   int
+}
 
 type RedisConfig struct {
 	URL          string
@@ -44,6 +62,7 @@ type InfraConfig struct {
 	MessagingNamespace    string
 	MessagingRequired     bool
 	GroupMessagingEnabled bool
+	MomentsCache          MomentsCacheConfig
 }
 
 func LoadInfra() (InfraConfig, error) {
@@ -56,6 +75,10 @@ func LoadInfra() (InfraConfig, error) {
 		return InfraConfig{}, err
 	}
 	groupMessagingEnabled, err := optionalBool("IM_GROUP_MESSAGING_ENABLED", false)
+	if err != nil {
+		return InfraConfig{}, err
+	}
+	momentsCache, err := loadMomentsCacheConfig()
 	if err != nil {
 		return InfraConfig{}, err
 	}
@@ -73,6 +96,7 @@ func LoadInfra() (InfraConfig, error) {
 		MessagingNamespace:    namespace,
 		MessagingRequired:     messagingRequired,
 		GroupMessagingEnabled: groupMessagingEnabled,
+		MomentsCache:          momentsCache,
 	}
 	if redisURL != "" {
 		redisPassword, err := valueOrFile("IM_REDIS_PASSWORD", "IM_REDIS_PASSWORD_FILE")
@@ -125,6 +149,58 @@ type timeoutValues struct {
 	dial  time.Duration
 	read  time.Duration
 	write time.Duration
+}
+
+func loadMomentsCacheConfig() (MomentsCacheConfig, error) {
+	enabled, err := optionalBool("IM_MOMENTS_CACHE_ENABLED", true)
+	if err != nil {
+		return MomentsCacheConfig{}, err
+	}
+	threshold, err := optionalInt("IM_MOMENTS_PULL_THRESHOLD", 500)
+	if err != nil {
+		return MomentsCacheConfig{}, err
+	}
+	if threshold <= 0 {
+		return MomentsCacheConfig{}, fmt.Errorf("IM_MOMENTS_PULL_THRESHOLD must be positive")
+	}
+	feedLimit, err := optionalInt("IM_MOMENTS_FEED_WARM_LIMIT", defaultMomentsFeedLimit)
+	if err != nil {
+		return MomentsCacheConfig{}, err
+	}
+	if feedLimit <= 0 {
+		return MomentsCacheConfig{}, fmt.Errorf("IM_MOMENTS_FEED_WARM_LIMIT must be positive")
+	}
+	pullSources, err := optionalInt("IM_MOMENTS_MAX_PULL_SOURCES", defaultMomentsPullSources)
+	if err != nil {
+		return MomentsCacheConfig{}, err
+	}
+	if pullSources <= 0 {
+		return MomentsCacheConfig{}, fmt.Errorf("IM_MOMENTS_MAX_PULL_SOURCES must be positive")
+	}
+	feedTTL, err := optionalDuration("IM_MOMENTS_FEED_TTL", defaultMomentsFeedTTL)
+	if err != nil {
+		return MomentsCacheConfig{}, err
+	}
+	likeTTL, err := optionalDuration("IM_MOMENTS_LIKE_TTL", defaultMomentsLikeTTL)
+	if err != nil {
+		return MomentsCacheConfig{}, err
+	}
+	operationTimeout, err := optionalDuration(
+		"IM_MOMENTS_CACHE_TIMEOUT",
+		defaultMomentsCacheTimeout,
+	)
+	if err != nil {
+		return MomentsCacheConfig{}, err
+	}
+	return MomentsCacheConfig{
+		Enabled:          enabled,
+		PullThreshold:    threshold,
+		FeedWarmLimit:    feedLimit,
+		FeedTTL:          feedTTL,
+		LikeTTL:          likeTTL,
+		OperationTimeout: operationTimeout,
+		MaxPullSources:   pullSources,
+	}, nil
 }
 
 func redisTimeouts() (timeoutValues, error) {

@@ -129,6 +129,7 @@ func (a *API) sendFriendRequest(c *gin.Context) {
 
 	if result.Accepted {
 		a.ensureFriendshipProjection(c.Request.Context(), current.ID, target.ID)
+		a.notifyMomentFriendshipChanged(c.Request.Context(), current.ID, target.ID)
 		friend := toPublicUserResponse(result.Friend)
 		c.JSON(http.StatusOK, sendFriendRequestResponse{
 			Status: "accepted",
@@ -203,6 +204,7 @@ func (a *API) acceptFriendRequest(c *gin.Context) {
 		log.Printf("load accepted friend for projection: %v", lookupErr)
 	} else {
 		a.ensureFriendshipProjection(c.Request.Context(), current.ID, friendUser.ID)
+		a.notifyMomentFriendshipChanged(c.Request.Context(), current.ID, friendUser.ID)
 	}
 
 	c.JSON(http.StatusOK, acceptFriendResponse{
@@ -281,6 +283,7 @@ func (a *API) deleteFriend(c *gin.Context) {
 		return
 	}
 	a.removeFriendshipProjection(c.Request.Context(), current.ID, target.ID)
+	a.notifyMomentFriendshipChanged(c.Request.Context(), current.ID, target.ID)
 	c.Status(http.StatusNoContent)
 }
 
