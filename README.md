@@ -4,7 +4,7 @@
 
 一个通过浏览器访问的 Web 即时通讯项目：私聊、群聊、已读与朋友圈。
 
-[功能](#功能) · [技术栈](#技术栈) · [架构](#架构) · [快速开始](#快速开始) · [文档](#文档)
+[功能](#功能) · [技术栈](#技术栈) · [架构](#架构) · [文档](#文档)
 
 ![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go&logoColor=00ADD8)
 ![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=61DAFB)
@@ -123,130 +123,6 @@ IM/
 │   └── versions/
 └── README.md
 ```
-
-## 快速开始
-
-### 环境要求
-
-- Go 1.26+
-- Node 26 + npm
-- MySQL 8.0+（推荐 8.4）
-- 可选：Redis 7.2、RabbitMQ 3.13（启用完整消息链路与已读时需要）
-
-下面的命令以 macOS/Linux shell 为例。
-
-### 1. 准备 MySQL
-
-在可连接的 MySQL 中创建数据库和具有建表/迁移权限的应用账号：
-
-```sql
-CREATE DATABASE im CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
-CREATE USER 'im_app'@'%' IDENTIFIED BY '<your-password>';
-GRANT ALL PRIVILEGES ON im.* TO 'im_app'@'%';
-```
-
-不要把自己的真实密码写进仓库或命令历史。示例使用 `'%'` 主机；实际部署可按来源收紧到具体地址。
-
-### 2. 启动后端
-
-用密码文件提供应用密码，不要把密码放进命令行或环境变量：
-
-```bash
-mkdir -p "$HOME/.config/im"
-install -m 600 /dev/null "$HOME/.config/im/mysql-app"
-# 用编辑器把应用密码写入上面的文件
-export IM_MYSQL_HOST=127.0.0.1
-export IM_MYSQL_PORT=3306
-export IM_MYSQL_DB=im
-export IM_MYSQL_USER=im_app
-export IM_MYSQL_PASSWORD_FILE="$HOME/.config/im/mysql-app"
-(cd backend && go run ./cmd/server)
-```
-
-后端启动时会自动执行迁移，默认监听 `127.0.0.1:8080`；不指定 `-web-dir` 时只提供 API。
-
-### 3. 启动前端开发服务器
-
-开发时用 Vite 代理后端；第 3 步和第 4 步是两种运行方式，按需二选一。
-
-```bash
-cd frontend
-npm ci
-npm run dev
-```
-
-浏览器打开 `http://localhost:5173/`。Vite 固定使用 5173，并把 `/api`（含 WebSocket）和 `/health` 代理到 `http://127.0.0.1:8080`。
-
-### 4. 构建前端并由 Go 托管
-
-```bash
-(cd frontend && npm ci && npm run build)
-(cd backend && go run ./cmd/server -web-dir ../frontend/dist)
-```
-
-浏览器打开 `http://127.0.0.1:8080/`。
-
-### 启用完整消息链路（可选）
-
-只配置 MySQL 时是本地模式：发送、历史和会话列表可用，会话消息号在 MySQL 事务中分配；已读回执、`focus`/`read` 和群已读人数不可用，未读数仍会从 MySQL 计算并显示，但不会随阅读清零。
-
-完整链路需要配置 Redis 和 RabbitMQ：设置 `IM_REDIS_URL(_FILE)`、`IM_RABBITMQ_URL(_FILE)` 及对应密码文件，设置 `IM_GROUP_MESSAGING_ENABLED=true` 开启群聊链路；`IM_MESSAGING_REQUIRED=true` 可选，用于基础设施缺失时直接启动失败；`IM_MESSAGING_NAMESPACE` 默认 `im:v12`。首次启动前，如果 Redis 中还没有 `seq:ready`，需要先执行一次：
-
-```bash
-(cd backend && go run ./cmd/server -backfill-seq)
-```
-
-后端在缺少 `seq:ready` 时会拒绝启动。具体配置、队列、备份和切换步骤见 [运行与发布操作](docs/operations.md)。
-
-## 发布与部署
-
-当前交付路径是 Linux 发布包，不是容器镜像。在干净的 `main` 工作区执行：
-
-```bash
-scripts/build-release.sh v2.1 /tmp/im-v2.1
-```
-
-产物包含 `bin/im-server`、`web/`、`RELEASE` 和 `SHA256SUMS`。上传到 Linux 机器后，由 `deploy/imctl` 负责启停、健康检查、备份、`backfill-seq`、`rebuild-redis` 和死信操作；基础设施由 `deploy/infractl` 管理。完整步骤、正式/验证实例隔离和回滚规则见 [运行与发布操作](docs/operations.md)。
-
-### 本机 Docker 运行
-
-`Dockerfile` 和 `compose.yaml` 只服务本机自托管：一条命令拉起应用和 MySQL / Redis / RabbitMQ，不参与上面的正式交付路径。这不是正式部署方式，`imctl`/`infractl` 仍是发布和运维的入口。
-
-```bash
-docker compose up -d mysql redis rabbitmq
-docker compose run --rm backfill-seq   # 全新数据卷上只需执行一次
-docker compose up -d app
-```
-
-浏览器打开 `http://127.0.0.1:8080/`。首次启动前必须执行 `backfill-seq`：后端在 Redis 缺少 `seq:ready` 时会拒绝启动，`backfill-seq` 会写入它。端口刻意错开（`8080` / `13308` / `16380` / `5674`、管理端 `15674`），便于与已有实例并存；`compose.yaml` 里的密码是仅本机可达的开发占位值，超出 localhost 的场景必须换成真实密钥。
-
-构建时的 `GOPROXY` 默认指向 `https://goproxy.cn,direct`，因为 BuildKit 不会继承宿主 shell 的代理设置。需要其他镜像源时用 `--build-arg GOPROXY=...` 覆盖。
-
-## 测试与验证
-
-```bash
-# 后端单元测试
-(cd backend && go test -race ./...)
-
-# 前端测试与构建
-(cd frontend && npm ci && npm test && npm run build)
-```
-
-真实 MySQL 集成测试由环境变量门控，未设置时自动跳过：
-
-```bash
-(cd backend && IM_TEST_MYSQL_DSN='<dsn>' go test -race ./internal/store)
-```
-
-运行实例的 smoke 需要先构建并托管前端。下面的 `8199` 是当前验证实例；不设置 `BASE_URL` 时 smoke 默认也打 8199，建议仍然显式指定目标地址：
-
-```bash
-BASE_URL=http://127.0.0.1:8199 node scripts/smoke.mjs
-BASE_URL=http://127.0.0.1:8199 node scripts/browser-smoke.mjs
-BASE_URL=http://127.0.0.1:8199 node scripts/cache-smoke.mjs
-```
-
-浏览器 smoke 默认使用 macOS 上的 Google Chrome，可用 `CHROME_PATH` 指定其他 Chrome/Chromium。smoke 会在输出目录写入 `manifest.json`，记录本轮创建的测试账号和群；清理时使用 `scripts/cleanup-test-data.mjs` 按 manifest 精确处理，不要使用宽泛的用户名通配符。
 
 ## 版本状态
 
