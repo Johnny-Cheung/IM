@@ -4,6 +4,7 @@ import {
   lastVisibleReadSeq,
   readFrame,
   readTargetKey,
+  type ReadCursorReporterOptions,
 } from "./readCursor";
 
 describe("read frames", () => {
@@ -87,12 +88,76 @@ describe("ReadCursorReporter", () => {
     vi.useRealTimers();
   });
 
-  function newReporter(result = true) {
+  function newReporter(
+    result = true,
+    options: ReadCursorReporterOptions = {
+      directLeading: false,
+      directIntervalMs: 1000,
+    },
+  ) {
     const send = vi.fn(() => result);
-    const reporter = new ReadCursorReporter(send);
+    const reporter = new ReadCursorReporter(send, options);
     reporter.setTarget({ kind: "direct", username: "bob" });
     return { reporter, send };
   }
+
+  it("sends the first direct observation immediately and coalesces the next window", () => {
+    const send = vi.fn(() => true);
+    const reporter = new ReadCursorReporter(send);
+    reporter.setTarget({ kind: "direct", username: "bob" });
+
+    reporter.observe(5);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith({
+      type: "read",
+      kind: "direct",
+      username: "bob",
+      last_read_seq: 5,
+    });
+
+    reporter.observe(6);
+    reporter.observe(8);
+    expect(send).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(199);
+    expect(send).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenLastCalledWith({
+      type: "read",
+      kind: "direct",
+      username: "bob",
+      last_read_seq: 8,
+    });
+  });
+
+  it("keeps group reporting on the one-second window", () => {
+    const send = vi.fn(() => true);
+    const reporter = new ReadCursorReporter(send);
+    reporter.setTarget({ kind: "group", groupID: 7 });
+
+    reporter.observe(12);
+    expect(send).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(999);
+    expect(send).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(send).toHaveBeenCalledWith({
+      type: "read",
+      kind: "group",
+      group_id: 7,
+      last_read_seq: 12,
+    });
+  });
+
+  it("retries a rejected leading direct frame after the short interval", () => {
+    const send = vi.fn(() => false);
+    const reporter = new ReadCursorReporter(send);
+    reporter.setTarget({ kind: "direct", username: "bob" });
+
+    reporter.observe(5);
+    expect(send).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(200);
+    expect(send).toHaveBeenCalledTimes(2);
+  });
 
   it("coalesces observations into one trailing frame", () => {
     const { reporter, send } = newReporter();

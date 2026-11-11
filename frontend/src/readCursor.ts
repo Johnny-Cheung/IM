@@ -1,6 +1,13 @@
 import type { FocusTarget } from "./focus";
 
-export const READ_CURSOR_INTERVAL_MS = 1000;
+export const READ_CURSOR_GROUP_INTERVAL_MS = 1000;
+export const READ_CURSOR_DIRECT_INTERVAL_MS = 200;
+
+export type ReadCursorReporterOptions = {
+  directIntervalMs?: number;
+  groupIntervalMs?: number;
+  directLeading?: boolean;
+};
 
 export type ReadFrame =
   | { type: "read"; kind: "direct"; username: string; last_read_seq: number }
@@ -74,11 +81,21 @@ export class ReadCursorReporter {
   private lastSentSeq = 0;
   private paused = false;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private lastDirectSendAt = 0;
+  private readonly directIntervalMs: number;
+  private readonly groupIntervalMs: number;
+  private readonly directLeading: boolean;
 
   constructor(
     private readonly send: (frame: ReadFrame) => boolean,
-    private readonly intervalMs: number = READ_CURSOR_INTERVAL_MS,
-  ) {}
+    options: ReadCursorReporterOptions = {},
+  ) {
+    this.directIntervalMs =
+      options.directIntervalMs ?? READ_CURSOR_DIRECT_INTERVAL_MS;
+    this.groupIntervalMs =
+      options.groupIntervalMs ?? READ_CURSOR_GROUP_INTERVAL_MS;
+    this.directLeading = options.directLeading ?? true;
+  }
 
   // setTarget returns true when the focused conversation changed.
   setTarget(target: FocusTarget | null): boolean {
@@ -96,6 +113,7 @@ export class ReadCursorReporter {
     this.pendingSeq = 0;
     this.latestSeq = 0;
     this.lastSentSeq = 0;
+    this.lastDirectSendAt = 0;
     return true;
   }
 
@@ -112,12 +130,21 @@ export class ReadCursorReporter {
     if (seq > this.pendingSeq) {
       this.pendingSeq = seq;
     }
-    if (this.timer === null) {
-      this.timer = setTimeout(() => {
-        this.timer = null;
-        this.flushNow();
-      }, this.intervalMs);
+    if (this.timer !== null) {
+      return;
     }
+    // Private chats get a leading edge: the first rendered message after a
+    // quiet interval goes out now. Messages arriving in the short trailing
+    // window are merged by the timer below.
+    if (this.target.kind === "direct" && this.directLeading) {
+      if (Date.now() - this.lastDirectSendAt >= this.directIntervalMs) {
+        this.flushNow();
+      } else {
+        this.schedule(this.directIntervalMs);
+      }
+      return;
+    }
+    this.schedule(this.intervalForTarget());
   }
 
   flushNow(): void {
@@ -139,10 +166,14 @@ export class ReadCursorReporter {
     if (!accepted) {
       // The socket may be closed or the server focus not established yet.
       // Keep the position so a reconnect or focus.ack can replay it.
+      this.schedule(this.intervalForTarget());
       return;
     }
     if (this.pendingSeq > this.lastSentSeq) {
       this.lastSentSeq = this.pendingSeq;
+    }
+    if (this.target.kind === "direct") {
+      this.lastDirectSendAt = Date.now();
     }
     this.pendingSeq = 0;
   }
@@ -180,6 +211,7 @@ export class ReadCursorReporter {
     this.clearTimer();
     this.paused = true;
     this.lastSentSeq = 0;
+    this.lastDirectSendAt = 0;
     if (this.latestSeq > this.pendingSeq) {
       this.pendingSeq = this.latestSeq;
     }
@@ -193,6 +225,23 @@ export class ReadCursorReporter {
     this.pendingSeq = 0;
     this.latestSeq = 0;
     this.lastSentSeq = 0;
+    this.lastDirectSendAt = 0;
+  }
+
+  private intervalForTarget(): number {
+    return this.target?.kind === "direct"
+      ? this.directIntervalMs
+      : this.groupIntervalMs;
+  }
+
+  private schedule(delayMs: number): void {
+    if (this.timer !== null || this.paused) {
+      return;
+    }
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.flushNow();
+    }, delayMs);
   }
 
   private clearTimer(): void {
