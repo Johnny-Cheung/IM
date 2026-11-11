@@ -49,6 +49,19 @@ function trackFocusFrames() {
   return { frames, off };
 }
 
+function trackReadFrames() {
+  const frames = [];
+  const off = tab.on("Network.webSocketFrameSent", ({ response }) => {
+    try {
+      const frame = JSON.parse(response.payloadData);
+      if (frame?.type === "read") frames.push({ frame, at: Date.now() });
+    } catch {
+      // Ignore non-JSON frames.
+    }
+  });
+  return { frames, off };
+}
+
 async function waitUntil(condition, message, timeout = 5000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -351,12 +364,29 @@ async function main() {
   await scenario("private foreground reading uses focus with receipts", async () => {
     const reads = trackReadRequests();
     const focus = trackFocusFrames();
+    const readFrames = trackReadFrames();
     try {
       await tab.select(directSelector("b"), `/chat/${name("b")}`);
       await waitUntil(() => focusTarget(focus.frames, "direct", name("b")), "opening a private chat did not focus it");
       const unread = `#conversation-list ${directSelector("b")} .unread-badge`;
-      await run.request("b", "POST", `/api/conversations/${name("a")}/messages`, { body: "私聊前台观看", client_message_id: randomUUID() });
+      const sentAt = Date.now();
+      const incoming = await run.request("b", "POST", `/api/conversations/${name("a")}/messages`, { body: "私聊前台观看", client_message_id: randomUUID() });
       await tab.waitFor("document.querySelector('#message-list')?.innerText.includes('私聊前台观看')");
+      await waitUntil(
+        () => readFrames.frames.some(({ frame }) =>
+          frame.kind === "direct"
+          && same(frame.username, name("b"))
+          && frame.last_read_seq >= incoming.message.seq),
+        "the private reader did not send the leading read frame",
+      );
+      const leadFrame = readFrames.frames.find(({ frame }) =>
+        frame.kind === "direct"
+        && same(frame.username, name("b"))
+        && frame.last_read_seq >= incoming.message.seq);
+      run.check(
+        "private first message advances the read frame without the one-second window",
+        leadFrame !== undefined && leadFrame.at - sentAt < 800,
+      );
       await delay(600);
       run.check("foreground private message leaves no unread", !await tab.evaluate(`!!document.querySelector(${JSON.stringify(unread)})`));
       run.check("private foreground sends no read request", reads.paths.length === 0);
@@ -396,6 +426,7 @@ async function main() {
     } finally {
       reads.off();
       focus.off();
+      readFrames.off();
     }
 
     await tab.select(memberSelector(live), `/chat/group/${live}`);
