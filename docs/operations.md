@@ -448,9 +448,9 @@ curl -fsS http://127.0.0.1:8199/ops/infra   # 检查 seq.ready 与 pipeline.reco
 
 - relay/consumer 批量化、发送路径缓存和客户端已读游标已在 Ubuntu 完成 direct 链路真实压测；压测发现的 consumer 批量回落已完成代码与单测修复（按 `server_message_id` 预查剔除完全相同的重投，其余冲突仍回落逐条），尚未做重复投递注入 soak，也未部署到 8198。
 - consumer 批量路径新增 `/ops/infra` 指标：`batch_duplicates_filtered`、`batch_fallbacks`、`message_conflicts`；正常重投下第一个会增长，后两个应接近 0。
-- 已读协议：`focus` 仍表示“打开会话即推进到最新”；停留前台时客户端把实际渲染到视口内的最大 `seq` 通过 WS `read` 帧上报，目标必须与当前 focus 一致，`last_read_seq=0` 被忽略；服务端复用现有 `AdvanceRead`，clamp 到会话计数器且只增不减。
+- 已读协议：`focus` 仍表示“打开会话即推进到最新”；停留前台时客户端把实际渲染到视口内的最大 `seq` 通过 WS `read` 帧上报，目标必须与当前 focus 一致，`last_read_seq=0` 被忽略；服务端复用现有 `AdvanceRead`，clamp 到会话计数器且只增不减。私聊首条可见消息立即上报、后续约 200ms 合并；群聊约 1 秒合并。
 - 服务端不再在消息投递后为“聚焦的接收者/群成员”推进水位，只保留发送者自读。客户端在滚动、切换会话、隐藏标签页、卸载和重连时 flush；隐藏时先发 `read` 再发 `blur`。
-- 不新增 Redis 键、HTTP 接口、后台 worker 或队列；已读仍通过 `dm:read:stream`/`group-read:stream` 异步写 MySQL。群聊 `group.read` 广播给除 reader 外的成员，大群回执扇出需要在压测中观察。
+- 不新增 Redis 键、HTTP 接口、后台 worker 或队列；已读仍通过 `dm:read:stream`/`group-read:stream` 异步写 MySQL。群聊不再广播 `group.read`，发送者在自己最后一条消息可见时按消息年龄和已读变化自适应轮询 `read-stats`；全部已读、消息不可见、页面隐藏、离线或超过 10 分钟时停止。
 - 验证：`go test ./...`、`go test -race ./internal/messaging ./internal/store`、`go vet ./...` 均通过；真实浏览器、重复投递 soak、群聊链路压测尚未执行。
 
 ## v1.10 删除私聊 feed，按会话懒加载（代码与单测完成，待 8199 验证）
