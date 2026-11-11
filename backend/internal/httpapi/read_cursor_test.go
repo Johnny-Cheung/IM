@@ -113,7 +113,7 @@ func TestWebSocketReadDirectIgnoresZeroSeq(t *testing.T) {
 	assertNoWSEventType(t, aliceConn, "messages.read", 300*time.Millisecond)
 }
 
-func TestWebSocketReadGroupAdvancesAndExcludesReader(t *testing.T) {
+func TestWebSocketReadGroupAdvancesWithoutBroadcast(t *testing.T) {
 	alice := store.User{ID: 1, Username: "alice", Nickname: "Alice"}
 	bob := store.User{ID: 2, Username: "bob", Nickname: "Bob"}
 	dataStore := &fakeStore{sessionByTokenHash: chatSessions(alice, bob)}
@@ -149,10 +149,9 @@ func TestWebSocketReadGroupAdvancesAndExcludesReader(t *testing.T) {
 		}
 		return false
 	})
-	event := readWSEventType(t, bobConn, "group.read")
-	if event["group_id"] != float64(7) {
-		t.Fatalf("group read event = %#v", event)
-	}
+	// Group receipts are pulled by each sender's client; an advance must not
+	// fan out to the whole group.
+	assertNoWSEventType(t, bobConn, "group.read", 300*time.Millisecond)
 	assertNoWSEventType(t, aliceConn, "group.read", 300*time.Millisecond)
 }
 

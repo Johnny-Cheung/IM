@@ -668,24 +668,6 @@ func (a *API) groupMessageRecipients(ctx context.Context, groupID uint64) []uint
 	return nil
 }
 
-// publishGroupReadFromRedis broadcasts a group read signal from the Redis
-// member set, keeping the read path off MySQL.
-func (a *API) publishGroupReadFromRedis(
-	ctx context.Context,
-	groupID uint64,
-	excluded map[uint64]struct{},
-) {
-	if a.groupReads == nil {
-		return
-	}
-	memberIDs, err := a.groupReads.MemberIDs(ctx, groupID)
-	if err != nil {
-		log.Printf("list group read broadcast members group=%d: %v", groupID, err)
-		return
-	}
-	a.publishGroupRead(memberIDs, groupID, excluded)
-}
-
 func (a *API) ensureGroupReadModelReady(c *gin.Context) bool {
 	if a.groupReads == nil {
 		writeError(c, http.StatusServiceUnavailable, "message_service_unavailable", "消息服务暂时不可用")

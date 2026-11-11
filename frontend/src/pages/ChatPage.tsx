@@ -53,12 +53,12 @@ import {
 } from "../readCursor";
 import { groupReceiptLabel, lastOwnSentSeq as findLastOwnSentSeq } from "../groupReceipt";
 import {
-  Debouncer,
-  READ_STATS_DEBOUNCE_MS,
+  GroupReceiptPoller,
+  type GroupReceiptTarget,
+} from "../groupReceiptPolling";
+import {
   ReadStatsGate,
-  parseGroupReadEvent,
   parseGroupReadStats,
-  type GroupReadEvent,
 } from "../readStats";
 import {
   acceptedSeqMap,
@@ -777,9 +777,8 @@ export function ChatPage() {
   const reconnectAttemptRef = useRef(0);
   const connectRef = useRef<() => void>(() => {});
   const syncingRef = useRef(false);
-  const groupReceiptTargetRef = useRef<{ groupID: number; seq: number } | null>(null);
+  const groupReceiptTargetRef = useRef<GroupReceiptTarget | null>(null);
   const readStatsGateRef = useRef(new ReadStatsGate());
-  const readStatsDebouncerRef = useRef(new Debouncer(READ_STATS_DEBOUNCE_MS));
   const nearBottomRef = useRef(true);
   const scrollToBottomNextRef = useRef(false);
   const pendingOlderScrollRef = useRef<ScrollPosition | null>(null);
@@ -1016,10 +1015,10 @@ export function ChatPage() {
     socket.send(JSON.stringify(frame));
   }, []);
 
-  const fetchGroupReadStats = useCallback(async () => {
+  const fetchGroupReadStats = useCallback(async (): Promise<GroupReadStats | null> => {
     const target = groupReceiptTargetRef.current;
     if (target === null || offlineRef.current) {
-      return;
+      return null;
     }
     const token = readStatsGateRef.current.begin(
       target.groupID,
@@ -1038,7 +1037,7 @@ export function ChatPage() {
         )
         || stats.seq !== target.seq
       ) {
-        return;
+        return null;
       }
       // The seq may have been reused by a different message after a rollback;
       // drop a response that no longer points at the message on screen.
@@ -1047,35 +1046,63 @@ export function ChatPage() {
         && message.group_id === target.groupID
         && message.seq === target.seq);
       if (local === undefined || local.id !== stats.message_id) {
-        return;
+        return null;
       }
       setGroupReceipt({
         groupID: target.groupID,
         seq: stats.seq,
         stats,
       });
+      return stats;
     } catch (error) {
-      // Keep the last good value; the next trigger retries.
+      // Keep the last good value; the next poll retries.
       handleSessionError(error);
+      return null;
     }
   }, [handleSessionError]);
 
-  const handleGroupRead = useCallback((event: GroupReadEvent) => {
-    const target = activeTargetRef.current;
-    if (target?.kind !== "group" || target.groupID !== event.groupID) {
-      return;
+  const groupReceiptVisible = useCallback(() => {
+    const target = groupReceiptTargetRef.current;
+    const active = activeTargetRef.current;
+    if (
+      target === null
+      || active?.kind !== "group"
+      || active.groupID !== target.groupID
+      || !pageVisibleRef.current
+      || offlineRef.current
+    ) {
+      return false;
     }
-    if (groupReceiptTargetRef.current === null) {
-      return;
+    const container = messageListRef.current;
+    if (container === null) {
+      return false;
     }
-    readStatsDebouncerRef.current.schedule(() => {
-      void fetchGroupReadStats();
-    });
-  }, [fetchGroupReadStats]);
+    const row = container.querySelector<HTMLElement>(
+      `.message-row[data-seq="${target.seq}"]`,
+    );
+    if (row === null) {
+      return false;
+    }
+    const viewport = container.getBoundingClientRect();
+    const rect = row.getBoundingClientRect();
+    return rect.bottom > viewport.top && rect.top < viewport.bottom;
+  }, []);
+
+  const groupReceiptPoller = useMemo(
+    () => new GroupReceiptPoller({
+      isEligible: groupReceiptVisible,
+      getAgeMs: () => {
+        const target = groupReceiptTargetRef.current;
+        return target === null ? 0 : Date.now() - target.sentAtMs;
+      },
+      fetch: fetchGroupReadStats,
+    }),
+    [fetchGroupReadStats, groupReceiptVisible],
+  );
 
   useEffect(() => () => {
-    readStatsDebouncerRef.current.cancel();
-  }, []);
+    groupReceiptPoller.stop();
+  }, [groupReceiptPoller]);
 
   // A rollback archives the user's own lost messages into the outbox; keep them
   // visible as failed rows in the open conversation so they can be retried.
@@ -1730,30 +1757,43 @@ export function ChatPage() {
   }, [pageVisible, syncFocus]);
 
   useEffect(() => {
-    readStatsDebouncerRef.current.cancel();
     readStatsGateRef.current.reset();
+    const ownMessage = lastOwnSentSeq > 0
+      ? messagesRef.current.find((message) =>
+        isGroupMessage(message)
+        && message.group_id === activeGroupID
+        && message.seq === lastOwnSentSeq)
+      : undefined;
+    const sentAt = ownMessage ? Date.parse(ownMessage.created_at) : Number.NaN;
     const target = activeGroupID > 0 && messagesBelongToActive
       && lastOwnSentSeq > 0
-      ? { groupID: activeGroupID, seq: lastOwnSentSeq }
+      ? {
+        groupID: activeGroupID,
+        seq: lastOwnSentSeq,
+        sentAtMs: Number.isFinite(sentAt) ? sentAt : Date.now(),
+      }
       : null;
     groupReceiptTargetRef.current = target;
     setGroupReceipt(null);
-    if (target !== null) {
-      void fetchGroupReadStats();
+    if (target === null) {
+      groupReceiptPoller.stop();
+      return;
     }
+    groupReceiptPoller.start(true, true);
   }, [
     activeGroupID,
-    fetchGroupReadStats,
+    groupReceiptPoller,
     lastOwnSentSeq,
     messagesBelongToActive,
   ]);
 
   useEffect(() => {
     if (!pageVisible) {
+      groupReceiptPoller.stop();
       return;
     }
-    void fetchGroupReadStats();
-  }, [fetchGroupReadStats, pageVisible]);
+    groupReceiptPoller.sync();
+  }, [groupReceiptPoller, pageVisible]);
 
   const loadOlderMessages = useCallback(async () => {
     const target = activeTargetRef.current;
@@ -1815,10 +1855,12 @@ export function ChatPage() {
       - container.scrollTop
       - container.clientHeight < 100;
     scheduleReadMeasurement();
+    groupReceiptPoller.sync();
     if (container.scrollTop < 80 && hasMore && !loadingOlder && !messagesLoading) {
       void loadOlderMessages();
     }
   }, [
+    groupReceiptPoller,
     hasMore,
     loadingOlder,
     loadOlderMessages,
@@ -1852,11 +1894,14 @@ export function ChatPage() {
 
   useLayoutEffect(() => {
     if (!pageVisible || messagesLoading || messages.length === 0) {
+      groupReceiptPoller.sync();
       return;
     }
     measureReadCursor();
+    groupReceiptPoller.sync();
   }, [
     activeKey,
+    groupReceiptPoller,
     measureReadCursor,
     messages,
     messagesKey,
@@ -2201,9 +2246,14 @@ export function ChatPage() {
       && activeTargetRef.current.groupID === event.groupID
     ) {
       void loadGroupDetail(event.groupID);
-      void fetchGroupReadStats();
+      groupReceiptPoller.refreshNow();
     }
-  }, [fetchGroupReadStats, loadConversations, loadGroupDetail, loseGroupAccess]);
+  }, [
+    groupReceiptPoller,
+    loadConversations,
+    loadGroupDetail,
+    loseGroupAccess,
+  ]);
 
   const scheduleReconnect = useCallback(() => {
     if (!mountedRef.current || replacedRef.current) {
@@ -2395,7 +2445,7 @@ export function ChatPage() {
         && initialLoadRef.current?.key === target.key
         && initialLoadRef.current.requestID === messagesRequestRef.current;
       syncFocus();
-      void fetchGroupReadStats();
+      groupReceiptPoller.refreshNow();
       if (target && !skipInitialSync) {
         if (target.kind === "group") {
           void loadGroupDetail(target.groupID);
@@ -2430,11 +2480,6 @@ export function ChatPage() {
           const ack = parseFocusAck(data);
           if (ack) {
             handleFocusAck(ack);
-          }
-        } else if (data?.type === "group.read") {
-          const readEvent = parseGroupReadEvent(data);
-          if (readEvent) {
-            handleGroupRead(readEvent);
           }
         } else if (data?.type === "moment.created") {
           setMomentsHasNew(true);
@@ -2473,10 +2518,9 @@ export function ChatPage() {
       socket.close();
     };
   }, [
-    fetchGroupReadStats,
+    groupReceiptPoller,
     handleFocusAck,
     handleGroupChanged,
-    handleGroupRead,
     handleIncomingGroupMessage,
     handleIncomingMessage,
     handleReadEvent,
@@ -2524,6 +2568,7 @@ export function ChatPage() {
     // the final cursor best-effort when this cleanup wins the race.
     readReporter.flushNow();
     readReporter.stop();
+    groupReceiptPoller.stop();
     if (cacheLimitsTimerRef.current !== null) {
       window.clearTimeout(cacheLimitsTimerRef.current);
       cacheLimitsTimerRef.current = null;
@@ -2532,7 +2577,7 @@ export function ChatPage() {
       cancelAnimationFrame(readMeasureFrameRef.current);
       readMeasureFrameRef.current = null;
     }
-  }, [readReporter]);
+  }, [groupReceiptPoller, readReporter]);
 
   useEffect(() => {
     if (offline) {
@@ -2548,6 +2593,7 @@ export function ChatPage() {
         // server-side focus; same-socket ordering makes read precede blur.
         readReporter.flushNow();
         readReporter.pause();
+        groupReceiptPoller.stop();
         focusReadyRef.current = null;
       }
       setPageVisible(visible);
@@ -2586,6 +2632,7 @@ export function ChatPage() {
     const handlePageHide = () => {
       readReporter.flushNow();
       readReporter.pause();
+      groupReceiptPoller.stop();
     };
     const handlePageShow = (event: PageTransitionEvent) => {
       if (event.persisted && document.visibilityState === "visible") {
@@ -2610,6 +2657,7 @@ export function ChatPage() {
     };
   }, [
     coldOffline,
+    groupReceiptPoller,
     loadConversations,
     offline,
     readReporter,

@@ -451,13 +451,10 @@ async function implicitReadOverWebSocket() {
     const readerJ = await open("j");
     run.check("viewers focus the group", !(await readerI.focusGroup(live)).error && !(await readerJ.focusGroup(live)).error);
 
-    const ownerFrom = owner.events.length;
     const first = await sendGroup("h", live, "隐式已读群消息");
     run.check("the first group message gets seq 1", first.message.seq === 1);
     readerI.send({ type: "read", kind: "group", group_id: live, last_read_seq: first.message.seq });
     readerJ.send({ type: "read", kind: "group", group_id: live, last_read_seq: first.message.seq });
-    await owner.waitFor((event) => event.type === "group.read" && event.group_id === live, "the sender never received group.read", ownerFrom);
-    run.check("sender receives group.read when focused viewers read", true);
     await until(async () => (await readStats("h", live, 1)).all_read, "focused viewers did not complete the receipt");
     const stats = await readStats("h", live, 1);
     run.check(

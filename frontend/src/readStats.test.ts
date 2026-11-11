@@ -1,25 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
-  Debouncer,
   ReadStatsGate,
-  parseGroupReadEvent,
   parseGroupReadStats,
 } from "./readStats";
-
-describe("group read events", () => {
-  it("parses a group read signal", () => {
-    expect(parseGroupReadEvent({ type: "group.read", group_id: 12 }))
-      .toEqual({ groupID: 12 });
-  });
-
-  it("drops malformed signals", () => {
-    expect(parseGroupReadEvent(null)).toBeNull();
-    expect(parseGroupReadEvent({ type: "group.read" })).toBeNull();
-    expect(parseGroupReadEvent({ type: "group.read", group_id: 0 })).toBeNull();
-    expect(parseGroupReadEvent({ type: "messages.read", group_id: 12 }))
-      .toBeNull();
-  });
-});
 
 describe("group read stats", () => {
   it("parses a valid response", () => {
@@ -61,37 +44,6 @@ describe("group read stats", () => {
       member_count: 2,
       all_read: false,
     })).toBeNull();
-  });
-});
-
-describe("Debouncer", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("coalesces bursts into one call", () => {
-    const run = vi.fn();
-    const debouncer = new Debouncer(300);
-    debouncer.schedule(run);
-    debouncer.schedule(run);
-    debouncer.schedule(run);
-    vi.advanceTimersByTime(299);
-    expect(run).not.toHaveBeenCalled();
-    vi.advanceTimersByTime(1);
-    expect(run).toHaveBeenCalledTimes(1);
-  });
-
-  it("drops a pending call on cancel", () => {
-    const run = vi.fn();
-    const debouncer = new Debouncer(300);
-    debouncer.schedule(run);
-    debouncer.cancel();
-    vi.advanceTimersByTime(1000);
-    expect(run).not.toHaveBeenCalled();
   });
 });
 

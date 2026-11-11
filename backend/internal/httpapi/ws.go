@@ -77,11 +77,6 @@ type wsFocusAckEvent struct {
 	Error       string `json:"error,omitempty"`
 }
 
-type wsGroupReadEvent struct {
-	Type    string `json:"type"`
-	GroupID uint64 `json:"group_id"`
-}
-
 type wsInboundFrame struct {
 	Type        string `json:"type"`
 	Kind        string `json:"kind"`
@@ -500,11 +495,6 @@ func (a *API) handleGroupFocus(client *wsClient, groupID uint64) {
 
 	client.setFocus(wsFocus{kind: wsFocusKindGroup, groupID: groupID})
 	logGroupReadStreamError(result, groupID)
-	if result.Advanced {
-		a.publishGroupReadFromRedis(ctx, groupID, map[uint64]struct{}{
-			client.userID: {},
-		})
-	}
 	a.sendFocusAck(client, wsFocusAckEvent{
 		Kind:        wsFocusKindGroup,
 		GroupID:     groupID,
@@ -585,13 +575,6 @@ func (a *API) handleReadFrame(client *wsClient, frame wsInboundFrame) {
 			return
 		}
 		logGroupReadStreamError(result, focus.groupID)
-		if result.Advanced {
-			a.publishGroupReadFromRedis(
-				ctx,
-				focus.groupID,
-				map[uint64]struct{}{client.userID: {}},
-			)
-		}
 	}
 }
 
@@ -612,35 +595,6 @@ func (a *API) sendFocusError(client *wsClient, kind, username string, groupID ui
 		GroupID:  groupID,
 		Error:    code,
 	})
-}
-
-func (a *API) publishGroupRead(
-	memberIDs []uint64,
-	groupID uint64,
-	excluded map[uint64]struct{},
-) {
-	if len(memberIDs) == 0 {
-		return
-	}
-	payload, err := json.Marshal(wsGroupReadEvent{
-		Type:    "group.read",
-		GroupID: groupID,
-	})
-	if err != nil {
-		log.Printf("marshal websocket group read event: %v", err)
-		return
-	}
-	targets := make([]uint64, 0, len(memberIDs))
-	for _, userID := range memberIDs {
-		if userID == 0 {
-			continue
-		}
-		if _, skip := excluded[userID]; skip {
-			continue
-		}
-		targets = append(targets, userID)
-	}
-	a.hub.Broadcast(targets, payload)
 }
 
 func checkWebSocketOrigin(r *http.Request) bool {
